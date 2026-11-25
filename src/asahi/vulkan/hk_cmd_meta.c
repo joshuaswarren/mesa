@@ -124,6 +124,7 @@ hk_copy_push_descriptor_set(struct hk_push_descriptor_set *dst,
    memcpy(dst->layout_hash, src->layout_hash, sizeof(dst->layout_hash));
    dst->layout_flags = src->layout_flags;
    dst->size = src->size;
+   hk_push_descriptor_set_reset_upload(dst);
    memcpy(dst->data, src->data, src->size);
 }
 
@@ -230,6 +231,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       if (save->has_push_desc0)
          hk_copy_push_descriptor_set(desc->push[0],
                                      hk_meta_saved_push_desc0(cmd, save));
+      else if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = NULL;
       desc->set_update_seq[0] = 0;
       desc->root.sets[0] = save->buffer_set0;
@@ -239,6 +242,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_active &= ~BITFIELD_BIT(0);
       desc->buffer_active |= BITFIELD_BIT(0);
    } else if (save->desc0) {
+      if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = save->desc0;
       desc->set_update_seq[0] = save->desc0_update_seq;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
@@ -254,6 +259,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       else
          desc->push_active &= ~BITFIELD_BIT(0);
    } else {
+      if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->push_active &= ~BITFIELD_BIT(0);
    }
    desc->non_push_generation++;
@@ -566,7 +573,7 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
          .src_addr = src_addr,
          .src_nonresident_addr = src_nonresident_addr,
          .dst_addr = dst_addr,
-         .map_addr = src_buffer->sparse_map->va->addr +
+         .map_addr = hk_buffer_sparse_map_addr(src_buffer) +
                      sizeof(struct hk_sparse_buffer_map_header),
          .resource_base = src_buffer->va->addr,
          .size = MIN2(size, max_dispatch_size),
@@ -2238,7 +2245,8 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
                                   const struct hk_image *dst,
                                   const VkBlitImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0 ||
+   if (!agx_chip_has_cap(dev->dev.chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+       info->regionCount == 0 ||
        !(src->planes[0].layout.compressed || dst->planes[0].layout.compressed))
       return false;
 
@@ -2263,7 +2271,7 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_g17p_mip_level_through_pbe(width, height)))
+           hk_mip_level_through_pbe(dev->dev.chip, width, height)))
          return false;
    }
    return true;
@@ -3486,7 +3494,53 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+   /* HAL200 writes a compressed colour array one layer at a time: the
+    * qualified BG/EOT contract is single-layer, so a layered render through
+    * the generic resolve path reaches a compressed source array's
+    * per-layer metadata through hardware stride derivation that is not
+    * reliable at --jobs 4 concurrency. hk_CmdCopyImage and
+    * hk_CmdBlitImage split 2D-array regions into per-slice passes on the
+    * same contract; apply the same split here so the generic resolve runs
+    * one layer at a time whenever either image is a compressed 2D
+    * array. */
+   if (agx_chip_native_agx3(dev->dev.chip) &&
+       src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+       dst_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+       (src_layout->compressed || dst_layout->compressed)) {
+      for (uint32_t r = 0; r < pResolveImageInfo->regionCount; ++r) {
+         const VkImageResolve2 *region = &pResolveImageInfo->pRegions[r];
+         const uint32_t src_slices =
+            vk_image_subresource_layer_count(&src_image->vk,
+                                             &region->srcSubresource);
+         const uint32_t dst_slices =
+            vk_image_subresource_layer_count(&dst_image->vk,
+                                             &region->dstSubresource);
+
+         for (uint32_t slice = 0; slice < src_slices; ++slice) {
+            VkImageResolve2 one;
+            if (!hk_g17p_image_resolve_slice(
+                   dev->dev.chip, src_image->vk.image_type,
+                   dst_image->vk.image_type, src_slices, dst_slices,
+                   region, slice, &one)) {
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FEATURE_NOT_PRESENT);
+               break;
+            }
+
+            VkResolveImageInfo2 info = *pResolveImageInfo;
+            info.regionCount = 1;
+            info.pRegions = &one;
+            vk_meta_resolve_image2(&cmd->vk, &dev->meta, &info);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               break;
+         }
+
+         if (vk_command_buffer_has_error(&cmd->vk))
+            break;
+      }
+   } else {
+      vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+   }
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 

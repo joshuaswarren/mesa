@@ -535,6 +535,10 @@ hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd)
    memcpy(push, cmd->state.cs.descriptors.push, sizeof(push));
    memset(&cmd->state.cs, 0, sizeof(cmd->state.cs));
    memcpy(cmd->state.cs.descriptors.push, push, sizeof(push));
+   for (unsigned i = 0; i < HK_MAX_SETS; i++) {
+      if (cmd->state.cs.descriptors.push[i])
+         hk_push_descriptor_set_reset_upload(cmd->state.cs.descriptors.push[i]);
+   }
 }
 
 void
@@ -5299,6 +5303,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
 
    desc->root.cs.group_count_addr = dispatch_addr;
    desc->root.cs.grid_helper_sparse_map_addr =
-      (use_primary && buffer->sparse_map) ? buffer->sparse_map->va->addr : 0;
+      (use_primary && buffer->sparse_map) ? hk_buffer_sparse_map_addr(buffer)
+                                          : 0;
    dispatch(cmd, agx_grid_indirect(dispatch_addr));
 }

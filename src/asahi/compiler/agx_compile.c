@@ -11837,6 +11837,34 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
+   /* Factor loop-invariant MAC reductions and strength-reduce linear-IV MACs
+    * before runtime-loop unrolling so the unrolled main loop (not just its
+    * scalar remainder) inherits the multiply-free reduction and hoisted
+    * invariant row addresses. */
+   if (runtime_loop_opts && m5_unroll_factor >= 2 && !nir->info.internal)
+      agx_factor_loop_mac(nir);
+
+   /* Exact-divisor partial unrolling for compile-time constant-trip counted
+    * loops that full unrolling skipped due to body size, plus monotonic 32-bit
+    * bit-pack accumulator strength reduction (zero runtime guard or dead tail
+    * loop). */
+   if (agx3_compute_opts && m5_unroll_factor >= 4 && !nir->info.internal) {
+      bool const_unrolled = false;
+      NIR_PASS(const_unrolled, nir, agx_nir_opt_const_loop_unroll,
+               m5_unroll_factor, m5_unroll_widest);
+      if (const_unrolled) {
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+         bool reassoc = false;
+         NIR_PASS(reassoc, nir, agx_nir_reassoc_const_offsets);
+         if (reassoc) {
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, nir_opt_algebraic);
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
+   }
+
    /* Counted loops whose trip count is only known at run time: run several
     * iterations per loop test where the bound allows it. On AGX3 the loop
     * control of a short body costs about as much as the body, and the
@@ -19223,14 +19251,14 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       }
    }
 
-   /* A workgroup of one subgroup needs only SIMD-group fences. (Runs after
-    * any pass that delimits shared-memory phases by workgroup barriers.) */
-   if (agx3_native_compute)
+   /* Run after all passes that delimit shared-memory phases by workgroup
+    * barriers. Preserve existing coverage for internal AGX3 shaders. */
+   if (agx3_native_compute ||
+       (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+        !key->secondary)) {
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
-   /* Larger workgroups: the barriers whose shared traffic stays in
-    * subgroup 0, such as a tree reduction's last five steps. */
-   if (agx3_native_compute)
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);

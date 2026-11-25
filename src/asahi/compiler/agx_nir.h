@@ -123,6 +123,8 @@ bool agx_nir_opt_licm_direct_sfu(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
 bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
+bool agx_nir_opt_const_loop_unroll(struct nir_shader *shader,
+                                   unsigned max_factor, unsigned *widest);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);

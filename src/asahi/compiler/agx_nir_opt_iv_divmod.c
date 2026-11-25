@@ -27,6 +27,157 @@ def_outside_loop(nir_def *def, nir_loop *loop)
    return true;
 }
 
+/* Match `load_root_agx` + optional 64-bit constant offset. */
+static bool
+match_root_const_addr(nir_scalar addr, uint64_t *off_out)
+{
+   addr = nir_scalar_chase_movs(addr);
+   if (addr.def->bit_size != 64 || addr.comp != 0)
+      return false;
+
+   uint64_t off = 0;
+   if (nir_scalar_is_alu(addr) && nir_scalar_alu_op(addr) == nir_op_iadd) {
+      nir_scalar s0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(addr, 0));
+      nir_scalar s1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(addr, 1));
+      if (nir_scalar_is_const(s1)) {
+         off = nir_scalar_as_uint(s1);
+         addr = s0;
+      } else if (nir_scalar_is_const(s0)) {
+         off = nir_scalar_as_uint(s0);
+         addr = s1;
+      } else {
+         return false;
+      }
+   }
+
+   if (nir_def_instr(addr.def)->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *root = nir_instr_as_intrinsic(nir_def_instr(addr.def));
+   if (root->intrinsic != nir_intrinsic_load_root_agx)
+      return false;
+
+   if (off_out)
+      *off_out = off;
+   return true;
+}
+
+/* True if `s` is a constant-offset push-constant, root-table, or preamble load
+ * (always loop-invariant and safe to hoist to a loop preheader). */
+static bool
+is_invariant_uniform_load(nir_scalar s, nir_intrinsic_op *op_out,
+                          uint64_t *key_out)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def->bit_size != 32 ||
+       nir_def_instr(s.def)->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(nir_def_instr(s.def));
+   if (intr->intrinsic == nir_intrinsic_load_push_constant) {
+      nir_scalar off = nir_scalar_resolved(intr->src[0].ssa, 0);
+      if (!nir_scalar_is_const(off))
+         return false;
+      if (op_out)
+         *op_out = intr->intrinsic;
+      if (key_out)
+         *key_out = (uint64_t)nir_intrinsic_base(intr) +
+                    nir_scalar_as_uint(off) + (uint64_t)s.comp * 4;
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_load_preamble) {
+      if (op_out)
+         *op_out = intr->intrinsic;
+      if (key_out)
+         *key_out = (uint64_t)nir_intrinsic_base(intr) + (uint64_t)s.comp * 2;
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+      uint64_t off = 0;
+      if (!match_root_const_addr(nir_scalar_resolved(intr->src[0].ssa, 0),
+                                 &off))
+         return false;
+      if (op_out)
+         *op_out = intr->intrinsic;
+      if (key_out)
+         *key_out = off + (uint64_t)s.comp * 4;
+      return true;
+   }
+   return false;
+}
+
+static bool
+scalar_loop_invariant(nir_scalar s, nir_loop *loop, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s) || def_outside_loop(s.def, loop) ||
+       is_invariant_uniform_load(s, NULL, NULL))
+      return true;
+   if (!depth || !nir_scalar_is_alu(s))
+      return false;
+
+   const nir_alu_instr *alu = nir_def_as_alu(s.def);
+   const unsigned nsrcs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < nsrcs; ++i) {
+      if (!scalar_loop_invariant(nir_scalar_chase_alu_src(s, i), loop,
+                                 depth - 1))
+         return false;
+   }
+   return true;
+}
+
+static bool
+same_divisor(nir_scalar a, nir_scalar b)
+{
+   a = nir_scalar_chase_movs(a);
+   b = nir_scalar_chase_movs(b);
+   if (a.def == b.def && a.comp == b.comp)
+      return true;
+   nir_intrinsic_op op_a, op_b;
+   uint64_t key_a, key_b;
+   if (is_invariant_uniform_load(a, &op_a, &key_a) &&
+       is_invariant_uniform_load(b, &op_b, &key_b))
+      return op_a == op_b && key_a == key_b;
+   return false;
+}
+
+static nir_def *
+materialize_divisor_in_preheader(nir_builder *b_pre, nir_scalar div,
+                                 nir_loop *loop)
+{
+   div = nir_scalar_chase_movs(div);
+   if (def_outside_loop(div.def, loop))
+      return nir_channel(b_pre, div.def, div.comp);
+
+   nir_intrinsic_instr *orig = nir_instr_as_intrinsic(nir_def_instr(div.def));
+   if (orig->intrinsic == nir_intrinsic_load_push_constant) {
+      nir_scalar off = nir_scalar_resolved(orig->src[0].ssa, 0);
+      nir_def *ld = nir_load_push_constant(
+         b_pre, orig->def.num_components, orig->def.bit_size,
+         nir_imm_int(b_pre, nir_scalar_as_uint(off)),
+         .base = nir_intrinsic_base(orig), .range = nir_intrinsic_range(orig));
+      return nir_channel(b_pre, ld, div.comp);
+   }
+   if (orig->intrinsic == nir_intrinsic_load_global_constant) {
+      uint64_t off = 0;
+      bool ok =
+         match_root_const_addr(nir_scalar_resolved(orig->src[0].ssa, 0), &off);
+      assert(ok);
+      (void)ok;
+      nir_def *addr = nir_iadd_imm(b_pre, nir_load_root_agx(b_pre), off);
+      nir_def *ld = nir_load_global_constant(
+         b_pre, orig->def.num_components, orig->def.bit_size, addr,
+         .access = nir_intrinsic_access(orig),
+         .align_mul = nir_intrinsic_align_mul(orig),
+         .align_offset = nir_intrinsic_align_offset(orig));
+      return nir_channel(b_pre, ld, div.comp);
+   }
+   assert(orig->intrinsic == nir_intrinsic_load_preamble);
+   nir_def *ld = nir_load_preamble(b_pre, orig->def.num_components,
+                                   orig->def.bit_size,
+                                   .base = nir_intrinsic_base(orig));
+   return nir_channel(b_pre, ld, div.comp);
+}
+
 static void
 collect_loops_rec(struct exec_list *list, struct util_dynarray *loops)
 {
@@ -89,12 +240,15 @@ struct unit_iv_loop {
    nir_phi_instr *iv;
    nir_scalar bound;
    bool is_unsigned_cmp;
+   bool bottom_tested;
 };
 
 /* Match a loop with a single back edge (header has exactly 2 predecessors:
- * preheader and latch), a single top exit `if (iv >= bound) break` or
- * `if (!(iv < bound)) break` (signed or unsigned), and a 32-bit header phi
- * `iv` initialized to 0 and incremented by +1 on the back edge. */
+ * preheader and latch), a single top exit `if (iv >= bound) break` (or
+ * `if (!(iv < bound)) break`) or rotated bottom exit `if (iv_next >= bound)
+ * break` (or `if (!(iv_next < bound)) break`) (signed or unsigned), and a
+ * 32-bit header phi `iv` initialized to 0 and incremented by +1 on the back
+ * edge. */
 static bool
 match_zero_unit_loop(nir_loop *loop, struct unit_iv_loop *out)
 {
@@ -107,91 +261,124 @@ match_zero_unit_loop(nir_loop *loop, struct unit_iv_loop *out)
    if (nir_block_num_preds(header) != 2 || nir_block_ends_in_jump(latch))
       return false;
 
-   nir_cf_node *next = nir_cf_node_next(&header->cf_node);
-   if (!next || next->type != nir_cf_node_if)
-      return false;
+   nir_cf_node *top_node = nir_cf_node_next(&header->cf_node);
+   nir_cf_node *bot_node = nir_cf_node_prev(&latch->cf_node);
 
-   nir_if *nif = nir_cf_node_as_if(next);
-   const bool break_in_then =
-      branch_is_lone_break(&nif->then_list) && branch_is_empty(&nif->else_list);
-   const bool break_in_else =
-      branch_is_lone_break(&nif->else_list) && branch_is_empty(&nif->then_list);
-   if (!break_in_then && !break_in_else)
-      return false;
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      const bool bottom = (pass == 1);
+      nir_cf_node *node = bottom ? bot_node : top_node;
+      if (!node || node->type != nir_cf_node_if)
+         continue;
+      if (bottom && !exec_list_is_empty(&latch->instr_list))
+         continue;
 
-   nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
-   bool break_when_true = break_in_then;
-   while (nir_scalar_is_alu(cond) && nir_scalar_alu_op(cond) == nir_op_inot) {
-      cond = nir_scalar_chase_alu_src(cond, 0);
-      break_when_true = !break_when_true;
+      nir_if *nif = nir_cf_node_as_if(node);
+      const bool break_in_then =
+         branch_is_lone_break(&nif->then_list) && branch_is_empty(&nif->else_list);
+      const bool break_in_else =
+         branch_is_lone_break(&nif->else_list) && branch_is_empty(&nif->then_list);
+      if (!break_in_then && !break_in_else)
+         continue;
+
+      nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+      bool break_when_true = break_in_then;
+      while (nir_scalar_is_alu(cond) && nir_scalar_alu_op(cond) == nir_op_inot) {
+         cond = nir_scalar_chase_alu_src(cond, 0);
+         break_when_true = !break_when_true;
+      }
+      if (!nir_scalar_is_alu(cond))
+         continue;
+
+      const nir_op op = nir_scalar_alu_op(cond);
+      if (op != nir_op_ilt && op != nir_op_ige &&
+          op != nir_op_ult && op != nir_op_uge)
+         continue;
+
+      const bool is_unsigned_cmp = (op == nir_op_ult || op == nir_op_uge);
+      nir_scalar lhs = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
+      nir_scalar rhs = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1));
+      if (lhs.def->bit_size != 32 || rhs.def->bit_size != 32)
+         continue;
+
+      /* We need continue condition `tested < bound` (i.e. break on
+       * `tested >= bound`).
+       * - break_when_true && ige/uge: break on lhs >= rhs -> tested = lhs, bound = rhs
+       * - !break_when_true && ilt/ult: continue on lhs < rhs -> tested = lhs, bound = rhs
+       */
+      const bool want_ge = break_when_true;
+      const bool is_ge = (op == nir_op_ige || op == nir_op_uge);
+      if (want_ge != is_ge)
+         continue;
+
+      nir_phi_instr *iv = NULL;
+      if (!bottom) {
+         if (lhs.comp != 0 || nir_def_instr(lhs.def)->type != nir_instr_type_phi)
+            continue;
+         iv = nir_instr_as_phi(nir_def_instr(lhs.def));
+      } else {
+         /* Bottom-tested loop compares `iv_next = iv + 1` against `bound`. */
+         if (lhs.comp != 0 || !nir_scalar_is_alu(lhs) ||
+             nir_scalar_alu_op(lhs) != nir_op_iadd)
+            continue;
+         nir_scalar a0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(lhs, 0));
+         nir_scalar a1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(lhs, 1));
+         if (a0.comp == 0 && nir_def_instr(a0.def)->type == nir_instr_type_phi &&
+             nir_scalar_is_const(a1) && nir_scalar_as_uint(a1) == 1) {
+            iv = nir_instr_as_phi(nir_def_instr(a0.def));
+         } else if (a1.comp == 0 && nir_def_instr(a1.def)->type == nir_instr_type_phi &&
+                    nir_scalar_is_const(a0) && nir_scalar_as_uint(a0) == 1) {
+            iv = nir_instr_as_phi(nir_def_instr(a1.def));
+         } else {
+            continue;
+         }
+      }
+
+      if (iv->instr.block != header || iv->def.num_components != 1 ||
+          iv->def.bit_size != 32)
+         continue;
+
+      nir_phi_src *init_src = nir_phi_get_src_from_block(iv, preheader);
+      nir_phi_src *back_src = nir_phi_get_src_from_block(iv, latch);
+      if (!init_src || !back_src)
+         continue;
+
+      nir_scalar init_s = nir_scalar_resolved(init_src->src.ssa, 0);
+      if (!nir_scalar_is_const(init_s) || nir_scalar_as_uint(init_s) != 0)
+         continue;
+
+      /* Verify back_src == iv + 1 (and matches lhs for bottom-tested loops). */
+      nir_scalar back_s = nir_scalar_resolved(back_src->src.ssa, 0);
+      if (bottom && (back_s.def != lhs.def || back_s.comp != lhs.comp))
+         continue;
+      if (!nir_scalar_is_alu(back_s) || nir_scalar_alu_op(back_s) != nir_op_iadd)
+         continue;
+      nir_scalar a0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(back_s, 0));
+      nir_scalar a1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(back_s, 1));
+      const bool step_ok =
+         (a0.def == &iv->def && a0.comp == 0 &&
+          nir_scalar_is_const(a1) && nir_scalar_as_uint(a1) == 1) ||
+         (a1.def == &iv->def && a1.comp == 0 &&
+          nir_scalar_is_const(a0) && nir_scalar_as_uint(a0) == 1);
+      if (!step_ok)
+         continue;
+
+      if (!scalar_loop_invariant(rhs, loop, 8))
+         continue;
+
+      *out = (struct unit_iv_loop){
+         .loop = loop,
+         .preheader = preheader,
+         .header = header,
+         .latch = latch,
+         .iv = iv,
+         .bound = rhs,
+         .is_unsigned_cmp = is_unsigned_cmp,
+         .bottom_tested = bottom,
+      };
+      return true;
    }
-   if (!nir_scalar_is_alu(cond))
-      return false;
 
-   const nir_op op = nir_scalar_alu_op(cond);
-   if (op != nir_op_ilt && op != nir_op_ige &&
-       op != nir_op_ult && op != nir_op_uge)
-      return false;
-
-   const bool is_unsigned_cmp = (op == nir_op_ult || op == nir_op_uge);
-   nir_scalar lhs = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
-   nir_scalar rhs = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1));
-   if (lhs.def->bit_size != 32 || rhs.def->bit_size != 32)
-      return false;
-
-   /* We need continue condition `iv < bound` (i.e. break on `iv >= bound`).
-    * - break_when_true && ige/uge: break on lhs >= rhs -> iv = lhs, bound = rhs
-    * - !break_when_true && ilt/ult: continue on lhs < rhs -> iv = lhs, bound = rhs
-    */
-   const bool want_ge = break_when_true;
-   const bool is_ge = (op == nir_op_ige || op == nir_op_uge);
-   if (want_ge != is_ge)
-      return false;
-
-   if (lhs.comp != 0 || nir_def_instr(lhs.def)->type != nir_instr_type_phi)
-      return false;
-
-   nir_phi_instr *iv = nir_instr_as_phi(nir_def_instr(lhs.def));
-   if (iv->instr.block != header || iv->def.num_components != 1 ||
-       iv->def.bit_size != 32)
-      return false;
-
-   nir_phi_src *init_src = nir_phi_get_src_from_block(iv, preheader);
-   nir_phi_src *back_src = nir_phi_get_src_from_block(iv, latch);
-   if (!init_src || !back_src)
-      return false;
-
-   nir_scalar init_s = nir_scalar_resolved(init_src->src.ssa, 0);
-   if (!nir_scalar_is_const(init_s) || nir_scalar_as_uint(init_s) != 0)
-      return false;
-
-   /* Verify back_src == iv + 1. */
-   nir_scalar back_s = nir_scalar_resolved(back_src->src.ssa, 0);
-   if (!nir_scalar_is_alu(back_s) || nir_scalar_alu_op(back_s) != nir_op_iadd)
-      return false;
-   nir_scalar a0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(back_s, 0));
-   nir_scalar a1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(back_s, 1));
-   const bool step_ok =
-      (a0.def == &iv->def && a0.comp == 0 &&
-       nir_scalar_is_const(a1) && nir_scalar_as_uint(a1) == 1) ||
-      (a1.def == &iv->def && a1.comp == 0 &&
-       nir_scalar_is_const(a0) && nir_scalar_as_uint(a0) == 1);
-   if (!step_ok)
-      return false;
-
-   if (!nir_scalar_is_const(rhs) && !def_outside_loop(rhs.def, loop))
-      return false;
-
-   *out = (struct unit_iv_loop){
-      .loop = loop,
-      .preheader = preheader,
-      .header = header,
-      .latch = latch,
-      .iv = iv,
-      .bound = rhs,
-      .is_unsigned_cmp = is_unsigned_cmp,
-   };
-   return true;
+   return false;
 }
 
 /* --- Pass 2: Unit-stepped IV div/mod strength reduction --- */
@@ -323,7 +510,9 @@ agx_nir_opt_iv_divmod(nir_shader *shader)
                if (num.def != &ul.iv->def || num.comp != 0)
                   continue;
                /* Leave compile-time constant divisors to nir_opt_idiv_const. */
-               if (nir_scalar_is_const(div) || !def_outside_loop(div.def, ul.loop))
+               if (nir_scalar_is_const(div) ||
+                   (!def_outside_loop(div.def, ul.loop) &&
+                    !is_invariant_uniform_load(div, NULL, NULL)))
                   continue;
 
                util_dynarray_append(&targets, alu);
@@ -354,7 +543,7 @@ agx_nir_opt_iv_divmod(nir_shader *shader)
             struct divmod_group *grp = NULL;
             for (unsigned g = 0; g < ngroups; ++g) {
                if (groups[g].is_unsigned == is_u &&
-                   scalar_equal_pair(groups[g].divisor, div)) {
+                   same_divisor(groups[g].divisor, div)) {
                   grp = &groups[g];
                   break;
                }
@@ -367,15 +556,20 @@ agx_nir_opt_iv_divmod(nir_shader *shader)
                grp->divisor = div;
                grp->is_unsigned = is_u;
                grp->zero = nir_imm_int(&b_pre, 0);
-               grp->d_def = nir_channel(&b_pre, div.def, div.comp);
+               grp->d_def =
+                  materialize_divisor_in_preheader(&b_pre, div, ul.loop);
 
                nir_def *abs_d = grp->d_def;
+               nir_def *q_step = NULL;
                grp->d_neg = NULL;
                if (!is_u &&
                    !divisor_is_known_nonneg(shader, range_ht, div, ul.header)) {
                   grp->d_neg = nir_ilt_imm(&b_pre, grp->d_def, 0);
                   abs_d = nir_bcsel(&b_pre, grp->d_neg,
                                     nir_ineg(&b_pre, grp->d_def), grp->d_def);
+                  q_step = nir_bcsel(&b_pre, grp->d_neg,
+                                     nir_imm_int(&b_pre, -1),
+                                     nir_imm_int(&b_pre, 1));
                }
 
                nir_phi_instr *q_phi = nir_phi_instr_create(shader);
@@ -389,10 +583,10 @@ agx_nir_opt_iv_divmod(nir_shader *shader)
                nir_def *r1 = nir_iadd_imm(&b_latch, &r_phi->def, 1);
                nir_def *wrap = nir_ieq(&b_latch, r1, abs_d);
                nir_def *r_next = nir_bcsel(&b_latch, wrap, grp->zero, r1);
+               nir_def *q_inc = q_step ? nir_iadd(&b_latch, &q_phi->def, q_step)
+                                       : nir_iadd_imm(&b_latch, &q_phi->def, 1);
                nir_def *q_next =
-                  nir_bcsel(&b_latch, wrap,
-                            nir_iadd_imm(&b_latch, &q_phi->def, 1),
-                            &q_phi->def);
+                  nir_bcsel(&b_latch, wrap, q_inc, &q_phi->def);
 
                nir_phi_instr_add_src(q_phi, ul.latch, q_next);
                nir_phi_instr_add_src(r_phi, ul.latch, r_next);
@@ -411,16 +605,12 @@ agx_nir_opt_iv_divmod(nir_shader *shader)
 
             switch (op) {
             case nir_op_udiv:
+            case nir_op_idiv:
                res = q;
                break;
             case nir_op_umod:
             case nir_op_irem:
                res = r;
-               break;
-            case nir_op_idiv:
-               res = grp->d_neg
-                        ? nir_bcsel(&b_use, grp->d_neg, nir_ineg(&b_use, q), q)
-                        : q;
                break;
             case nir_op_imod:
                if (grp->d_neg) {

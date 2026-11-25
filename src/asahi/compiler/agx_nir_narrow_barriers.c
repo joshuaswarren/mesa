@@ -4,23 +4,30 @@
  */
 
 /*
- * A compute workgroup of at most 32 invocations is one AGX subgroup, so its
- * workgroup scope and subgroup scope name the same invocations. Narrow its
- * workgroup execution scope and workgroup-or-wider memory scope to subgroup
- * scope on barriers that order only shared memory (or nothing): shared memory
- * is private to one workgroup, so a wider memory scope such as DEVICE adds no
- * cross-workgroup visibility, and the backend then emits the SIMD-group
- * shared-memory fence instead of the threadgroup rendezvous. Barriers that
- * order device memory or images keep their scopes. Metal's compiler removes
- * these barriers from 32-wide variants of the same kernels on M5 (Geekbench's
- * particle kernel).
+ * Narrow workgroup shared-memory barriers to subgroup scope when the barrier
+ * provably orders only invocations within a single 32-wide AGX subgroup.
+ *
+ * 1. Single-subgroup workgroups (1..32 fixed invocations): workgroup scope and
+ *    subgroup scope name the same invocations. Narrow workgroup execution and
+ *    workgroup/device memory scopes on barriers that order only shared memory
+ *    (or execution only) to subgroup scope, avoiding a threadgroup rendezvous
+ *    while preserving compiler ordering. Barriers that order global/device
+ *    memory or images keep their original scopes.
+ *
+ * 2. Larger fixed workgroups (>32 invocations): a workgroup shared-memory
+ *    rendezvous can act at subgroup scope when the shared-memory traffic it
+ *    orders stays inside subgroup 0 (local invocation index < 32; AGX assigns
+ *    invocations to 32-wide subgroups in local index order), such as the tail
+ *    steps of a tree reduction (`if (tid < off) s[tid] += s[tid + off];
+ *    barrier();` for off <= 16).
  */
 
 #include "agx_nir.h"
 #include "compiler/nir/nir_builder.h"
 
 static bool
-narrow(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+narrow_single_subgroup_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                             void *data)
 {
    if (intr->intrinsic != nir_intrinsic_barrier ||
        (nir_intrinsic_memory_modes(intr) & ~nir_var_mem_shared))
@@ -45,41 +52,34 @@ agx_nir_narrow_single_subgroup_barriers(nir_shader *shader)
        shader->info.workgroup_size_variable)
       return false;
 
-   const unsigned invocations = shader->info.workgroup_size[0] *
-                                shader->info.workgroup_size[1] *
-                                shader->info.workgroup_size[2];
+   const uint64_t invocations = (uint64_t)shader->info.workgroup_size[0] *
+                                (uint64_t)shader->info.workgroup_size[1] *
+                                (uint64_t)shader->info.workgroup_size[2];
    if (!invocations || invocations > 32)
       return false;
 
-   return nir_shader_intrinsics_pass(shader, narrow, nir_metadata_all, NULL);
+   return nir_shader_intrinsics_pass(shader, narrow_single_subgroup_instr,
+                                     nir_metadata_all, NULL);
 }
 
 /*
- * Larger fixed workgroups: a workgroup barrier that orders only shared
- * memory can also act at subgroup scope when the shared memory traffic it
- * orders stays inside subgroup 0, the invocations with local index < 32 (AGX
- * assigns invocations to 32-wide subgroups in local index order). That is
- * the tail of a tree reduction: `if (tid < off) s[tid] += s[tid + off];
- * barrier();` with off <= 16. Metal's compiler leaves those steps without a
- * barrier on M5 (Geekbench's particle kernel at 64 and 128 invocations).
- *
- * Phases are the code between kept barriers. Barrier B narrows when the
- * phase before it (back to the last kept barrier) or the phase after it (to
- * the next barrier) has no shared-memory access at all -- the neighbouring
- * kept barriers then order everything B would -- or when every shared access
- * in both is guarded by a condition implying local index < 32. Narrowed
+ * Larger fixed workgroups: phases are the code between kept barriers. Barrier B
+ * narrows when the phase before it (back to the last kept barrier) or the phase
+ * after it (to the next barrier) has no shared-memory access at all -- the
+ * neighbouring kept barriers then order everything B would -- or when every
+ * shared access in both is guarded by a condition implying local index < 32,
+ * and B does not order non-shared memory traffic across subgroups. Narrowed
  * barriers merge their phases, so a later decision sees the merged phase.
  *
- * Only when every barrier of the shader is a plain shared-memory workgroup
- * rendezvous (plain_shared_barrier) and all lie in one control-flow list
- * outside any loop: the phases are then program-order ranges between
- * rendezvous (supersets, for code in the branches of an if, which is
- * conservative). Tile-memory accesses count as unguarded traffic.
+ * Only runs when every barrier of the shader is a plain shared-memory workgroup
+ * rendezvous (plain_shared_barrier) and all lie in one non-divergent
+ * control-flow list outside any loop: phases are then program-order ranges
+ * between rendezvous (conservative supersets for nested if arms). Tile-memory
+ * accesses count as unguarded traffic.
  */
 
 struct sg0 {
-   nir_def *index;    /* load_local_invocation_index, or NULL */
-   nir_def *id;       /* load_local_invocation_id, used as .x when 1D */
+   nir_def *id; /* load_local_invocation_id, used as .x when 1D */
 };
 
 static bool
@@ -100,19 +100,23 @@ is_tid(const struct sg0 *t, nir_scalar s)
 
 /* Whether cond being `value` implies local index < 32. */
 static bool
-implies_subgroup0(const struct sg0 *t, nir_scalar cond, bool value, unsigned depth)
+implies_subgroup0(const struct sg0 *t, nir_scalar cond, bool value,
+                  unsigned depth)
 {
    cond = nir_scalar_chase_movs(cond);
    if (!depth || !nir_scalar_is_alu(cond))
       return false;
    nir_op op = nir_scalar_alu_op(cond);
    if (op == nir_op_inot)
-      return implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 0), !value, depth - 1);
+      return implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 0), !value,
+                               depth - 1);
    if (((op == nir_op_iand && value) || (op == nir_op_ior && !value)) &&
        nir_op_infos[op].num_inputs == 2) {
       /* Both hold (or both fail): either one implying it suffices. */
-      return implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 0), value, depth - 1) ||
-             implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 1), value, depth - 1);
+      return implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 0), value,
+                               depth - 1) ||
+             implies_subgroup0(t, nir_scalar_chase_alu_src(cond, 1), value,
+                               depth - 1);
    }
 
    /* Only binary comparisons from here (b2b1 and other unary ops have no
@@ -122,24 +126,33 @@ implies_subgroup0(const struct sg0 *t, nir_scalar cond, bool value, unsigned dep
    nir_scalar a = nir_scalar_chase_alu_src(cond, 0);
    nir_scalar b = nir_scalar_chase_alu_src(cond, 1);
    const bool tid_a = is_tid(t, a), tid_b = is_tid(t, b);
-   if ((!tid_a || !nir_scalar_is_const(b)) && (!tid_b || !nir_scalar_is_const(a)))
+   if ((!tid_a || !nir_scalar_is_const(b)) &&
+       (!tid_b || !nir_scalar_is_const(a)))
       return false;
+
    /* Normalize to tid OP c. */
-   const uint64_t c = nir_scalar_as_uint(tid_a ? b : a);
+   nir_scalar cs = tid_a ? b : a;
+   const uint64_t c = nir_scalar_as_uint(cs);
    switch (op) {
    case nir_op_ieq:
       return value && c < 32;
    case nir_op_ine:
       return !value && c < 32;
-   case nir_op_ult:
    case nir_op_ilt:
-      /* tid < c true, or c < tid false (tid <= c). The index is
-       * nonnegative, so the signed compare is the same for c < 2^31. */
+      if (nir_scalar_as_int(cs) < 0)
+         return false;
+      FALLTHROUGH;
+   case nir_op_ult:
+      /* tid < c true, or c < tid false (tid <= c). The index is nonnegative
+       * and <= 1023, so the signed compare matches for nonnegative c. */
       if (c > INT32_MAX)
          return false;
       return tid_a ? (value && c <= 32) : (!value && c < 32);
-   case nir_op_uge:
    case nir_op_ige:
+      if (nir_scalar_as_int(cs) < 0)
+         return false;
+      FALLTHROUGH;
+   case nir_op_uge:
       /* tid >= c false (tid < c), or c >= tid true (tid <= c). */
       if (c > INT32_MAX)
          return false;
@@ -153,25 +166,31 @@ static bool
 guarded_subgroup0(const struct sg0 *t, nir_instr *instr)
 {
    nir_cf_node *child = &instr->block->cf_node;
-   for (nir_cf_node *node = child->parent; node; child = node, node = node->parent) {
+   for (nir_cf_node *node = child->parent; node;
+        child = node, node = node->parent) {
       if (node->type != nir_cf_node_if)
          continue;
       nir_if *nif = nir_cf_node_as_if(node);
       bool in_then = false;
       foreach_list_typed(nir_cf_node, n, node, &nif->then_list)
          in_then |= n == child;
-      if (implies_subgroup0(t, nir_get_scalar(nif->condition.ssa, 0), in_then, 6))
+      if (implies_subgroup0(t, nir_get_scalar(nif->condition.ssa, 0), in_then,
+                            6))
          return true;
    }
    return false;
 }
 
 static bool
-inside_loop(nir_block *block)
+inside_loop_or_divergent_if(nir_block *block)
 {
-   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent)
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
       if (node->type == nir_cf_node_loop)
          return true;
+      if (node->type == nir_cf_node_if &&
+          nir_src_is_divergent(&nir_cf_node_as_if(node)->condition))
+         return true;
+   }
    return false;
 }
 
@@ -193,7 +212,7 @@ member_list(nir_block *block)
 }
 
 /* Workgroup memory: shared variables and the tile memory a compute shader can
- * reach (as agx_nir_lower_workgroup_split counts it). */
+ * reach. */
 static bool
 workgroup_memory_access(nir_intrinsic_instr *intr, bool *tile)
 {
@@ -227,10 +246,10 @@ plain_shared_barrier(nir_intrinsic_instr *intr)
 }
 
 struct phase {
-   bool any;       /* a shared-memory access */
-   bool outside;   /* one not limited to subgroup 0 */
-   bool writes;    /* a write to other memory (stores, atomics, ...) */
-   bool reads;     /* a read of other memory that a write may change */
+   bool any;     /* a shared-memory access */
+   bool outside; /* one not limited to subgroup 0 */
+   bool writes;  /* a write to other memory (stores, atomics, ...) */
+   bool reads;   /* a read of other memory that a write may change */
 };
 
 /* Memory other than workgroup memory: a barrier's rendezvous orders it
@@ -255,9 +274,9 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
    if (shader->info.stage != MESA_SHADER_COMPUTE ||
        shader->info.workgroup_size_variable)
       return false;
-   const unsigned invocations = shader->info.workgroup_size[0] *
-                                shader->info.workgroup_size[1] *
-                                shader->info.workgroup_size[2];
+   const uint64_t invocations = (uint64_t)shader->info.workgroup_size[0] *
+                                (uint64_t)shader->info.workgroup_size[1] *
+                                (uint64_t)shader->info.workgroup_size[2];
    if (invocations <= 32)
       return false;
    const bool one_d = shader->info.workgroup_size[1] == 1 &&
@@ -267,7 +286,9 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
    if (!impl)
       return false;
 
-   /* Every barrier, in program order; all in one list outside loops. */
+   nir_divergence_analysis(shader);
+
+   /* Every barrier, in program order; all in one uniform list outside loops. */
    struct util_dynarray barriers;
    util_dynarray_init(&barriers, NULL);
    const struct exec_list *list = NULL;
@@ -285,21 +306,22 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
          if (intr->intrinsic != nir_intrinsic_barrier)
             continue;
          const struct exec_list *l = member_list(block);
-         if (inside_loop(block) || !l || (list && l != list) ||
+         if (inside_loop_or_divergent_if(block) || !l || (list && l != list) ||
              !plain_shared_barrier(intr))
             usable = false;
          list = l;
          util_dynarray_append(&barriers, intr);
       }
    }
-   const unsigned count = util_dynarray_num_elements(&barriers, nir_intrinsic_instr *);
+   const unsigned count =
+      util_dynarray_num_elements(&barriers, nir_intrinsic_instr *);
    if (!usable || count == 0) {
       util_dynarray_fini(&barriers);
       return false;
    }
    nir_intrinsic_instr **bar = barriers.data;
 
-   /* The shared accesses of each gap between consecutive barriers. */
+   /* The shared and non-shared memory accesses of each gap between barriers. */
    struct phase *gaps = calloc(count + 1, sizeof(*gaps));
    unsigned gap = 0;
    nir_foreach_block(block, impl) {

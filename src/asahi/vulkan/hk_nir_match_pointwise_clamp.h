@@ -211,13 +211,18 @@ struct hk_dual_fadd_ep_copy_push {
    uint32_t _pad;
 };
 
+/* Push words of the cooperative-matrix GEMM residual-FADD post-pass
+ * (hk_nir_apply_gemm_fadd()): the GPU addresses of the FADD residual input,
+ * the FADD destination and the copy destination for the output element at
+ * hk_nir_gemm_output::output.offset_B. Each is the address itself, as in the
+ * other dual writes, never a difference from the output's address. */
 struct hk_dual_fadd_push {
-   uint32_t res_delta_lo;
-   uint32_t res_delta_hi;
-   uint32_t dst1_delta_lo;
-   uint32_t dst1_delta_hi;
-   uint32_t dst2_delta_lo;
-   uint32_t dst2_delta_hi;
+   uint32_t res_va_lo;
+   uint32_t res_va_hi;
+   uint32_t dst1_va_lo;
+   uint32_t dst1_va_hi;
+   uint32_t dst2_va_lo;
+   uint32_t dst2_va_hi;
 };
 
 struct hk_dual_pad4_push {

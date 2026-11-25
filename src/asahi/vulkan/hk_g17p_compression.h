@@ -12,24 +12,27 @@
 #include <stddef.h>
 #include <string.h>
 
-/* HAL200 lossless compression policy (G17P full policy, plus 2x/4x MSAA depth
- * across native HAL200).
+/* HAL200 lossless compression policy across native HAL200 AGX3B parts
+ * (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G16G and G17P).
  *
  * The compressed Gen9 PBE (write) packet matches Apple's HAL200 StateFields
  * encoder byte-for-byte for GPU-tiled one-layer 2D images, the read
  * descriptor carries the same compression bit and metadata address, and the
- * G17P ZLS control word Apple's Framebuffer builds uses the same load/store
+ * HAL200 ZLS control word Apple's Framebuffer builds uses the same load/store
  * compression bits (2/4/6/8), 16-bit depth format bit and metadata stride
  * encoding as Mesa's agx_pack_zls_control. The shapes below are the ones
- * whose every write path in hk goes through one of those three units or the
- * libagx_fast_clear metadata kernel:
+ * whose every write path in Borealis goes through one of those three units or
+ * the libagx_fast_clear metadata kernel:
  *
- *  - Color: single-plane, 1-8 byte texels, 2D (single-layer or arrays), cube,
- *    3D, and 2x/4x MSAA (including attachments, arrays, input attachments, and
- *    multiview), plus across G17P 16-byte texels
+ *  - Color: single-plane, 1-8 byte texels, 2D (single-layer or arrays), cube
+ *    and 3D single-sample, plus 16-byte texels
  *    (R32G32B32A32_{UINT,SINT,SFLOAT}) for single-sample 2D (single-layer,
- *    arrays, and cubemaps). Any spilled compressed colour attachment is
- *    decompressed in-place before the render pass via libagx_agx3_decompress /
+ *    arrays, and cubemaps). The 1-8 byte 2x/4x MSAA variants (attachments,
+ *    arrays, input attachments, multiview) are gated by
+ *    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G16G and G17P), sharing the Gen9
+ *    PBE/texture/AIL metadata encodings and per-layer compressed resolve split.
+ *    Any spilled compressed colour attachment is decompressed in-place before
+ *    the render pass via libagx_agx3_decompress /
  *    libagx_reset_compression_metadata (with emrt_texture packed uncompressed
  *    on HAL200).
  *  - Not R11G11B10F: attachments store through the format's own class
@@ -37,21 +40,19 @@
  *    field back as zero, however it was written. Rendering NaN into an
  *    R11G11B10F attachment has to keep it, so they stay plain.
  *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
- *    one level, one sample (single-layer or arrays) on G17P; across HAL200
- *    (G16G and G17P) also the depth plane at 2x and 4x (one level, plane 0
- *    only; single-layer on G16G, single-layer or arrays on G17P). Multisampled
+ *    one level, one sample (single-layer or arrays), plus the depth plane at
+ *    2x and 4x (one level, plane 0 only, single-layer or arrays). Multisampled
  *    depth goes through ZLS rather than the colour tilebuffer's background
  *    reload program, so it is unaffected by
  *    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT. The 2x/4x depth plane excludes
  *    input-attachment use (its S8 plane stays plain); it admits the
  *    feedback-loop usage and sample-location flag zink sets on every depth
- *    attachment, as single-sample depth does. The ZLS unit compresses the S8 stencil plane with the same
- *    metadata layout as depth (stencil
- *    load/store compression bits 4/8), it is read through its R8_UINT
- *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
- *    as D32S8, so these planes carry every GL depth/stencil buffer's ZLS
- *    traffic; buffer uploads into them take the graphics copy (R32_UINT
- *    and R8_UINT PBEs).
+ *    attachment, as single-sample depth does. The ZLS unit compresses the S8
+ *    stencil plane with the same metadata layout as depth (stencil load/store
+ *    compression bits 4/8), it is read through its R8_UINT alias, and its
+ *    clears are metadata fast clears. Zink stores GL Z24S8 as D32S8, so these
+ *    planes carry every GL depth/stencil buffer's ZLS traffic; buffer uploads
+ *    into them take the graphics copy (R32_UINT and R8_UINT PBEs).
  *
  * Images that may be shared with another process or device (external
  * memory, WSI, DRM modifiers) stay plain under this private policy. Colour
@@ -178,7 +179,7 @@ static inline bool
 hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
                                unsigned plane, const VkImageCreateInfo *info)
 {
-   if (!agx_chip_native_hal200(chip) || !info ||
+   if (!agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) || !info ||
        (plane != 0 && !(plane == 1 &&
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
@@ -186,19 +187,18 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    /* Keep depth/stencil off the extended colour shapes: their mip chains and
     * standalone S8 reach colour-alias transfer paths that refuse them, which
     * makes legal commands fail at EndCommandBuffer. Single-level depth arrays
-    * are admitted below. Colour's layered/MSAA packet support is independent
-    * of this restriction.
+    * are admitted below. Colour's layered packet support is independent of
+    * this restriction; 2x/4x MSAA colour is gated by
+    * AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION further below.
     *
-    * All G17P SoCs share the Gen9 PBE, ZLS and texture encodings for layered,
-    * cube and 3D colour, 2x/4x MSAA colour (including attachments, arrays,
-    * input attachments, and multiview), and single-level depth arrays. Any
-    * spilled compressed colour target (including 2x/4x MSAA targets spilled by
+    * All native HAL200 AGX3B parts (G16G, G17P) share the Gen9 PBE, ZLS,
+    * texture, and AIL compression metadata encodings for layered, cube, and 3D
+    * colour, 16-byte single-sample 2D/array/cube colour, and single-level
+    * 1x/2x/4x depth (single-layer and arrays). Any spilled compressed colour
+    * target (including 2x/4x MSAA targets spilled by
     * AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT or MRT/multiview tilebuffer pressure)
     * is decompressed in-place before the render pass by
     * libagx_agx3_decompress / libagx_reset_compression_metadata. */
-   /* 16-byte colour (single-sample 2D, arrays, and cubemaps): all G17P SoCs
-    * share the same HAL200/Gen9 PBE, texture, compression metadata encoding,
-    * and libagx_agx3_decompress spill path. */
    (void)chip_id;
    const bool color_16b = hk_g17p_compression_color_format_16b(info->format);
    /* Not B10G11R11_UFLOAT: a compressed tile of its class reads NaN back as
@@ -283,19 +283,14 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
          depth && !(info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
-      /* Non-G17P HAL200 parts (G16G) only take 2x/4x MSAA depth here;
-       * single-sample depth stays plain until verified separately on G16G. */
-      if (chip != AGX_CHIP_G17P && !depth_ms)
-         return false;
-      /* Single-level depth arrays across G17P (single-sample both planes, and
-       * 2x/4x MSAA plane 0). Every access to one layer addresses its metadata
-       * at compression_layer_stride_B: ZLS (with the metadata layer stride for
-       * layered rendering), the metadata fast clear, the texture and PBE
-       * descriptors. The graphics copies, uploads and blits split into
-       * single-layer passes (hk_cmd_meta.c). */
+      /* Single-level depth arrays across native HAL200 (single-sample both
+       * planes, and 2x/4x MSAA plane 0). Every access to one layer addresses
+       * its metadata at compression_layer_stride_B: ZLS (with the metadata
+       * layer stride for layered rendering), the metadata fast clear, the
+       * texture and PBE descriptors. The graphics copies, uploads and blits
+       * split into single-layer passes (hk_cmd_meta.c). */
       const bool depth_array =
-         (info->samples == VK_SAMPLE_COUNT_1_BIT ||
-          (chip == AGX_CHIP_G17P && depth_ms)) &&
+         (info->samples == VK_SAMPLE_COUNT_1_BIT || depth_ms) &&
          info->mipLevels == 1 && depth;
       if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
           !info->arrayLayers || (info->arrayLayers != 1 && !depth_array) ||
@@ -308,16 +303,17 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return depth && info->mipLevels == 1;
    }
 
-   /* Non-G17P HAL200 parts (G16G) keep colour plain here; G16G single-sample
-    * colour compression is gated separately (#638). */
-   if (chip != AGX_CHIP_G17P)
-      return false;
-
    /* 16-byte texels stay on single-sample 2D shapes (single-layer, arrays,
     * and cubemaps): 3D targets cannot use libagx_agx3_decompress on 8-MRT
     * spill, and multisampled 16-byte targets exceed the uncovered-tile MSAA
     * reload bound (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). */
    if (color_16b && (three_d || multisampled))
+      return false;
+
+   /* 1-8B 2x/4x MSAA colour is gated by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION
+    * across native HAL200 parts (G16G and G17P). */
+   if (color && multisampled &&
+       !agx_chip_has_cap(chip, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION))
       return false;
 
    if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
@@ -363,14 +359,15 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    if (!(info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
-       !hk_g17p_mip_level_through_pbe(info->extent.width,
-                                      info->extent.height))
+       !hk_mip_level_through_pbe(chip, info->extent.width,
+                                 info->extent.height))
       return false;
    return true;
 }
 
-/* G17P compression policy without a specific chip id: admits all architectural
- * G17P shapes uniformly across A18 Pro, M4 Pro, and M4 Max. */
+/* HAL200 compression policy without a specific chip id: admits all
+ * architectural HAL200 shapes uniformly across G16G and G17P (M4, A18 Pro,
+ * M4 Pro, and M4 Max). */
 static inline bool
 hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
                              const VkImageCreateInfo *info)
@@ -378,11 +375,21 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    return hk_hal200_compression_eligible(chip, 0, plane, info);
 }
 
-/* G17P and M5 colour images shared through
+/* Whether an AGX3 chip shares single-level colour images compressed through
+ * DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED (native HAL200 via
+ * AGX_CAP_HAL200_LOSSLESS_COMPRESSION, or M5 HAL300). */
+static inline bool
+hk_chip_shared_compression_supported(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+          agx_chip_g17_m5(chip);
+}
+
+/* HAL200 and M5 colour images shared through
  * DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
  *
  * The modifier is the sharing contract. With one level, one layer and one
- * sample, the G17P (legacy AIL policy) compressed allocation is a function of
+ * sample, the HAL200 (legacy AIL policy) compressed allocation is a function of
  * the format's block size and the extent alone: GPU tiling, the image, then
  * its metadata, in one memory plane. The M5 allocation (AIL_LAYOUT_POLICY_M5
  * and its metadata, one memory plane) is too. Exporter and importer therefore derive
@@ -418,7 +425,7 @@ hk_g17p_shared_compression_shape(enum agx_chip chip, VkFormat format,
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
-   return agx_chip_g17p_or_m5(chip) &&
+   return hk_chip_shared_compression_supported(chip) &&
           type == VK_IMAGE_TYPE_2D &&
           !(flags & ~allowed_flags) && !(usage & ~allowed_usage) &&
           hk_g17p_compression_color_format(format);

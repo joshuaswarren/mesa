@@ -634,6 +634,11 @@ VkResult hk_fs_build_sample_variant(struct hk_device *dev,
                                     struct hk_api_shader *obj,
                                     unsigned samples);
 
+/* Whether variant `idx` of a fragment shader has been completely published
+ * and is safe to read locklessly (acquire-loads sample_source->ready_mask
+ * when lazy sample variants are present). */
+bool hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx);
+
 void hk_shader_binary_cache_finish(struct hk_device *dev);
 bool hk_shader_ensure_link_ht_locked(struct hk_shader *shader);
 

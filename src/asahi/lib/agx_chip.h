@@ -1242,13 +1242,14 @@ agx_chip_has_fp32_denorm_preserve(enum agx_chip chip)
           agx_chip_native_or_m5(chip);
 }
 
-/* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
- * layout has a bias field; Gen4 does not, so the shader applies the bias. */
+/* Whether the sampler state word carries the LOD bias.  The HAL200 and Gen5
+ * sampler layouts have a bias field; Gen4 does not, so the shader applies it. */
 static inline bool
 agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 {
-   return agx_chip_sampler_generation(chip) ==
-          AGX_SAMPLER_GENERATION_GEN4_HAL200;
+   const enum agx_sampler_generation gen = agx_chip_sampler_generation(chip);
+   return gen == AGX_SAMPLER_GENERATION_GEN4_HAL200 ||
+          gen == AGX_SAMPLER_GENERATION_GEN5;
 }
 
 /*

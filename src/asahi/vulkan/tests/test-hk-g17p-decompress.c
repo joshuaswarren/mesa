@@ -36,6 +36,14 @@ texture_header(void)
    return cfg;
 }
 
+/* As texture_header(), for a PBE packet. */
+static struct AGX_PBE
+pbe_header(void)
+{
+   struct AGX_PBE cfg = {AGX_PBE_header};
+   return cfg;
+}
+
 static void
 check_kernel(const uint32_t *bin, const char *name)
 {
@@ -208,8 +216,74 @@ main(void)
    assert(hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_2D));
    assert(!hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_3D));
 
+   /* Verify Gen9 compressed AIL layout + PBE descriptor emission for the key
+    * HAL200 targets (rgba8, rgba16f, rgba32f 1x 2D/array, d32f via R32_UINT
+    * copy alias). 2x/4x MSAA colour compression on native HAL200 is enabled
+    * across G16G and G17P via AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION; the
+    * chip-caps row test owns the admission matrix, and the 2x/4x compressed
+    * layout + PBE path is further exercised through
+    * hk_hal200_compression_eligible() in test-hk-g17p-compression.c. */
+   static const struct {
+      enum pipe_format format;
+      unsigned layers;
+   } pbe_cases[] = {
+      { PIPE_FORMAT_R8G8B8A8_UNORM, 1 },
+      { PIPE_FORMAT_R8G8B8A8_UNORM, 4 },
+      { PIPE_FORMAT_R16G16B16A16_FLOAT, 1 },
+      { PIPE_FORMAT_R32G32B32A32_FLOAT, 1 },
+      { PIPE_FORMAT_R32G32B32A32_FLOAT, 6 },
+      { PIPE_FORMAT_R32_UINT, 1 },
+      { PIPE_FORMAT_R32_UINT, 4 },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(pbe_cases); ++i) {
+      struct ail_layout layout = {
+         .policy = ail_layout_policy_for_descriptor_generation(
+            agx_chip_descriptor_generation(AGX_CHIP_G16G)),
+         .tiling = AIL_TILING_GPU,
+         .compressed = true,
+         .format = pbe_cases[i].format,
+         .width_px = 512,
+         .height_px = 512,
+         .depth_px = pbe_cases[i].layers,
+         .levels = 1,
+         .sample_count_sa = 1,
+         .renderable = true,
+      };
+      ail_make_miptree(&layout);
+      assert(layout.policy == AIL_LAYOUT_POLICY_LEGACY);
+      assert(layout.metadata_offset_B > 0);
+      assert(layout.compression_layer_stride_B > 0);
+      assert(layout.compression_layer_stride_B % AIL_CACHELINE == 0);
+      assert(ail_is_level_logically_compressed(&layout, 0));
+
+      const bool layered = pbe_cases[i].layers > 1;
+      struct AGX_PBE pbe = pbe_header();
+      pbe.dimension = layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
+                              : AGX_TEXTURE_DIMENSION_2D;
+      pbe.layout = AGX_LAYOUT_GPU;
+      pbe.channels = ail_pixel_format[pbe_cases[i].format].channels;
+      pbe.type = ail_pixel_format[pbe_cases[i].format].type;
+      pbe.swizzle_r = AGX_CHANNEL_R;
+      pbe.swizzle_g = AGX_CHANNEL_G;
+      pbe.swizzle_b = AGX_CHANNEL_B;
+      pbe.swizzle_a = AGX_CHANNEL_A;
+      pbe.buffer = 0x100000;
+      pbe.width = layout.width_px;
+      pbe.height = layout.height_px;
+      pbe.layers = pbe_cases[i].layers;
+      pbe.levels = 1;
+      pbe.level = 0;
+      pbe.page_aligned_layers = layout.page_aligned_layers;
+      pbe.compressed = true;
+      pbe.extended = true;
+      pbe.acceleration_buffer = 0x100000 + layout.metadata_offset_B;
+      struct hk_native_pbe_descriptor packed_pbe;
+      assert(hk_pack_native_pbe(
+         agx_chip_descriptor_generation(AGX_CHIP_G16G), &packed_pbe, &pbe));
+   }
+
    printf("AGX3 decompression: 21 kernels (G17P+G16G+G17G) + %u formats x 6 "
-          "shapes + M5 16-byte spill passed\n",
-          format_count);
+          "shapes + M5 16-byte spill + %zu HAL200 1x PBE layouts passed\n",
+          format_count, ARRAY_SIZE(pbe_cases));
    return 0;
 }

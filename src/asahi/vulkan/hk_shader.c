@@ -3025,7 +3025,9 @@ agx_nir_lower_custom_border(nir_shader *nir)
  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
  * c without its integer-border bit (hk_nir_lower_descriptors()). */
 static bool
-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0,
+                          bool has_unbiased_sampler,
+                          unsigned descriptor_generation)
 {
    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
    if (s < 0)
@@ -3053,10 +3055,10 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
       return false;
    if (nir_scalar_equal(tested, c))
       return true;
-   if (!g17p)
+   if (!has_unbiased_sampler)
       return false;
    const struct hk_sampled_image_descriptor_layout native =
-      hk_sampled_image_descriptor_layout(9);
+      hk_sampled_image_descriptor_layout(descriptor_generation);
    return hk_nir_border_indices_same_descriptor(
       tested, c,
       native.clamp_0_sampler_index - native.sampler -
@@ -3069,7 +3071,9 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
  * emulation, unless every clamp-to-0 sample sits directly in the then-list
  * of its branch (hk_is_border_emulation_if()). */
 static bool
-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
+hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs,
+                         bool has_unbiased_sampler,
+                         unsigned descriptor_generation)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -3088,7 +3092,9 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
                in_then |= node == &block->cf_node;
             if (!in_then ||
-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
+                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr),
+                                           has_unbiased_sampler,
+                                           descriptor_generation)) {
                return false;
             }
 
@@ -3802,13 +3808,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else if (agx_chip_agx3_path(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
                support_lod_bias,
-               agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
-                  agx_chip_hal300_path(dev->dev.chip));
+               agx_chip_sampler_has_lod_bias(dev->dev.chip));
    else
       NIR_PASS(lowered_complex, nir, agx_nir_lower_texture_early,
                support_lod_bias);
 
-   if (agx_chip_native_agx3(dev->dev.chip) &&
+   if (agx_chip_native_or_m5(dev->dev.chip) &&
        agx_chip_sampler_has_lod_bias(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                hk_lower_g17p_sampler_bias, nir_metadata_control_flow, NULL);
@@ -7815,6 +7820,21 @@ hk_fs_sample_variant_store(struct hk_device *dev,
    blob_finish(&blob);
 }
 
+bool
+hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx)
+{
+   if (!obj || idx >= hk_api_num_variants(obj))
+      return false;
+
+   const struct hk_fs_sample_source *src = obj->sample_source;
+   if (src) {
+      if (!(p_atomic_read(&src->ready_mask) & BITFIELD_BIT(idx)))
+         return false;
+   }
+
+   return obj->variants[idx].compiled;
+}
+
 VkResult
 hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
                            unsigned samples)
@@ -8876,8 +8896,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      const bool border_g17p = dev->dev.chip == AGX_CHIP_G17P;
-      if (hk_find_border_emulation(nir, &ifs, border_g17p) &&
+      const bool unbiased = agx_chip_sampler_has_lod_bias(dev->dev.chip);
+      const unsigned desc_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (hk_find_border_emulation(nir, &ifs, unbiased, desc_gen) &&
           ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;
@@ -8901,7 +8922,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (lr_nir && !border_emulating) {
          struct util_dynarray lr_ifs;
          util_dynarray_init(&lr_ifs, NULL);
-         if (hk_find_border_emulation(lr_nir, &lr_ifs, border_g17p) &&
+         if (hk_find_border_emulation(lr_nir, &lr_ifs, unbiased, desc_gen) &&
              lr_ifs.size)
             hk_drop_border_emulation(&lr_ifs);
          util_dynarray_fini(&lr_ifs);

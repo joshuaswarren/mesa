@@ -251,7 +251,36 @@ bool hk_agx3_g17p_multisample_store_supported(struct agx_tilebuffer_layout *tib,
 
 bool hk_agx3_g17p_direct_color_resolve_supported(
    struct agx_tilebuffer_layout *tib, unsigned color_attachment_count,
-   bool has_resolve_target, bool average_resolve, bool store_source);
+   bool has_resolve_target, bool average_resolve, bool store_source,
+   bool r11g11b10_own_class);
+
+/* Native AGX3 fragment attachment capture encodes at most 16 write ranges in
+ * the kernel (distinct from HK_DRM_MAX_FRAGMENT_ATTACHMENTS = 20, which sizes
+ * the uapi array for AGX2). Reserving 2 slots for depth and stencil leaves 14
+ * slots for color and direct-resolve views. */
+#define HK_AGX3_G17P_MAX_FRAGMENT_WRITE_RANGES      16u
+#define HK_AGX3_G17P_MAX_DEPTH_STENCIL_WRITE_RANGES 2u
+#define HK_AGX3_G17P_MAX_COLOR_RESOLVE_WRITE_RANGES \
+   (HK_AGX3_G17P_MAX_FRAGMENT_WRITE_RANGES -        \
+    HK_AGX3_G17P_MAX_DEPTH_STENCIL_WRITE_RANGES)
+
+struct hk_agx3_g17p_mixed_resolve_target {
+   enum pipe_format format;
+   enum pipe_format view_format;
+   bool has_resolve_target;
+   bool average_resolve;
+   bool store_source;
+   bool resolve_pbe_valid;
+   bool resolve_format_matches;
+   unsigned resolve_samples;
+};
+
+bool hk_agx3_g17p_mixed_direct_color_resolve_supported(
+   const struct agx_tilebuffer_layout *framebuffer_tib,
+   const struct hk_agx3_g17p_mixed_resolve_target *stored_targets,
+   unsigned stored_count, bool partial_render, bool incomplete_render_area,
+   bool suspend_resume, bool any_unstored_resolve,
+   unsigned color_and_resolve_views);
 
 /* The single colour attachment of a pass whose final end-of-tile program
  * would both store the multisample samples and resolve them. */

@@ -1845,25 +1845,31 @@ hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
    return true;
 }
 
-static bool
-addr_matches_ssbo(nir_def *addr, unsigned set, unsigned binding)
+/* The element deref an output store addresses: deref_buffer_address of
+ * cast(load_vulkan_descriptor(output))[index], as the cooperative-matrix GEMM
+ * builder writes it (gemm_f32_addr(), gemm_vec4_addr()). NULL otherwise. */
+static nir_deref_instr *
+output_store_element(nir_def *addr, unsigned set, unsigned binding)
 {
    nir_intrinsic_instr *ba = intr(addr, nir_intrinsic_deref_buffer_address);
    if (!ba)
-      return false;
-   nir_deref_instr *d = nir_src_as_deref(ba->src[0]);
-   while (d && d->deref_type != nir_deref_type_cast)
-      d = nir_deref_instr_parent(d);
-   if (!d || d->deref_type != nir_deref_type_cast)
-      return false;
-   nir_intrinsic_instr *desc = intr(d->parent.ssa, nir_intrinsic_load_vulkan_descriptor);
+      return NULL;
+   nir_deref_instr *el = nir_src_as_deref(ba->src[0]);
+   if (!el || el->deref_type != nir_deref_type_array ||
+       el->arr.index.ssa->bit_size != 32)
+      return NULL;
+   nir_deref_instr *cast = nir_deref_instr_parent(el);
+   if (!cast || cast->deref_type != nir_deref_type_cast)
+      return NULL;
+   nir_intrinsic_instr *desc = intr(cast->parent.ssa, nir_intrinsic_load_vulkan_descriptor);
    if (!desc || nir_intrinsic_desc_type(desc) != nir_descriptor_type_storage_buffer)
-      return false;
+      return NULL;
    nir_intrinsic_instr *res = intr(desc->src[0].ssa, nir_intrinsic_vulkan_resource_index);
-   if (!res || nir_intrinsic_desc_type(res) != nir_descriptor_type_storage_buffer)
-      return false;
-   return nir_intrinsic_desc_set(res) == set &&
-          nir_intrinsic_binding(res) == binding;
+   if (!res || nir_intrinsic_desc_type(res) != nir_descriptor_type_storage_buffer ||
+       nir_intrinsic_desc_set(res) != set || nir_intrinsic_binding(res) != binding)
+      return NULL;
+   const unsigned stride = nir_deref_instr_array_stride(el);
+   return stride == 4 || stride == 8 || stride == 16 ? el : NULL;
 }
 
 static nir_def *
@@ -1896,15 +1902,22 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-   nir_def *res_delta = push_u64(
-      &b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, res_delta_lo)), pb);
-   nir_def *dst1_delta =
+   /* The residual and destination addresses are push constants, as in every
+    * other dual write, plus the store's byte offset from the output's first
+    * element. None of them depends on the output descriptor's address: a
+    * difference of addresses added to it makes every epilogue access only as
+    * right as the output base the compiled shader forms, and a wrong base
+    * sends the access outside every buffer, which faults the GPU on G16G
+    * (no soft faults). */
+   nir_def *res_va = push_u64(
+      &b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, res_va_lo)), pb);
+   nir_def *dst1_va =
       !inplace
-         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst1_delta_lo)), pb)
+         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst1_va_lo)), pb)
          : NULL;
-   nir_def *dst2_delta =
+   nir_def *dst2_va =
       has_copy
-         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst2_delta_lo)), pb)
+         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst2_va_lo)), pb)
          : NULL;
 
    const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
@@ -1921,7 +1934,8 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
             continue;
          if (nstores >= ARRAY_SIZE(stores))
             return false;
-         if (!addr_matches_ssbo(st->src[1].ssa, info->output.set, info->output.binding))
+         if (!output_store_element(st->src[1].ssa, info->output.set,
+                                   info->output.binding))
             return false;
          nir_def *val = st->src[0].ssa;
          const unsigned comps = val->num_components;
@@ -1938,6 +1952,7 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
       nir_def *res_vals[16];
       nir_def *sums[16];
       nir_def *out_addrs[16];
+      nir_def *elem_offs[16];
       unsigned comps_arr[16];
       unsigned align_arr[16];
       for (unsigned i = 0; i < nstores; ++i) {
@@ -1961,7 +1976,16 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
                }
             }
          }
-         nir_def *res_addr = nir_iadd(&b, out_addrs[i], res_delta);
+         /* Byte offset of this store from the output's first element: the
+          * builder's index already counts output.offset_B. */
+         nir_deref_instr *el = output_store_element(
+            out_addrs[i], info->output.set, info->output.binding);
+         elem_offs[i] = nir_u2u64(
+            &b, nir_iadd_imm(&b,
+                             nir_imul_imm(&b, el->arr.index.ssa,
+                                          nir_deref_instr_array_stride(el)),
+                             -(int64_t)info->output.offset_B));
+         nir_def *res_addr = nir_iadd(&b, res_va, elem_offs[i]);
          res_vals[i] = nir_load_global(&b, comps_arr[i], 32, res_addr,
                                        .align_mul = align_arr[i], .access = read);
       }
@@ -1981,7 +2005,7 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
          for (unsigned i = 0; i < nstores; ++i)
             sums[i] = nir_fadd(&b, stores[i]->src[0].ssa, res_vals[i]);
          for (unsigned i = 0; i < nstores; ++i) {
-            nir_def *d1_addr = nir_iadd(&b, out_addrs[i], dst1_delta);
+            nir_def *d1_addr = nir_iadd(&b, dst1_va, elem_offs[i]);
             nir_store_global(&b, sums[i], d1_addr, .align_mul = align_arr[i],
                              .write_mask = (uint32_t)BITFIELD_MASK(comps_arr[i]),
                              .access = ACCESS_NON_READABLE);
@@ -1990,7 +2014,7 @@ hk_nir_apply_gemm_fadd(struct nir_shader *nir,
 
       if (has_copy) {
          for (unsigned i = 0; i < nstores; ++i) {
-            nir_def *d2_addr = nir_iadd(&b, out_addrs[i], dst2_delta);
+            nir_def *d2_addr = nir_iadd(&b, dst2_va, elem_offs[i]);
             nir_store_global(&b, sums[i], d2_addr, .align_mul = align_arr[i],
                              .write_mask = (uint32_t)BITFIELD_MASK(comps_arr[i]),
                              .access = ACCESS_NON_READABLE);

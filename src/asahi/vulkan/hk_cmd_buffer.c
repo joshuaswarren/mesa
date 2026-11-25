@@ -450,23 +450,28 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->uploader.main.base = 0;
    cmd->uploader.main.offset = 0;
    cmd->uploader.main.capacity = 0;
+   cmd->uploader.main.cpu_cached = false;
    cmd->uploader.usc.map = NULL;
    cmd->uploader.usc.base = 0;
    cmd->uploader.usc.offset = 0;
    cmd->uploader.usc.capacity = 0;
+   cmd->uploader.usc.cpu_cached = false;
    cmd->uploader.root.map = NULL;
    cmd->uploader.root.base = 0;
    cmd->uploader.root.offset = 0;
    cmd->uploader.root.capacity = 0;
+   cmd->uploader.root.cpu_cached = false;
    cmd->uploader.vdm.map = NULL;
    cmd->uploader.vdm.base = 0;
    cmd->uploader.vdm.offset = 0;
    cmd->uploader.vdm.capacity = 0;
    cmd->uploader.vdm.vdm_alias = 0;
+   cmd->uploader.vdm.cpu_cached = false;
    cmd->uploader.streams.map = NULL;
    cmd->uploader.streams.base = 0;
    cmd->uploader.streams.offset = 0;
    cmd->uploader.streams.capacity = 0;
+   cmd->uploader.streams.cpu_cached = false;
 
    cmd->current_cs.gfx = NULL;
    cmd->current_cs.cs = NULL;
@@ -610,12 +615,16 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
    return VK_SUCCESS;
 }
 
-struct agx_ptr
-hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
-                        struct hk_uploader *uploader, uint32_t size,
-                        uint32_t alignment, enum hk_cmd_bo_type type)
+static struct agx_ptr
+hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                               struct hk_uploader *uploader, uint32_t size,
+                               uint32_t alignment, enum hk_cmd_bo_type type,
+                               bool *cpu_cached_out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (cpu_cached_out)
+      *cpu_cached_out = false;
 
    /* Specially handle large allocations owned by the command buffer, e.g. used
     * for statically allocated vertex output buffers with geometry shaders.
@@ -648,6 +657,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
          return (struct agx_ptr){0};
       }
       *slot = bo;
+      if (cpu_cached_out)
+         *cpu_cached_out = (bo->flags & AGX_BO_WRITEBACK) != 0;
       return (struct agx_ptr){
          .gpu = bo->va->addr,
          .cpu = cpu,
@@ -662,6 +673,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
    if (uploader->map != NULL && offset <= uploader->capacity &&
        size <= uploader->capacity - offset) {
       uploader->offset = offset + size;
+      if (cpu_cached_out)
+         *cpu_cached_out = uploader->cpu_cached;
 
       return (struct agx_ptr){
          .gpu = uploader->base + offset,
@@ -678,6 +691,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
    bo->stream_only = type == HK_CMD_BO_MAIN &&
                      uploader == &cmd->uploader.streams;
 
+   const bool bo_cpu_cached = bo->bo && (bo->bo->flags & AGX_BO_WRITEBACK);
+
    /* Pick whichever of the current upload BO and the new BO will have more
     * room left to be the BO for the next upload.  If our upload size is
     * bigger than the old offset, we're better off burning the whole new
@@ -690,12 +705,46 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
       uploader->base = bo->addr;
       uploader->offset = size;
       uploader->capacity = bo->size;
+      uploader->cpu_cached = bo_cpu_cached;
    }
+
+   if (cpu_cached_out)
+      *cpu_cached_out = bo_cpu_cached;
 
    return (struct agx_ptr){
       .gpu = bo->addr,
       .cpu = bo->map,
    };
+}
+
+struct agx_ptr
+hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
+                        struct hk_uploader *uploader, uint32_t size,
+                        uint32_t alignment, enum hk_cmd_bo_type type)
+{
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         NULL);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_cached(struct hk_cmd_buffer *cmd, uint32_t size,
+                     uint32_t alignment, bool *cpu_cached_out)
+{
+   struct hk_uploader *uploader = &cmd->uploader.main;
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment,
+                                         HK_CMD_BO_MAIN, cpu_cached_out);
 }
 
 static __attribute__((hot)) struct agx_ptr
@@ -1654,17 +1703,43 @@ hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
-   struct hk_api_shader *fs =
-      gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
-   if (!vs || !fs || fs->g17p_sample_variants)
+   struct hk_api_shader *fs = hk_bound_fs_obj(gfx);
+   if (!vs || !fs)
+      return false;
+
+   const unsigned samples =
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples;
+   if (fs->g17p_sample_variants &&
+       !(samples == 0 || samples == 1 || samples == 2 || samples == 4 ||
+         (samples == 8 && fs->g17p_sample_variants == 4)))
+      return false;
+
+   const unsigned fs_idx =
+      fs->g17p_sample_variants && samples > 1 ? util_logbase2(samples) : 0;
+   if (!hk_fs_sample_variant_ready(fs, fs_idx))
       return false;
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
-   const struct hk_shader *hw_fs = hk_fs_variant(fs, 1);
-   if (!hw_vs || !hw_fs || !hw_vs->compiled || !hw_fs->compiled)
+   const struct hk_shader *hw_fs = &fs->variants[fs_idx];
+   if (!hw_vs || !hw_vs->compiled || !hw_fs->compiled)
       return false;
 
-   if (hw_fs->info.agx3_combined_sampler_valid)
+   bool uses_combined_sampler = hw_fs->info.agx3_combined_sampler_valid;
+   if (!uses_combined_sampler) {
+      /* If another published sample variant of the same API shader uses
+       * CPU-decoded combined samplers, require unchanged static sets in case
+       * rasterization_samples switches before the next descriptor bind. */
+      for (unsigned i = 0; i < fs->g17p_sample_variants; ++i) {
+         if (i == fs_idx || !hk_fs_sample_variant_ready(fs, i))
+            continue;
+         if (fs->variants[i].info.agx3_combined_sampler_valid) {
+            uses_combined_sampler = true;
+            break;
+         }
+      }
+   }
+
+   if (uses_combined_sampler)
       return hk_descriptor_sets_unchanged(desc);
 
    return true;
@@ -1728,6 +1803,8 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       desc->push_active &= ~BITFIELD_BIT(s);
       desc->push_dirty &= ~BITFIELD_BIT(s);
       desc->buffer_active &= ~BITFIELD_BIT(s);
+      if (desc->push[s])
+         hk_push_descriptor_set_reset_upload(desc->push[s]);
 
       root_changed |=
          desc->root.set_dynamic_buffer_start[s] != dyn_buffer_start;
@@ -1887,6 +1964,8 @@ hk_bind_buffer_set(struct hk_descriptor_state *desc,
    desc->push_active &= ~BITFIELD_BIT(s);
    desc->push_dirty &= ~BITFIELD_BIT(s);
    desc->buffer_active |= BITFIELD_BIT(s);
+   if (desc->push[s])
+      hk_push_descriptor_set_reset_upload(desc->push[s]);
 
    /* Descriptor-buffer layouts have no dynamic buffers. */
    desc->root.set_dynamic_buffer_start[s] =
@@ -2010,8 +2089,6 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    desc->buffer_active &= ~BITFIELD_BIT(set);
    desc->push_dirty |= BITFIELD_BIT(set);
    desc->push_active |= BITFIELD_BIT(set);
-   desc->generation++;
-   desc->non_push_generation++;
 
    return desc->push[set];
 }
@@ -2126,20 +2203,57 @@ void
 hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
                                      struct hk_descriptor_state *desc)
 {
+   bool root_changed = false;
+
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct hk_push_descriptor_set *push_set = desc->push[set_idx];
       /* Only the bytes the pushed layout uses; the rest is never read.
        * hk_push_descriptor_set_begin() keeps that within the storage. */
       STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= HK_PUSH_DESCRIPTOR_SET_SIZE);
       const uint32_t size = MAX2(push_set->size, HK_MIN_UBO_ALIGNMENT);
-      const uint64_t push_set_addr =
-         hk_pool_upload(cmd, push_set->data, size, HK_MIN_UBO_ALIGNMENT);
+      uint64_t push_set_addr;
 
-      desc->root.sets[set_idx] = push_set_addr;
-      desc->set_sizes[set_idx] = size;
+      /* last_cpu_ptr is only populated when the backing command-pool allocation
+       * is mapped CPU write-back (AGX_BO_WRITEBACK); write-combined allocations
+       * leave it NULL so this path never reads back WC pages or keeps a
+       * duplicate 10 KiB shadow copy. */
+      if (push_set->last_gpu_addr && push_set->last_cpu_ptr &&
+          push_set->last_size == size &&
+          memcmp(push_set->last_cpu_ptr, push_set->data, size) == 0) {
+         push_set_addr = push_set->last_gpu_addr;
+      } else {
+         bool cpu_cached = false;
+         struct agx_ptr uploaded =
+            hk_pool_alloc_cached(cmd, size, HK_MIN_UBO_ALIGNMENT, &cpu_cached);
+         if (likely(uploaded.cpu != NULL)) {
+            memcpy(uploaded.cpu, push_set->data, size);
+            if (cpu_cached) {
+               push_set->last_gpu_addr = uploaded.gpu;
+               push_set->last_cpu_ptr = uploaded.cpu;
+               push_set->last_size = size;
+            } else {
+               hk_push_descriptor_set_reset_upload(push_set);
+            }
+            push_set_addr = uploaded.gpu;
+         } else {
+            hk_push_descriptor_set_reset_upload(push_set);
+            push_set_addr = 0;
+         }
+      }
+
+      if (desc->root.sets[set_idx] != push_set_addr ||
+          desc->set_sizes[set_idx] != size) {
+         desc->root.sets[set_idx] = push_set_addr;
+         desc->set_sizes[set_idx] = size;
+         root_changed = true;
+      }
    }
 
-   hk_root_mark_dirty(desc);
+   if (root_changed) {
+      hk_root_mark_dirty(desc);
+      desc->generation++;
+      desc->non_push_generation++;
+   }
    desc->push_dirty = 0;
 }
 

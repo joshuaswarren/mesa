@@ -47,7 +47,8 @@ static const unsigned all_caps =
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |
    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |
    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
-   AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG;
+   AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
+   AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -202,6 +203,44 @@ test_native_mixed_epilog(void)
    }
 }
 
+/* AGX_CAP_HAL200_LOSSLESS_COMPRESSION is enabled across native HAL200 AGX3B
+ * parts (G16G and G17P) and off on G15* (M3), M5 HAL300 (Gen10), G18G, AGX2,
+ * and unadmitted parts. */
+static void
+test_hal200_lossless_compression(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G16G || c == AGX_CHIP_G17P;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ==
+                    expected,
+                 c);
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ==
+                    agx_chip_native_hal200(c),
+                 c);
+   }
+}
+
+/* AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION is enabled across native HAL200 AGX3B
+ * parts (G16G and G17P) and off on every chip without the base HAL200 cap. */
+static void
+test_hal200_msaa_color_compression(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G16G || c == AGX_CHIP_G17P;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
+                    expected,
+                 c);
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
+                    agx_chip_native_hal200(c),
+                 c);
+      /* MSAA colour never enables without the base HAL200 cap. */
+      if (agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION))
+         CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION), c);
+   }
+}
+
 int
 main(void)
 {
@@ -215,6 +254,8 @@ main(void)
    test_sparse_binding();
    test_zls_full_render_bounds();
    test_native_mixed_epilog();
+   test_hal200_lossless_compression();
+   test_hal200_msaa_color_compression();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,
