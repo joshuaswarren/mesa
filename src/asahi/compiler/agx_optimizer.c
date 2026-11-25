@@ -2004,6 +2004,72 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+/* The constant operand of a bitwise operation, as an immediate or through
+ * the mov_imm that materialized it. */
+static bool
+agx_bitop_constant(agx_instr **defs, agx_index src, uint64_t *value)
+{
+   if (src.abs || src.neg || src.memory)
+      return false;
+   if (src.type == AGX_INDEX_IMMEDIATE) {
+      *value = src.value;
+      return true;
+   }
+   if (src.type != AGX_INDEX_NORMAL)
+      return false;
+   const agx_instr *def = defs[src.value];
+   if (!def || def->op != AGX_OPCODE_MOV_IMM)
+      return false;
+   *value = def->imm;
+   return true;
+}
+
+/* x & c2 where x = y & c1 is x itself when c1 sets no bit that c2 clears.
+ * AGX3B meets it whenever a byte that u2u8 has already masked is masked
+ * again, as agx_pack_integer_8_agx3 does for each even channel of a packed
+ * 8-bit store. Returns the move that replaces I, or NULL. */
+static agx_instr *
+agx_optimizer_redundant_and(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a & b) ||
+       I->nr_dests != 1 || I->nr_srcs != 2 || I->saturate ||
+       I->dest[0].type != AGX_INDEX_NORMAL || agx_channels(I->dest[0]) != 1)
+      return NULL;
+
+   const unsigned bits = agx_size_align_16(I->dest[0].size) * 16;
+   const uint64_t width = bits >= 64 ? UINT64_MAX : BITFIELD64_MASK(bits);
+
+   for (unsigned s = 0; s < 2; ++s) {
+      const agx_index val = I->src[s];
+      uint64_t c2;
+      if (val.type != AGX_INDEX_NORMAL || val.abs || val.neg || val.memory ||
+          val.size != I->dest[0].size || agx_channels(val) != 1 ||
+          !agx_bitop_constant(defs, I->src[1 - s], &c2))
+         continue;
+
+      const agx_instr *def = defs[val.value];
+      if (!def || def->op != AGX_OPCODE_BITOP ||
+          def->truth_table != UTIL_LUT2(a & b) || def->nr_dests != 1 ||
+          def->nr_srcs != 2 || def->saturate ||
+          def->dest[0].size != val.size)
+         continue;
+
+      for (unsigned t = 0; t < 2; ++t) {
+         uint64_t c1;
+         if (agx_bitop_constant(defs, def->src[t], &c1) &&
+             (c1 & ~c2 & width) == 0) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_instr *mov = agx_mov_to(&b, I->dest[0], val);
+            agx_remove_instruction(I);
+            return mov;
+         }
+      }
+   }
+
+   return NULL;
+}
+
 /*
  * Fuse sign-extends into addition-like instructions.
  */
@@ -2098,6 +2164,9 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_ballot(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
+         agx_instr *mov = agx_optimizer_redundant_and(ctx, defs, I);
+         if (mov)
+            defs[mov->dest[0].value] = mov;
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
       }
