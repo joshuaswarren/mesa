@@ -2773,6 +2773,752 @@ match_stereo_sad_u8(nir_shader *s, uint32_t set_layout_count,
 }
 
 /* ---------------------------------------------------------------------------
+ * Matcher 3: 2D 3x3 Sobel Gradient Magnitude + Quantized Direction
+ *            (R8 src -> i32 dir + f32 mag)
+ * --------------------------------------------------------------------------- */
+
+static int
+match_coord_offset_1(nir_def *def, nir_def *coord, const uint32_t wg_size[3])
+{
+   if (same_val(def, coord, wg_size))
+      return 1;
+   def = strip_mov(def);
+   if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
+      return -1;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (alu->op == nir_op_iadd) {
+      for (unsigned side = 0; side < 2; side++) {
+         int32_t c = 0;
+         if (same_val(alu->src[side].src.ssa, coord, wg_size) &&
+             match_const_i32(alu->src[1 - side].src.ssa, &c)) {
+            if (c == -1)
+               return 0;
+            if (c == 1)
+               return 2;
+         }
+      }
+   } else if (alu->op == nir_op_isub &&
+              same_val(alu->src[0].src.ssa, coord, wg_size)) {
+      int32_t c = 0;
+      if (match_const_i32(alu->src[1].src.ssa, &c)) {
+         if (c == 1)
+            return 0;
+         if (c == -1)
+            return 2;
+      }
+   }
+   return -1;
+}
+
+static bool
+match_const_f32_bits(nir_def *def, uint32_t *bits_out)
+{
+   def = strip_mov(def);
+   if (!def || def->bit_size != 32 || def->num_components != 1)
+      return false;
+   if (nir_def_instr(def)->type != nir_instr_type_load_const)
+      return false;
+   *bits_out = nir_src_as_uint(nir_src_for_ssa(def));
+   return true;
+}
+
+static bool
+match_const_f32_int(nir_def *def, int *val_out)
+{
+   uint32_t bits = 0;
+   if (!match_const_f32_bits(def, &bits))
+      return false;
+   float f;
+   memcpy(&f, &bits, sizeof(f));
+   if (f == 2.0f) {
+      *val_out = 2;
+      return true;
+   }
+   if (f == -2.0f) {
+      *val_out = -2;
+      return true;
+   }
+   if (f == 1.0f) {
+      *val_out = 1;
+      return true;
+   }
+   if (f == -1.0f) {
+      *val_out = -1;
+      return true;
+   }
+   return false;
+}
+
+/* Recursively evaluate a linear combination of the 8 Sobel u8 samples. */
+static bool
+eval_sobel_linear(nir_def *def, nir_intrinsic_instr *const samples[9],
+                  int coeffs[9], unsigned depth)
+{
+   if (depth > 24)
+      return false;
+   def = strip_mov(def);
+   if (!def || def->bit_size != 32 || def->num_components != 1 ||
+       nir_def_instr(def)->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (nir_alu_instr_is_exact(alu))
+      return false;
+
+   if (alu->op == nir_op_u2f32 || alu->op == nir_op_i2f32) {
+      nir_def *s = strip_mov(alu->src[0].src.ssa);
+      if (alu->op == nir_op_i2f32 && s &&
+          nir_def_instr(s)->type == nir_instr_type_alu &&
+          nir_instr_as_alu(nir_def_instr(s))->op == nir_op_u2u32) {
+         s = strip_mov(nir_instr_as_alu(nir_def_instr(s))->src[0].src.ssa);
+      } else if (alu->op == nir_op_i2f32) {
+         return false;
+      }
+      if (!s || nir_def_instr(s)->type != nir_instr_type_intrinsic)
+         return false;
+      nir_intrinsic_instr *ld = nir_instr_as_intrinsic(nir_def_instr(s));
+      for (unsigned k = 0; k < 9; k++) {
+         if (samples[k] == ld) {
+            memset(coeffs, 0, 9 * sizeof(int));
+            coeffs[k] = 1;
+            return true;
+         }
+      }
+      return false;
+   }
+
+   if (alu->op == nir_op_fneg) {
+      if (!eval_sobel_linear(alu->src[0].src.ssa, samples, coeffs, depth + 1))
+         return false;
+      for (unsigned k = 0; k < 9; k++)
+         coeffs[k] = -coeffs[k];
+      return true;
+   }
+
+   if (alu->op == nir_op_fadd || alu->op == nir_op_fsub) {
+      int a[9], b[9];
+      if (!eval_sobel_linear(alu->src[0].src.ssa, samples, a, depth + 1) ||
+          !eval_sobel_linear(alu->src[1].src.ssa, samples, b, depth + 1))
+         return false;
+      int sign = (alu->op == nir_op_fsub) ? -1 : 1;
+      for (unsigned k = 0; k < 9; k++)
+         coeffs[k] = a[k] + sign * b[k];
+      return true;
+   }
+
+   if (alu->op == nir_op_fmul) {
+      int sc = 0;
+      nir_def *var = NULL;
+      if (match_const_f32_int(alu->src[0].src.ssa, &sc))
+         var = alu->src[1].src.ssa;
+      else if (match_const_f32_int(alu->src[1].src.ssa, &sc))
+         var = alu->src[0].src.ssa;
+      else
+         return false;
+      if (!eval_sobel_linear(var, samples, coeffs, depth + 1))
+         return false;
+      for (unsigned k = 0; k < 9; k++)
+         coeffs[k] *= sc;
+      return true;
+   }
+
+   if (alu->op == nir_op_ffma) {
+      int sc = 0;
+      nir_def *var = NULL;
+      if (match_const_f32_int(alu->src[0].src.ssa, &sc))
+         var = alu->src[1].src.ssa;
+      else if (match_const_f32_int(alu->src[1].src.ssa, &sc))
+         var = alu->src[0].src.ssa;
+      else
+         return false;
+      int a[9], c[9];
+      if (!eval_sobel_linear(var, samples, a, depth + 1) ||
+          !eval_sobel_linear(alu->src[2].src.ssa, samples, c, depth + 1))
+         return false;
+      for (unsigned k = 0; k < 9; k++)
+         coeffs[k] = sc * a[k] + c[k];
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+match_flt_zero(nir_def *cond, nir_def *val)
+{
+   cond = strip_mov(cond);
+   if (!cond || nir_def_instr(cond)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(cond));
+   uint32_t bits = 0;
+   return alu->op == nir_op_flt &&
+          strip_mov(alu->src[0].src.ssa) == strip_mov(val) &&
+          match_const_f32_bits(alu->src[1].src.ssa, &bits) && bits == 0u;
+}
+
+static bool
+match_bcsel_const_pair(nir_def *def, nir_def *neg_val, int32_t t_const,
+                       int32_t e_const)
+{
+   def = strip_mov(def);
+   if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   return alu->op == nir_op_bcsel &&
+          match_flt_zero(alu->src[0].src.ssa, neg_val) &&
+          is_const_i32(alu->src[1].src.ssa, t_const) &&
+          is_const_i32(alu->src[2].src.ssa, e_const);
+}
+
+/* Match the exact 8-sector Sobel direction quantization:
+ *   ratio = fabs(gx * frcp(gy))  (or fabs(fdiv(gx, gy)))
+ *   diag  = (gy < 0) ? ((gx < 0) ? 5 : 3) : ((gx < 0) ? 7 : 1)
+ *   q1    = (ratio < 0.41421357f) ? ((gy < 0) ? 4 : 0) : diag
+ *   q2    = (2.4142137f < ratio) ? ((gx < 0) ? 6 : 2) : q1
+ *   dir   = (q2 + 6) & 7 */
+static bool
+match_sobel_dir_expr(nir_def *dir_def, nir_def *gy, nir_def *gx)
+{
+   dir_def = strip_mov(dir_def);
+   if (!dir_def || nir_def_instr(dir_def)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *a_and = nir_instr_as_alu(nir_def_instr(dir_def));
+   if (a_and->op != nir_op_iand)
+      return false;
+
+   nir_def *add_def = NULL;
+   if (is_const_i32(a_and->src[1].src.ssa, 7))
+      add_def = strip_mov(a_and->src[0].src.ssa);
+   else if (is_const_i32(a_and->src[0].src.ssa, 7))
+      add_def = strip_mov(a_and->src[1].src.ssa);
+   else
+      return false;
+
+   if (!add_def || nir_def_instr(add_def)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *a_add = nir_instr_as_alu(nir_def_instr(add_def));
+   if (a_add->op != nir_op_iadd)
+      return false;
+
+   nir_def *q2 = NULL;
+   if (is_const_i32(a_add->src[1].src.ssa, 6))
+      q2 = strip_mov(a_add->src[0].src.ssa);
+   else if (is_const_i32(a_add->src[0].src.ssa, 6))
+      q2 = strip_mov(a_add->src[1].src.ssa);
+   else
+      return false;
+
+   if (!q2 || nir_def_instr(q2)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *s2 = nir_instr_as_alu(nir_def_instr(q2));
+   if (s2->op != nir_op_bcsel)
+      return false;
+
+   /* s2->src[0] must be `2.4142137f (0x401a827a) < ratio`. */
+   nir_def *c2 = strip_mov(s2->src[0].src.ssa);
+   if (!c2 || nir_def_instr(c2)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *cmp2 = nir_instr_as_alu(nir_def_instr(c2));
+   uint32_t hi_bits = 0;
+   if (cmp2->op != nir_op_flt ||
+       !match_const_f32_bits(cmp2->src[0].src.ssa, &hi_bits) ||
+       hi_bits != 0x401a827au)
+      return false;
+   nir_def *ratio = strip_mov(cmp2->src[1].src.ssa);
+
+   /* Verify `ratio == fabs(gx * frcp(gy))` or `fabs(fdiv(gx, gy))`. */
+   if (!ratio || nir_def_instr(ratio)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *rabs = nir_instr_as_alu(nir_def_instr(ratio));
+   if (rabs->op != nir_op_fabs)
+      return false;
+   nir_def *quot = strip_mov(rabs->src[0].src.ssa);
+   if (!quot || nir_def_instr(quot)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *qa = nir_instr_as_alu(nir_def_instr(quot));
+   bool quot_ok = false;
+   if (qa->op == nir_op_fdiv &&
+       strip_mov(qa->src[0].src.ssa) == strip_mov(gx) &&
+       strip_mov(qa->src[1].src.ssa) == strip_mov(gy)) {
+      quot_ok = true;
+   } else if (qa->op == nir_op_fmul) {
+      for (unsigned side = 0; side < 2; side++) {
+         if (strip_mov(qa->src[side].src.ssa) != strip_mov(gx))
+            continue;
+         nir_def *rcp = strip_mov(qa->src[1 - side].src.ssa);
+         if (rcp && nir_def_instr(rcp)->type == nir_instr_type_alu &&
+             nir_instr_as_alu(nir_def_instr(rcp))->op == nir_op_frcp &&
+             strip_mov(nir_instr_as_alu(nir_def_instr(rcp))->src[0].src.ssa) ==
+                strip_mov(gy))
+            quot_ok = true;
+      }
+   }
+   if (!quot_ok)
+      return false;
+
+   /* s2->src[1] must be `(gx < 0) ? 6 : 2`. */
+   if (!match_bcsel_const_pair(s2->src[1].src.ssa, gx, 6, 2))
+      return false;
+
+   /* s2->src[2] is `q1 = (ratio < 0.41421357f) ? ((gy < 0) ? 4 : 0) : diag`. */
+   nir_def *q1 = strip_mov(s2->src[2].src.ssa);
+   if (!q1 || nir_def_instr(q1)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *s1 = nir_instr_as_alu(nir_def_instr(q1));
+   if (s1->op != nir_op_bcsel)
+      return false;
+   nir_def *c1 = strip_mov(s1->src[0].src.ssa);
+   if (!c1 || nir_def_instr(c1)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *cmp1 = nir_instr_as_alu(nir_def_instr(c1));
+   uint32_t lo_bits = 0;
+   if (cmp1->op != nir_op_flt || strip_mov(cmp1->src[0].src.ssa) != ratio ||
+       !match_const_f32_bits(cmp1->src[1].src.ssa, &lo_bits) ||
+       lo_bits != 0x3ed413cdu)
+      return false;
+
+   if (!match_bcsel_const_pair(s1->src[1].src.ssa, gy, 4, 0))
+      return false;
+
+   /* `diag = (gy < 0) ? ((gx < 0) ? 5 : 3) : ((gx < 0) ? 7 : 1)`. */
+   nir_def *diag = strip_mov(s1->src[2].src.ssa);
+   if (!diag || nir_def_instr(diag)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *sd = nir_instr_as_alu(nir_def_instr(diag));
+   return sd->op == nir_op_bcsel && match_flt_zero(sd->src[0].src.ssa, gy) &&
+          match_bcsel_const_pair(sd->src[1].src.ssa, gx, 5, 3) &&
+          match_bcsel_const_pair(sd->src[2].src.ssa, gx, 7, 1);
+}
+
+/* Match `x >= 1 && x < w - 1 && y >= 1 && y < h - 1` returning x, y, w, h. */
+static bool
+match_sobel_interior_guard(nir_def *cond, bool negated,
+                           const uint32_t wg_size[3], nir_def **x_out,
+                           nir_def **y_out, nir_def **w_pc_out,
+                           nir_def **h_pc_out)
+{
+   struct bool_term terms[8];
+   unsigned n = 0;
+   if (!collect_and_terms(cond, negated, terms, &n, 8) || n != 4)
+      return false;
+
+   nir_def *x = NULL, *y = NULL, *w_pc = NULL, *h_pc = NULL;
+   bool got_x_lo = false, got_y_lo = false;
+   for (unsigned i = 0; i < 4; i++) {
+      nir_def *lhs = NULL, *rhs = NULL;
+      bool is_lt = false, is_u = false;
+      if (!decompose_cmp_term(terms[i], &lhs, &rhs, &is_lt, &is_u) || is_u)
+         return false;
+      unsigned comp = 0;
+      if (!match_global_id_comp(lhs, wg_size, &comp) || comp > 1)
+         return false;
+      if (!is_lt) {
+         if (!is_const_i32(rhs, 1))
+            return false;
+         if (comp == 0) {
+            x = lhs;
+            got_x_lo = true;
+         } else {
+            y = lhs;
+            got_y_lo = true;
+         }
+      } else {
+         /* `coord < dim - 1` */
+         nir_def *r = strip_mov(rhs);
+         if (!r || nir_def_instr(r)->type != nir_instr_type_alu)
+            return false;
+         nir_alu_instr *ra = nir_instr_as_alu(nir_def_instr(r));
+         nir_def *dim = NULL;
+         if (ra->op == nir_op_iadd) {
+            if (is_const_i32(ra->src[1].src.ssa, -1))
+               dim = ra->src[0].src.ssa;
+            else if (is_const_i32(ra->src[0].src.ssa, -1))
+               dim = ra->src[1].src.ssa;
+         } else if (ra->op == nir_op_isub &&
+                    is_const_i32(ra->src[1].src.ssa, 1)) {
+            dim = ra->src[0].src.ssa;
+         }
+         uint16_t pc = 0;
+         if (!dim || !match_push_const_u32(dim, &pc))
+            return false;
+         if (comp == 0) {
+            x = lhs;
+            w_pc = dim;
+         } else {
+            y = lhs;
+            h_pc = dim;
+         }
+      }
+   }
+
+   if (!got_x_lo || !got_y_lo || !x || !y || !w_pc || !h_pc)
+      return false;
+   *x_out = x;
+   *y_out = y;
+   *w_pc_out = w_pc;
+   *h_pc_out = h_pc;
+   return true;
+}
+
+static bool
+verify_sobel_cf_list(struct exec_list *cf_list, nir_if *int_if,
+                     nir_if *border_if)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *blk = nir_cf_node_as_block(node);
+         nir_foreach_instr(instr, blk) {
+            if (instr->type == nir_instr_type_jump)
+               return false;
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (nif != int_if && nif != border_if)
+            return false;
+         if (!verify_sobel_cf_list(&nif->then_list, int_if, border_if) ||
+             !verify_sobel_cf_list(&nif->else_list, int_if, border_if))
+            return false;
+         break;
+      }
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+match_sobel_3x3_u8(nir_shader *s, uint32_t set_layout_count,
+                   struct vk_descriptor_set_layout *const *set_layouts,
+                   struct hk_2d_stencil_plan *plan)
+{
+   const uint32_t *wg = plan->orig_wg_size;
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+
+   nir_if *int_if = NULL;
+   foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+      if (node->type == nir_cf_node_if) {
+         if (int_if)
+            return false;
+         int_if = nir_cf_node_as_if(node);
+      } else if (node->type != nir_cf_node_block) {
+         return false;
+      }
+   }
+   if (!int_if)
+      return false;
+
+   nir_def *x = NULL, *y = NULL, *w_pc = NULL, *h_pc = NULL;
+   struct exec_list *int_list = NULL, *else_list = NULL;
+   if (match_sobel_interior_guard(int_if->condition.ssa, false, wg, &x, &y,
+                                  &w_pc, &h_pc)) {
+      int_list = &int_if->then_list;
+      else_list = &int_if->else_list;
+   } else if (match_sobel_interior_guard(int_if->condition.ssa, true, wg, &x,
+                                         &y, &w_pc, &h_pc)) {
+      int_list = &int_if->else_list;
+      else_list = &int_if->then_list;
+   } else {
+      return false;
+   }
+
+   /* Interior branch must be a single block with 8 src loads and 2 stores. */
+   if (!exec_list_is_singular(int_list))
+      return false;
+   nir_cf_node *in_node =
+      exec_node_data(nir_cf_node, exec_list_get_head(int_list), node);
+   if (in_node->type != nir_cf_node_block)
+      return false;
+   nir_block *int_blk = nir_cf_node_as_block(in_node);
+
+   nir_intrinsic_instr *samples[9] = {NULL};
+   unsigned sample_cnt = 0;
+   uint32_t src_set = 0, src_bind = 0;
+   uint16_t stride_pc = 0;
+
+   nir_intrinsic_instr *int_stores[2] = {NULL, NULL};
+   unsigned int_store_cnt = 0;
+
+   nir_foreach_instr(instr, int_blk) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_deref) {
+         if (nir_intrinsic_access(intr) &
+             (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_NON_TEMPORAL))
+            return false;
+         uint32_t set = 0, bind = 0;
+         nir_def *idx = NULL;
+         if (!match_ssbo_deref_access(nir_src_as_deref(intr->src[0]), 8, &set,
+                                      &bind, &idx))
+            return false;
+         /* idx must be `(y + dy) * stride + (x + dx)`. */
+         idx = strip_mov(idx);
+         if (!idx || nir_def_instr(idx)->type != nir_instr_type_alu)
+            return false;
+         nir_alu_instr *add = nir_instr_as_alu(nir_def_instr(idx));
+         if (add->op != nir_op_iadd)
+            return false;
+         int dx = -1, dy = -1;
+         uint16_t sp = 0;
+         for (unsigned side = 0; side < 2; side++) {
+            int cx = match_coord_offset_1(add->src[side].src.ssa, x, wg);
+            if (cx < 0)
+               continue;
+            nir_def *prod = strip_mov(add->src[1 - side].src.ssa);
+            if (!prod || nir_def_instr(prod)->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *mul = nir_instr_as_alu(nir_def_instr(prod));
+            if (mul->op != nir_op_imul && mul->op != nir_op_amul)
+               continue;
+            for (unsigned ms = 0; ms < 2; ms++) {
+               int cy = match_coord_offset_1(mul->src[ms].src.ssa, y, wg);
+               uint16_t p = 0;
+               if (cy >= 0 &&
+                   match_push_const_u32(mul->src[1 - ms].src.ssa, &p)) {
+                  dx = cx;
+                  dy = cy;
+                  sp = p;
+                  break;
+               }
+            }
+            if (dy >= 0)
+               break;
+         }
+         if (dx < 0 || dy < 0 || (dx == 1 && dy == 1))
+            return false;
+         if (sample_cnt == 0) {
+            src_set = set;
+            src_bind = bind;
+            stride_pc = sp;
+         } else if (set != src_set || bind != src_bind || sp != stride_pc) {
+            return false;
+         }
+         if (samples[dy * 3 + dx])
+            return false;
+         samples[dy * 3 + dx] = intr;
+         sample_cnt++;
+      } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+         if (int_store_cnt >= 2 || nir_intrinsic_write_mask(intr) != 1 ||
+             (nir_intrinsic_access(intr) &
+              (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_NON_TEMPORAL)))
+            return false;
+         int_stores[int_store_cnt++] = intr;
+      }
+   }
+
+   if (sample_cnt != 8 || int_store_cnt != 2)
+      return false;
+
+   /* Classify the 2 interior stores into `mag` (`fabs(gy) + fabs(gx)`) and
+    * `dir` (`(q + 6) & 7`). */
+   nir_intrinsic_instr *mag_st = NULL, *dir_st = NULL;
+   uint32_t mag_set = 0, mag_bind = 0, dir_set = 0, dir_bind = 0;
+   nir_def *gy_def = NULL, *gx_def = NULL;
+   uint16_t w_off = 0, h_off = 0;
+   if (!match_push_const_u32(w_pc, &w_off) ||
+       !match_push_const_u32(h_pc, &h_off))
+      return false;
+
+   static const int expect_gy[9] = {1, 2, 1, 0, 0, 0, -1, -2, -1};
+   static const int expect_gx[9] = {1, 0, -1, 2, 0, -2, 1, 0, -1};
+
+   for (unsigned i = 0; i < 2; i++) {
+      uint32_t set = 0, bind = 0;
+      nir_def *idx = NULL;
+      uint16_t sp = 0;
+      if (!match_ssbo_deref_access(nir_src_as_deref(int_stores[i]->src[0]), 32,
+                                   &set, &bind, &idx) ||
+          !match_linear_index(idx, y, x, &sp, wg) || sp != w_off)
+         return false;
+
+      nir_def *val = strip_mov(int_stores[i]->src[1].ssa);
+      if (val && nir_def_instr(val)->type == nir_instr_type_alu &&
+          nir_instr_as_alu(nir_def_instr(val))->op == nir_op_fadd) {
+         nir_alu_instr *fa = nir_instr_as_alu(nir_def_instr(val));
+         nir_def *a0 = strip_mov(fa->src[0].src.ssa);
+         nir_def *a1 = strip_mov(fa->src[1].src.ssa);
+         if (a0 && a1 && nir_def_instr(a0)->type == nir_instr_type_alu &&
+             nir_def_instr(a1)->type == nir_instr_type_alu &&
+             nir_instr_as_alu(nir_def_instr(a0))->op == nir_op_fabs &&
+             nir_instr_as_alu(nir_def_instr(a1))->op == nir_op_fabs) {
+            nir_def *v0 = nir_instr_as_alu(nir_def_instr(a0))->src[0].src.ssa;
+            nir_def *v1 = nir_instr_as_alu(nir_def_instr(a1))->src[0].src.ssa;
+            int c0[9], c1[9];
+            if (eval_sobel_linear(v0, samples, c0, 0) &&
+                eval_sobel_linear(v1, samples, c1, 0)) {
+               if (memcmp(c0, expect_gy, sizeof(c0)) == 0 &&
+                   memcmp(c1, expect_gx, sizeof(c1)) == 0) {
+                  gy_def = v0;
+                  gx_def = v1;
+                  mag_st = int_stores[i];
+                  mag_set = set;
+                  mag_bind = bind;
+                  continue;
+               }
+               if (memcmp(c1, expect_gy, sizeof(c1)) == 0 &&
+                   memcmp(c0, expect_gx, sizeof(c0)) == 0) {
+                  gy_def = v1;
+                  gx_def = v0;
+                  mag_st = int_stores[i];
+                  mag_set = set;
+                  mag_bind = bind;
+                  continue;
+               }
+            }
+         }
+      }
+      if (!dir_st) {
+         dir_st = int_stores[i];
+         dir_set = set;
+         dir_bind = bind;
+      }
+   }
+
+   if (!mag_st || !dir_st || !gy_def || !gx_def)
+      return false;
+   if (!match_sobel_dir_expr(dir_st->src[1].ssa, gy_def, gx_def))
+      return false;
+
+   /* Match border else branch: `if (x < width && y < height) { mag[idx] = 0; }`. */
+   nir_if *border_if = NULL;
+   foreach_list_typed(nir_cf_node, node, node, else_list) {
+      if (node->type == nir_cf_node_if) {
+         if (border_if)
+            return false;
+         border_if = nir_cf_node_as_if(node);
+      } else if (node->type != nir_cf_node_block) {
+         return false;
+      }
+   }
+   if (!border_if)
+      return false;
+
+   nir_def *bx = NULL, *by = NULL, *bw = NULL, *bh = NULL;
+   struct exec_list *bstore_list = NULL;
+   if (cf_list_is_empty_block(&border_if->else_list) &&
+       match_xy_bounds_cond(border_if->condition.ssa, false, wg, &bx, &by, &bw,
+                            &bh)) {
+      bstore_list = &border_if->then_list;
+   } else if (cf_list_is_empty_block(&border_if->then_list) &&
+              match_xy_bounds_cond(border_if->condition.ssa, true, wg, &bx, &by,
+                                   &bw, &bh)) {
+      bstore_list = &border_if->else_list;
+   } else {
+      return false;
+   }
+   if (!same_val(bw, w_pc, wg) || !same_val(bh, h_pc, wg))
+      return false;
+
+   if (!exec_list_is_singular(bstore_list))
+      return false;
+   nir_cf_node *bnode =
+      exec_node_data(nir_cf_node, exec_list_get_head(bstore_list), node);
+   if (bnode->type != nir_cf_node_block)
+      return false;
+   nir_block *bblk = nir_cf_node_as_block(bnode);
+
+   nir_intrinsic_instr *border_mag_st = NULL;
+   nir_foreach_instr(instr, bblk) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_store_deref) {
+         if (border_mag_st)
+            return false;
+         border_mag_st = intr;
+      }
+   }
+   if (!border_mag_st || nir_intrinsic_write_mask(border_mag_st) != 1 ||
+       !is_const_i32(border_mag_st->src[1].ssa, 0) ||
+       (nir_intrinsic_access(border_mag_st) &
+        (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_NON_TEMPORAL)))
+      return false;
+
+   uint32_t bm_set = 0, bm_bind = 0;
+   nir_def *bm_idx = NULL;
+   uint16_t bm_sp = 0;
+   if (!match_ssbo_deref_access(nir_src_as_deref(border_mag_st->src[0]), 32,
+                                &bm_set, &bm_bind, &bm_idx) ||
+       bm_set != mag_set || bm_bind != mag_bind ||
+       !match_linear_index(bm_idx, y, x, &bm_sp, wg) || bm_sp != w_off)
+      return false;
+
+   if ((src_set == dir_set && src_bind == dir_bind) ||
+       (src_set == mag_set && src_bind == mag_bind) ||
+       (dir_set == mag_set && dir_bind == mag_bind))
+      return false;
+
+   /* Completeness check across the whole shader. */
+   if (!verify_sobel_cf_list(&impl->body, int_if, border_if))
+      return false;
+
+   unsigned seen_loads = 0, seen_stores = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex ||
+             instr->type == nir_instr_type_call)
+            return false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_deref: {
+            bool ok = false;
+            for (unsigned k = 0; k < 9; k++)
+               if (samples[k] == intr)
+                  ok = true;
+            if (!ok)
+               return false;
+            seen_loads++;
+            break;
+         }
+         case nir_intrinsic_store_deref:
+            if (intr == mag_st || intr == dir_st || intr == border_mag_st) {
+               seen_stores++;
+               break;
+            }
+            return false;
+         case nir_intrinsic_load_push_constant:
+         case nir_intrinsic_vulkan_resource_index:
+         case nir_intrinsic_load_vulkan_descriptor:
+         case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_base_global_invocation_id:
+         case nir_intrinsic_load_base_workgroup_id:
+         case nir_intrinsic_load_local_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
+         case nir_intrinsic_load_num_workgroups:
+         case nir_intrinsic_load_workgroup_size:
+            break;
+         default:
+            return false;
+         }
+      }
+   }
+   if (seen_loads != 8 || seen_stores != 3)
+      return false;
+
+   if (!populate_binding_info(set_layout_count, set_layouts, src_set, src_bind,
+                              &plan->bufs[0]) ||
+       !populate_binding_info(set_layout_count, set_layouts, dir_set, dir_bind,
+                              &plan->bufs[1]) ||
+       !populate_binding_info(set_layout_count, set_layouts, mag_set, mag_bind,
+                              &plan->bufs[2]))
+      return false;
+
+   plan->kind = HK_2D_STENCIL_SOBEL_3X3_U8;
+   plan->tile_w = 128;
+   plan->tile_h = 8;
+   plan->width_pc_offset_B = w_off;
+   plan->height_pc_offset_B = h_off;
+   plan->stride_pc_offset_B = stride_pc;
+   return true;
+}
+
+/* ---------------------------------------------------------------------------
  * Top-level matcher entry point
  * --------------------------------------------------------------------------- */
 
@@ -2895,6 +3641,8 @@ hk_nir_match_2d_stencil(const nir_shader *orig_nir, uint32_t set_layout_count,
    bool matched = false;
    if (orig_nir->info.num_ssbos == 2)
       matched = match_box_blur_u8(s, set_layout_count, set_layouts, &plan);
+   else if (orig_nir->info.num_ssbos == 3)
+      matched = match_sobel_3x3_u8(s, set_layout_count, set_layouts, &plan);
    else if (orig_nir->info.num_ssbos == 6)
       matched = match_stereo_sad_u8(s, set_layout_count, set_layouts, &plan);
 
@@ -3013,6 +3761,12 @@ store_sh_u8x4(nir_builder *b, nir_deref_instr *arr, nir_def *idx4,
               nir_def *val_u8x4)
 {
    nir_store_deref(b, nir_build_deref_array(b, arr, idx4), val_u8x4, 0xf);
+}
+
+static nir_def *
+load_sh_u8x4(nir_builder *b, nir_deref_instr *arr, nir_def *idx4)
+{
+   return nir_load_deref(b, nir_build_deref_array(b, arr, idx4));
 }
 
 static nir_def *
@@ -3978,6 +4732,261 @@ build_stereo_sad_u8_kernel(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
+/* 2D shared-memory 3x3 Sobel gradient magnitude + quantized direction:
+ *   Tile 128x8 (1024 px/WG), WG 256x1x1 (32x8 logical, 4 horizontal px/thread).
+ *   Shared memory: 10 rows x 35 u8x4 (= 140 B/row >= 130 B, odd u32 stride)
+ *   = 1,400 B (1.37 KiB -> full occupancy).
+ *   Cooperative coalesced u8x4 preload, 6 vectorized u8x4 shared loads per
+ *   4 pixels, exact integer Gx/Gy -> f32 + bit-identical angle quantization,
+ *   and coalesced u32x4 interior stores to dir and mag. */
+static void
+build_sobel_3x3_u8_kernel(nir_builder *b,
+                          const struct hk_2d_stencil_plan *plan,
+                          nir_address_format ssbo_addr_format)
+{
+   const unsigned WG = 256;
+   const unsigned TILE_W = 128;
+   const unsigned TILE_H = 8;
+   const unsigned H_EXT = TILE_H + 2; /* 10 */
+   const unsigned W_EXT = TILE_W + 2; /* 130 */
+   const unsigned SH_U4 = 35;         /* 140 B >= 132 B, odd -> conflict-free */
+   const unsigned SH_B = SH_U4 * 4;
+
+   b->shader->info.workgroup_size[0] = WG;
+   b->shader->info.workgroup_size[1] = 1;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.workgroup_size_variable = false;
+   b->shader->info.shared_size = 0;
+
+   nir_variable *sh_src_var = nir_variable_create(
+      b->shader, nir_var_mem_shared,
+      glsl_array_type(glsl_vector_type(GLSL_TYPE_UINT8, 4), H_EXT * SH_U4, 0),
+      "sh_sobel");
+   nir_deref_instr *sh_src = nir_build_deref_var(b, sh_src_var);
+
+   nir_deref_instr *src_u8 = build_ssbo_base_deref(
+      b, &plan->bufs[0], ssbo_addr_format, glsl_uint8_t_type(), 1);
+   nir_deref_instr *src_u8x4 = build_ssbo_base_deref(
+      b, &plan->bufs[0], ssbo_addr_format,
+      glsl_vector_type(GLSL_TYPE_UINT8, 4), 1);
+   nir_deref_instr *dir_u32 = build_ssbo_base_deref(
+      b, &plan->bufs[1], ssbo_addr_format, glsl_uint_type(), 4);
+   nir_deref_instr *dir_u32x4 = build_ssbo_base_deref(
+      b, &plan->bufs[1], ssbo_addr_format, glsl_uvec4_type(), 4);
+   nir_deref_instr *mag_u32 = build_ssbo_base_deref(
+      b, &plan->bufs[2], ssbo_addr_format, glsl_uint_type(), 4);
+   nir_deref_instr *mag_u32x4 = build_ssbo_base_deref(
+      b, &plan->bufs[2], ssbo_addr_format, glsl_uvec4_type(), 4);
+
+   nir_def *width = load_pc_i32(b, plan->width_pc_offset_B);
+   nir_def *height = load_pc_i32(b, plan->height_pc_offset_B);
+   nir_def *stride = load_pc_i32(b, plan->stride_pc_offset_B);
+
+   nir_def *tid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *wgid = nir_load_workgroup_id(b);
+   nir_def *tile_x = nir_imul_imm(b, nir_channel(b, wgid, 0), TILE_W);
+   nir_def *tile_y = nir_imul_imm(b, nir_channel(b, wgid, 1), TILE_H);
+   nir_def *x_start = nir_iadd_imm(b, tile_x, -1);
+   nir_def *y_start = nir_iadd_imm(b, tile_y, -1);
+
+   nir_def *lane32 = nir_iand_imm(b, tid, 31);
+   nir_def *warp8 = nir_ushr_imm(b, tid, 5);
+
+   /* Phase 0: Preload 10 x 130 halo bytes into `sh_src`. */
+   nir_def *tile_fast = nir_iand(
+      b,
+      nir_iand(b, nir_ige_imm(b, x_start, 0),
+               nir_ige(b, width, nir_iadd_imm(b, x_start, 132))),
+      nir_iand(b, nir_ige_imm(b, y_start, 0),
+               nir_ige(b, height, nir_iadd_imm(b, y_start, H_EXT))));
+
+   nir_push_if(b, tile_fast);
+   {
+      /* Fast interior preload: 8 warps load rows 0..7, warps 0..1 load 8..9. */
+      nir_def *gx_main = nir_iadd(b, x_start, nir_ishl_imm(b, lane32, 2));
+      nir_def *gx_tail = nir_iadd_imm(b, x_start, 128);
+      for (unsigned pass = 0; pass < 2; pass++) {
+         nir_def *sy = pass == 0 ? warp8 : nir_iadd_imm(b, warp8, 8);
+         if (pass == 1)
+            nir_push_if(b, nir_ilt_imm(b, sy, H_EXT));
+         nir_def *gy = nir_iadd(b, y_start, sy);
+         nir_def *row_off = nir_imul(b, gy, stride);
+         nir_def *sh_u4_row = nir_imul_imm(b, sy, SH_U4);
+         store_sh_u8x4(b, sh_src, nir_iadd(b, sh_u4_row, lane32),
+                       load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, row_off, gx_main)));
+         nir_push_if(b, nir_ieq_imm(b, lane32, 0));
+         {
+            store_sh_u8x4(
+               b, sh_src, nir_iadd_imm(b, sh_u4_row, 32),
+               load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, row_off, gx_tail)));
+         }
+         nir_pop_if(b, NULL);
+         if (pass == 1)
+            nir_pop_if(b, NULL);
+      }
+   }
+   nir_push_else(b, NULL);
+   {
+      nir_variable *sy_v =
+         nir_local_variable_create(b->impl, glsl_int_type(), "ssy");
+      nir_store_var(b, sy_v, warp8, 0x1);
+      nir_loop *rl = nir_push_loop(b);
+      rl->control = nir_loop_control_dont_unroll;
+      {
+         nir_def *sy = nir_load_var(b, sy_v);
+         nir_push_if(b, nir_ige_imm(b, sy, H_EXT));
+         nir_jump(b, nir_jump_break);
+         nir_pop_if(b, NULL);
+
+         nir_def *gy = nir_iadd(b, y_start, sy);
+         nir_push_if(b, nir_iand(b, nir_ige_imm(b, gy, 0),
+                                 nir_ilt(b, gy, height)));
+         {
+            nir_def *row_off = nir_imul(b, gy, stride);
+            nir_def *sh_row = nir_imul_imm(b, sy, SH_B);
+            nir_variable *cx_v =
+               nir_local_variable_create(b->impl, glsl_int_type(), "scx");
+            nir_store_var(b, cx_v, lane32, 0x1);
+            nir_loop *cl = nir_push_loop(b);
+            cl->control = nir_loop_control_dont_unroll;
+            {
+               nir_def *cx = nir_load_var(b, cx_v);
+               nir_push_if(b, nir_ige_imm(b, cx, W_EXT));
+               nir_jump(b, nir_jump_break);
+               nir_pop_if(b, NULL);
+
+               nir_def *gx = nir_iadd(b, x_start, cx);
+               nir_push_if(b, nir_iand(b, nir_ige_imm(b, gx, 0),
+                                       nir_ilt(b, gx, width)));
+               {
+                  store_sh_u8x4_byte(
+                     b, sh_src, nir_iadd(b, sh_row, cx),
+                     load_ssbo_u8(b, src_u8, nir_iadd(b, row_off, gx)));
+               }
+               nir_pop_if(b, NULL);
+               nir_store_var(b, cx_v, nir_iadd_imm(b, cx, 32), 0x1);
+            }
+            nir_pop_loop(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+         nir_store_var(b, sy_v, nir_iadd_imm(b, sy, 8), 0x1);
+      }
+      nir_pop_loop(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+
+   emit_shared_barrier(b);
+
+   /* Phase 1: 32x8 threads compute 4 consecutive horizontal pixels each. */
+   nir_def *bx = lane32;
+   nir_def *row = warp8;
+   nir_def *x0 = nir_iadd(b, tile_x, nir_ishl_imm(b, bx, 2));
+   nir_def *py = nir_iadd(b, tile_y, row);
+
+   nir_push_if(b, nir_ilt(b, py, height));
+   {
+      /* Load 3 rows x 6 bytes via 6 coalesced u8x4 shared loads. */
+      nir_def *p[3][6];
+      for (unsigned dy = 0; dy < 3; dy++) {
+         nir_def *sh_u4 =
+            nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, row, dy), SH_U4), bx);
+         nir_def *v0 = load_sh_u8x4(b, sh_src, sh_u4);
+         nir_def *v1 = load_sh_u8x4(b, sh_src, nir_iadd_imm(b, sh_u4, 1));
+         p[dy][0] = nir_u2u32(b, nir_channel(b, v0, 0));
+         p[dy][1] = nir_u2u32(b, nir_channel(b, v0, 1));
+         p[dy][2] = nir_u2u32(b, nir_channel(b, v0, 2));
+         p[dy][3] = nir_u2u32(b, nir_channel(b, v0, 3));
+         p[dy][4] = nir_u2u32(b, nir_channel(b, v1, 0));
+         p[dy][5] = nir_u2u32(b, nir_channel(b, v1, 1));
+      }
+
+      nir_def *c_lo = nir_imm_int(b, 0x3ed413cdu);
+      nir_def *c_hi = nir_imm_int(b, 0x401a827au);
+      nir_def *fzero = nir_imm_float(b, 0.0f);
+
+      nir_def *dir_out[4];
+      nir_def *mag_out[4];
+      for (unsigned t = 0; t < 4; t++) {
+         nir_def *top = nir_iadd(
+            b, nir_iadd(b, p[0][t], p[0][t + 2]),
+            nir_ishl_imm(b, p[0][t + 1], 1));
+         nir_def *bot = nir_iadd(
+            b, nir_iadd(b, p[2][t], p[2][t + 2]),
+            nir_ishl_imm(b, p[2][t + 1], 1));
+         nir_def *lft = nir_iadd(
+            b, nir_iadd(b, p[0][t], p[2][t]),
+            nir_ishl_imm(b, p[1][t], 1));
+         nir_def *rgt = nir_iadd(
+            b, nir_iadd(b, p[0][t + 2], p[2][t + 2]),
+            nir_ishl_imm(b, p[1][t + 2], 1));
+
+         nir_def *gy = nir_i2f32(b, nir_isub(b, top, bot));
+         nir_def *gx = nir_i2f32(b, nir_isub(b, lft, rgt));
+
+         nir_def *mag = nir_fadd(b, nir_fabs(b, gy), nir_fabs(b, gx));
+         nir_def *ratio = nir_fabs(b, nir_fmul(b, gx, nir_frcp(b, gy)));
+
+         nir_def *gx_neg = nir_flt(b, gx, fzero);
+         nir_def *gy_neg = nir_flt(b, gy, fzero);
+         nir_def *d_neg_gy =
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 5), nir_imm_int(b, 3));
+         nir_def *d_pos_gy =
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 7), nir_imm_int(b, 1));
+         nir_def *diag = nir_bcsel(b, gy_neg, d_neg_gy, d_pos_gy);
+         nir_def *q0 = nir_bcsel(
+            b, nir_flt(b, ratio, c_lo),
+            nir_bcsel(b, gy_neg, nir_imm_int(b, 4), nir_imm_int(b, 0)), diag);
+         nir_def *q1 = nir_bcsel(
+            b, nir_flt(b, c_hi, ratio),
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 6), nir_imm_int(b, 2)), q0);
+         dir_out[t] = nir_iand_imm(b, nir_iadd_imm(b, q1, 6), 7);
+         mag_out[t] = mag;
+      }
+
+      nir_def *wm1 = nir_iadd_imm(b, width, -1);
+      nir_def *hm1 = nir_iadd_imm(b, height, -1);
+      nir_def *y_int = nir_iand(b, nir_ige_imm(b, py, 1), nir_ilt(b, py, hm1));
+      nir_def *all_int = nir_iand(
+         b, y_int,
+         nir_iand(b, nir_ige_imm(b, x0, 1),
+                  nir_ilt(b, nir_iadd_imm(b, x0, 3), wm1)));
+      nir_def *out_row = nir_imul(b, py, width);
+
+      nir_push_if(b, all_int);
+      {
+         nir_def *off = nir_iadd(b, out_row, x0);
+         store_ssbo_u32x4(b, dir_u32x4, off, nir_vec(b, dir_out, 4));
+         store_ssbo_u32x4(b, mag_u32x4, off, nir_vec(b, mag_out, 4));
+      }
+      nir_push_else(b, NULL);
+      {
+         for (unsigned t = 0; t < 4; t++) {
+            nir_def *px = nir_iadd_imm(b, x0, t);
+            nir_push_if(b, nir_ilt(b, px, width));
+            {
+               nir_def *off = nir_iadd(b, out_row, px);
+               nir_def *is_int = nir_iand(
+                  b, y_int,
+                  nir_iand(b, nir_ige_imm(b, px, 1), nir_ilt(b, px, wm1)));
+               nir_push_if(b, is_int);
+               {
+                  store_ssbo_u32(b, dir_u32, off, dir_out[t]);
+                  store_ssbo_u32(b, mag_u32, off, mag_out[t]);
+               }
+               nir_push_else(b, NULL);
+               {
+                  store_ssbo_u32(b, mag_u32, off, nir_imm_int(b, 0));
+               }
+               nir_pop_if(b, NULL);
+            }
+            nir_pop_if(b, NULL);
+         }
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
 nir_shader *
 hk_nir_build_tiled_2d_stencil(void *mem_ctx, const nir_shader *orig_nir,
                               const struct hk_2d_stencil_plan *plan,
@@ -3998,6 +5007,9 @@ hk_nir_build_tiled_2d_stencil(void *mem_ctx, const nir_shader *orig_nir,
       break;
    case HK_2D_STENCIL_STEREO_SAD_U8:
       build_stereo_sad_u8_kernel(&b, plan, ssbo_addr_format);
+      break;
+   case HK_2D_STENCIL_SOBEL_3X3_U8:
+      build_sobel_3x3_u8_kernel(&b, plan, ssbo_addr_format);
       break;
    default:
       ralloc_free(b.shader);
@@ -4226,6 +5238,39 @@ hk_2d_stencil_validate_dispatch_core(
          return false;
       if (!cost_same && !va_ranges_disjoint(a[5].base_addr, cost_bytes,
                                             a[3].base_addr, cost_bytes))
+         return false;
+
+      *out_groups_x = DIV_ROUND_UP((uint32_t)width, (uint32_t)plan->tile_w);
+      *out_groups_y = DIV_ROUND_UP((uint32_t)height, (uint32_t)plan->tile_h);
+      return true;
+   }
+   case HK_2D_STENCIL_SOBEL_3X3_U8: {
+      if ((uint32_t)width > (uint32_t)INT32_MAX - (plan->tile_w + 16u) ||
+          (uint32_t)height > (uint32_t)INT32_MAX - (plan->tile_h + 16u))
+         return false;
+
+      const uint64_t out_elems = (uint64_t)width * (uint64_t)height;
+      if (out_elems > (uint64_t)INT32_MAX / 4u)
+         return false;
+      const uint64_t out_bytes = out_elems * 4u;
+
+      struct hk_buffer_address src_addr = {0}, dir_addr = {0}, mag_addr = {0};
+      if (!resolve_ssbo_binding(desc, &plan->bufs[0], &src_addr) ||
+          !resolve_ssbo_binding(desc, &plan->bufs[1], &dir_addr) ||
+          !resolve_ssbo_binding(desc, &plan->bufs[2], &mag_addr))
+         return false;
+
+      if (src_addr.size < img_bytes || dir_addr.size < out_bytes ||
+          mag_addr.size < out_bytes || (dir_addr.base_addr & 3u) != 0 ||
+          (mag_addr.base_addr & 3u) != 0)
+         return false;
+
+      if (!va_ranges_disjoint(dir_addr.base_addr, out_bytes, src_addr.base_addr,
+                              img_bytes) ||
+          !va_ranges_disjoint(mag_addr.base_addr, out_bytes, src_addr.base_addr,
+                              img_bytes) ||
+          !va_ranges_disjoint(dir_addr.base_addr, out_bytes, mag_addr.base_addr,
+                              out_bytes))
          return false;
 
       *out_groups_x = DIV_ROUND_UP((uint32_t)width, (uint32_t)plan->tile_w);

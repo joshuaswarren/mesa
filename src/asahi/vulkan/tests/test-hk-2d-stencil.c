@@ -596,12 +596,247 @@ test_stereo_sad_matcher_and_builder(void)
    printf("hk_2d_stencil: stereo SAD matcher/builder/validator tests passed\n");
 }
 
+enum sobel_variant {
+   SOB_NONE,
+   SOB_WITH_BASE_WG,
+   SOB_DUPLICATE_TAP,  /* negative: duplicate tap instead of 8 distinct */
+   SOB_WRONG_SIGN,     /* negative: flipped Gx sign */
+   SOB_BORDER_NONZERO, /* negative: border writes 1.0f instead of 0.0f */
+   SOB_EXACT_FADD,     /* negative: NoContraction on gradient */
+   SOB_COUNT,
+};
+
+static nir_shader *
+build_sobel_3x3_shader(enum sobel_variant v, uint32_t wg_x, uint32_t wg_y)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &test_nir_options, "test_sobel_3x3");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = wg_x;
+   b.shader->info.workgroup_size[1] = wg_y;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 3;
+
+   nir_deref_instr *src = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+   nir_deref_instr *dir = make_ssbo_base(&b, 1, glsl_int_type(), 4);
+   nir_deref_instr *mag = make_ssbo_base(&b, 2, glsl_float_type(), 4);
+
+   nir_def *w =
+      nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 4);
+   nir_def *h =
+      nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 4, .range = 4);
+   nir_def *stride =
+      nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 8, .range = 4);
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *x = nir_channel(&b, gid, 0);
+   nir_def *y = nir_channel(&b, gid, 1);
+   if (v == SOB_WITH_BASE_WG) {
+      nir_def *bwg = nir_load_base_workgroup_id(&b, 32);
+      x = nir_iadd(&b, x, nir_imul_imm(&b, nir_channel(&b, bwg, 0), wg_x));
+      y = nir_iadd(&b, y, nir_imul_imm(&b, nir_channel(&b, bwg, 1), wg_y));
+   }
+
+   nir_def *out_idx = nir_iadd(&b, nir_imul(&b, y, w), x);
+   nir_def *is_int = nir_iand(
+      &b,
+      nir_iand(&b, nir_ige_imm(&b, x, 1),
+               nir_ilt(&b, x, nir_iadd_imm(&b, w, -1))),
+      nir_iand(&b, nir_ige_imm(&b, y, 1),
+               nir_ilt(&b, y, nir_iadd_imm(&b, h, -1))));
+
+   nir_push_if(&b, is_int);
+   {
+      nir_def *xm1 = nir_iadd_imm(&b, x, -1);
+      nir_def *xp1 = nir_iadd_imm(&b, x, 1);
+      nir_def *ym1 = nir_iadd_imm(&b, y, -1);
+      nir_def *yp1 = nir_iadd_imm(&b, y, 1);
+      nir_def *r0 = nir_imul(&b, ym1, stride);
+      nir_def *r1 = nir_imul(&b, y, stride);
+      nir_def *r2 = nir_imul(&b, yp1, stride);
+
+      nir_def *p00 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, xm1, r0)))));
+      nir_def *p10 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, xm1, r1)))));
+      nir_def *p20 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, xm1, r2)))));
+      nir_def *p01 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, x, r0)))));
+      nir_def *p21 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, x, r2)))));
+      nir_def *p02 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, xp1, r0)))));
+      nir_def *p12 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(
+                              &b, nir_build_deref_ptr_as_array(
+                                     &b, src,
+                                     nir_iadd(&b, v == SOB_DUPLICATE_TAP ? xm1 : xp1,
+                                              r1)))));
+      nir_def *p22 = nir_i2f32(
+         &b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(
+                                                 &b, src, nir_iadd(&b, xp1, r2)))));
+
+      nir_def *two = nir_imm_float(&b, 2.0f);
+      if (v == SOB_EXACT_FADD)
+         b.fp_math_ctrl = nir_fp_exact;
+      nir_def *gy = nir_fadd(
+         &b,
+         nir_fadd(&b, nir_fsub(&b, p00, p20),
+                  nir_fsub(&b, nir_fmul(&b, two, p01), nir_fmul(&b, two, p21))),
+         nir_fsub(&b, p02, p22));
+      b.fp_math_ctrl = 0;
+
+      nir_def *gx = nir_fsub(
+         &b, nir_fadd(&b, nir_fadd(&b, p00, nir_fmul(&b, two, p10)), p20),
+         nir_fadd(&b, nir_fadd(&b, p02, nir_fmul(&b, two, p12)), p22));
+      if (v == SOB_WRONG_SIGN)
+         gx = nir_fneg(&b, gx);
+
+      nir_def *m = nir_fadd(&b, nir_fabs(&b, gy), nir_fabs(&b, gx));
+      nir_def *ratio = nir_fabs(&b, nir_fmul(&b, gx, nir_frcp(&b, gy)));
+      nir_def *fzero = nir_imm_float(&b, 0.0f);
+      nir_def *gx_n = nir_flt(&b, gx, fzero);
+      nir_def *gy_n = nir_flt(&b, gy, fzero);
+      nir_def *diag = nir_bcsel(
+         &b, gy_n, nir_bcsel(&b, gx_n, nir_imm_int(&b, 5), nir_imm_int(&b, 3)),
+         nir_bcsel(&b, gx_n, nir_imm_int(&b, 7), nir_imm_int(&b, 1)));
+      nir_def *q1 = nir_bcsel(
+         &b, nir_flt(&b, ratio, nir_imm_int(&b, 0x3ed413cdu)),
+         nir_bcsel(&b, gy_n, nir_imm_int(&b, 4), nir_imm_int(&b, 0)), diag);
+      nir_def *q2 = nir_bcsel(
+         &b, nir_flt(&b, nir_imm_int(&b, 0x401a827au), ratio),
+         nir_bcsel(&b, gx_n, nir_imm_int(&b, 6), nir_imm_int(&b, 2)), q1);
+      nir_def *d = nir_iand_imm(&b, nir_iadd_imm(&b, q2, 6), 7);
+
+      nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dir, out_idx), d, 0x1);
+      nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, mag, out_idx), m, 0x1);
+   }
+   nir_push_else(&b, NULL);
+   {
+      nir_push_if(&b, nir_iand(&b, nir_ilt(&b, x, w), nir_ilt(&b, y, h)));
+      {
+         nir_def *bv = (v == SOB_BORDER_NONZERO) ? nir_imm_float(&b, 1.0f)
+                                                 : nir_imm_float(&b, 0.0f);
+         nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, mag, out_idx), bv,
+                         0x1);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_validate_shader(b.shader, "build_sobel_3x3_shader");
+   return b.shader;
+}
+
+static void
+test_sobel_3x3_matcher_and_builder(void)
+{
+   struct hk_descriptor_set_layout *layout = make_test_layout(3, false);
+   struct hk_descriptor_set_layout *uab_layout = make_test_layout(3, true);
+   struct vk_descriptor_set_layout *layouts[1] = {&layout->vk};
+   struct vk_descriptor_set_layout *uab_layouts[1] = {&uab_layout->vk};
+
+   for (unsigned v = 0; v < SOB_COUNT; v++) {
+      nir_shader *s = build_sobel_3x3_shader((enum sobel_variant)v, 1024, 1);
+      struct hk_2d_stencil_plan plan = {0};
+      bool expect = (v <= SOB_WITH_BASE_WG);
+      bool got = hk_nir_match_2d_stencil(s, 1, layouts, &plan);
+      if (got != expect)
+         fprintf(stderr, "sobel variant %u failed: got=%d expect=%d\n", v, got,
+                 expect);
+      assert(got == expect);
+      if (expect) {
+         assert(plan.kind == HK_2D_STENCIL_SOBEL_3X3_U8);
+         assert(plan.tile_w == 128 && plan.tile_h == 8);
+         assert(plan.width_pc_offset_B == 0);
+         assert(plan.height_pc_offset_B == 4);
+         assert(plan.stride_pc_offset_B == 8);
+
+         nir_shader *tiled = hk_nir_build_tiled_2d_stencil(
+            NULL, s, &plan, nir_address_format_64bit_bounded_global);
+         assert(tiled != NULL);
+         assert(tiled->info.workgroup_size[0] == 256);
+         ralloc_free(tiled);
+      }
+      ralloc_free(s);
+   }
+
+   /* Test AGX-preprocessed NIR. */
+   {
+      nir_shader *s = build_sobel_3x3_shader(SOB_WITH_BASE_WG, 1024, 1);
+      agx_preprocess_nir_native_defer_idiv(s, AGX_CHIP_G17P);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(s, 1, layouts, &plan));
+      assert(plan.kind == HK_2D_STENCIL_SOBEL_3X3_U8);
+      nir_shader *tiled = hk_nir_build_tiled_2d_stencil(
+         NULL, s, &plan, nir_address_format_64bit_bounded_global);
+      assert(tiled != NULL);
+      ralloc_free(tiled);
+      ralloc_free(s);
+   }
+
+   /* Reject UPDATE_AFTER_BIND. */
+   {
+      nir_shader *s = build_sobel_3x3_shader(SOB_NONE, 1024, 1);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(!hk_nir_match_2d_stencil(s, 1, uab_layouts, &plan));
+      ralloc_free(s);
+   }
+
+   /* Dispatch validation. */
+   {
+      nir_shader *s = build_sobel_3x3_shader(SOB_NONE, 1024, 1);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(s, 1, layouts, &plan));
+
+      struct hk_buffer_address bufs[3] = {
+         {.base_addr = 0x1000000, .size = 4096 * 2048},
+         {.base_addr = 0x2000000, .size = 4096 * 2048 * 4},
+         {.base_addr = 0x6000000, .size = 4096 * 2048 * 4},
+      };
+      struct hk_descriptor_set ds = {
+         .layout = layout,
+         .mapped_ptr = bufs,
+         .size = sizeof(bufs),
+      };
+      struct hk_descriptor_state desc = {0};
+      desc.sets[0] = &ds;
+      int32_t pc[3] = {2048, 1024, 2048};
+      memcpy(desc.root.push, pc, sizeof(pc));
+      desc.push_written_dwords = 0x7;
+
+      uint32_t gx = 0, gy = 0;
+      assert(hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                  2, 1024, 1, &gx, &gy));
+      assert(gx == 16 && gy == 128);
+
+      /* dir overlaps mag -> reject. */
+      bufs[2].base_addr = bufs[1].base_addr + 16;
+      assert(!hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                   2, 1024, 1, &gx, &gy));
+      ralloc_free(s);
+   }
+
+   free(layout);
+   free(uab_layout);
+   printf("hk_2d_stencil: sobel 3x3 matcher/builder/validator tests passed\n");
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
    test_box_blur_matcher_and_builder();
    test_stereo_sad_matcher_and_builder();
+   test_sobel_3x3_matcher_and_builder();
    glsl_type_singleton_decref();
    return 0;
 }
