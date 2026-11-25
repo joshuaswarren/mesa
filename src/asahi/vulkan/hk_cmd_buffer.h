@@ -76,18 +76,53 @@ struct hk_linked_shader;
 struct agx_usc_builder;
 struct vk_shader;
 
+/* Dynamic graphics state subset consumed by hk_g17p_build_native_bind_tail().
+ * Kept separate from dyn->generation so unrelated dynamic state changes
+ * (blend constants, vertex input, color write masks, etc.) never thrash the
+ * HAL200 bind tail or its memo. */
+struct hk_g17p_bind_tail_dyn_state {
+   VkViewport viewports[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
+   VkRect2D scissors[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
+   struct vk_stencil_test_face_state stencil_front;
+   struct vk_stencil_test_face_state stencil_back;
+   uint32_t rasterization_stream;
+   uint32_t line_width_raw;
+   uint32_t depth_bias_constant_raw;
+   uint32_t depth_bias_clamp_raw;
+   uint32_t depth_bias_slope_raw;
+   uint8_t depth_bias_representation;
+   uint8_t viewport_count;
+   uint8_t scissor_count;
+   uint8_t depth_clip_enable;
+   uint8_t polygon_mode;
+   uint8_t cull_mode;
+   uint8_t front_face;
+   uint8_t line_mode;
+   uint8_t depth_compare_op;
+   uint8_t domain_origin;
+   uint8_t rasterization_samples;
+   bool depth_clip_negative_one_to_one;
+   bool rasterizer_discard_enable;
+   bool depth_clamp_enable;
+   bool depth_bias_enable;
+   bool depth_bias_exact;
+   bool depth_test_enable;
+   bool depth_write_enable;
+   bool depth_bounds_test_enable;
+   bool stencil_test_enable;
+};
+
 /* A complete but unpublished HAL200 state update.  The referenced VDM state
  * is command-buffer-owned.  The scissor/depth records stay inline until the
  * draw chooses its live stream, so preparation cannot perturb stream-local
  * indices or make firmware-visible bytes reachable early. */
 struct hk_g17p_prepared_bind_tail {
-   struct agx_vdm_hal200_bind_tail tail;
-   uint8_t scissors[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
-                   [AGX_SCISSOR_LENGTH];
-   uint8_t depth_bias[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
-                    [AGX_DEPTH_BIAS_LENGTH];
+   /* Hot per-draw validation fields grouped at the front so
+    * hk_g17p_flush_dynamic_state_fast() and hk_g17p_emit_native_bind_tail()
+    * stay in adjacent hot fields on the steady-state draw path. */
    uint64_t dynamic_generation;
    uint64_t descriptor_generation;
+   uint64_t non_push_descriptor_generation;
    uint64_t vertex_buffer_generation;
    uint64_t root;
    /* The fragment shader variant the tail launches, its published stage
@@ -96,20 +131,36 @@ struct hk_g17p_prepared_bind_tail {
    const struct hk_shader *fragment_shader;
    uint64_t fragment_program;
    uint64_t fragment_dma_set_base;
+   struct hk_linked_shader *linked_vs;
+   struct hk_linked_shader *linked_fs;
+   uint32_t cull_word;
+   uint32_t render_view_mask;
+   uint8_t render_color_count;
+   uint8_t render_samples;
+   uint8_t viewport_count;
+   /* Cached set index returned by hk_g17p_dma_set_index(fragment_shader), or
+    * -1 when the fragment shader has no set-sourced uniform DMA span. */
+   int8_t fragment_dma_set_index;
+   bool in_meta;
+   /* Metadata fields above (including fragment_program and cull_word) match
+    * the active state. */
+   bool valid;
+   /* prepared->tail's embedded FS and CULL records still match
+    * fragment_program and cull_word (false after an incremental standalone
+    * PPP update until a full bind tail is rebuilt). */
+   bool fs_record_in_tail_valid;
+
+   /* Cold state compared only on full bind-tail checks or rebuilds. */
    struct hk_image_view *render_color0;
    struct hk_image_view *render_depth;
    struct hk_image_view *render_stencil;
    VkRect2D render_area;
    VkFormat render_depth_format;
+   VkFormat render_stencil_format;
    uint32_t render_width;
    uint32_t render_height;
    uint32_t render_layer_count;
-   uint32_t render_view_mask;
-   uint8_t render_color_count;
-   uint8_t render_samples;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
-   struct hk_linked_shader *linked_vs;
-   struct hk_linked_shader *linked_fs;
    uint64_t varyings;
    uint32_t varying_counts_32;
    uint32_t varying_counts_16;
@@ -118,12 +169,15 @@ struct hk_g17p_prepared_bind_tail {
    uint8_t object_type;
    uint8_t provoking;
    uint8_t occlusion_mode;
-   uint8_t viewport_count;
    uint8_t effective_fragment_pass_type;
    bool generate_primitive_id;
    bool force_never_in_shader;
-   bool in_meta;
-   bool valid;
+   bool rasterizer_discard;
+   struct agx_vdm_hal200_bind_tail tail;
+   uint8_t scissors[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
+                   [AGX_SCISSOR_LENGTH];
+   uint8_t depth_bias[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
+                    [AGX_DEPTH_BIAS_LENGTH];
 };
 
 /** Root descriptor table. */
@@ -313,6 +367,7 @@ struct hk_upload_stats {
    uint64_t draw_param_uploads, draw_param_bytes, draw_param_reuses;
    uint64_t draw_id_uploads, draw_id_bytes, draw_id_reuses;
    uint64_t constant_uploads, constant_bytes, constant_reuses;
+   uint64_t xfer_desc_walks;
 };
 
 #define hk_upload_stat(cmd, field, value)                                      \
@@ -523,6 +578,11 @@ struct hk_descriptor_state {
       bool push_launched;
    } root_change;
    uint64_t generation;
+   /* Advances on every descriptor state change except hk_push_constants()
+    * (set binds, dynamic offsets, push descriptors, descriptor buffers, meta
+    * restores), so push-only launches and xfer_clean can track descriptor
+    * resource mutations in O(1). */
+   uint64_t non_push_generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
    /* Immutable command-buffer storage; reset with descriptor state. Only the
@@ -538,6 +598,7 @@ struct hk_descriptor_state {
 
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
+   uint32_t set_update_seq[HK_MAX_SETS];
    uint32_t sets_dirty;
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
@@ -990,9 +1051,17 @@ struct hk_graphics_state {
       const uint8_t *state_cpu;
       uint32_t state_compact;
       uint32_t state_size;
+      uint32_t cull_word;
+      uint32_t raster_fragment_control;
+      uint16_t viewport_length;
       const struct hk_shader *fs;
       const struct hk_shader *hw_vs;
       bool valid;
+      /* Cached viewport payload (at state_cpu + AGX_G17P_BIND_GROUP_BYTES),
+       * raster_fragment_control, and prepared->scissors/depth_bias are valid
+       * for reuse across material switches when viewport/scissor/depth-bias
+       * state is unchanged. */
+      bool viewport_valid;
    } g17p_bind_tail_memo;
 
    /* Per vertex-attribute slot: the last API format seen and the pipe format
@@ -1041,6 +1110,8 @@ struct hk_graphics_state {
 
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
+   /* Bitmask of vb[] slots with a non-zero range currently bound. */
+   uint32_t bound_vb_mask;
 
    /* Transform feedback buffers */
    struct hk_addr_range xfb[4];
@@ -1134,7 +1205,7 @@ struct hk_graphics_state {
    /* Effective AGX_PASS_TYPE_* selected for the active draw (hk_partial_mrt_hsr). */
    uint8_t effective_fragment_pass_type;
 
-   /* Keep these four native graphics caches contiguous: AGX2 resets leave
+   /* Keep these five native graphics caches contiguous: AGX2 resets leave
     * their zero-initialized storage untouched.
     *
     * Exact last VS/FS loader identities. These are recording-only selectors;
@@ -1155,6 +1226,12 @@ struct hk_graphics_state {
       uint64_t address;
       bool valid;
    } g17p_combined_sampler_pointers[32];
+
+   /* Dynamic graphics state snapshot for g17p_bind_tail (kept out of
+    * struct hk_g17p_prepared_bind_tail so hot graphics fields stay dense).
+    * Read only when g17p_bind_tail.valid or g17p_bind_tail_memo.valid /
+    * viewport_valid is true. */
+   struct hk_g17p_bind_tail_dyn_state g17p_bind_tail_dyn;
 
    /* Exact immutable eMRT descriptor-table upload used by every fragment
     * program in one spilled render configuration. */
@@ -1726,12 +1803,14 @@ struct hk_cs {
 
    /* G17P / HAL200: the last complete bind tail published into this VDM
     * stream.  Every record in that tail latches independently in PPP state,
-    * so a subsequent draw whose only changed tail input is the fragment
-    * program can elide the tail (when the fragment program is unchanged) or
-    * emit a single 8-byte PPP_STATE_UPDATE for the 28-byte fragment record. */
+    * so a subsequent draw whose only changed tail inputs are the fragment
+    * program and/or cull/front-face mode can elide the tail (0 bytes) or emit
+    * standalone 8-byte PPP_STATE_UPDATE records for the 28-byte FS and/or
+    * 8-byte CULL records. */
    struct {
       uint64_t fs_program;
       uint32_t state_compact;
+      uint32_t cull_word;
       uint32_t scissor_size, depth_bias_size;
       uint8_t viewport_count;
       bool valid;
@@ -2512,8 +2591,10 @@ hk_cmd_buffer_pool(struct hk_cmd_buffer *cmd)
  * runs before the draw-time dirty-state flush. A cached copy refreshed only
  * by that flush was stale there, so the first draw after a blend-equation
  * change published a fragment program without the blend-constant range and
- * the epilog read unwritten uniforms. Prepared programs are keyed by
- * dynamic_graphics_state.generation, which covers every input here. */
+ * the epilog read unwritten uniforms. Blend-constant value changes dirty and
+ * re-upload the root (invalidating prepared->valid and moving the root
+ * address), while changes in whether an epilog reads blend constants change
+ * linked_fs. */
 static inline bool
 hk_uses_blend_constant(const struct vk_color_blend_state *cb)
 {
@@ -2777,10 +2858,25 @@ static inline struct hk_cs *
 hk_cs_create_at(struct hk_cmd_buffer *cmd, bool compute, struct agx_ptr root)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_cmd_pool *pool = cmd->vk.pool ? hk_cmd_buffer_pool(cmd) : NULL;
    size_t initial_size = hk_cs_root_size(dev->dev.chip, compute);
 
-   /* Allocate hk_cs for the new stream */
-   struct hk_cs *cs = malloc(sizeof(*cs));
+   /* Recycle a pool-owned hk_cs (keeping scissor/depth_bias storage warm)
+    * when available to avoid per-pass heap traffic on steady-state recordings. */
+   struct hk_cs *cs;
+   struct util_dynarray scissor = UTIL_DYNARRAY_INIT;
+   struct util_dynarray depth_bias = UTIL_DYNARRAY_INIT;
+   if (pool && !list_is_empty(&pool->free_cs)) {
+      cs = list_first_entry(&pool->free_cs, struct hk_cs, node);
+      list_del(&cs->node);
+      pool->num_free_cs--;
+      scissor = cs->scissor;
+      depth_bias = cs->depth_bias;
+   } else {
+      cs = malloc(sizeof(*cs));
+      if (!cs)
+         return NULL;
+   }
    *cs = (struct hk_cs){
       .cmd = cmd,
       .type = compute ? HK_CS_CDM : HK_CS_VDM,
@@ -2790,6 +2886,8 @@ hk_cs_create_at(struct hk_cmd_buffer *cmd, bool compute, struct agx_ptr root)
       .chunk = root,
       .current = root.cpu,
       .end = root.cpu + initial_size,
+      .scissor = scissor,
+      .depth_bias = depth_bias,
    };
 
    util_dynarray_init(&cs->compute_resources, NULL);
@@ -2812,6 +2910,7 @@ hk_cs_create(struct hk_cmd_buffer *cmd, bool compute)
 }
 
 static inline void hk_flush_oq_pending(struct hk_cmd_buffer *cmd);
+static inline void hk_cs_destroy(struct hk_cs *cs);
 
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
@@ -2865,7 +2964,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
          if (!hk_graphics_cs_publishable(
                 dev->dev.chip, initialized,
                 cs->agx3_active_context_selector_valid)) {
-            free(cs);
+            hk_cs_destroy(cs);
             return NULL;
          }
       }
@@ -2932,7 +3031,10 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
    hk_root_mark_dirty(&gfx->descriptors);
+   gfx->g17p_bind_tail.valid = false;
+   gfx->g17p_bind_tail.fs_record_in_tail_valid = false;
    gfx->g17p_bind_tail_memo.valid = false;
+   gfx->g17p_bind_tail_memo.viewport_valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
 }
@@ -3068,17 +3170,37 @@ hk_cs_destroy(struct hk_cs *cs)
    hk_cs_invalidate_compute_pair(cs);
    util_dynarray_fini(&cs->compute_resources);
    util_dynarray_fini(&cs->render_resources);
-   if (cs->type == HK_CS_VDM) {
-      util_dynarray_fini(&cs->scissor);
-      util_dynarray_fini(&cs->depth_bias);
-   } else {
-      util_dynarray_fini(&cs->imm_writes);
-      util_dynarray_fini(&cs->imm_write_query_ranges);
-      util_dynarray_fini(&cs->oq_stamps);
-      util_dynarray_fini(&cs->query_access_ranges);
-   }
+   util_dynarray_fini(&cs->scissor);
+   util_dynarray_fini(&cs->depth_bias);
+   util_dynarray_fini(&cs->imm_writes);
+   util_dynarray_fini(&cs->imm_write_query_ranges);
+   util_dynarray_fini(&cs->oq_stamps);
+   util_dynarray_fini(&cs->query_access_ranges);
 
    free(cs);
+}
+
+#define HK_CMD_POOL_CS_CACHE_MAX 4u
+
+static inline void
+hk_cs_recycle(struct hk_cmd_pool *pool, struct hk_cs *cs)
+{
+   if (!pool || pool->num_free_cs >= HK_CMD_POOL_CS_CACHE_MAX) {
+      hk_cs_destroy(cs);
+      return;
+   }
+
+   hk_cs_invalidate_compute_pair(cs);
+   util_dynarray_fini(&cs->compute_resources);
+   util_dynarray_fini(&cs->render_resources);
+   util_dynarray_fini(&cs->imm_writes);
+   util_dynarray_fini(&cs->imm_write_query_ranges);
+   util_dynarray_fini(&cs->oq_stamps);
+   util_dynarray_fini(&cs->query_access_ranges);
+   util_dynarray_clear(&cs->scissor);
+   util_dynarray_clear(&cs->depth_bias);
+   list_add(&cs->node, &pool->free_cs);
+   pool->num_free_cs++;
 }
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
@@ -3354,6 +3476,9 @@ void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
 
 void hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd);
 void hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd);
+/* Non-static for unit tests (hk_cpu_upload_bench). */
+void hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
+                             uint64_t extra_hi);
 
 void hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
                          const mesa_shader_stage *stages,
@@ -3442,8 +3567,19 @@ bool hk_m5_compute_uniform_dma_ranges(
    struct hk_cmd_buffer *cmd, const struct hk_shader *s, uint64_t root_ptr,
    struct agx3_ioto_uniform_range *ranges, size_t capacity, size_t *count);
 
+int8_t hk_g17p_dma_set_index(const struct hk_shader *s);
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
                               const struct hk_shader *s);
+
+static inline uint64_t
+hk_g17p_dma_set_base_from_index(const struct hk_cmd_buffer *cmd, int8_t set_idx)
+{
+   if (set_idx < 0)
+      return 0;
+
+   const uint64_t base = cmd->state.gfx.descriptors.root.sets[set_idx];
+   return base ? base : AGX_ZERO_PAGE_ADDRESS;
+}
 
 struct agx3_ioto_uniform_range;
 bool hk_g17p_dma_ranges(const struct hk_descriptor_state *desc,
@@ -3553,6 +3689,7 @@ struct hk_meta_save {
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
    struct hk_addr_range vb0;
    struct hk_descriptor_set *desc0;
+   uint32_t desc0_update_seq;
    /* Nested meta must retain the outer query/conditional-rendering scope. */
    bool in_meta;
    bool has_push_desc0;

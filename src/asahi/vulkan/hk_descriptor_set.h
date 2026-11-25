@@ -15,6 +15,7 @@
 #include "vk_object.h"
 
 #include "util/list.h"
+#include "util/u_atomic.h"
 #include "util/vma.h"
 
 struct hk_descriptor_set_layout;
@@ -136,6 +137,10 @@ struct hk_descriptor_set {
    void *mapped_ptr;
    uint64_t addr;
    uint32_t size;
+   /* Monotonic atomic update counter incremented on every descriptor write or
+    * copy into this set, so command-buffer root retention detects in-place
+    * descriptor updates. */
+   uint32_t update_seq;
    /* mapped_ptr is in a CPU-cached pool BO (hk_descriptor_pool::cpu_cached). */
    bool cpu_cached;
 

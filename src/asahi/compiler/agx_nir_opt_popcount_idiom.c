@@ -17,7 +17,7 @@
  *    c = (((x + (x >> 4)) & 0x0f0f0f0f) * 0x01010101) >> 24;
  *
  * Both equal bitCount(x) for every 32-bit x. LLVM-based shader compilers
- * recognize them; M5 counts bits in one instruction.
+ * recognize them; AGX counts bits in one instruction.
  */
 
 #include "agx_nir.h"

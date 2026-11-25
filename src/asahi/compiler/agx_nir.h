@@ -135,6 +135,9 @@ bool agx_nir_lower_g17p_helper_samples(struct nir_shader *s);
 bool agx_nir_lower_g17p_texture_early(struct nir_shader *s,
                                      bool support_lod_bias,
                                      bool sampler_has_lod_bias);
+bool agx_nir_lower_agx3d_texture_early(struct nir_shader *s,
+                                      bool support_lod_bias,
+                                      bool sampler_has_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);
 /* G18G (M6) shares the G17G family's Gen10 descriptors, but keeps the texture
  * lowering forms the J873 GL 4.6 campaign qualified. A G18G caller ORs this

@@ -68,6 +68,8 @@ hk_files = files(
   'hk_nir_wgid.h',
   'hk_image_view.c',
   'hk_nir_copy_identity4.c',
+  'hk_nir_tensor_ops.c',
+  'hk_nir_tensor_ops.h',
   'hk_nir_match_pointwise_clamp.c',
   'hk_image_view.h',
   'hk_instance.c',
@@ -686,6 +688,22 @@ if with_tests
     executable(
       'hk_agx3_compressed_buf2img_test',
       files('tests/test-hk-agx3-compressed-buf2img.c',
+            'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_g17p_linear_slice_copy',
+    executable(
+      'hk_g17p_linear_slice_copy_test',
+      files('tests/test-hk-g17p-linear-slice-copy.c',
             'hk_g17p_meta_copy_core.c'),
       include_directories : [include_directories('.'), inc_include, inc_src,
                              inc_asahi],
@@ -1595,6 +1613,15 @@ if with_tests
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi],
     dependencies : [idep_nir, idep_mesautil, idep_libagx],
+    link_with : [libasahi_compiler],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+
+  test('hk_tensor_ops', executable('hk_tensor_ops_test',
+    files('tests/test-hk-tensor-ops.c', 'hk_nir_tensor_ops.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi],
+    dependencies : [idep_nir, idep_mesautil, idep_libagx, dep_m],
     link_with : [libasahi_compiler],
     link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
