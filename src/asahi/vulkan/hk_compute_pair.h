@@ -73,6 +73,30 @@ hk_compute_pair_producer_unref(struct hk_compute_pair_producer *p)
       p->destroy(p);
 }
 
+/* The producer state of a depthwise or GEMM compute shader that `info`
+ * compiles from `nir`, its NIR before hk_lower_nir(). NULL on failure. */
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_create(struct hk_device *dev,
+                                const struct vk_shader_compile_info *info,
+                                uint32_t features,
+                                const struct hk_compute_pair_info *pair,
+                                const struct nir_shader *nir);
+
+/* A depthwise or GEMM producer goes into a shader binary with what its fused
+ * variants compile from: its NIR, compile options and set layouts.
+ * Serialization returns false for any other producer, and for one whose set
+ * layouts have immutable or embedded samplers; the shader then loads without
+ * one, and is not fused at submission. */
+bool hk_compute_pair_producer_serialize(struct blob *blob,
+                                        const struct hk_compute_pair_producer *p);
+
+/* The producer of the pair `pair` that hk_compute_pair_producer_serialize()
+ * wrote, or NULL. */
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob,
+                                     const struct hk_compute_pair_info *pair);
+
 struct hk_shader *
 hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,

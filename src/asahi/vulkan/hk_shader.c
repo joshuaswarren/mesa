@@ -9991,27 +9991,37 @@ hk_compute_pair_producer_destroy(struct hk_compute_pair_producer *p)
 }
 
 static struct hk_compute_pair_producer *
-hk_compute_pair_producer_create(struct hk_device *dev,
-                                const struct vk_shader_compile_info *info,
-                                enum hk_feature_key features,
-                                const struct hk_compute_pair_info *pair,
-                                const nir_shader *nir)
+hk_compute_pair_producer_alloc(struct hk_device *dev,
+                               const struct hk_compute_pair_info *pair)
 {
-   if (info->set_layout_count > HK_MAX_SETS)
-      return NULL;
    struct hk_compute_pair_producer *p = calloc(1, sizeof(*p));
    if (!p)
       return NULL;
-   p->nir = nir_shader_clone(NULL, nir);
-   if (!p->nir) {
-      free(p);
-      return NULL;
-   }
    pipe_reference_init(&p->ref, 1);
    p->destroy = hk_compute_pair_producer_destroy;
    p->dev = dev;
    simple_mtx_init(&p->lock, mtx_plain);
    p->info = *pair;
+   return p;
+}
+
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_create(struct hk_device *dev,
+                                const struct vk_shader_compile_info *info,
+                                uint32_t features,
+                                const struct hk_compute_pair_info *pair,
+                                const nir_shader *nir)
+{
+   if (info->set_layout_count > HK_MAX_SETS)
+      return NULL;
+   struct hk_compute_pair_producer *p = hk_compute_pair_producer_alloc(dev, pair);
+   if (!p)
+      return NULL;
+   p->nir = nir_shader_clone(NULL, nir);
+   if (!p->nir) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
+   }
    p->flags = info->flags;
    if (info->robustness)
       p->robustness = *info->robustness;
@@ -10021,6 +10031,82 @@ hk_compute_pair_producer_create(struct hk_device *dev,
    for (uint32_t i = 0; i < info->set_layout_count; ++i) {
       if (info->set_layouts[i])
          p->set_layouts[i] = vk_descriptor_set_layout_ref(info->set_layouts[i]);
+   }
+   return p;
+}
+
+bool
+hk_compute_pair_producer_serialize(struct blob *blob,
+                                   const struct hk_compute_pair_producer *p)
+{
+   if (!p->nir || (p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
+                   p->info.role != HK_COMPUTE_PAIR_GEMM))
+      return false;
+
+   blob_write_uint32(blob, p->flags);
+   blob_write_bytes(blob, &p->robustness, sizeof(p->robustness));
+   blob_write_uint32(blob, p->next_stage_mask);
+   blob_write_uint32(blob, p->features);
+   blob_write_uint32(blob, p->set_layout_count);
+   for (uint32_t i = 0; i < p->set_layout_count; ++i) {
+      blob_write_uint8(blob, p->set_layouts[i] != NULL);
+      if (p->set_layouts[i] &&
+          !hk_descriptor_set_layout_serialize(
+             blob, vk_to_hk_descriptor_set_layout(p->set_layouts[i])))
+         return false;
+   }
+   nir_serialize(blob, p->nir, false);
+   return !blob->out_of_memory;
+}
+
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob,
+                                     const struct hk_compute_pair_info *pair)
+{
+   if (pair->role != HK_COMPUTE_PAIR_DEPTHWISE &&
+       pair->role != HK_COMPUTE_PAIR_GEMM)
+      return NULL;
+
+   const VkShaderCreateFlagsEXT flags = blob_read_uint32(blob);
+   struct vk_pipeline_robustness_state robustness;
+   blob_copy_bytes(blob, &robustness, sizeof(robustness));
+   const VkShaderStageFlags next_stage_mask = blob_read_uint32(blob);
+   const uint32_t features = blob_read_uint32(blob);
+   const uint32_t set_layout_count = blob_read_uint32(blob);
+   if (blob->overrun || set_layout_count > HK_MAX_SETS)
+      return NULL;
+
+   struct hk_compute_pair_producer *p = hk_compute_pair_producer_alloc(dev, pair);
+   if (!p)
+      return NULL;
+   p->flags = flags;
+   p->robustness = robustness;
+   p->next_stage_mask = next_stage_mask;
+   p->features = features;
+   p->set_layout_count = set_layout_count;
+   for (uint32_t i = 0; i < set_layout_count; ++i) {
+      if (!blob_read_uint8(blob))
+         continue;
+      struct hk_descriptor_set_layout *layout =
+         hk_descriptor_set_layout_deserialize(dev, blob);
+      if (!layout) {
+         hk_compute_pair_producer_unref(p);
+         return NULL;
+      }
+      p->set_layouts[i] = &layout->vk;
+   }
+
+   /* An overrun reads as no layout: refuse before reading NIR from it. */
+   if (blob->overrun) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
+   }
+   p->nir = nir_deserialize(NULL, &agx_nir_options, blob);
+   if (blob->overrun || !p->nir ||
+       p->nir->info.stage != MESA_SHADER_COMPUTE) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
    }
    return p;
 }
@@ -11238,6 +11324,23 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
+
+      const uint32_t producer_size = blob_read_uint32(blob);
+      const void *producer_data = blob_read_bytes(blob, producer_size);
+      if (blob->overrun) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+      if (producer_size) {
+         struct blob_reader producer;
+         blob_reader_init(&producer, producer_data, producer_size);
+         obj->compute_pair_producer =
+            hk_compute_pair_producer_deserialize(dev, &producer, &pair);
+         if (!obj->compute_pair_producer || producer.current != producer.end) {
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+         }
+      }
    }
 
    if (has_identity_copy4) {
@@ -11860,6 +11963,24 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
    blob_write_bytes(blob, shader->data_ptr, shader->data_size);
 }
 
+/* A compute-pair producer follows its pair's info, size-prefixed: size 0 for
+ * a shader without one, which then is not fused at submission. A
+ * serialization a producer refuses leaves size 0 too. */
+static bool
+hk_write_compute_pair_producer(struct blob *blob,
+                               const struct hk_compute_pair_producer *p)
+{
+   struct blob payload;
+   blob_init(&payload);
+   const bool written = p && hk_compute_pair_producer_serialize(&payload, p) &&
+                        payload.size <= UINT32_MAX;
+   blob_write_uint32(blob, written ? payload.size : 0);
+   if (written)
+      blob_write_bytes(blob, payload.data, payload.size);
+   blob_finish(&payload);
+   return !blob->out_of_memory;
+}
+
 static bool
 hk_api_shader_serialize(struct vk_device *vk_dev,
                         const struct vk_shader *vk_shader, struct blob *blob)
@@ -11904,8 +12025,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->gemm_cmat32 ? 4 : 0) |
                              (obj->gemm_cmat64 ? 8 : 0) |
                              (obj->gemm_cmat16 ? 16 : 0));
-   if (obj->compute_pair)
+   if (obj->compute_pair) {
       hk_compute_pair_info_serialize(blob, obj->compute_pair);
+      if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
+         return false;
+   }
    if (obj->identity_copy4)
       hk_identity_copy4_serialize(blob, &obj->identity_copy4_info);
 

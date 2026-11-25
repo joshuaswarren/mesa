@@ -14,6 +14,7 @@
 #include "hk_sampler.h"
 #include "hk_native_descriptor.h"
 
+#include "util/blob.h"
 #include "vk_pipeline_layout.h"
 
 static bool
@@ -597,4 +598,96 @@ hk_GetDescriptorSetLayoutBindingOffsetEXT(VkDevice device,
    VK_FROM_HANDLE(hk_descriptor_set_layout, layout, _layout);
 
    *pOffset = layout->binding[binding].offset;
+}
+
+bool
+hk_descriptor_set_layout_serialize(struct blob *blob,
+                                   const struct hk_descriptor_set_layout *layout)
+{
+   if (layout->embedded_samplers)
+      return false;
+   for (uint32_t b = 0; b < layout->binding_count; ++b) {
+      if (layout->binding[b].immutable_samplers)
+         return false;
+   }
+
+   blob_write_uint32(blob, layout->vk.flags);
+   blob_write_uint32(blob, layout->vk.dynamic_descriptor_count);
+   blob_write_uint8(blob, layout->descriptor_generation);
+   blob_write_uint8(blob, layout->native_sampler_indices);
+   blob_write_uint32(blob, layout->non_variable_descriptor_buffer_size);
+   blob_write_uint32(blob, layout->max_buffer_size);
+   blob_write_uint32(blob, layout->binding_count);
+   for (uint32_t b = 0; b < layout->binding_count; ++b) {
+      const struct hk_descriptor_set_binding_layout *binding =
+         &layout->binding[b];
+      blob_write_uint32(blob, binding->type);
+      blob_write_uint32(blob, binding->flags);
+      blob_write_uint32(blob, binding->array_size);
+      blob_write_uint32(blob, binding->offset);
+      blob_write_uint16(blob, binding->stride);
+      blob_write_uint8(blob, binding->dynamic_buffer_index);
+   }
+   return !blob->out_of_memory;
+}
+
+/* The fewest bytes hk_descriptor_set_layout_serialize() writes per binding. */
+#define HK_SERIALIZED_BINDING_MIN_SIZE (4 * sizeof(uint32_t) + sizeof(uint16_t) + 1)
+
+struct hk_descriptor_set_layout *
+hk_descriptor_set_layout_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob)
+{
+   const enum agx_chip chip = hk_device_physical(dev)->dev.chip;
+   const VkDescriptorSetLayoutCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = blob_read_uint32(blob),
+   };
+   const uint32_t dynamic_descriptor_count = blob_read_uint32(blob);
+   const uint8_t descriptor_generation = blob_read_uint8(blob);
+   const uint8_t native_sampler_indices = blob_read_uint8(blob);
+   const uint32_t non_variable_size = blob_read_uint32(blob);
+   const uint32_t max_buffer_size = blob_read_uint32(blob);
+   const uint32_t binding_count = blob_read_uint32(blob);
+
+   /* Every layout of this device has the generation and sampler indices
+    * hk_CreateDescriptorSetLayout() gives it. A binding count the rest of the
+    * blob cannot hold was not written by the serializer. */
+   if (blob->overrun ||
+       descriptor_generation != agx_chip_descriptor_generation(chip) ||
+       native_sampler_indices != agx_chip_native_or_m5(chip) ||
+       binding_count > (size_t)(blob->end - blob->current) /
+                          HK_SERIALIZED_BINDING_MIN_SIZE)
+      return NULL;
+
+   struct hk_descriptor_set_layout *layout = vk_descriptor_set_layout_zalloc(
+      &dev->vk,
+      sizeof(*layout) + binding_count * sizeof(layout->binding[0]), &info);
+   if (!layout)
+      return NULL;
+
+   layout->vk.dynamic_descriptor_count = dynamic_descriptor_count;
+   layout->vk.destroy = hk_descriptor_set_layout_destroy;
+   layout->descriptor_generation = descriptor_generation;
+   layout->native_sampler_indices = native_sampler_indices;
+   layout->non_variable_descriptor_buffer_size = non_variable_size;
+   layout->max_buffer_size = max_buffer_size;
+   layout->binding_count = binding_count;
+   for (uint32_t b = 0; b < binding_count; ++b) {
+      struct hk_descriptor_set_binding_layout *binding = &layout->binding[b];
+      binding->type = blob_read_uint32(blob);
+      binding->flags = blob_read_uint32(blob);
+      binding->array_size = blob_read_uint32(blob);
+      binding->offset = blob_read_uint32(blob);
+      binding->stride = blob_read_uint16(blob);
+      binding->dynamic_buffer_index = blob_read_uint8(blob);
+   }
+
+   if (blob->overrun) {
+      vk_descriptor_set_layout_unref(&dev->vk, &layout->vk);
+      return NULL;
+   }
+
+   hk_descriptor_set_layout_hash(layout);
+   return layout;
 }
