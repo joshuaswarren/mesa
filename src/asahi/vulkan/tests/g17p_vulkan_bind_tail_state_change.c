@@ -7,15 +7,19 @@
  * cull mode, depth compare op, and color blend).
  *
  * Driven under asahi_noop_drm_shim with ASAHI_SHIM_VALIDATE_G17P_STREAM=1 and
- * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2:
- *   Draw 0: initial draw                    -> full bind tail (#1)
- *   Draw 1: push-constant-only change       -> elided tail (#1) + 28B FS PPP (#1)
- *   Draw 2: dynamic scissor + push const    -> full bind tail (#2)
- *   Draw 3: dynamic viewport + push const   -> full bind tail (#3)
- *   Draw 4: dynamic cull mode + push const  -> full bind tail (#4)
- *   Draw 5: dynamic depth op + push const   -> full bind tail (#5)
- *   Draw 6: blend-enabled pipe + push const -> full bind tail (#6)
- *   Draw 7: push-constant-only change       -> elided tail (#2) + 28B FS PPP (#2)
+ * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3,4 (or 6,3,0,4 with --vs-only-push):
+ *   Draw 0:  initial draw                    -> full bind tail (#1)
+ *   Draw 1:  push-constant-only change       -> elided tail (#1) + 28B FS PPP (#1)
+ *   Draw 2:  dynamic scissor + push const    -> full bind tail (#2)
+ *   Draw 3:  dynamic viewport + push const   -> full bind tail (#3)
+ *   Draw 4:  dynamic cull mode + push const  -> elided tail (#2) + 28B FS PPP (#2) + 8B CULL PPP (#1)
+ *   Draw 5:  pure cull-mode-only change      -> 8B CULL PPP (#2), no VDM state update
+ *   Draw 6:  pure front-face-only change     -> 8B CULL PPP (#3), no VDM state update
+ *   Draw 7:  dynamic depth op + push const   -> full bind tail (#4)
+ *   Draw 8:  blend-enabled pipe + push const -> full bind tail (#5)
+ *   Draw 9:  push-constant-only change       -> elided tail (#3) + 28B FS PPP (#3)
+ *   Draw 10: pure cull-mode-only change      -> 8B CULL PPP (#4), clears fs_record_in_tail_valid
+ *   Draw 11: new render pass, same state     -> full bind tail (#6) rebuilt after fs_record_in_tail_valid=false
  */
 
 #include <stdbool.h>
@@ -388,6 +392,7 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
       VK_DYNAMIC_STATE_VIEWPORT,
       VK_DYNAMIC_STATE_SCISSOR,
       VK_DYNAMIC_STATE_CULL_MODE,
+      VK_DYNAMIC_STATE_FRONT_FACE,
       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
    };
    VkPipelineDynamicStateCreateInfo dyn = {
@@ -783,6 +788,7 @@ main(int argc, char **argv)
    vkCmdSetViewport(cmd, 0, 1, &vp0);
    vkCmdSetScissor(cmd, 0, 1, &sc0);
    vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
+   vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -815,7 +821,8 @@ main(int argc, char **argv)
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 4: rasterizer cull-mode change -> must re-emit full bind tail (#4). */
+   /* Draw 4: rasterizer cull-mode change + push const -> elided tail (#2) +
+    * 28B FS PPP (#2, or 0 for --vs-only-push) + 8B CULL PPP (#1). */
    vkCmdSetCullMode(cmd, VK_CULL_MODE_FRONT_BIT);
    pc.draw_id = 4;
    pc.color[0] = 0.3f;
@@ -824,32 +831,68 @@ main(int argc, char **argv)
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 5: depth-stencil compare-op change -> must re-emit full bind tail (#5). */
+   /* Draw 5: pure bare-CULL-only change (no push-constant update) ->
+    * hk_g17p_flush_dynamic_state_fast() early return emitting ONLY an 8B CULL
+    * PPP update (#2) directly between INDEX_LIST draws with no VDM state
+    * update. */
+   vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   /* Draw 6: pure front-face-only change (no push-constant update) ->
+    * early return emitting ONLY an 8B CULL PPP update (#3). */
+   vkCmdSetFrontFace(cmd, VK_FRONT_FACE_CLOCKWISE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   /* Draw 7: depth-stencil compare-op change -> must re-emit full bind tail (#4). */
    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_GREATER_OR_EQUAL);
-   pc.draw_id = 5;
+   pc.draw_id = 7;
    pc.color[1] = 0.2f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 6: blend state change (pipeline bind) -> must re-emit full bind tail (#6). */
+   /* Draw 8: blend state change (pipeline bind) -> must re-emit full bind tail (#5). */
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_blend);
-   pc.draw_id = 6;
+   pc.draw_id = 8;
    pc.color[2] = 0.1f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 7: push-constant-only change after blend bind -> elided (#2) + 28B FS PPP (#2). */
-   pc.draw_id = 7;
+   /* Draw 9: push-constant-only change after blend bind -> elided (#3) +
+    * 28B FS PPP (#3, or 0 for --vs-only-push). */
+   pc.draw_id = 9;
    pc.color[0] = 0.95f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
+   /* Draw 10: pure bare-CULL-only change -> 8B CULL PPP (#4), leaving
+    * prepared->valid == true and fs_record_in_tail_valid == false in both
+    * normal and --vs-only-push modes. */
+   vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   vkCmdEndRenderPass(cmd);
+
+   /* Draw 11: new render pass (LOAD_OP_CLEAR -> fresh render stream) with
+    * unchanged pipeline, dynamic state, and push constants must rebuild the
+    * full bind tail (#6) because fs_record_in_tail_valid is false. */
+   vkCmdBeginRenderPass(
+      cmd,
+      &(VkRenderPassBeginInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+         .renderPass = rp,
+         .framebuffer = fb,
+         .renderArea = {{0, 0}, {size, size}},
+         .clearValueCount = 2,
+         .pClearValues = clears,
+      },
+      VK_SUBPASS_CONTENTS_INLINE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
    vkCmdEndRenderPass(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 
