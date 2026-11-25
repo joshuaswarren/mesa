@@ -831,3 +831,168 @@ TEST(AGX3VisionOpts, Agx3bDeviceLoadWindowAfterRegisterAllocation)
    EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G16G, 38, true), 8u);
    EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G16G, 39, true), 6u);
 }
+
+TEST(AGX3VisionOpts, Top2MinPositiveAndNegative)
+{
+   /* Positive: classic argmin2 recurrence initialized with init(b1) <= init(b2)
+    * collapses bit-exactly to b1' = min(d, b1), b2' = min(max(d, b1), b2).
+    * Negative: violated invariant init(b1) > init(b2) must not transform. */
+   for (int neg = 0; neg < 2; ++neg) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, neg ? "top2_neg" : "top2_pos");
+      b.shader->info.workgroup_size[0] = 32;
+      nir_def *base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .range = 16);
+      nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 16);
+
+      nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_variable *vb1 = nir_local_variable_create(b.impl, glsl_int_type(), "b1");
+      nir_variable *vb2 = nir_local_variable_create(b.impl, glsl_int_type(), "b2");
+      nir_variable *vidx = nir_local_variable_create(b.impl, glsl_int_type(), "idx");
+      nir_store_var(&b, vi, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, vb1, nir_imm_int(&b, neg ? 100 : INT32_MAX), 1);
+      nir_store_var(&b, vb2, nir_imm_int(&b, neg ? 50 : INT32_MAX), 1);
+      nir_store_var(&b, vidx, nir_imm_int(&b, -1), 1);
+
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, vi);
+         nir_push_if(&b, nir_ige(&b, i, n));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_def *d = nir_load_global(
+            &b, 1, 32, nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, i, 2))),
+            .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER));
+         nir_def *b1 = nir_load_var(&b, vb1);
+         nir_def *b2 = nir_load_var(&b, vb2);
+         nir_push_if(&b, nir_ilt(&b, d, b1));
+         {
+            nir_store_var(&b, vb2, b1, 1);
+            nir_store_var(&b, vb1, d, 1);
+            nir_store_var(&b, vidx, i, 1);
+         }
+         nir_push_else(&b, NULL);
+         {
+            nir_push_if(&b, nir_ilt(&b, d, b2));
+            nir_store_var(&b, vb2, d, 1);
+            nir_pop_if(&b, NULL);
+         }
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, vi, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_store_global(
+         &b, nir_vec3(&b, nir_load_var(&b, vb1), nir_load_var(&b, vb2), nir_load_var(&b, vidx)),
+         base, .write_mask = 7);
+      nir_lower_vars_to_ssa(b.shader);
+      nir_opt_peephole_select_options ps_opts = {};
+      ps_opts.limit = 16;
+      ps_opts.indirect_load_ok = true;
+      ps_opts.expensive_alu_ok = true;
+      nir_opt_peephole_select(b.shader, &ps_opts);
+      nir_opt_algebraic(b.shader);
+      nir_opt_dce(b.shader);
+
+      bool changed = agx_nir_opt_top2_min(b.shader);
+      nir_validate_shader(b.shader, "top2_min");
+      if (neg)
+         EXPECT_FALSE(changed);
+      else
+         EXPECT_TRUE(changed);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Top2MinNestedOuterIfFormD)
+{
+   /* Nested `if (d < b2) { if (d < b1) { b2 = b1; b1 = d; idx = i; } else b2 = d; }`
+    * lowers via peephole_select + algebraic to `b1' = (d < min(b1, b2)) ? d : b1`,
+    * `b2' = (d < b2) ? max(d, b1) : b2`, which collapses cleanly with b1 <= b2. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "top2_nested_form_d");
+   b.shader->info.workgroup_size[0] = 32;
+   nir_def *base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .range = 16);
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 16);
+
+   nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *vb1 = nir_local_variable_create(b.impl, glsl_int_type(), "b1");
+   nir_variable *vb2 = nir_local_variable_create(b.impl, glsl_int_type(), "b2");
+   nir_variable *vidx = nir_local_variable_create(b.impl, glsl_int_type(), "idx");
+   nir_store_var(&b, vi, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, vb1, nir_imm_int(&b, INT32_MAX), 1);
+   nir_store_var(&b, vb2, nir_imm_int(&b, INT32_MAX), 1);
+   nir_store_var(&b, vidx, nir_imm_int(&b, -1), 1);
+
+   nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, vi);
+      nir_push_if(&b, nir_ige(&b, i, n));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *d = nir_load_global(
+         &b, 1, 32, nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, i, 2))),
+         .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER));
+      nir_def *b1 = nir_load_var(&b, vb1);
+      nir_def *b2 = nir_load_var(&b, vb2);
+      nir_push_if(&b, nir_ilt(&b, d, b2));
+      {
+         nir_push_if(&b, nir_ilt(&b, d, b1));
+         {
+            nir_store_var(&b, vb2, b1, 1);
+            nir_store_var(&b, vb1, d, 1);
+            nir_store_var(&b, vidx, i, 1);
+         }
+         nir_push_else(&b, NULL);
+         {
+            nir_store_var(&b, vb2, d, 1);
+         }
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, vi, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, NULL);
+
+   nir_store_global(
+      &b, nir_vec3(&b, nir_load_var(&b, vb1), nir_load_var(&b, vb2), nir_load_var(&b, vidx)),
+      base, .write_mask = 7);
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_peephole_select_options ps_opts = {};
+   ps_opts.limit = 16;
+   ps_opts.indirect_load_ok = true;
+   ps_opts.expensive_alu_ok = true;
+   for (int iter = 0; iter < 4; ++iter) {
+      nir_opt_peephole_select(b.shader, &ps_opts);
+      nir_opt_copy_prop(b.shader);
+      nir_opt_cse(b.shader);
+      nir_opt_algebraic(b.shader);
+      nir_opt_dce(b.shader);
+   }
+
+   EXPECT_TRUE(agx_nir_opt_top2_min(b.shader));
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "top2_min_form_d");
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_bcsel), 1u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_imin), 2u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_imax), 1u);
+   ralloc_free(b.shader);
+}
+
+TEST(AGX3VisionOpts, SharedIndexSortNegativeNonSort)
+{
+   /* A non-sort compute shader must remain untouched by agx_nir_opt_shared_index_sort. */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options,
+                                                  "shared_sort_neg");
+   b.shader->info.workgroup_size[0] = 32;
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .range = 16);
+   nir_def *out = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 8), .range = 16);
+   nir_def *v = nir_load_global(&b, 1, 32, addr);
+   nir_store_global(&b, v, out, .write_mask = 1);
+   nir_lower_vars_to_ssa(b.shader);
+
+   EXPECT_FALSE(agx_nir_opt_shared_index_sort(b.shader));
+   nir_validate_shader(b.shader, "shared_index_sort_neg");
+   ralloc_free(b.shader);
+}
