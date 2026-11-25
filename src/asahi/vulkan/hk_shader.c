@@ -3728,12 +3728,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool hw_txf_bounds =
       agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
-   const bool lower_agx3_robust_fetches =
-      agx_chip_agx3_path(dev->dev.chip) &&
-      !hw_txf_bounds &&
-      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   const bool lower_agx3_robust_fetches =
+      agx_chip_agx3_path(dev->dev.chip) &&
+      !native_robust_images &&
+      !hw_txf_bounds &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
 
    /* A G17P image load does not see a store made earlier in the same
@@ -4124,13 +4125,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                   (void *)dev);
       }
 
-      /* G18G storage images use the 96-byte record, whose image-atomic
-       * word hk_descriptor_set.c writes after the texture/PBE pair. */
       NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_for_generation,
-               agx_chip_descriptor_generation(dev->dev.chip) |
-                  (dev->dev.chip == AGX_CHIP_G18G
-                      ? AGX_NIR_TEXTURE_IMAGE_SIDEBAND
-                      : 0));
+               agx_chip_descriptor_generation(dev->dev.chip));
    }
    NIR_PASS(lowered_complex, nir, agx_nir_lower_multisampled_image_store);
 
