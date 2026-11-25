@@ -108,15 +108,18 @@ test_unknown_has_none(void)
       CHECK(!agx_chip_has_cap((enum agx_chip)i, 0));
 }
 
-/* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled only on G17P until
- * per-generation hardware A/B benchmarks and CTS rows qualify other parts. */
+/* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled on G17P and M5 (G17G,
+ * G17S, G17C); G15, G16, G18G, and AGX2 stay off until per-generation
+ * hardware A/B benchmarks and CTS rows qualify them. */
 static void
 test_coalesce_pure_global_workgroups(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
-                    (c == AGX_CHIP_G17P),
+                    expected,
                  c);
    }
 }

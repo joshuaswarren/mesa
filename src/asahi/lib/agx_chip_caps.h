@@ -67,8 +67,8 @@ enum agx_chip_cap {
     * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
     * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
     * launch-rate floor on large grids. Measured and qualified on G17P
-    * (HAL200); off on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until
-    * per-generation hardware A/B and CTS rows are collected. */
+    * (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G18G, and
+    * AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 
    /* A compute or transfer barrier between work of one CDM stream that makes
@@ -174,8 +174,8 @@ enum agx_chip_cap {
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
     AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
-    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN10_2D_COMPRESSION |              \
-    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
+    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
