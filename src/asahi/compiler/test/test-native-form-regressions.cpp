@@ -7380,11 +7380,17 @@ TEST(NativeForms, AGX3BArrayShadowConstantLodKeepsEncodableImmediates)
        AGX_CHIP_G17P, true},
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, true,
        AGX_CHIP_G17P, true},
-      /* Other AGX3B chips (e.g. G16G) follow the same staging rule. */
+      /* Other AGX3B chips (G16G, G15G) follow the same staging rule. */
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G16G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x3800, false,
        AGX_CHIP_G16G, false},
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000, false,
        AGX_CHIP_G16G, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G15G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000, false,
+       AGX_CHIP_G15G, true},
    };
    for (const auto &c : cases) {
       SCOPED_TRACE(::testing::Message()

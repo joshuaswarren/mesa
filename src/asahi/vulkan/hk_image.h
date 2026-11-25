@@ -272,8 +272,8 @@ hk_agx2_packed_float_copy(enum agx_chip chip, VkFormat format)
  * class no resolved pixel is its samples' mean, and the wrong value changes
  * from run to run (aurora-r11g11b10f 2, res-eot). It is also the only class
  * that could write the format compressed. The PBE is shared across native
- * HAL200 SoCs (G17P and G16G), so all of them take it: measured on the M4 Pro
- * (since c724930c) and the M4 Max, and shared by M4 (G16G) and A18 Pro.
+ * HAL200 SoCs (G17P and G16G), so all of them take it: measured on M4 (G16G),
+ * M4 Pro (since c724930c), and M4 Max, and shared by A18 Pro.
  * M5 already stores the format in its own class (agx_rt0_pbe_format()). */
 static inline bool
 hk_eot_r11g11b10_own_class(const struct agx_device *dev)

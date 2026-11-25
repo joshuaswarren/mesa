@@ -631,7 +631,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
             (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
          continue;
-      /* A G17P array comparison without an offset stages its level or bias
+      /* An AGX3B array comparison without an offset stages its level or bias
        * beside the layer from a register; an immediate would share SMP's
        * operand with that layer, which agx3_emit_texture_sample() refuses.
        * A zero level or bias, and an explicit level in a stage the packer

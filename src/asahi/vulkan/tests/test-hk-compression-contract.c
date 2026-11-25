@@ -197,6 +197,28 @@ query_feedback_disables_color_compression(struct hk_physical_device *pdev)
           feedback_hic.identicalMemoryLayout;
 }
 
+static void
+check_r11g11b10_eot_class(const struct agx_device *dev)
+{
+   const bool own_class = agx_chip_native_hal200(dev->chip);
+   assert(hk_eot_r11g11b10_own_class(dev) == own_class);
+
+   const enum pipe_format pbe =
+      hk_eot_pbe_format(dev, PIPE_FORMAT_R11G11B10_FLOAT);
+   const enum pipe_format key =
+      hk_eot_key_format(dev, PIPE_FORMAT_R11G11B10_FLOAT);
+   if (own_class) {
+      assert(pbe == PIPE_FORMAT_R11G11B10_FLOAT);
+      assert(key == PIPE_FORMAT_R10G10B10A2_UNORM);
+   } else if (agx_chip_g17_m5(dev->chip)) {
+      assert(pbe == PIPE_FORMAT_R11G11B10_FLOAT);
+      assert(key == PIPE_FORMAT_R11G11B10_FLOAT);
+   } else {
+      assert(pbe == PIPE_FORMAT_R32_UINT);
+      assert(key == PIPE_FORMAT_R11G11B10_FLOAT);
+   }
+}
+
 int
 main(void)
 {
@@ -228,6 +250,7 @@ main(void)
       assert(query_feedback_disables_color_compression(pdev) ==
              cases[i].expect_feedback_disables);
       check_interchange_modifiers(pdev);
+      check_r11g11b10_eot_class(&pdev->dev);
    }
 
    /* Disabling compression disables the contract query and Interchange too. */
