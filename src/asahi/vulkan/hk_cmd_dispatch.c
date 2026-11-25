@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include <math.h>
 #include "libagx/query.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_helpers.h"
@@ -3847,6 +3848,268 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 }
 
 static struct hk_shader *
+hk_select_tensor_op(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                    struct hk_shader *normal, struct agx_grid *grid)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   const struct hk_tensor_op_info *info = &api->tensor_op_info;
+
+   if (!api->tensor_op_primary || !agx_chip_native_or_m5(dev->dev.chip) ||
+       cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+       grid->mode != AGX_CDM_MODE_DIRECT ||
+       !hk_nir_dispatch_zero_base(desc->root.cs.base_group) ||
+       !hk_identity_copy4_supported_local(info->local) ||
+       memcmp(info->local, normal->b.info.workgroup_size, sizeof(info->local)) ||
+       grid->count[2] != 1)
+      return normal;
+
+   if ((uint64_t)grid->count[0] * info->local[0] > (uint64_t)INT32_MAX ||
+       (uint64_t)grid->count[1] * info->local[1] > (uint64_t)INT32_MAX)
+      return normal;
+
+   struct hk_shader *alt = NULL;
+   uint32_t new_grid[3] = {0, 0, 0};
+   uint64_t src_bytes = 0, dst_start = 0, dst_bytes = 0;
+   unsigned align = 4;
+
+   if (info->kind == HK_TENSOR_OP_CONCAT_X) {
+      int32_t dim_n = 1, dim_h = 0, dim_q = 0, dim_c = 0;
+      int32_t dst_sy = 0, dst_sq = 0, dst_ox = 0;
+      if ((info->dim_n_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dim_n_off, &dim_n)) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &dim_h) ||
+          !hk_read_push_i32(desc, info->dim_q_off, &dim_q) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &dim_c) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &dst_sy) ||
+          !hk_read_push_i32(desc, info->dst_stride_q_off, &dst_sq) ||
+          (info->dst_off_x_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dst_off_x_off, &dst_ox)))
+         return normal;
+
+      if (dim_n <= 0 || dim_h <= 0 || dim_q <= 0 || dim_c <= 0 ||
+          dst_sy < 0 || dst_sq < 0 || dst_ox < 0)
+         return normal;
+
+      uint64_t x_lim = 0, y_lim = 0, src_elems = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)dim_q, (uint64_t)(uint32_t)dim_c, &x_lim) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dim_n, (uint64_t)(uint32_t)dim_h, &y_lim) ||
+          x_lim > (uint64_t)INT32_MAX || y_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow(y_lim, x_lim, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)y_lim, info->local[1]))
+         return normal;
+
+      /* Require distinct destination elements so vectorized stores match scalar order. */
+      uint64_t q_span = 0, y_span = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)(dim_q - 1), (uint64_t)(uint32_t)dst_sq, &q_span) ||
+          __builtin_mul_overflow(y_lim - 1, (uint64_t)(uint32_t)dst_sy, &y_span))
+         return normal;
+      const bool non_overlap_qy =
+         (dim_q == 1 || (uint64_t)(uint32_t)dst_sq >= (uint64_t)(uint32_t)dim_c) &&
+         (y_lim == 1 || (uint64_t)(uint32_t)dst_sy >= q_span + (uint64_t)(uint32_t)dim_c);
+      const bool non_overlap_yq =
+         (y_lim == 1 || (uint64_t)(uint32_t)dst_sy >= (uint64_t)(uint32_t)dim_c) &&
+         (dim_q == 1 || (uint64_t)(uint32_t)dst_sq >= y_span + (uint64_t)(uint32_t)dim_c);
+      if (!non_overlap_qy && !non_overlap_yq)
+         return normal;
+
+      uint64_t dst_max = 0;
+      if (__builtin_add_overflow(q_span, y_span, &dst_max) ||
+          __builtin_add_overflow(dst_max, (uint64_t)(uint32_t)dst_ox, &dst_max) ||
+          __builtin_add_overflow(dst_max, (uint64_t)(uint32_t)(dim_c - 1), &dst_max) ||
+          dst_max >= (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      const bool contig = (dst_sq == dim_c);
+      if (contig || dim_c == 1 || dim_c == 2 || dim_c == 4) {
+         alt = api->tensor_op_primary;
+         const uint32_t or_row = (uint32_t)x_lim | (uint32_t)dst_ox | (uint32_t)dst_sy;
+         const uint32_t or_str = (uint32_t)dst_ox | (uint32_t)dst_sy | (uint32_t)dst_sq;
+         const bool is_v4 = contig ? ((or_row & 3u) == 0) : (dim_c == 4 && (or_str & 3u) == 0);
+         const bool is_v2 = contig ? ((or_row & 1u) == 0) : (dim_c == 2 && (or_str & 1u) == 0);
+         const unsigned vec = is_v4 ? 4u : (is_v2 ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t x_cnt = contig ? (uint32_t)(x_lim / vec) : (uint32_t)dim_q;
+         if (!alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             alt->b.info.workgroup_size[2] != 1)
+            return normal;
+         new_grid[0] = DIV_ROUND_UP(x_cnt, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)y_lim, alt->b.info.workgroup_size[1]);
+         new_grid[2] = 1;
+      } else {
+         alt = api->tensor_op_secondary;
+         if (!alt || !alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             !alt->b.info.workgroup_size[2])
+            return normal;
+         const uint32_t or_all =
+            (uint32_t)dim_c | (uint32_t)dst_ox | (uint32_t)dst_sy | (uint32_t)dst_sq;
+         const unsigned vec = ((or_all & 3u) == 0) ? 4u : (((or_all & 1u) == 0) ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t c_units = (uint32_t)dim_c / vec;
+         new_grid[0] = DIV_ROUND_UP(c_units, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)dim_q, alt->b.info.workgroup_size[1]);
+         new_grid[2] = DIV_ROUND_UP((uint32_t)y_lim, alt->b.info.workgroup_size[2]);
+      }
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = (uint64_t)(uint32_t)dst_ox * sizeof(uint32_t);
+      dst_bytes = (dst_max - (uint64_t)(uint32_t)dst_ox + 1u) * sizeof(uint32_t);
+   } else if (info->kind == HK_TENSOR_OP_CONCAT_Y) {
+      int32_t dim_n = 0, dim_h = 0, dim_w = 1, dim_c = 0;
+      int32_t dst_sn = 0, dst_yo = 0;
+      if (!hk_read_push_i32(desc, info->dim_n_off, &dim_n) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &dim_h) ||
+          (info->dim_q_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dim_q_off, &dim_w)) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &dim_c) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &dst_sn) ||
+          (info->dst_off_x_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dst_off_x_off, &dst_yo)))
+         return normal;
+
+      if (dim_n <= 0 || dim_h <= 0 || dim_w <= 0 || dim_c <= 0 ||
+          dst_sn < 0 || dst_yo < 0 || (dim_n > 1 && dst_sn < dim_h))
+         return normal;
+
+      uint64_t x_lim = 0, y_lim = 0, src_elems = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)dim_w, (uint64_t)(uint32_t)dim_c, &x_lim) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dim_n, (uint64_t)(uint32_t)dim_h, &y_lim) ||
+          x_lim > (uint64_t)INT32_MAX || y_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow(y_lim, x_lim, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)y_lim, info->local[1]))
+         return normal;
+
+      uint64_t dst_row_max = 0, dst_min_el = 0, dst_end_el = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)(dim_n - 1), (uint64_t)(uint32_t)dst_sn, &dst_row_max) ||
+          __builtin_add_overflow(dst_row_max, (uint64_t)(uint32_t)dst_yo, &dst_row_max) ||
+          __builtin_add_overflow(dst_row_max, (uint64_t)(uint32_t)(dim_h - 1), &dst_row_max) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dst_yo, x_lim, &dst_min_el) ||
+          __builtin_mul_overflow(dst_row_max + 1u, x_lim, &dst_end_el) ||
+          dst_end_el > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      bool use_1d = false;
+      if (dim_n == 1 && ((src_elems & 3u) == 0) && ((dst_min_el & 3u) == 0) &&
+          api->tensor_op_primary->b.info.workgroup_size[0] > 0 &&
+          api->tensor_op_primary->b.info.workgroup_size[1] == 1 &&
+          api->tensor_op_primary->b.info.workgroup_size[2] == 1) {
+         const uint64_t total4 = src_elems / 4u;
+         const uint64_t wg_chunk =
+            (uint64_t)api->tensor_op_primary->b.info.workgroup_size[0] * 4u;
+         const uint64_t gx_1d = DIV_ROUND_UP(total4, wg_chunk);
+         if (gx_1d > 0 && gx_1d <= 65535u) {
+            alt = api->tensor_op_primary;
+            align = 16;
+            new_grid[0] = (uint32_t)gx_1d;
+            new_grid[1] = 1;
+            new_grid[2] = 1;
+            use_1d = true;
+         }
+      }
+      if (!use_1d) {
+         alt = api->tensor_op_secondary;
+         if (!alt || !alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             !alt->b.info.workgroup_size[2])
+            return normal;
+         const unsigned vec = ((x_lim & 3u) == 0) ? 4u : (((x_lim & 1u) == 0) ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t x_units = (uint32_t)(x_lim / vec);
+         new_grid[0] = DIV_ROUND_UP(x_units, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)dim_h, alt->b.info.workgroup_size[1]);
+         new_grid[2] = DIV_ROUND_UP((uint32_t)dim_n, alt->b.info.workgroup_size[2]);
+      }
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = dst_min_el * sizeof(uint32_t);
+      dst_bytes = (dst_end_el - dst_min_el) * sizeof(uint32_t);
+   } else if (info->kind == HK_TENSOR_OP_RESAMPLE_NEAREST) {
+      int32_t out_w = 0, out_h = 0, ch = 0, in_w = 0;
+      int32_t sx_bits = 0, sy_bits = 0;
+      if (!hk_read_push_i32(desc, info->dim_q_off, &out_w) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &out_h) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &ch) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &in_w) ||
+          !hk_read_push_i32(desc, info->dst_stride_q_off, &sx_bits) ||
+          !hk_read_push_i32(desc, info->scale_y_off, &sy_bits))
+         return normal;
+
+      float scale_x = 0.0f, scale_y = 0.0f;
+      memcpy(&scale_x, &sx_bits, sizeof(scale_x));
+      memcpy(&scale_y, &sy_bits, sizeof(scale_y));
+      if (out_w <= 0 || out_h <= 0 || ch <= 0 || in_w <= 0 ||
+          !isfinite(scale_x) || !isfinite(scale_y) ||
+          scale_x < 0.0f || scale_y < 0.0f)
+         return normal;
+
+      const float max_sx_f = floorf((float)(out_w - 1) * scale_x);
+      const float max_sy_f = floorf((float)(out_h - 1) * scale_y);
+      if (!isfinite(max_sx_f) || !isfinite(max_sy_f) ||
+          max_sx_f < 0.0f || max_sx_f >= (float)in_w ||
+          max_sy_f < 0.0f || max_sy_f > (float)(INT32_MAX / 4))
+         return normal;
+
+      uint64_t x_lim = 0, dst_elems = 0, src_px = 0, src_elems = 0;
+      const uint64_t max_sx = (uint64_t)(int32_t)max_sx_f;
+      const uint64_t max_sy = (uint64_t)(int32_t)max_sy_f;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)out_w, (uint64_t)(uint32_t)ch, &x_lim) ||
+          x_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)out_h, x_lim, &dst_elems) ||
+          dst_elems > (uint64_t)INT32_MAX / 4u ||
+          __builtin_mul_overflow(max_sy, (uint64_t)(uint32_t)in_w, &src_px) ||
+          __builtin_add_overflow(src_px, max_sx + 1u, &src_px) ||
+          __builtin_mul_overflow(src_px, (uint64_t)(uint32_t)ch, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)out_h, info->local[1]))
+         return normal;
+
+      alt = api->tensor_op_primary;
+      if (!alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+          !alt->b.info.workgroup_size[2])
+         return normal;
+      const unsigned vec = ((ch & 3) == 0) ? 4u : (((ch & 1) == 0) ? 2u : 1u);
+      align = vec * 4u;
+      const uint32_t c_units = (uint32_t)ch / vec;
+      new_grid[0] = DIV_ROUND_UP(c_units, alt->b.info.workgroup_size[0]);
+      new_grid[1] = DIV_ROUND_UP((uint32_t)out_w, alt->b.info.workgroup_size[1]);
+      new_grid[2] = DIV_ROUND_UP((uint32_t)out_h, alt->b.info.workgroup_size[2]);
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = 0;
+      dst_bytes = dst_elems * sizeof(uint32_t);
+   } else {
+      return normal;
+   }
+
+   if (!alt || !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
+       !new_grid[0] || new_grid[0] > 65535u ||
+       !new_grid[1] || new_grid[1] > 65535u ||
+       !new_grid[2] || new_grid[2] > 65535u)
+      return normal;
+
+   struct hk_storage_backing src_b, dst_b;
+   if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, src_bytes, align, &src_b) ||
+       !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, dst_start, dst_bytes, align, &dst_b) ||
+       !hk_intervals_disjoint(&src_b, 0, src_bytes, &dst_b, dst_start, dst_bytes))
+      return normal;
+
+   grid->count[0] = new_grid[0];
+   grid->count[1] = new_grid[1];
+   grid->count[2] = new_grid[2];
+   return alt;
+}
+
+static struct hk_shader *
 hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                          struct hk_shader *normal, struct agx_grid *grid,
                          struct hk_copy4_dispatch_cert *cert_out)
@@ -4400,6 +4663,12 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
        * here by design since no CDM dispatch is emitted. */
       if (copy4_cert.role == HK_COMPUTE_PAIR_SELF_COPY && cs->stats.cmds > 0)
          return;
+      local_size = agx_workgroup(selected->b.info.workgroup_size[0],
+                                 selected->b.info.workgroup_size[1],
+                                 selected->b.info.workgroup_size[2]);
+   } else if (api && api->tensor_op_primary && !api->identity_copy4 &&
+              !api->compute_pair && !in_threads && !invocation_stat) {
+      selected = hk_select_tensor_op(cmd, api, s, &grid);
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);

@@ -7014,6 +7014,14 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       hk_shader_destroy(dev, obj->gemm_cmat64, true);
       free(obj->gemm_cmat64);
    }
+   if (obj->tensor_op_primary) {
+      hk_shader_destroy(dev, obj->tensor_op_primary, true);
+      free(obj->tensor_op_primary);
+   }
+   if (obj->tensor_op_secondary) {
+      hk_shader_destroy(dev, obj->tensor_op_secondary, true);
+      free(obj->tensor_op_secondary);
+   }
 
    if (obj->binary_cache_entry)
       hk_shader_binary_cache_entry_unref(dev, obj->binary_cache_entry);
@@ -10485,6 +10493,62 @@ hk_compile_identity_copy4(struct hk_device *dev,
    return alternate;
 }
 
+static struct hk_shader *
+hk_compile_tensor_op(struct hk_device *dev,
+                     const struct vk_shader_compile_info *info,
+                     const VkAllocationCallbacks *allocator,
+                     enum hk_feature_key features,
+                     struct hk_tensor_op_info *info_out,
+                     struct hk_shader **secondary_out)
+{
+   *secondary_out = NULL;
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       info->stage != MESA_SHADER_COMPUTE || info->nir->info.internal ||
+       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
+      return NULL;
+
+   nir_shader *candidate = nir_shader_clone(NULL, info->nir);
+   if (!candidate)
+      return NULL;
+
+   const nir_opt_access_options access_options = {.is_vulkan = true};
+   NIR_PASS(_, candidate, nir_opt_access, &access_options);
+   NIR_PASS(_, candidate, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
+
+   struct hk_tensor_op_info op_info = {0};
+   nir_shader *primary_nir = NULL, *secondary_nir = NULL;
+   const bool matched = hk_nir_match_and_build_tensor_op(
+      candidate, &op_info, &primary_nir, &secondary_nir);
+   ralloc_free(candidate);
+   if (!matched || !primary_nir) {
+      ralloc_free(primary_nir);
+      ralloc_free(secondary_nir);
+      return NULL;
+   }
+
+   struct hk_shader *primary =
+      hk_compile_compute_alt_nir(dev, info, allocator, features, primary_nir);
+   if (!primary) {
+      ralloc_free(secondary_nir);
+      return NULL;
+   }
+
+   if (secondary_nir) {
+      struct hk_shader *secondary =
+         hk_compile_compute_alt_nir(dev, info, allocator, features, secondary_nir);
+      if (!secondary) {
+         hk_shader_destroy(dev, primary, true);
+         free(primary);
+         return NULL;
+      }
+      *secondary_out = secondary;
+   }
+
+   *info_out = op_info;
+   return primary;
+}
+
 static VkResult
 hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -10505,6 +10569,9 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    struct hk_shader *im2col_vec4 = NULL;
    struct hk_shader *fadd_dual = NULL;
    struct hk_identity_copy4 identity_copy4_info = {0};
+   struct hk_shader *tensor_op_primary = NULL;
+   struct hk_shader *tensor_op_secondary = NULL;
+   struct hk_tensor_op_info tensor_op_info = {0};
    nir_shader *shaders[shader_count];
    nir_shader *lr_nirs[shader_count];
    struct hk_local_read_info lr_infos[shader_count];
@@ -10622,6 +10689,11 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          identity_copy4 = hk_compile_identity_copy4(dev, info, pAllocator,
                                                     hk_features, &identity_copy4_info,
                                                     &im2col_vec4, &fadd_dual);
+
+      if (shader_count == 1 && !identity_copy4)
+         tensor_op_primary = hk_compile_tensor_op(dev, info, pAllocator,
+                                                  hk_features, &tensor_op_info,
+                                                  &tensor_op_secondary);
 
       if (shader_count == 1 && info->stage == MESA_SHADER_COMPUTE &&
           !nir->info.internal && agx_chip_native_or_m5(dev->dev.chip)) {
@@ -10888,6 +10960,14 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             hk_shader_destroy(dev, fadd_dual, true);
             free(fadd_dual);
          }
+         if (tensor_op_primary) {
+            hk_shader_destroy(dev, tensor_op_primary, true);
+            free(tensor_op_primary);
+         }
+         if (tensor_op_secondary) {
+            hk_shader_destroy(dev, tensor_op_secondary, true);
+            free(tensor_op_secondary);
+         }
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
             hk_api_shader_destroy(&dev->vk, shaders_out[j], pAllocator);
@@ -10927,6 +11007,23 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    if (fadd_dual) {
       hk_shader_destroy(dev, fadd_dual, true);
       free(fadd_dual);
+   }
+
+   if (tensor_op_primary) {
+      if (!identity_copy4 && !has_compute_pair) {
+         struct hk_api_shader *obj =
+            container_of(shaders_out[0], struct hk_api_shader, vk);
+         obj->tensor_op_primary = tensor_op_primary;
+         obj->tensor_op_secondary = tensor_op_secondary;
+         obj->tensor_op_info = tensor_op_info;
+      } else {
+         hk_shader_destroy(dev, tensor_op_primary, true);
+         free(tensor_op_primary);
+         if (tensor_op_secondary) {
+            hk_shader_destroy(dev, tensor_op_secondary, true);
+            free(tensor_op_secondary);
+         }
+      }
    }
 
    if (has_compute_pair) {
@@ -11460,6 +11557,51 @@ hk_identity_copy4_deserialize(struct blob_reader *blob,
    *has_fadd_dual_out = (flags & 2) != 0;
 }
 
+static void
+hk_tensor_op_info_serialize(struct blob *blob,
+                            const struct hk_tensor_op_info *info)
+{
+   blob_write_uint8(blob, info->kind);
+   blob_write_uint8(blob, info->src_set);
+   blob_write_uint8(blob, info->dst_set);
+   blob_write_uint16(blob, info->src_binding);
+   blob_write_uint16(blob, info->dst_binding);
+   blob_write_uint16(blob, info->push_bytes);
+   for (unsigned i = 0; i < 3; ++i)
+      blob_write_uint16(blob, info->local[i]);
+   blob_write_uint16(blob, info->dim_n_off);
+   blob_write_uint16(blob, info->dim_h_off);
+   blob_write_uint16(blob, info->dim_q_off);
+   blob_write_uint16(blob, info->dim_c_off);
+   blob_write_uint16(blob, info->dst_stride_y_off);
+   blob_write_uint16(blob, info->dst_off_x_off);
+   blob_write_uint16(blob, info->dst_stride_q_off);
+   blob_write_uint16(blob, info->scale_y_off);
+}
+
+static void
+hk_tensor_op_info_deserialize(struct blob_reader *blob,
+                              struct hk_tensor_op_info *info)
+{
+   *info = (struct hk_tensor_op_info){0};
+   info->kind = blob_read_uint8(blob);
+   info->src_set = blob_read_uint8(blob);
+   info->dst_set = blob_read_uint8(blob);
+   info->src_binding = blob_read_uint16(blob);
+   info->dst_binding = blob_read_uint16(blob);
+   info->push_bytes = blob_read_uint16(blob);
+   for (unsigned i = 0; i < 3; ++i)
+      info->local[i] = blob_read_uint16(blob);
+   info->dim_n_off = blob_read_uint16(blob);
+   info->dim_h_off = blob_read_uint16(blob);
+   info->dim_q_off = blob_read_uint16(blob);
+   info->dim_c_off = blob_read_uint16(blob);
+   info->dst_stride_y_off = blob_read_uint16(blob);
+   info->dst_off_x_off = blob_read_uint16(blob);
+   info->dst_stride_q_off = blob_read_uint16(blob);
+   info->scale_y_off = blob_read_uint16(blob);
+}
+
 static VkResult
 hk_deserialize_optional_compute_alt(struct hk_device *dev,
                                     struct blob_reader *blob,
@@ -11530,18 +11672,21 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_gemm_cmat64 = (variant_flags3 & 8) != 0;
    const bool has_gemm_cmat16 = (variant_flags3 & 16) != 0;
    const bool has_compute_opt = (variant_flags3 & 32) != 0;
+   const bool has_tensor_op = (variant_flags3 & 64) != 0;
+   const bool has_tensor_op_alt = (variant_flags3 & 128) != 0;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags3 & ~63u) ||
        (has_im2col_vec4 && !has_identity_copy4) ||
+       (has_tensor_op_alt && !has_tensor_op) ||
+       (has_tensor_op && (has_identity_copy4 || has_compute_pair)) ||
        (has_depthwise_vec4 && !has_compute_pair) ||
        ((has_gemm_cmat16 || has_gemm_cmat32 || has_gemm_cmat64) &&
         (!has_compute_pair || !agx_chip_cooperative_matrix_supported(dev->dev.chip))) ||
-       ((has_compute_pair || has_identity_copy4) &&
+       ((has_compute_pair || has_identity_copy4 || has_tensor_op) &&
         (stage != MESA_SHADER_COMPUTE || !agx_chip_native_or_m5(dev->dev.chip))) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_byte_stencil && stage != MESA_SHADER_COMPUTE) ||
@@ -11571,7 +11716,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        !p_atomic_read(&hk_device_physical(dev)->border_emulation))
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
-   if (cache_candidate && (has_identity_copy4 || has_compute_pair))
+   if (cache_candidate && (has_identity_copy4 || has_compute_pair || has_tensor_op))
       return VK_NOT_READY;
 
    const unsigned sample_variant_count = sample_variants
@@ -11631,6 +11776,20 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
           (has_fadd_dual &&
            (has_compute_pair ||
             obj->identity_copy4_info.kind != HK_IDENTITY_COPY4_LINEAR_FADD))) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+
+   if (has_tensor_op) {
+      hk_tensor_op_info_deserialize(blob, &obj->tensor_op_info);
+      if (blob->overrun ||
+          !hk_identity_copy4_supported_local(obj->tensor_op_info.local) ||
+          obj->tensor_op_info.push_bytes > HK_COMPUTE_OPT_PUSH_BYTES ||
+          obj->tensor_op_info.kind < HK_TENSOR_OP_CONCAT_X ||
+          obj->tensor_op_info.kind > HK_TENSOR_OP_RESAMPLE_NEAREST ||
+          (has_tensor_op_alt &&
+           obj->tensor_op_info.kind == HK_TENSOR_OP_RESAMPLE_NEAREST)) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
@@ -11720,6 +11879,24 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    if (has_gemm_cmat64) {
       VkResult result = hk_deserialize_optional_compute_alt(
          dev, blob, &obj->gemm_cmat64);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   }
+
+   if (has_tensor_op) {
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &obj->tensor_op_primary);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   }
+
+   if (has_tensor_op_alt) {
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &obj->tensor_op_secondary);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
@@ -12429,7 +12606,9 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->gemm_cmat32 ? 4 : 0) |
                              (obj->gemm_cmat64 ? 8 : 0) |
                              (obj->gemm_cmat16 ? 16 : 0) |
-                             (obj->compute_opt ? 32 : 0));
+                             (obj->compute_opt ? 32 : 0) |
+                             (obj->tensor_op_primary ? 64 : 0) |
+                             (obj->tensor_op_secondary ? 128 : 0));
    if (obj->compute_pair) {
       hk_compute_pair_info_serialize(blob, obj->compute_pair);
       if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
@@ -12446,6 +12625,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
    if (obj->identity_copy4)
       hk_identity_copy4_serialize(blob, &obj->identity_copy4_info,
                                   fadd_dual != NULL);
+   if (obj->tensor_op_primary)
+      hk_tensor_op_info_serialize(blob, &obj->tensor_op_info);
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -12496,7 +12677,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       }
    }
 
-   const struct hk_shader *compute_alts[7] = {
+   const struct hk_shader *compute_alts[9] = {
       obj->identity_copy4,
       fadd_dual,
       obj->im2col_vec4,
@@ -12504,6 +12685,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       obj->gemm_cmat16,
       obj->gemm_cmat32,
       obj->gemm_cmat64,
+      obj->tensor_op_primary,
+      obj->tensor_op_secondary,
    };
    for (unsigned ai = 0; ai < ARRAY_SIZE(compute_alts); ++ai) {
       if (!compute_alts[ai])
