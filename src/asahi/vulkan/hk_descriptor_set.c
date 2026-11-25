@@ -953,6 +953,7 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                 layout->non_variable_descriptor_buffer_size,
                 sizeof(push_set->data));
       push_set->size = 0;
+      hk_push_descriptor_set_reset_upload(push_set);
       return false;
    }
 

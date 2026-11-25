@@ -1602,7 +1602,7 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
 
 /* Only ordinary graphics programs whose descriptor values are fetched through
  * the root/table in GPU memory qualify.  CPU-decoded combined sampler programs
- * and variant selection retain the existing publication path.
+ * retain the existing publication path.
  */
 static bool
 hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
@@ -1618,15 +1618,39 @@ hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
-   struct hk_api_shader *fs =
-      gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
-   if (!vs || !fs || fs->g17p_sample_variants)
+   struct hk_api_shader *fs = hk_bound_fs_obj(gfx);
+   if (!vs || !fs)
+      return false;
+
+   const unsigned samples =
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples;
+   if (fs->g17p_sample_variants &&
+       !(samples == 0 || samples == 1 || samples == 2 || samples == 4 ||
+         (samples == 8 && fs->g17p_sample_variants == 4)))
+      return false;
+
+   const unsigned fs_idx =
+      fs->g17p_sample_variants && samples > 1 ? util_logbase2(samples) : 0;
+   if (!hk_fs_sample_variant_ready(fs, fs_idx))
       return false;
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
-   const struct hk_shader *hw_fs = hk_fs_variant(fs, 1);
-   return hw_vs && hw_fs && hw_vs->compiled && hw_fs->compiled &&
-          !hw_fs->info.agx3_combined_sampler_valid;
+   const struct hk_shader *hw_fs = &fs->variants[fs_idx];
+   if (!hw_vs || !hw_vs->compiled ||
+       hw_fs->info.agx3_combined_sampler_valid)
+      return false;
+
+   /* If another published sample variant of the same API shader uses
+    * CPU-decoded combined samplers, keep the conservative invalidation path
+    * in case rasterization_samples switches before the next descriptor bind. */
+   for (unsigned i = 0; i < fs->g17p_sample_variants; ++i) {
+      if (i == fs_idx || !hk_fs_sample_variant_ready(fs, i))
+         continue;
+      if (fs->variants[i].info.agx3_combined_sampler_valid)
+         return false;
+   }
+
+   return true;
 }
 
 static void
@@ -1680,6 +1704,8 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       desc->push_active &= ~BITFIELD_BIT(s);
       desc->push_dirty &= ~BITFIELD_BIT(s);
       desc->buffer_active &= ~BITFIELD_BIT(s);
+      if (desc->push[s])
+         hk_push_descriptor_set_reset_upload(desc->push[s]);
 
       root_changed |=
          desc->root.set_dynamic_buffer_start[s] != dyn_buffer_start;
@@ -1834,6 +1860,8 @@ hk_bind_buffer_set(struct hk_descriptor_state *desc,
    desc->push_active &= ~BITFIELD_BIT(s);
    desc->push_dirty &= ~BITFIELD_BIT(s);
    desc->buffer_active |= BITFIELD_BIT(s);
+   if (desc->push[s])
+      hk_push_descriptor_set_reset_upload(desc->push[s]);
 
    /* Descriptor-buffer layouts have no dynamic buffers. */
    desc->root.set_dynamic_buffer_start[s] =
@@ -1954,7 +1982,6 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    desc->buffer_active &= ~BITFIELD_BIT(set);
    desc->push_dirty |= BITFIELD_BIT(set);
    desc->push_active |= BITFIELD_BIT(set);
-   desc->generation++;
 
    return desc->push[set];
 }
@@ -2069,20 +2096,56 @@ void
 hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
                                      struct hk_descriptor_state *desc)
 {
+   const bool can_reuse =
+      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   bool root_changed = false;
+
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct hk_push_descriptor_set *push_set = desc->push[set_idx];
       /* Only the bytes the pushed layout uses; the rest is never read.
        * hk_push_descriptor_set_begin() keeps that within the storage. */
       STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= HK_PUSH_DESCRIPTOR_SET_SIZE);
       const uint32_t size = MAX2(push_set->size, HK_MIN_UBO_ALIGNMENT);
-      const uint64_t push_set_addr =
-         hk_pool_upload(cmd, push_set->data, size, HK_MIN_UBO_ALIGNMENT);
+      uint64_t push_set_addr;
 
-      desc->root.sets[set_idx] = push_set_addr;
-      desc->set_sizes[set_idx] = size;
+      /* Reading back uploaded pool memory is only fast when HK_CMD_BO_MAIN is
+       * CPU-cached (AGX_BO_WRITEBACK); on uncached WC command memory, re-upload
+       * instead of reading WC pages or keeping a duplicate 10 KiB shadow. */
+      if (can_reuse && push_set->last_gpu_addr && push_set->last_cpu_ptr &&
+          push_set->last_size == size &&
+          memcmp(push_set->last_cpu_ptr, push_set->data, size) == 0) {
+         push_set_addr = push_set->last_gpu_addr;
+      } else {
+         struct agx_ptr uploaded =
+            hk_pool_alloc(cmd, size, HK_MIN_UBO_ALIGNMENT);
+         if (likely(uploaded.cpu != NULL)) {
+            memcpy(uploaded.cpu, push_set->data, size);
+            if (can_reuse) {
+               push_set->last_gpu_addr = uploaded.gpu;
+               push_set->last_cpu_ptr = uploaded.cpu;
+               push_set->last_size = size;
+            } else {
+               hk_push_descriptor_set_reset_upload(push_set);
+            }
+            push_set_addr = uploaded.gpu;
+         } else {
+            hk_push_descriptor_set_reset_upload(push_set);
+            push_set_addr = 0;
+         }
+      }
+
+      if (desc->root.sets[set_idx] != push_set_addr ||
+          desc->set_sizes[set_idx] != size) {
+         desc->root.sets[set_idx] = push_set_addr;
+         desc->set_sizes[set_idx] = size;
+         root_changed = true;
+      }
    }
 
-   hk_root_mark_dirty(desc);
+   if (root_changed) {
+      hk_root_mark_dirty(desc);
+      desc->generation++;
+   }
    desc->push_dirty = 0;
 }
 

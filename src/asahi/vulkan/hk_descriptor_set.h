@@ -162,8 +162,21 @@ struct hk_push_descriptor_set {
    VkDescriptorSetLayoutCreateFlags layout_flags;
    /* Bytes of data the last update's layout uses */
    uint32_t size;
+   /* Snapshot of the last pool upload for this push set in this command
+    * buffer; reused when a subsequent flush sees identical bytes. */
+   uint64_t last_gpu_addr;
+   const void *last_cpu_ptr;
+   uint32_t last_size;
    uint8_t data[HK_PUSH_DESCRIPTOR_SET_SIZE];
 };
+
+static inline void
+hk_push_descriptor_set_reset_upload(struct hk_push_descriptor_set *push_set)
+{
+   push_set->last_gpu_addr = 0;
+   push_set->last_cpu_ptr = NULL;
+   push_set->last_size = 0;
+}
 
 bool hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
                                    struct hk_descriptor_set_layout *layout,

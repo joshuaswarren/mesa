@@ -124,6 +124,7 @@ hk_copy_push_descriptor_set(struct hk_push_descriptor_set *dst,
    memcpy(dst->layout_hash, src->layout_hash, sizeof(dst->layout_hash));
    dst->layout_flags = src->layout_flags;
    dst->size = src->size;
+   hk_push_descriptor_set_reset_upload(dst);
    memcpy(dst->data, src->data, src->size);
 }
 
@@ -229,6 +230,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       if (save->has_push_desc0)
          hk_copy_push_descriptor_set(desc->push[0],
                                      hk_meta_saved_push_desc0(cmd, save));
+      else if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = NULL;
       desc->root.sets[0] = save->buffer_set0;
       desc->set_sizes[0] = save->buffer_set_size0;
@@ -237,6 +240,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_active &= ~BITFIELD_BIT(0);
       desc->buffer_active |= BITFIELD_BIT(0);
    } else if (save->desc0) {
+      if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = save->desc0;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
       desc->sets_dirty |= BITFIELD_BIT(0);
@@ -251,6 +256,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       else
          desc->push_active &= ~BITFIELD_BIT(0);
    } else {
+      if (desc->push[0])
+         hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->push_active &= ~BITFIELD_BIT(0);
    }
 

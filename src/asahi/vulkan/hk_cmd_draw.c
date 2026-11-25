@@ -115,7 +115,6 @@
    (cmd->state.gfx.linked_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
 
 static void hk_flush_shaders(struct hk_cmd_buffer *cmd);
-static struct hk_shader *hk_bound_fs(struct hk_cmd_buffer *cmd);
 static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
@@ -334,6 +333,10 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
    memset(gfx, 0, sizeof(*gfx));
    gfx->render = render_save;
    memcpy(gfx->descriptors.push, push, sizeof(push));
+   for (unsigned i = 0; i < HK_MAX_SETS; i++) {
+      if (gfx->descriptors.push[i])
+         hk_push_descriptor_set_reset_upload(gfx->descriptors.push[i]);
+   }
    gfx->descriptors.root.draw.pipeline_stats = pipeline_stats;
    gfx->descriptors.root.draw.pipeline_stats_flags = pipeline_stats_flags;
    gfx->descriptors.root.mesh_prims_query = mesh_prims_query;
@@ -3804,7 +3807,7 @@ hk_xfer_match_descriptors(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
  * buffers, [extra_lo, extra_hi) (indirect parameters) or the conditional
  * rendering predicate. Shader stores to transform feedback buffers are
  * matched against everything. */
-static void
+void
 hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
                         uint64_t extra_hi)
 {
@@ -3821,6 +3824,7 @@ hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
 
    const bool clean =
       st->xfer_clean.valid && st->xfer_clean.version == st->xfer_version &&
+      !gfx->descriptors.push_dirty &&
       st->xfer_clean.descriptors == gfx->descriptors.generation &&
       st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation &&
       st->xfer_clean.index == gfx->index.buffer.addr;
@@ -3838,7 +3842,7 @@ hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
             cmd, gfx->index.buffer.addr,
             gfx->index.buffer.addr + gfx->index.buffer.range, state);
 
-      st->xfer_clean.valid = state == NULL;
+      st->xfer_clean.valid = state == NULL && !gfx->descriptors.push_dirty;
       st->xfer_clean.version = st->xfer_version;
       st->xfer_clean.descriptors = gfx->descriptors.generation;
       st->xfer_clean.vertex_buffers = gfx->vertex_buffer_generation;
@@ -5975,21 +5979,6 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
          return hk_gs_in_prim(cmd);
       }
    }
-}
-
-static struct hk_api_shader *
-hk_bound_fs_obj(struct hk_graphics_state *gfx)
-{
-   if (gfx->mesh_fs)
-      return gfx->mesh_fs;
-   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
-}
-
-static struct hk_shader *
-hk_bound_fs(struct hk_cmd_buffer *cmd)
-{
-   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
-                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
 static uint64_t
@@ -9834,9 +9823,10 @@ hk_g17p_prepared_bind_tail_matches(
 
    /* The tail launches a fragment program whose UNIFORM_DMA span, when it is
     * set-sourced, names the set address the root held when the program was
-    * built (hk_g17p_dma_set_base()). A push descriptor set gets its address
-    * when it is flushed, which moves that address without a new descriptor
-    * generation or root identity. */
+    * built (hk_g17p_dma_set_base()). Flushing a changed push descriptor set
+    * updates that address and advances descriptor generation; checking
+    * fragment_dma_set_base directly also guards against any cached-root or
+    * descriptor-buffer set-base mismatch. */
    return prepared->valid &&
           prepared->descriptor_generation == gfx->descriptors.generation &&
           prepared->vertex_buffer_generation ==

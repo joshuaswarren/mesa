@@ -2935,6 +2935,21 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
 }
 
+static inline struct hk_api_shader *
+hk_bound_fs_obj(struct hk_graphics_state *gfx)
+{
+   if (gfx->mesh_fs)
+      return gfx->mesh_fs;
+   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
+}
+
+static inline struct hk_shader *
+hk_bound_fs(struct hk_cmd_buffer *cmd)
+{
+   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
+                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
+}
+
 static inline size_t
 hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
 {
@@ -3352,6 +3367,8 @@ void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
 
 void hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd);
 void hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd);
+void hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
+                             uint64_t extra_hi);
 
 void hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
                          const mesa_shader_stage *stages,

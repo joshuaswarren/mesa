@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -107,6 +108,8 @@ bind(struct fixture *f, uint32_t offset, VkShaderStageFlags stages)
    hk_CmdBindDescriptorSets2KHR(hk_cmd_buffer_to_handle(&f->cmd), &info);
 }
 
+static void push_descriptor_and_msaa_correctness(struct fixture *f);
+
 static void
 correctness(struct fixture *f)
 {
@@ -153,6 +156,315 @@ correctness(struct fixture *f)
    hk_cmd_upload_draw_id(cmd, 0);
    CHECK(*id == 65535);
    CHECK(cmd->vk.record_result == VK_SUCCESS);
+   reset(f);
+   push_descriptor_and_msaa_correctness(f);
+}
+
+static void
+push_descriptor_and_msaa_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+
+   /* Sample-variant fragment shaders retain descriptor roots when the bound
+    * sample variant is published (ready) and neither it nor any ready sibling
+    * uses CPU-decoded combined samplers. */
+   {
+      struct hk_api_shader *msaa_fs =
+         calloc(1, hk_api_shader_size(MESA_SHADER_FRAGMENT, 3));
+      CHECK(msaa_fs);
+      msaa_fs->vk.stage = MESA_SHADER_FRAGMENT;
+      msaa_fs->g17p_sample_variants = 3;
+      msaa_fs->variants[2].compiled = true; /* 4x MSAA variant only */
+      CHECK(hk_fs_sample_variant_ready(msaa_fs, 2));
+      CHECK(!hk_fs_sample_variant_ready(msaa_fs, 1));
+      CHECK(!hk_fs_sample_variant_ready(msaa_fs, 3));
+      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = msaa_fs;
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 4;
+
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      uint64_t gen = desc->generation;
+      hk_root_mark_clean(desc);
+      desc->sets_dirty = 0;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen && !hk_root_dirty(desc) && !desc->sets_dirty);
+
+      /* Bound 4x variant using CPU-decoded combined samplers must not retain. */
+      msaa_fs->variants[2].info.agx3_combined_sampler_valid = true;
+      hk_root_mark_clean(desc);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+      msaa_fs->variants[2].info.agx3_combined_sampler_valid = false;
+
+      /* Published sibling 1x variant with combined samplers stays conservative. */
+      msaa_fs->variants[0].compiled = true;
+      msaa_fs->variants[0].info.agx3_combined_sampler_valid = true;
+      gen = desc->generation;
+      hk_root_mark_clean(desc);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+      msaa_fs->variants[0].info.agx3_combined_sampler_valid = false;
+
+      /* Uncompiled bound variant (2x) must not retain. */
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 2;
+      gen = desc->generation;
+      hk_root_mark_clean(desc);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+
+      /* Out-of-range sample count (8x on 3-variant shader) fails closed. */
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 8;
+      gen = desc->generation;
+      hk_root_mark_clean(desc);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 1;
+      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f->fs_api;
+      free(msaa_fs);
+   }
+
+   /* Push-descriptor elision, WC guard, invalidation paths, and transfer sync. */
+   {
+      struct hk_descriptor_set_layout *push_layout =
+         calloc(1, sizeof(*push_layout) + sizeof(push_layout->binding[0]));
+      struct hk_push_descriptor_set *push = calloc(1, sizeof(*push));
+      struct hk_push_descriptor_set *cs_push = calloc(1, sizeof(*cs_push));
+      CHECK(push_layout && push && cs_push);
+
+      push_layout->vk.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT;
+      push_layout->vk.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+      push_layout->descriptor_generation = 9;
+      push_layout->non_variable_descriptor_buffer_size = 64;
+      push_layout->max_buffer_size = 64;
+      push_layout->binding_count = 1;
+      push_layout->binding[0] = (struct hk_descriptor_set_binding_layout){
+         .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .array_size = 1,
+         .offset = 0,
+         .stride = sizeof(struct hk_buffer_address),
+      };
+
+      struct vk_pipeline_layout push_pl = {0};
+      push_pl.base.type = VK_OBJECT_TYPE_PIPELINE_LAYOUT;
+      push_pl.set_layouts[0] = &push_layout->vk;
+
+      struct hk_buffer buf = {0};
+      buf.vk.base.type = VK_OBJECT_TYPE_BUFFER;
+      buf.vk.base.device = &f->dev.vk;
+      buf.vk.device_address = 0x800000;
+      buf.vk.size = 4096;
+
+      desc->push[0] = push;
+      VkDescriptorBufferInfo bi = {
+         .buffer = hk_buffer_to_handle(&buf),
+         .offset = 0,
+         .range = 64,
+      };
+      VkWriteDescriptorSet write = {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .pBufferInfo = &bi,
+      };
+      VkPushDescriptorSetInfoKHR push_info = {
+         .sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
+         .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+         .layout = vk_pipeline_layout_to_handle(&push_pl),
+         .set = 0,
+         .descriptorWriteCount = 1,
+         .pDescriptorWrites = &write,
+      };
+
+      /* Initial push + flush uploads, dirties root, and advances generation. */
+      hk_root_mark_clean(desc);
+      uint64_t gen = desc->generation;
+      const uint32_t off0 = cmd->uploader.main.offset;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      CHECK(desc->push_dirty == BITFIELD_BIT(0) && desc->generation == gen);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      const uint64_t addr1 = desc->root.sets[0];
+      const uint32_t off1 = cmd->uploader.main.offset;
+      CHECK(addr1 != 0 && off1 > off0);
+      CHECK(hk_root_dirty(desc) && desc->generation == gen + 1);
+      CHECK(desc->set_sizes[0] == 64 && !desc->push_dirty);
+
+      /* Identical re-push on G17P elides allocation, root dirty, and gen bump. */
+      hk_root_mark_clean(desc);
+      gen = desc->generation;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(desc->root.sets[0] == addr1 && cmd->uploader.main.offset == off1);
+      CHECK(!hk_root_dirty(desc) && desc->generation == gen);
+
+      /* Mutating the pushed UBO offset allocates a fresh immutable upload. */
+      bi.offset = 64;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      const uint64_t addr2 = desc->root.sets[0];
+      CHECK(addr2 != addr1 && cmd->uploader.main.offset > off1);
+      struct hk_buffer_address uploaded1, uploaded2;
+      memcpy(&uploaded1, (const uint8_t *)f->main_map + addr1 - 0x100000,
+             sizeof(uploaded1));
+      memcpy(&uploaded2, (const uint8_t *)f->main_map + addr2 - 0x100000,
+             sizeof(uploaded2));
+      CHECK(uploaded1.base_addr == 0x800000 && uploaded2.base_addr == 0x800040);
+      CHECK(hk_root_dirty(desc) && desc->generation == gen + 1);
+
+      /* Changing pushed layout size forces a fresh upload even with matching prefix. */
+      hk_root_mark_clean(desc);
+      gen = desc->generation;
+      push_layout->non_variable_descriptor_buffer_size = 96;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(desc->root.sets[0] != addr2 && desc->set_sizes[0] == 96);
+      CHECK(hk_root_dirty(desc) && desc->generation == gen + 1);
+      push_layout->non_variable_descriptor_buffer_size = 64;
+
+      /* Non-G17P chips (uncached WC command memory) never read last_cpu_ptr. */
+      const enum agx_chip wc_chips[] = {AGX_CHIP_G13G, AGX_CHIP_G17S};
+      for (unsigned i = 0; i < ARRAY_SIZE(wc_chips); ++i) {
+         f->dev.dev.chip = wc_chips[i];
+         hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+         hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+         const uint64_t wc_addr1 = desc->root.sets[0];
+         CHECK(wc_addr1 != 0 && push->last_gpu_addr == 0 &&
+               push->last_cpu_ptr == NULL && push->last_size == 0);
+         hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+         hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+         CHECK(desc->root.sets[0] != wc_addr1 && push->last_cpu_ptr == NULL);
+      }
+      f->dev.dev.chip = AGX_CHIP_G17P;
+
+      /* Binding a regular descriptor set resets the push upload snapshot. */
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0 && push->last_cpu_ptr != NULL);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+
+      /* Binding a descriptor buffer (hk_bind_buffer_set) resets the snapshot. */
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0 && push->last_cpu_ptr != NULL);
+      cmd->state.descriptor_buffers[0] = 0x900000;
+      const uint32_t buf_idx = 0;
+      const VkDeviceSize buf_off = 0;
+      const VkSetDescriptorBufferOffsetsInfoEXT dbo = {
+         .sType = VK_STRUCTURE_TYPE_SET_DESCRIPTOR_BUFFER_OFFSETS_INFO_EXT,
+         .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+         .layout = vk_pipeline_layout_to_handle(&push_pl),
+         .firstSet = 0,
+         .setCount = 1,
+         .pBufferIndices = &buf_idx,
+         .pOffsets = &buf_off,
+      };
+      hk_CmdSetDescriptorBufferOffsets2EXT(hk_cmd_buffer_to_handle(cmd), &dbo);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+
+      /* Meta save/restore resets push upload snapshots across all branches. */
+      cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
+      cmd->vk.dynamic_graphics_state.ms.sample_locations =
+         &cmd->state.gfx._dynamic_sl;
+      struct hk_meta_save save = {0};
+
+      /* Branch 1: save->has_push_desc0 restores saved bytes and resets snapshot. */
+      bi.offset = 0;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      bi.offset = 128;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+      struct hk_buffer_address restored;
+      memcpy(&restored, push->data, sizeof(restored));
+      CHECK(restored.base_addr == 0x800000);
+
+      /* Branch 2: save->desc0 resets desc->push[0] if meta pushed to set 0. */
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+
+      /* Branch 3: trailing else (neither set0 nor push0 at begin) resets snapshot. */
+      desc->sets[0] = NULL;
+      desc->push[0] = NULL;
+      desc->push_active = 0;
+      desc->buffer_active = 0;
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      desc->push[0] = push;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+
+      /* Secondary command-buffer state invalidation resets gfx and cs snapshots. */
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+      CHECK(push->last_gpu_addr != 0);
+      hk_cmd_invalidate_graphics_state(cmd);
+      CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+            push->last_size == 0);
+
+      cmd->state.cs.descriptors.push[0] = cs_push;
+      push_info.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      hk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.cs.descriptors);
+      CHECK(cs_push->last_gpu_addr != 0);
+      hk_cmd_invalidate_compute_state(cmd);
+      CHECK(cs_push->last_gpu_addr == 0 && cs_push->last_cpu_ptr == NULL &&
+            cs_push->last_size == 0);
+
+      /* Transfer-to-draw xfer_clean cache must not skip hk_xfer_match_descriptors()
+       * when push_dirty is set before desc->generation advances at flush. */
+      push_info.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+      f->set_layout.descriptor_generation = 9;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      struct hk_cs xfer_cs = {
+         .type = HK_CS_CDM,
+         .sync = {.seq = 1},
+      };
+      memset(&cmd->sync, 0, sizeof(cmd->sync));
+      cmd->sync.xfer_writes[0] = (struct hk_sync_xfer_write){
+         .lo = 0x900000,
+         .hi = 0x901000,
+         .cs = &xfer_cs,
+      };
+      cmd->sync.xfer_write_count = 1;
+      cmd->sync.xfer_version = 1;
+      hk_xfer_check_draw_slow(cmd, 0, 0);
+      CHECK(cmd->sync.xfer_clean.valid && cmd->sync.xfer_write_count == 1);
+      CHECK(cmd->sync.xfer_clean.descriptors == desc->generation);
+
+      hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+      CHECK(desc->push_dirty == BITFIELD_BIT(0));
+      CHECK(cmd->sync.xfer_clean.descriptors == desc->generation);
+      hk_xfer_check_draw_slow(cmd, 0, 0);
+      CHECK(cmd->sync.xfer_write_count == 0 && !cmd->sync.xfer_clean.valid);
+
+      memset(&cmd->sync, 0, sizeof(cmd->sync));
+      f->set_layout.descriptor_generation = 0;
+      util_dynarray_fini(&cmd->meta_push_saves);
+      desc->push[0] = NULL;
+      cmd->state.cs.descriptors.push[0] = NULL;
+      free(cs_push);
+      free(push);
+      free(push_layout);
+   }
+
    reset(f);
 }
 
