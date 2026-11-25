@@ -177,5 +177,9 @@ agx_nir_lower_word_bounds(nir_shader *shader)
    }
 
    ralloc_free(mem);
+   nir_foreach_function_impl(other, shader) {
+      if (other != impl)
+         nir_no_progress(other);
+   }
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }

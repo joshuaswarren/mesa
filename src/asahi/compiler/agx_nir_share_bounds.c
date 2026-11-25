@@ -321,5 +321,9 @@ agx_nir_share_bounds(nir_shader *s, bool size_below_u32_max)
       progress |= share_block(&b, block, size_below_u32_max, mem_ctx);
 
    ralloc_free(mem_ctx);
+   nir_foreach_function_impl(other, s) {
+      if (other != impl)
+         nir_no_progress(other);
+   }
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
