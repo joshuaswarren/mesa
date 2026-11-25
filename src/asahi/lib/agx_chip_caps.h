@@ -140,6 +140,13 @@ enum agx_chip_cap {
     * PBE/texture/AIL metadata contract and per-layer compressed resolve split.
     * Off on every chip without AGX_CAP_HAL200_LOSSLESS_COMPRESSION. */
    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION = 1u << 19,
+
+   /* A signed-zero preserving fp32 fmin/fmax may be lowered to the hardware
+    * min/max, with an integer min/max of the bits when the operands compare
+    * equal (agx_nir_lower_fminmax_signed_zero). That needs the fp32 compares
+    * to order denormals exactly whenever the shader preserves them. Measured
+    * on G17P. */
+   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT = 1u << 20,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -160,7 +167,7 @@ enum agx_chip_cap {
     AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
     AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
-    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION)
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
