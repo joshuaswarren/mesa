@@ -48,6 +48,14 @@ struct hk_identity_copy4 {
 struct nir_shader *hk_nir_copy_identity4(const struct nir_shader *orig,
                                          struct hk_identity_copy4 *info);
 
+/* Dual-output packed vec4 alternate for certified LINEAR_FADD shaders: writes
+ * each computed vec4 to both the original destination SSBO and a second 16B-
+ * aligned destination VA passed in push constants at
+ * hk_dual_write_push_offset(info->push_bytes). Returns NULL for other kinds.
+ */
+struct nir_shader *hk_nir_copy_identity4_fadd_dual(const struct nir_shader *orig,
+                                                   struct hk_identity_copy4 *info);
+
 /* Packed vec4 alternate for certified 2D im2col shaders (both unit-stride and
  * non-unit-stride paths) when channels, kernel_width, input_width, and
  * patches_width are multiples of 4.

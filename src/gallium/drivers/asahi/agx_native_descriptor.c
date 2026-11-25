@@ -293,7 +293,10 @@ agx_gallium_pack_native_texture(
          .address = semantic->address,
          .srgb = semantic->srgb,
          .srgb_2_channel = semantic->srgb_2_channel,
-         .stride = semantic->layout == AGX_LAYOUT_LINEAR ? semantic->stride : 0,
+         .stride = semantic->layout == AGX_LAYOUT_LINEAR ||
+                      semantic->layout == AGX_LAYOUT_INTERCHANGE
+                      ? semantic->stride
+                      : 0,
          .depth = semantic->layout == AGX_LAYOUT_LINEAR ? 1 : semantic->depth,
          .page_aligned_layers =
             plain_2d ? false : semantic->page_aligned_layers,
@@ -319,6 +322,8 @@ agx_gallium_pack_native_texture(
    }
 
    if (generation == AGX_DESCRIPTOR_GENERATION_10) {
+      if (semantic->layout == AGX_LAYOUT_INTERCHANGE)
+         return false;
       if (!semantic->width || semantic->width > 32768 || !semantic->height ||
           semantic->height > 32768)
          return false;
@@ -476,7 +481,8 @@ agx_gallium_pack_native_pbe_impl(
    const bool compressed_2d =
       legacy->compressed && gen9 &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
-      legacy->layout == AGX_LAYOUT_GPU && !multisample;
+      (legacy->layout == AGX_LAYOUT_GPU ||
+       legacy->layout == AGX_LAYOUT_INTERCHANGE) && !multisample;
    const bool compressed_2d_ms =
       legacy->compressed && gen9 &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
@@ -485,6 +491,8 @@ agx_gallium_pack_native_pbe_impl(
       legacy->compressed && gen9 && (array || three_d) &&
       legacy->layout == AGX_LAYOUT_GPU &&
       legacy->level == 0 && legacy->levels == 1 && !legacy->unk_mipmapped;
+   const bool strided = legacy->layout == AGX_LAYOUT_LINEAR ||
+                        legacy->layout == AGX_LAYOUT_INTERCHANGE;
    if ((!layered && !multisample && !g18_layered &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        /* Gen10 linear 2D is agx_pbe_agx3_2d_pack()'s layout exactly. The
@@ -501,12 +509,15 @@ agx_gallium_pack_native_pbe_impl(
         * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch 1024),
         * which the codec reproduces; on G18G the PBE holds pitch/16-1 at
         * word1[59:44]. hk already admits it (8295c0d67c5). */
-       (legacy->layout == AGX_LAYOUT_LINEAR &&
+       (strided &&
         (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||
+       (legacy->layout == AGX_LAYOUT_INTERCHANGE &&
+        (!gen9 || layered || multisample || !legacy->compressed)) ||
        (legacy->layout != AGX_LAYOUT_LINEAR &&
         legacy->layout != AGX_LAYOUT_TWIDDLED &&
-        legacy->layout != AGX_LAYOUT_GPU) ||
+        legacy->layout != AGX_LAYOUT_GPU &&
+        legacy->layout != AGX_LAYOUT_INTERCHANGE) ||
        legacy->unk_52 || legacy->rotate_90 || legacy->flip_vertical ||
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
                        legacy->samples != AGX_SAMPLE_COUNT_4)
@@ -524,7 +535,7 @@ agx_gallium_pack_native_pbe_impl(
                   legacy->unk_mipmapped)) ||
        (!gen9 && legacy->srgb) ||
        (legacy->extended != legacy->compressed) ||
-       (legacy->layout == AGX_LAYOUT_LINEAR
+       (strided
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4
            : legacy->stride != 0) ||
        (!legacy->compressed && !gen10_multisample && legacy->acceleration_buffer) ||
@@ -549,7 +560,7 @@ agx_gallium_pack_native_pbe_impl(
       .compressed = legacy->compressed,
       .acceleration_buffer = legacy->acceleration_buffer,
       .stride_B =
-         legacy->layout == AGX_LAYOUT_LINEAR ? legacy->stride + 4 : 0,
+         strided ? legacy->stride + 4 : 0,
       .page_aligned_layers = legacy->page_aligned_layers,
       .srgb = legacy->srgb,
    };

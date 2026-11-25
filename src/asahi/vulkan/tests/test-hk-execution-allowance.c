@@ -222,8 +222,8 @@ int main(void)
       assert(hk_shader_binary_version(chip) ==
              (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
               chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ||
-              chip == AGX_CHIP_G17D ? 50 :
-              chip <= AGX_CHIP_G15P ? 38 : 37));
+              chip == AGX_CHIP_G17D ? 51 :
+              chip <= AGX_CHIP_G15P ? 38 : 39));
    assert(hk_as_build_flags(AGX_CHIP_G17P, 0, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_RENDER_RAY_QUERY, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD, false) == 0);

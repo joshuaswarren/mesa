@@ -626,13 +626,15 @@ check_vs(struct pipe_context *pctx)
          /* 3) Mid-MDI fast path -> VDM STREAM_LINK -> forced fallback on batch
           * flush (> 100,000 draws) -> fast path recovery through the last draw. */
          CHECK(ctx->batch->draws < 98700u);
-         struct agx_batch *pre_flush_batch = ctx->batch;
+         /* The flushed batch's slot can be reused, so compare its sequence
+          * number rather than its pointer. */
+         const uint64_t pre_flush_seqnum = ctx->batch->seqnum;
          ctx->batch->draws = 98700u;
          emits = ctx->perf.vs_emits;
          draws_before = ctx->perf.draws;
          pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_large, &indirect_draw, 1);
          CHECK(!ctx->any_faults);
-         CHECK(ctx->batch && ctx->batch != pre_flush_batch);
+         CHECK(ctx->batch && ctx->batch->seqnum != pre_flush_seqnum);
          CHECK(ctx->batch->draws > 0 && ctx->batch->draws < large_count);
          CHECK(ctx->perf.draws == draws_before + large_count);
          CHECK(ctx->perf.vs_emits == emits + large_count);

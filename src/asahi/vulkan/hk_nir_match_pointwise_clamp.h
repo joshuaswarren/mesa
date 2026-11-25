@@ -96,6 +96,9 @@ struct hk_nir_gemm_output {
    struct hk_nir_clamp_buffer output;
    struct hk_nir_clamp_buffer reads[3]; /* 0: A, 1: B, 2: bias (optional) */
    uint32_t m_offset_B, n_offset_B, k_offset_B, bias_mode_offset_B;
+   uint32_t push_bytes;
+   uint32_t out_res_type, read_res_type[3];
+   uint32_t desc_comps;
    uint32_t local_size[3];
    uint32_t rows_per_thread;
    uint32_t float_controls_execution_mode;
@@ -103,15 +106,50 @@ struct hk_nir_gemm_output {
    bool has_bias_mode;
    bool has_bias_buffer;
    bool is_guarded;
+   bool cmat_valid;
 };
 
 enum hk_compute_pair_role {
+   HK_COMPUTE_PAIR_NONE = 0,
    HK_COMPUTE_PAIR_DEPTHWISE = 1,
    HK_COMPUTE_PAIR_CLAMP = 2,
    HK_COMPUTE_PAIR_GEMM = 3,
+   HK_COMPUTE_PAIR_COPY4 = 4,
+   HK_COMPUTE_PAIR_SELF_COPY = 5,
+   HK_COMPUTE_PAIR_PAD4 = 6,
+   HK_COMPUTE_PAIR_FADD = 7,
 };
 
-#define HK_COMPUTE_PAIR_INFO_VERSION 4u
+enum hk_compute_pair_dual_write {
+   HK_COMPUTE_PAIR_DUAL_NONE = 0,
+   HK_COMPUTE_PAIR_DUAL_COPY = 1,
+   HK_COMPUTE_PAIR_DUAL_PAD4 = 2,
+};
+
+static inline uint32_t
+hk_dual_write_push_offset(uint32_t push_bytes)
+{
+   return ALIGN_POT(push_bytes, 8u);
+}
+
+struct hk_dual_copy_push {
+   uint32_t dst2_va_lo;
+   uint32_t dst2_va_hi;
+};
+
+struct hk_dual_pad4_push {
+   uint32_t dst2_va_lo;
+   uint32_t dst2_va_hi;
+   uint32_t pad_va_lo;
+   uint32_t pad_va_hi;
+   uint32_t in_h;
+   uint32_t in_w;
+   uint32_t out_h;
+   uint32_t out_w;
+   uint32_t pad_idx[4];
+};
+
+#define HK_COMPUTE_PAIR_INFO_VERSION 5u
 
 struct hk_compute_pair_info {
    uint32_t version;
@@ -120,6 +158,7 @@ struct hk_compute_pair_info {
       struct hk_nir_depthwise_output depthwise;
       struct hk_nir_gemm_output gemm;
       struct hk_nir_pointwise_clamp clamp;
+      uint32_t fadd_push_bytes;
    };
 };
 
@@ -144,6 +183,16 @@ struct hk_nir_direct_shape {
    uint32_t base_group[3];
 };
 
+bool hk_nir_depthwise_producer_footprint(
+   const struct hk_nir_depthwise_output *producer,
+   const struct hk_nir_direct_shape *producer_launch,
+   uint64_t producer_ends[4], uint64_t *out_elems_out);
+
+bool hk_nir_gemm_producer_footprint(
+   const struct hk_nir_gemm_output *producer,
+   const struct hk_nir_direct_shape *producer_launch,
+   uint64_t producer_ends[4], uint32_t *m_out, uint32_t *n_out);
+
 bool hk_nir_depthwise_clamp_footprint(
    const struct hk_nir_depthwise_output *producer,
    const struct hk_nir_pointwise_clamp *consumer,
@@ -167,13 +216,59 @@ hk_nir_splice_epilogue(const struct nir_shader *producer,
                        struct hk_nir_clamp_buffer output,
                        const struct hk_nir_clamp_epilogue *epilogue);
 
-/* Build a packed vec4 2-pixel-per-thread depthwise convolution NIR alternate
- * from a certified depthwise producer (with vec4_valid == true). When
- * `epilogue` is non-NULL, folds that exact clamp epilogue into both pixel
- * outputs; handles both biased and biasless depthwise kernels. */
+/* Build a packed vec4 2-pixel-per-thread (horizontal pair (ox, ox+1) with Z
+ * carrying output row oy) depthwise convolution NIR alternate from a certified
+ * depthwise producer (with vec4_valid == true). When `epilogue` is non-NULL,
+ * folds that exact clamp epilogue into both pixel outputs; handles both biased
+ * and biasless depthwise kernels. */
 struct nir_shader *
 hk_nir_build_depthwise_vec4(const struct nir_shader *producer,
                             const struct hk_nir_depthwise_output *info,
-                            const struct hk_nir_clamp_epilogue *epilogue);
+                            const struct hk_nir_clamp_epilogue *epilogue,
+                            enum hk_compute_pair_dual_write dual_write);
+
+/* Build a Direct-B 4 KiB XOR-swizzled Shared-A f32matmad8x8 GEMM NIR alternate
+ * (tile_n == 16, 32, or 64) from a certified row-major GEMM producer (with
+ * cmat_valid == true). When `epilogue` is non-NULL, folds that exact clamp
+ * epilogue into output writeback; when `dual_write` is non-zero, also writes
+ * the fused copy4 or pad4 destination buffer directly from registers. */
+struct nir_shader *
+hk_nir_build_gemm_cmat(const struct nir_shader *producer,
+                       const struct hk_nir_gemm_output *info,
+                       uint32_t tile_n,
+                       const struct hk_nir_clamp_epilogue *epilogue,
+                       enum hk_compute_pair_dual_write dual_write);
+
+/* M-tile height for each cooperative-matrix GEMM variant:
+ *   tile_n == 16: 32x16, K_step=32 (4 KiB shared A, 128 threads)
+ *   tile_n == 32: 64x32, K_step=16 (4 KiB shared A, 128 threads)
+ *   tile_n == 64: 32x64, K_step=32 (4 KiB shared A, 128 threads) */
+static inline uint32_t
+hk_gemm_cmat_tile_m(uint32_t tile_n)
+{
+   return tile_n == 32u ? 64u : 32u;
+}
+
+/* Validate dispatch dimensions for cooperative-matrix GEMM replacement.
+ * Unguarded GEMM executes ceil(K/32) unconditional 32-wide tiles, so K must
+ * be a multiple of 32 (not merely 16) to match the original shader exactly. */
+static inline bool
+hk_gemm_cmat_dispatch_dims_ok(bool is_guarded, uint64_t m_u, uint32_t n_u,
+                              uint32_t k_u, const uint32_t grid[3])
+{
+   if (n_u == 0 || k_u == 0 || m_u == 0 || grid[2] != 1)
+      return false;
+   if (is_guarded) {
+      const uint64_t need_x = ((uint64_t)n_u + 31ull) / 32ull;
+      const uint64_t need_y = (m_u + 31ull) / 32ull;
+      return (uint64_t)grid[0] >= need_x &&
+             (uint64_t)grid[1] >= need_y &&
+             (uint64_t)grid[0] * 32ull <= (uint64_t)INT32_MAX &&
+             (uint64_t)grid[1] * 32ull <= (uint64_t)INT32_MAX;
+   }
+   return (n_u % 32u) == 0 && (k_u % 32u) == 0 && (m_u % 64ull) == 0 &&
+          grid[1] != 0 && (uint64_t)grid[0] * 32ull == (uint64_t)n_u &&
+          (uint64_t)grid[1] * 32ull == m_u && m_u <= (uint64_t)INT32_MAX;
+}
 
 #endif

@@ -41,6 +41,32 @@ fresh_select(struct hk_graphics_state *gfx, uint8_t reads,
    return gfx->root;
 }
 
+/* The root steps hk_g17p_flush_dynamic_state_fast() takes for a draw that
+ * changes nothing but what the test marked, with a push-only vertex launch
+ * that succeeds whenever it is tried. draw_fits stands for the draw's own
+ * terms of push_launch_fits: a direct draw, a vertex shader without a
+ * preamble, and a fragment shader that reads neither push constants nor the
+ * root's address. */
+enum fast_root_step {
+   FAST_ROOT_KEEP,        /* early return: the published launch is current */
+   FAST_ROOT_PUSH_LAUNCH, /* vertex launch over push constants, root kept */
+   FAST_ROOT_UPLOAD,      /* full root upload */
+};
+
+static enum fast_root_step
+fast_draw_root(struct hk_descriptor_state *d, bool draw_fits)
+{
+   const bool push_launch_fits = hk_root_push_only_dirty(d) && draw_fits;
+   if (hk_root_launch_current(d, push_launch_fits))
+      return FAST_ROOT_KEEP;
+   if (push_launch_fits && hk_root_push_only_dirty(d)) {
+      hk_root_mark_push_launched(d);
+      return FAST_ROOT_PUSH_LAUNCH;
+   }
+   hk_root_mark_clean(d);
+   return FAST_ROOT_UPLOAD;
+}
+
 static void
 select_and_check_size(struct hk_graphics_state *fresh,
                       struct hk_graphics_state *cached, uint8_t reads,
@@ -271,6 +297,96 @@ main(void)
       fresh->root = cached->root = 0;
       select_and_check(fresh, cached, 0, memo, shadow);
    }
+   /* Root change tracking: push-only until any other change. */
+   {
+      struct hk_descriptor_state *d = calloc(1, sizeof(*d));
+      CHECK(d != NULL);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_push_only_dirty(d));
+
+      /* Any other change makes the root fully dirty, and a later push does
+       * not make it push-only again. */
+      hk_root_mark_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      /* A change before the push keeps it fully dirty too. */
+      hk_root_mark_dirty(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_push_only_dirty(d));
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty(d);
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d));
+      free(d);
+   }
+
+   /* A push-only vertex launch is current for the next draw that changes
+    * nothing, while the root itself stays dirty for every other reader. */
+   {
+      struct hk_descriptor_state *d = calloc(1, sizeof(*d));
+      CHECK(d != NULL);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* Push once, draw three times: one push-only launch, then the early
+       * return, as after a full upload. */
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+      CHECK(hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+
+      /* New push constants need a new push-only launch. */
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* New descriptors need a full upload. The next push launches
+       * push-only again. */
+      hk_root_mark_dirty(d);
+      CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+      CHECK(!hk_root_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      hk_root_mark_push_dirty(d);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* A draw that needs the full root (an indirect draw, a fragment
+       * shader reading push constants, or any path but the fast one) still
+       * finds it dirty and uploads it. */
+      CHECK(hk_root_dirty(d));
+      CHECK(!hk_root_launch_current(d, false));
+      CHECK(fast_draw_root(d, false) == FAST_ROOT_UPLOAD);
+      CHECK(!hk_root_dirty(d) && hk_root_launch_current(d, false));
+
+      /* Any upload, through any path, ends the push-only launch, and so
+       * does a push that follows another change. */
+      hk_root_mark_push_dirty(d);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      hk_root_mark_dirty(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+      free(d);
+   }
+
    printf("root fragment: %" PRIu64 " checks passed\n", checks);
    free(fresh);
    free(cached);

@@ -289,6 +289,9 @@ hk_get_device_extensions(const struct agx_device *dev,
        * depth clip. */
       .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
       .EXT_depth_clip_enable = true,
+      /* Descriptor buffers use AGX_CAP_DESCRIPTOR_BUFFER (agx_chip_caps.h):
+       * AGX2, native AGX3, and M5 are qualified; G18G still uses AGX2-biased
+       * sampler indices and record-time compute image lowering. */
       .EXT_descriptor_buffer =
          agx_chip_has_cap(dev->chip, AGX_CAP_DESCRIPTOR_BUFFER),
       .EXT_descriptor_indexing = true,
@@ -781,8 +784,13 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
+      /* M5 storage buffer descriptors embed the residency map page of a
+       * sparse buffer (hk_buffer_address::sparse_map_page), and capture/
+       * replay keeps the buffer's VA but not its map's: a replayed
+       * descriptor would name a stale map. */
       .descriptorBufferCaptureReplay =
-         supported_extensions->EXT_descriptor_buffer,
+         supported_extensions->EXT_descriptor_buffer &&
+         !agx_chip_g17_m5(dev->chip),
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =
@@ -2394,7 +2402,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * buffer .pointer refers to, so the queue-limits query cannot work there.
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
-       !pdev->dev.is_virtio) {
+       !pdev->dev.is_virtio && !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2447,7 +2455,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * admission via hk_queue_admits_at_entry() on G17P/M5; other runtimes
     * report exhaustion at submit time), unused families consume no kernel
     * queues. */
-   if (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) {
+   if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
+       !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queue_count = queue_count,

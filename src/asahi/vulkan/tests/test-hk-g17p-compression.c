@@ -60,8 +60,12 @@ check_formats(void)
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
-      CHECK(ELIGIBLE(i) == (c || d));
+      CHECK(ELIGIBLE(i) == (c || c16 || d));
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO,
+                                           0, &i) == (c || c16 || d));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_M4_PRO,
+                                           0, &i) == (c || c16 || d));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_M4_MAX,
                                            0, &i) == (c || c16 || d));
    }
    CHECK(color == 46);
@@ -178,21 +182,23 @@ check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
    i = base; i.extent.depth = 2;
    CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
+   CHECK(CHIP_ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
-   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
-   /* Mipmapped 2D arrays and mipmapped cubemaps compress for 1-8B colour;
-    * 16B colour, depth, and mipmapped 3D stay plain. */
+   CHECK(CHIP_ELIGIBLE(i));
+   /* Mipmapped 2D arrays and mipmapped cubemaps compress for 1-8B and 16B
+    * colour; depth and mipmapped 3D stay plain. */
    i = base; i.arrayLayers = 4; i.mipLevels = 4;
-   CHECK(CHIP_ELIGIBLE(i) == (!is_depth && !is_color_16b));
+   CHECK(CHIP_ELIGIBLE(i) == !is_depth);
    i = base; i.extent.width = 256; i.extent.height = 256;
    i.arrayLayers = 6; i.mipLevels = 4;
    i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-   CHECK(CHIP_ELIGIBLE(i) == (!is_depth && !is_color_16b));
+   CHECK(CHIP_ELIGIBLE(i) == !is_depth);
    i = base; i.imageType = VK_IMAGE_TYPE_3D; i.extent.depth = 4; i.mipLevels = 2;
    CHECK(!CHIP_ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
+      CHECK(CHIP_ELIGIBLE(i) == (!is_color_16b && (s == 2 || s == 4)));
+      i.arrayLayers = 4;
       CHECK(CHIP_ELIGIBLE(i) == (!is_color_16b && (s == 2 || s == 4)));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;

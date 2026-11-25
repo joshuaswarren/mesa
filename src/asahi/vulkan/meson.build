@@ -64,6 +64,7 @@ hk_files = files(
   'hk_image_layout_core.c',
   'hk_image_layout_core.h',
   'hk_identity_copy4.h',
+  'hk_nir_wgid.h',
   'hk_image_view.c',
   'hk_nir_copy_identity4.c',
   'hk_nir_match_pointwise_clamp.c',
@@ -145,6 +146,17 @@ hk_drirc = custom_target(
   ],
 )
 
+hk_entrypoints = custom_target(
+  input : [vk_entrypoints_gen, vk_api_xml],
+  output : ['hk_entrypoints.h', 'hk_entrypoints.c'],
+  command : [
+    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
+    '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'hk',
+    '--beta', with_vulkan_beta.to_string(),
+  ],
+  depend_files : vk_entrypoints_gen_depend_files,
+)
+
 if with_tests
   test('hk_execution_allowance',
     executable('hk_execution_allowance_test',
@@ -208,6 +220,15 @@ if with_tests
       'hk_g17p_storage_image_test',
       files('tests/test-hk-g17p-storage-image.c'),
       include_directories : include_directories('.'),
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'hk_pass_merge',
+    executable(
+      'hk_pass_merge_test',
+      files('tests/test-hk-pass-merge.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src],
     ),
     suite : ['asahi'],
   )
@@ -419,7 +440,9 @@ if with_tests
       'hk_query_oq',
       executable(
         'hk_query_oq_test',
-        files('tests/test-hk-query-oq.c', 'hk_query_oq.c', 'hk_sync.c'),
+        files('tests/test-hk-query-oq.c', 'hk_query_oq.c', 'hk_sync.c',
+              'hk_event.c'),
+        hk_entrypoints[0],
         include_directories : [
           include_directories('.'),
           inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
@@ -765,17 +788,6 @@ if with_tests
 
 endif
 
-hk_entrypoints = custom_target(
-  input : [vk_entrypoints_gen, vk_api_xml],
-  output : ['hk_entrypoints.h', 'hk_entrypoints.c'],
-  command : [
-    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
-    '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'hk',
-    '--beta', with_vulkan_beta.to_string(),
-  ],
-  depend_files : vk_entrypoints_gen_depend_files,
-)
-
 subdir('bvh')
 
 hk_deps = [
@@ -860,6 +872,12 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_compute_pair_cache', executable('hk_compute_pair_cache_test',
+    files('tests/test-hk-compute-pair-cache.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_host_image_copy', executable('hk_host_image_copy_test',
     files('tests/test-hk-host-image-copy.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
@@ -891,8 +909,20 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_binding_base', executable('hk_binding_base_test',
+    files('tests/test-hk-binding-base.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_m5_store_window', executable('hk_m5_store_window_test',
     files('tests/test-hk-m5-store-window.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_aligned_uadd_sat', executable('hk_aligned_uadd_sat_test',
+    files('tests/test-hk-aligned-uadd-sat.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
@@ -1461,6 +1491,22 @@ if with_tests
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
+  test('hk_pack_atomics', executable('hk_pack_atomics_test',
+    files('tests/test-hk-pack-atomics.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_cmd_pending', executable('hk_cmd_pending_test',
+    files('tests/test-hk-cmd-pending.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_lib],
+    link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
 endif
 

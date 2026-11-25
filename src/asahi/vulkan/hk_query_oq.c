@@ -18,6 +18,50 @@
 #include "util/list.h"
 #include "util/u_dynarray.h"
 
+void
+hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = cmd->state.oq_pending_render;
+   if (!render)
+      return;
+
+   /* Any later stream or sync record flushed oq_pending_render into post_gfx,
+    * so nothing depends on this render. Verify no tail requirement names it,
+    * then stamp its free retirement slots directly (same slot order as
+    * hk_stamp_oq_available()). */
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
+      if (cut && cut->sync.seq >= render->sync.seq) {
+         hk_flush_oq_pending(cmd);
+         return;
+      }
+   }
+
+   const unsigned order[] = {1, 2, 0};
+   unsigned free_slots[ARRAY_SIZE(order)], nfree = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+      const unsigned slot = order[i];
+      if ((slot == 0 && render->timestamp.start.handle) ||
+          render->oq_stamp[slot].handle)
+         continue;
+      free_slots[nfree++] = slot;
+   }
+
+   if (nfree < render->oq_pending_count) {
+      hk_flush_oq_pending(cmd);
+      return;
+   }
+
+   for (unsigned i = 0; i < render->oq_pending_count; ++i) {
+      render->oq_stamp[free_slots[i]] = (struct agx_timestamp_req){
+         .handle = render->oq_pending[i].handle,
+         .offset_B = render->oq_pending[i].offset_B,
+      };
+   }
+   render->oq_pending_count = 0;
+   cmd->state.oq_pending_render = NULL;
+}
+
 bool
 hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {

@@ -78,6 +78,19 @@ enum agx_chip_cap {
     * has finished, without the strong cache flush. Measured on G17P and M5
     * (G17G, G17S, G17C); G15 and G16G keep the flush until measured there. */
    AGX_CAP_CDM_WAR_WEAK_BARRIER = 1u << 11,
+
+   /* Gen9 2D depth compression and compressed DRM_FORMAT_MOD_APPLE_INTERCHANGE
+    * scanout (in both Gallium and Borealis) are enabled on this chip. Private
+    * Gen9 colour compression is gated separately by
+    * agx_chip_gen9_color_compression() (G16G and G17P). */
+   AGX_CAP_GEN9_2D_COMPRESSION = 1u << 12,
+
+   /* Register allocation tie-breaks co-read GPR pairs across the three 32-bit
+    * register banks ((reg / 2) % 3) and coalesces single-use loop RMW
+    * accumulator chains on non-preamble shaders. Enabled on G17P (HAL200); off
+    * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
+    * hardware A/B and CTS rows are collected. */
+   AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -95,14 +108,27 @@ enum agx_chip_cap {
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
+    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA)
 
-/* What the single-die M5 parts (G17G, G17S, G17C) share. G17D keeps
- * VDM_INDIRECT_INDEX_BOUNDS and HW_TXF_BOUNDS off until measured on J775D. */
+/* What the single-die M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+
+/* G17D partitions AGX_CAPS_M5 into measured capabilities (enabled) and
+ * unmeasured exclusions (kept off until measured on J775D). test-chip-caps.c
+ * asserts the two sets are disjoint and cover AGX_CAPS_M5, so adding a new
+ * capability to AGX_CAPS_M5 forces an explicit decision for G17D. */
+#define AGX_CAPS_G17D_MEASURED                                                 \
+   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX)
+
+#define AGX_CAPS_G17D_EXCLUDED                                                 \
+   (AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS | AGX_CAP_HW_TXF_BOUNDS |                \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+
+#define AGX_CAPS_G17D AGX_CAPS_G17D_MEASURED
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
@@ -130,8 +156,7 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G17D, AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX,    \
-     __VA_ARGS__)                                                              \
+   X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
    X(G18G, 0, __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so

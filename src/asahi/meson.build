@@ -400,39 +400,44 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
-  # Descriptor buffer sizes and strides as vkd3d-proton lays out its heaps.
-  test(
-    'hk-g17p-descriptor-buffer-sizes',
-    prog_python,
-    args : [
-      files('../gallium/drivers/asahi/tests/run-shim.py'),
-      libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_sizes,
-    ],
-    env : [
-      'ASAHI_SHIM_CHIP=g17p',
-      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
-    ],
-    depends : [_dev_icd, libvulkan_asahi],
-    suite : ['asahi'],
-  )
+  foreach chip : ['g15g', 'g15s', 'g15c', 'g16g', 'g17p', 'g17s']
+    # Descriptor buffer sizes and strides as vkd3d-proton lays out its heaps.
+    test(
+      'hk-' + chip + '-descriptor-buffer-sizes',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_descriptor_buffer_sizes,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 
-  # Texel buffer descriptors from vkGetDescriptorEXT: their software metadata.
-  test(
-    'hk-g17p-descriptor-buffer-texel',
-    prog_python,
-    args : [
-      files('../gallium/drivers/asahi/tests/run-shim.py'),
-      libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_texel,
-    ],
-    env : [
-      'ASAHI_SHIM_CHIP=g17p',
-      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
-    ],
-    depends : [_dev_icd, libvulkan_asahi],
-    suite : ['asahi'],
-  )
+  foreach chip : ['g17p', 'g17s']
+    # Texel and storage buffer descriptors from vkGetDescriptorEXT: their
+    # software metadata.
+    test(
+      'hk-' + chip + '-descriptor-buffer-texel',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_descriptor_buffer_texel,
+      ] + (chip == 'g17s' ? ['m5'] : []),
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 
   # A render on one queue read by compute on another, ordered by timeline
   # semaphores, including waits made by submissions without command buffers;

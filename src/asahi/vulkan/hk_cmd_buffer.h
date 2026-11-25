@@ -29,6 +29,8 @@
 #include "asahi/lib/agx_ppp_viewport_payload_core.h"
 #include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
+#include "asahi/libagx/query.h"
+#include "hk_query_oq.h"
 
 #include "hk_private.h"
 #include "hk_barrier.h"
@@ -510,7 +512,16 @@ static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
               "the dynamic buffer table is followed by its set starts");
 
 struct hk_descriptor_state {
-   bool root_dirty;
+   /* How root differs from the last uploaded root: read and written only
+    * through hk_root_dirty() and the other hk_root_*() helpers below.
+    * push_only is set while every change since that upload was to push
+    * constants, push_launched while the vertex launch last published reads
+    * the current push constants from an upload of their own. */
+   struct {
+      bool dirty;
+      bool push_only;
+      bool push_launched;
+   } root_change;
    uint64_t generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
@@ -541,6 +552,73 @@ struct hk_descriptor_state {
    /* Bitmask of 32-bit push-constant DWORDs written in this command buffer. */
    uint64_t push_written_dwords;
 };
+
+/* Whether root differs from the last uploaded root. */
+static inline bool
+hk_root_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty;
+}
+
+/* Whether root differs from the last uploaded root in push constants alone. */
+static inline bool
+hk_root_push_only_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty && desc->root_change.push_only;
+}
+
+/* Whether the vertex launch last published reads every root byte a draw
+ * needs: the root is as uploaded, or only push constants changed since and
+ * that launch reads them from their own upload (hk_root_mark_push_launched()).
+ * push_launch_fits says whether the draw could take such a launch
+ * (hk_agx3_try_push_only_vs_program()). The root itself stays dirty either
+ * way, so every path that reads it from the uploaded copy uploads it first. */
+static inline bool
+hk_root_launch_current(const struct hk_descriptor_state *desc,
+                       bool push_launch_fits)
+{
+   return !desc->root_change.dirty ||
+          (push_launch_fits && desc->root_change.push_launched);
+}
+
+/* Root changed in anything but push constants, or in unknown bytes. */
+static inline void
+hk_root_mark_dirty(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = true;
+   desc->root_change.push_only = false;
+   desc->root_change.push_launched = false;
+}
+
+/* Root changed in its push constants. An earlier change of any other kind
+ * since the last upload keeps the root fully dirty. */
+static inline void
+hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
+{
+   if (!desc->root_change.dirty) {
+      desc->root_change.dirty = true;
+      desc->root_change.push_only = true;
+   }
+   desc->root_change.push_launched = false;
+}
+
+/* The vertex program was launched over the current push constants alone,
+ * and the uploaded root, which still holds older ones, was kept. */
+static inline void
+hk_root_mark_push_launched(struct hk_descriptor_state *desc)
+{
+   assert(hk_root_push_only_dirty(desc));
+   desc->root_change.push_launched = true;
+}
+
+/* Root was uploaded as it is. */
+static inline void
+hk_root_mark_clean(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = false;
+   desc->root_change.push_only = false;
+   desc->root_change.push_launched = false;
+}
 
 struct hk_attachment {
    VkRenderingAttachmentFlagBitsKHR flags;
@@ -758,6 +836,10 @@ enum hk_g17p_range_source {
    HK_G17P_RANGE_SOURCE_BUFFER = 5,
    /* Hoisted AGX3 vertex preamble output buffer (computed once in PREGFX). */
    HK_G17P_RANGE_SOURCE_PREAMBLE_OUT = 6,
+   /* Push-constant slice inside the graphics root (uniform DMA span inside
+    * root.push[]). Replays from root + offset in full-root mode, or from a
+    * narrow uploaded push slice when push_only_root is set. */
+   HK_G17P_RANGE_SOURCE_PUSH = 7,
    /* Uploaded while collecting the ranges (combined-sampler pointers,
     * spilled render-target descriptors), or a buffer span the buffer does
     * not wholly cover: not re-derivable. */
@@ -788,6 +870,11 @@ struct hk_g17p_launch {
    uint8_t flags;
    uint8_t count;
    bool valid;
+   /* Vertex launch whose only root-backed uniform ranges lie inside
+    * root.push[push_min_B .. push_min_B + push_size_B). */
+   bool push_only_root;
+   uint16_t push_min_B;
+   uint16_t push_size_B;
    uint8_t source[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    /* Descriptor set of a SET or BUFFER range; HK_G17P_LAUNCH_ROOT_SET for a
     * BUFFER range whose descriptor is in the root. */
@@ -1196,6 +1283,10 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
+    * Lives on the command buffer so it survives CS splits and
+    * merge_control_streams. */
+   bool cdm_barrier_pending;
 };
 
 /*
@@ -1289,6 +1380,9 @@ struct hk_cs {
     * own (hk_cdm_cache_flush()). A patch site written later
     * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
+
+   /* The vertex stages read the hoisted preamble after this stream. */
+   bool pre_gfx_writes_preamble;
 
    /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
     * which a merge moves with its bytes. */
@@ -1435,6 +1529,19 @@ struct hk_cs {
     * (hk_resolve_deferred_oq_available()). Implies CDM. */
    struct util_dynarray oq_stamps;
    bool oq_avail_deferred;
+
+   /* Native AGX3: occlusion availability writes staged inline on a render
+    * stream so single-render command buffers stamp availability directly at
+    * EndCommandBuffer without allocating and discarding a post_gfx CDM stream
+    * and its GPU control-stream root. Materialized into post_gfx on demand by
+    * hk_flush_oq_pending() before any later stream or sync record. */
+   struct hk_oq_pending {
+      uint64_t avail_addr;
+      uint32_t handle;
+      uint32_t offset_B;
+      uint8_t avail_size;
+   } oq_pending[3];
+   uint8_t oq_pending_count;
 
    /* Number of successfully emitted draws whose last raster producer is
     * positively known to target only hardware Layer=0, without multiview.
@@ -2046,6 +2153,14 @@ struct hk_cmd_buffer {
       struct hk_rendering_state render;
    } pass_merge;
 
+   /* Per-recording compute group-count cache (384 B) lives outside `state` so
+    * empty and graphics-only command buffer resets skip zeroing it. */
+   struct hk_group_count_cache_entry {
+      uint32_t x, y, z, valid;
+      uint64_t addr;
+   } group_count_cache[16];
+   bool used_group_count_cache;
+
    /* Set by hk_reset_cmd_buffer, cleared by vkBeginCommandBuffer. */
    bool g17p_pristine;
 
@@ -2055,10 +2170,6 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
-      struct hk_group_count_cache_entry {
-         uint32_t x, y, z, valid;
-         uint64_t addr;
-      } group_count_cache[16];
       /* vkCmdBindDescriptorBuffersEXT() */
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
@@ -2090,6 +2201,11 @@ struct hk_cmd_buffer {
 
       /* Scoped around direct/indirect AS builds, including their meta blits. */
       bool as_build_recording;
+
+      /* Render stream holding unstamped inline occlusion availability records
+       * (cs->oq_pending). Cleared by hk_flush_oq_pending() or
+       * hk_resolve_pending_oq_available(). */
+      struct hk_cs *oq_pending_render;
 
       /* AGX3: the last render pass instance stored a whole depth-only image
        * that nothing recorded since may have read. A later instance that
@@ -2299,7 +2415,7 @@ hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
          .valid = lo < hi,
          .device_address = device_address,
       };
-   } else if (dst->valid) {
+   } else if (dst->valid && lo < hi) {
       dst->lo = MIN2(dst->lo, lo);
       dst->hi = MAX2(dst->hi, hi);
       dst->device_address |= device_address;
@@ -2693,6 +2809,8 @@ hk_cs_create(struct hk_cmd_buffer *cmd, bool compute)
    return root.cpu ? hk_cs_create_at(cmd, compute, root) : NULL;
 }
 
+static inline void hk_flush_oq_pending(struct hk_cmd_buffer *cmd);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
@@ -2705,6 +2823,10 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->state.pending_z_store.cs) &&
        !cmd->state.deferred_clear_hold)
       cmd->state.pending_z_store.cs = NULL;
+   if (unlikely(cmd->state.oq_pending_render) &&
+       (ptr == &cmd->current_cs.post_gfx ||
+        cmd->current_cs.gfx != cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
 
    if (vk_command_buffer_has_error(&cmd->vk))
       return NULL;
@@ -2807,7 +2929,7 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->dirty = ~0;
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
-   gfx->descriptors.root_dirty = true;
+   hk_root_mark_dirty(&gfx->descriptors);
    gfx->g17p_bind_tail_memo.valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
@@ -2959,6 +3081,7 @@ hk_cs_destroy(struct hk_cs *cs)
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 bool hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd);
 void hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd);
 
 bool hk_g17p_smooth_varyings_supported(
@@ -3009,6 +3132,50 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
    }
 
    *ptr = NULL;
+}
+
+static inline void
+hk_flush_oq_pending(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = cmd->state.oq_pending_render;
+   if (!render)
+      return;
+
+   cmd->state.oq_pending_render = NULL;
+   const uint8_t count = render->oq_pending_count;
+   render->oq_pending_count = 0;
+   if (!count)
+      return;
+
+   struct hk_cs *cs =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.post_gfx, true);
+   if (!cs || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   if (!cs->imm_writes.data)
+      cs->imm_writes = UTIL_DYNARRAY_INIT;
+   if (!cs->oq_stamps.data)
+      cs->oq_stamps = UTIL_DYNARRAY_INIT;
+
+   for (unsigned i = 0; i < count; ++i) {
+      const struct hk_oq_pending *p = &render->oq_pending[i];
+      const struct libagx_imm_write imm = {
+         .address = p->avail_addr,
+         .value = 1,
+      };
+      util_dynarray_append(&cs->imm_writes, imm);
+      hk_cmd_note_imm_write_query_range(cmd, cs, p->handle, p->offset_B,
+                                        p->avail_size);
+      const struct hk_oq_stamp stamp = {
+         .handle = p->handle,
+         .offset_B = p->offset_B,
+         .render_seq = render->sync.seq,
+      };
+      util_dynarray_append(&cs->oq_stamps, stamp);
+   }
+
+   if (cmd->current_cs.gfx != render)
+      hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 }
 
 static void
@@ -3294,6 +3461,9 @@ uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       bool task);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
+uint64_t hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd,
+                                          struct hk_shader *s,
+                                          struct hk_linked_shader *linked);
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
