@@ -179,6 +179,9 @@ struct hk_shader_info {
    bool agx3_gen1_fragment_rq;
    /* HK_ROOT_READS_* classes of root bytes the shader may read. */
    uint8_t agx3_root_reads;
+   /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
+    * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
+   uint64_t agx3_dynbuf_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -249,6 +252,7 @@ struct hk_local_read_shader_meta {
    struct agx_fs_epilog_link_info epilog_key;
    uint8_t set_count;
    uint8_t agx3_root_reads;
+   uint64_t agx3_dynbuf_reads;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;

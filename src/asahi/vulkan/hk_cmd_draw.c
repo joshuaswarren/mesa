@@ -14312,7 +14312,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             const bool use_shadow =
                verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
             const uint64_t fs_root = hk_agx3_fragment_root_select(
-               gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
+               gfx, fs_src->info.agx3_root_reads,
+               fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
                true, use_shadow);
             if (fs_root != prev_fs_root) {
                const uint64_t fragment_program =

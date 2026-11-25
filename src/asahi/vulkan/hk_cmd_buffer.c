@@ -4229,6 +4229,7 @@ hk_agx3_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
    const bool use_shadow =
       verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
    return hk_agx3_fragment_root_select(gfx, s->info.agx3_root_reads,
+                                       s->info.agx3_dynbuf_reads,
                                        s->root_descriptor_size, true,
                                        use_shadow);
 }
