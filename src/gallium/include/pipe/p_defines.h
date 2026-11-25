@@ -950,6 +950,7 @@ struct pipe_caps {
    bool fs_point_is_sysval;
    bool fs_face_is_integer_sysval;
    bool invalidate_buffer;
+   bool invalidate_pbo_upload_destination;
    bool generate_mipmap;
    bool string_marker;
    bool surface_no_compress;

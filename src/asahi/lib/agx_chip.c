@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #include "util/bitscan.h"
+#include "util/macros.h"
 
 enum agx_chip
 agx_chip_from_params(const struct drm_asahi_params_global *params)
@@ -99,23 +100,13 @@ agx_chip_driver_supported(enum agx_chip chip)
    }
 }
 
-/* The firmware interface version does not determine the GPU record layout.
- * Both T8122 interfaces consume G15 records and Gen4 sampler words. Keep the
- * physical chip as G15G so compiler scheduling and hardware workarounds agree.
+/* T8122's HAL200 firmware is admitted only on the revision and core layout
+ * it was measured with: one ten-core cluster with eight or ten cores enabled.
  */
 static bool
-agx_t8122_params_supported(const struct drm_asahi_params_global *params)
+agx_t8122_hal200_check(const struct drm_asahi_params_global *params)
 {
-   if (params->chip_id != 0x8122 || params->num_dies != 1 ||
-       params->num_clusters_total != 1 ||
-       params->usc_generation != AGX_ISA_AGX3)
-      return false;
-
-   if (params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY)
-      return true;
-
-   if (params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_200 ||
-       params->gpu_revision != 0x20 || params->num_cores_per_cluster != 10)
+   if (params->gpu_revision != 0x20 || params->num_cores_per_cluster != 10)
       return false;
 
    const uint64_t mask = params->core_masks[0];
@@ -127,11 +118,103 @@ agx_t8122_params_supported(const struct drm_asahi_params_global *params)
          return false;
    }
 
-   return agx_chip_command_stream_generation(AGX_CHIP_G15G) ==
-             AGX_CS_GENERATION_G15 &&
-          agx_chip_sampler_generation(AGX_CHIP_G15G) ==
-             AGX_SAMPLER_GENERATION_GEN4 &&
-          agx_chip_sampler_heap_element_size(AGX_CHIP_G15G) == 32;
+   return true;
+}
+
+/* Which device-open path admits a SoC. */
+enum agx_soc_contract {
+   /* The native AGX3 path: agx_params_driver_supported(). */
+   AGX_SOC_NATIVE,
+   /* The M5 path: agx_params_m5_supported(). */
+   AGX_SOC_M5,
+   /* M6 bring-up: agx_params_g18g_bringup_supported(). */
+   AGX_SOC_G18G_BRINGUP,
+};
+
+/*
+ * The AGX3 SoCs the driver admits, one row per kernel contract. A chip name
+ * such as G17P covers several SoCs, and recognising it is not enough: each
+ * SoC is admitted only with the topology and firmware interface its rows
+ * were measured on. Every admitted SoC executes AGX3 shaders.
+ */
+struct agx_soc {
+   /* drm_asahi_params_global::chip_id */
+   uint32_t chip_id;
+   /* What agx_chip_from_params() names the reported identity. */
+   enum agx_chip chip;
+   uint32_t dies;
+   /* 0 accepts any cluster count agx_chip_from_params() accepts. */
+   uint32_t clusters;
+   /* enum drm_asahi_gpu_hal_generation */
+   uint32_t hal;
+   enum agx_soc_contract contract;
+   /* Further checks of the kernel's report, or NULL. */
+   bool (*check)(const struct drm_asahi_params_global *params);
+};
+
+static const struct agx_soc agx_socs[] = {
+   /* T8122 (M3). The firmware interface version does not determine the
+    * record layout: both interfaces take G15 records and Gen4 samplers, and
+    * the chip stays G15G so scheduling and hardware workarounds agree. */
+   {0x8122, AGX_CHIP_G15G, 1, 1, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
+    NULL},
+   {0x8122, AGX_CHIP_G15G, 1, 1, DRM_ASAHI_GPU_HAL_200, AGX_SOC_NATIVE,
+    agx_t8122_hal200_check},
+
+   /* T6030 (M3 Pro) and T6031 (M3 Max), AGX3 shaders on the legacy firmware
+    * interface. Binned parts differ only in their core masks, which every
+    * consumer reads from the parameters, so the masks are not checked. */
+   {0x6030, AGX_CHIP_G15S, 1, 2, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
+    NULL},
+   {0x6031, AGX_CHIP_G15C, 1, 4, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
+    NULL},
+
+   /* T8132 (M4). */
+   {0x8132, AGX_CHIP_G16G, 1, 1, DRM_ASAHI_GPU_HAL_200, AGX_SOC_NATIVE, NULL},
+
+   /* G17P is the A18 Pro, and the M4 Pro and M4 Max on the G17 kernel
+    * runtime. The shared chip name must not admit another SoC or topology;
+    * a binned M4 Pro keeps two clusters. */
+   {AGX_CHIP_ID_A18_PRO, AGX_CHIP_G17P, 1, 1, DRM_ASAHI_GPU_HAL_200,
+    AGX_SOC_NATIVE, NULL},
+   {AGX_CHIP_ID_M4_PRO, AGX_CHIP_G17P, 1, 2, DRM_ASAHI_GPU_HAL_200,
+    AGX_SOC_NATIVE, NULL},
+   {AGX_CHIP_ID_M4_MAX, AGX_CHIP_G17P, 1, 4, DRM_ASAHI_GPU_HAL_200,
+    AGX_SOC_NATIVE, NULL},
+
+   /* T8142 (M5), and T6050 as the M5 Pro (J714s, J716s) and the M5 Max
+    * (J716c). */
+   {0x8142, AGX_CHIP_G17G, 1, 1, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
+   {0x6050, AGX_CHIP_G17S, 1, 2, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
+   {0x6050, AGX_CHIP_G17C, 1, 4, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
+
+   /* T8152 (M6, J873). The shim's G18G profile and the J873 G18G kernel
+    * driver both publish HAL 300 until the uAPI has a PI_400 value. */
+   {0x8152, AGX_CHIP_G18G, 1, 0, DRM_ASAHI_GPU_HAL_300, AGX_SOC_G18G_BRINGUP,
+    NULL},
+};
+
+/* The row admitting what the kernel reports, or NULL. */
+static const struct agx_soc *
+agx_soc_lookup(const struct drm_asahi_params_global *params)
+{
+   if (!params || params->usc_generation != AGX_ISA_AGX3)
+      return NULL;
+
+   const enum agx_chip chip = agx_chip_from_params(params);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(agx_socs); ++i) {
+      const struct agx_soc *soc = &agx_socs[i];
+
+      if (soc->chip == chip && soc->chip_id == params->chip_id &&
+          soc->dies == params->num_dies &&
+          (!soc->clusters || soc->clusters == params->num_clusters_total) &&
+          soc->hal == params->gpu_hal_generation &&
+          (!soc->check || soc->check(params)))
+         return soc;
+   }
+
+   return NULL;
 }
 
 bool
@@ -144,46 +227,12 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
    if (!agx_chip_driver_supported(chip))
       return false;
 
-   switch (chip) {
-   case AGX_CHIP_G17P: {
-      /* Honeykrisp's first AGX3 path is the exact T8140/A18 Pro contract.
-       * Do not let the shared G17P ISA name admit another SoC or topology. */
-      const bool a18_pro = params->chip_id == AGX_CHIP_ID_A18_PRO &&
-                           params->num_clusters_total == 1;
-      /* M4 Pro: two clusters (a binned part keeps two). */
-      const bool m4_pro = params->chip_id == AGX_CHIP_ID_M4_PRO &&
-                          params->num_clusters_total == 2;
-      const bool m4_max = params->chip_id == AGX_CHIP_ID_M4_MAX &&
-                          params->num_clusters_total == 4;
-      return (a18_pro || m4_pro || m4_max) && params->num_dies == 1 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
-   }
-   case AGX_CHIP_G15G:
-      return agx_t8122_params_supported(params);
-   case AGX_CHIP_G15S:
-      /* T6030/M3 Pro: one die, two clusters, AGX3 shaders on the legacy
-       * (pre-HAL200) firmware interface. */
-      return params->chip_id == 0x6030 && params->num_dies == 1 &&
-             params->num_clusters_total == 2 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
-   case AGX_CHIP_G15C:
-      /* T6031/M3 Max: the same generation as T6030 with four clusters.
-       * Binned parts differ only in their core masks, which every consumer
-       * reads from the parameters, so the masks are not part of the check. */
-      return params->chip_id == 0x6031 && params->num_dies == 1 &&
-             params->num_clusters_total == 4 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
-   case AGX_CHIP_G16G:
-      return params->chip_id == 0x8132 && params->num_dies == 1 &&
-             params->num_clusters_total == 1 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
-   default:
+   /* AGX2 parts are admitted by their chip. */
+   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2)
       return true;
-   }
+
+   const struct agx_soc *soc = agx_soc_lookup(params);
+   return soc && soc->contract == AGX_SOC_NATIVE;
 }
 
 /* G15G uses the separately admitted T8122 runtime: its baseline advertises
@@ -227,35 +276,17 @@ agx_chip_exact_product_name(enum agx_chip chip)
 bool
 agx_params_m5_supported(const struct drm_asahi_params_global *params)
 {
-   if (!params || params->num_dies != 1 ||
-       params->usc_generation != AGX_ISA_AGX3 ||
-       params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
-      return false;
-
-   const enum agx_chip chip = agx_chip_from_params(params);
-   return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
-           params->num_clusters_total == 1) ||
-          /* T6050 M5 Pro (J714s/J716s): G17S, one die, two clusters. */
-          (chip == AGX_CHIP_G17S && params->chip_id == 0x6050 &&
-           params->num_clusters_total == 2) ||
-          /* T6050 M5 Max (J716c): G17C, one die, four clusters. */
-          (chip == AGX_CHIP_G17C && params->chip_id == 0x6050 &&
-           params->num_clusters_total == 4);
+   const struct agx_soc *soc = agx_soc_lookup(params);
+   return soc && soc->contract == AGX_SOC_M5;
 }
 
-/*
- * The M6 bring-up contract: the J873's G18G (chip 0x8152, one die, USC 3).
- * The shim's G18G profile and the J873 G18G kernel driver both publish HAL
- * 300 until the uAPI has a PI_400 value. Like the M5 contract above, it is
- * admitted by its exact hardware identity; see agx_open_device.
- */
+/* Like the M5 contracts, M6 bring-up is admitted by its exact hardware
+ * identity; see agx_open_device. */
 bool
 agx_params_g18g_bringup_supported(const struct drm_asahi_params_global *params)
 {
-   return params && agx_chip_from_params(params) == AGX_CHIP_G18G &&
-          params->chip_id == 0x8152 && params->num_dies == 1 &&
-          params->usc_generation == AGX_ISA_AGX3 &&
-          params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_300;
+   const struct agx_soc *soc = agx_soc_lookup(params);
+   return soc && soc->contract == AGX_SOC_G18G_BRINGUP;
 }
 
 bool

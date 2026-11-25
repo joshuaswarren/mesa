@@ -9,17 +9,13 @@
 
 #include <string.h>
 
-/* The G15G, G15X, G16G, G16X, G17P, G17G and G17X families all use this
- * direct 40-byte launch record with the AGX3 compute encoding.  G16P and
- * G17A have no corresponding direct witness and deliberately remain
- * closed. */
 bool
 agx3_cdm_direct_launch_target_grounded(enum agx_chip chip)
 {
    return agx3_cdm_launch_target_grounded(chip);
 }
 
-bool
+static bool
 agx3_cdm_direct_template_build(
    const struct agx3_cdm_direct_template_fields *fields,
    struct agx3_cdm_direct_template *result)

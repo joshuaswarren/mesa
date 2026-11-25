@@ -16,6 +16,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "hk_g17p_compression.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
@@ -85,11 +86,9 @@ hk_device_init_meta(struct hk_device *dev)
    /* hk never uses layered rendering for meta, so a one-layer attachment
     * view always renders Layer 0: the specialization holds on every chip. */
    dev->meta.specialize_single_layer_buffer_upload = true;
-   /* Other native chips lower a stencil blit to eight bit-selective discard
-    * passes. G17P exports stencil in one draw, which also resolves depth and
-    * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
-   dev->meta.use_stencil_export = !agx_chip_native_agx3(dev->dev.chip) ||
-                                  dev->dev.chip == AGX_CHIP_G17P;
+   /* Export stencil in one draw across all chips, which also resolves depth
+    * and stencil together (1.50 to 0.48 ms for a 2x D32S8 at 3456x2234). */
+   dev->meta.use_stencil_export = true;
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
@@ -97,12 +96,12 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_combined_blit_descriptors =
       agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      agx_chip_native_agx3(dev->dev.chip);
+      agx_chip_agx3_path(dev->dev.chip);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
    dev->meta.buffer_access.max_fill_chunk_size =
-      agx_chip_native_agx3(dev->dev.chip) ? 16 : 0;
+      agx_chip_agx3_path(dev->dev.chip) ? 16 : 0;
 
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; ++i) {
       dev->meta.buffer_access.optimal_wg_size[i] = 64;
@@ -151,7 +150,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 
       save->pipeline_stats_flags = desc->root.draw.pipeline_stats_flags;
       desc->root.draw.pipeline_stats_flags = 0;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    } else {
       save->shaders[MESA_SHADER_COMPUTE] = cmd->state.cs.shader;
    }
@@ -159,6 +158,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->vb0 = cmd->state.gfx.vb[0];
 
    save->desc0 = desc->sets[0];
+   save->desc0_update_seq = desc->set_update_seq[0];
    save->has_push_desc0 = desc->push[0];
    save->push_active0 = !!(desc->push_active & BITFIELD_BIT(0));
    save->buffer_active0 = !!(desc->buffer_active & BITFIELD_BIT(0));
@@ -221,7 +221,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
             VkPipelineBindPoint bind_point)
 {
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
 
    desc->buffer_active &= ~BITFIELD_BIT(0);
    if (save->buffer_active0) {
@@ -231,6 +231,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
          hk_copy_push_descriptor_set(desc->push[0],
                                      hk_meta_saved_push_desc0(cmd, save));
       desc->sets[0] = NULL;
+      desc->set_update_seq[0] = 0;
       desc->root.sets[0] = save->buffer_set0;
       desc->set_sizes[0] = save->buffer_set_size0;
       desc->sets_dirty |= BITFIELD_BIT(0);
@@ -239,6 +240,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->buffer_active |= BITFIELD_BIT(0);
    } else if (save->desc0) {
       desc->sets[0] = save->desc0;
+      desc->set_update_seq[0] = save->desc0_update_seq;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
       desc->sets_dirty |= BITFIELD_BIT(0);
       desc->push_dirty &= ~BITFIELD_BIT(0);
@@ -254,6 +256,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    } else {
       desc->push_active &= ~BITFIELD_BIT(0);
    }
+   desc->non_push_generation++;
 
    /* Nested meta operations end in the reverse order they begin, so this
     * save is the last one stacked. */
@@ -295,7 +298,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       cmd->state.gfx.dirty |= HK_DIRTY_OCCLUSION;
 
       desc->root.draw.pipeline_stats_flags = save->pipeline_stats_flags;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    } else {
       hk_cmd_bind_compute_shader(cmd, save->shaders[MESA_SHADER_COMPUTE]);
    }
@@ -316,7 +319,7 @@ hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_agx3(dev->dev.chip) || !target || !address ||
+   if (!agx_chip_native_or_g18g(dev->dev.chip) || !target || !address ||
        ((address | size) & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -356,8 +359,10 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_SPARSE_BUFFER_COPY,
    HK_META_OBJECT_KEY_BLOCK_COPY,
    HK_META_OBJECT_KEY_G17P_MIP,
+   HK_META_OBJECT_KEY_AGX3_GEN10_MIP,
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
+   HK_META_OBJECT_KEY_AGX3_COMPRESSED_BUF2IMG,
    HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
 };
 
@@ -561,7 +566,7 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
          .src_addr = src_addr,
          .src_nonresident_addr = src_nonresident_addr,
          .dst_addr = dst_addr,
-         .map_addr = src_buffer->sparse_map->va->addr +
+         .map_addr = hk_buffer_sparse_map_addr(src_buffer) +
                      sizeof(struct hk_sparse_buffer_map_header),
          .resource_base = src_buffer->va->addr,
          .size = MIN2(size, max_dispatch_size),
@@ -1414,7 +1419,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          const enum agx_chip chip =
             container_of(device, struct hk_device, vk)->dev.chip;
          const bool g17p_color =
-            agx_chip_native_or_m5(chip) &&
+            agx_chip_agx3_path(chip) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);
@@ -2233,7 +2238,8 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
                                   const struct hk_image *dst,
                                   const VkBlitImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0 ||
+   if (!agx_chip_has_cap(dev->dev.chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+       info->regionCount == 0 ||
        !(src->planes[0].layout.compressed || dst->planes[0].layout.compressed))
       return false;
 
@@ -2258,17 +2264,25 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_g17p_mip_level_through_pbe(width, height)))
+           hk_mip_level_through_pbe(dev->dev.chip, width, height)))
          return false;
    }
    return true;
 }
 
+#define HK_G17P_MIP_WG_SIZE 16
+
 struct hk_g17p_mip_key {
    enum hk_meta_object_key_type key_type;
    bool odd;
+   bool exact_2x2;
    bool metadata;
+   bool aligned_16;
+   bool tile_64x64;
+   uint8_t pad[3];
 };
+static_assert(sizeof(struct hk_g17p_mip_key) == 12,
+              "G17P mip pipeline key must have no implicit padding");
 
 struct hk_g17p_mip_push {
    uint64_t dst;
@@ -2281,13 +2295,11 @@ struct hk_g17p_mip_push {
    uint32_t tiles_per_row;
    uint32_t tile_width_log2;
    uint32_t tile_height_log2;
-   uint32_t metadata_width_tl;
-   uint32_t metadata_height_tl;
    uint32_t metadata_interleave_bits;
    uint32_t metadata_major_is_x;
    uint32_t uncompressed_mode;
 };
-static_assert(sizeof(struct hk_g17p_mip_push) == 72,
+static_assert(sizeof(struct hk_g17p_mip_push) == 64,
               "G17P mip push data must be tightly packed");
 
 #define mip_push(b, field)                                                     \
@@ -2305,24 +2317,25 @@ hk_nir_spread_bits(nir_builder *b, nir_def *v)
    return nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 1)), 0x55555555);
 }
 
-/* The even bits of the low 10 bits of v, packed: inverse of the spread */
+/* The even bits of the low 8 bits of v, packed: inverse of the spread */
 static nir_def *
-hk_nir_compact_bits(nir_builder *b, nir_def *v)
+hk_nir_compact_bits_8(nir_builder *b, nir_def *v)
 {
-   v = nir_iand_imm(b, v, 0x155);
-   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x133);
-   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x10f);
-   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 4)), 0x1f);
+   v = nir_iand_imm(b, v, 0x55);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x33);
+   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f);
 }
 
 static nir_shader *
 build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
 {
+   assert(!(key->exact_2x2 && key->odd));
+
    nir_builder build =
       nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "hk-g17p-mip");
    nir_builder *b = &build;
-   b->shader->info.workgroup_size[0] = TILE_WIDTH;
-   b->shader->info.workgroup_size[1] = TILE_HEIGHT;
+   b->shader->info.workgroup_size[0] = HK_G17P_MIP_WG_SIZE;
+   b->shader->info.workgroup_size[1] = HK_G17P_MIP_WG_SIZE;
 
    nir_variable *texture = nir_variable_create(
       b->shader, nir_var_uniform,
@@ -2331,52 +2344,81 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
    texture->data.descriptor_set = 0;
    texture->data.binding = 0;
 
-   /* Lay the 32x32 invocations of a workgroup out in Morton order, as the
-    * GPU-tiled layout stores texels: each 32-invocation group then covers an
-    * 8x4 block, whose texels are 128 contiguous bytes, instead of a 32-texel
-    * row scattered over two tiles.
+   /* Lay the 16x16 invocations of a workgroup out in Morton order, matching
+    * both one 16x16 compression metadata tile and the GPU-tiled texel layout:
+    * each 32-invocation subgroup covers an 8x4 block (128 contiguous bytes),
+    * while 256-thread workgroups allow up to 4 concurrent groups per core.
     */
    nir_def *lid = nir_load_local_invocation_id(b);
-   nir_def *index = nir_iadd(b, nir_channel(b, lid, 0),
-                             nir_imul_imm(b, nir_channel(b, lid, 1), TILE_WIDTH));
+   nir_def *index =
+      nir_ior(b, nir_channel(b, lid, 0),
+              nir_ishl_imm(b, nir_channel(b, lid, 1), 4));
    nir_def *wg = nir_load_workgroup_id(b);
-   nir_def *x = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 0), TILE_WIDTH),
-                         hk_nir_compact_bits(b, index));
-   nir_def *y = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 1), TILE_HEIGHT),
-                         hk_nir_compact_bits(b, nir_ushr_imm(b, index, 1)));
-   nir_def *width = mip_push(b, width);
-   nir_def *height = mip_push(b, height);
+   nir_def *wg_x = nir_channel(b, wg, 0);
+   nir_def *wg_y = nir_channel(b, wg, 1);
+   nir_def *x =
+      nir_ior(b, nir_ishl_imm(b, wg_x, 4), hk_nir_compact_bits_8(b, index));
+   nir_def *y = nir_ior(b, nir_ishl_imm(b, wg_y, 4),
+                        hk_nir_compact_bits_8(b, nir_ushr_imm(b, index, 1)));
+   nir_def *width = (!key->aligned_16 || key->odd) ? mip_push(b, width) : NULL;
+   nir_def *height = !key->aligned_16 ? mip_push(b, height) : NULL;
 
-   nir_push_if(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)));
+   /* When dimensions are not multiples of 16, guard each axis in its own
+    * non-flattened branch so each test lowers to a single AGX3B IF_ICMP
+    * against the aligned push-constant uniform without materializing uniform
+    * comparands into GPRs. */
+   nir_if *x_if = NULL, *y_if = NULL;
+   if (!key->aligned_16) {
+      x_if = nir_push_if(b, nir_ult(b, x, width));
+      x_if->control = nir_selection_control_dont_flatten;
+      y_if = nir_push_if(b, nir_ult(b, y, height));
+      y_if->control = nir_selection_control_dont_flatten;
+   }
+
    {
-      nir_def *x0, *y0, *wx, *wy;
-      if (key->odd) {
-         nir_def *axis = mip_push(b, axis);
-         nir_def *x_entry = nir_load_global(
-            b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
-            .align_mul = 4);
-         nir_def *y_entry = nir_load_global(
-            b, 1, 32,
-            nir_iadd(b, axis,
-                     nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
-            .align_mul = 4);
-         x0 = nir_iand_imm(b, x_entry, 0xffff);
-         y0 = nir_iand_imm(b, y_entry, 0xffff);
-         wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
-         wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
-      } else {
-         nir_def *scale_x = mip_push(b, scale_x);
-         nir_def *scale_y = mip_push(b, scale_y);
-         x0 = nir_imul(b, x, scale_x);
-         y0 = nir_imul(b, y, scale_y);
-         wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
-         wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
-      }
+      nir_def *x0, *y0, *x1, *y1;
+      nir_def *weights[4] = {NULL};
 
-      nir_def *x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
-      nir_def *y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
-      nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
-      nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+      if (key->exact_2x2) {
+         x0 = nir_ishl_imm(b, x, 1);
+         y0 = nir_ishl_imm(b, y, 1);
+         x1 = nir_ior_imm(b, x0, 1);
+         y1 = nir_ior_imm(b, y0, 1);
+      } else {
+         nir_def *wx, *wy;
+         if (key->odd) {
+            nir_def *axis = mip_push(b, axis);
+            nir_def *x_entry = nir_load_global(
+               b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
+               .align_mul = 4);
+            nir_def *y_entry = nir_load_global(
+               b, 1, 32,
+               nir_iadd(b, axis,
+                        nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
+               .align_mul = 4);
+            x0 = nir_iand_imm(b, x_entry, 0xffff);
+            y0 = nir_iand_imm(b, y_entry, 0xffff);
+            wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
+            wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
+         } else {
+            nir_def *scale_x = mip_push(b, scale_x);
+            nir_def *scale_y = mip_push(b, scale_y);
+            x0 = nir_imul(b, x, scale_x);
+            y0 = nir_imul(b, y, scale_y);
+            wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
+            wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
+         }
+
+         x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
+         y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
+         nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
+         nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+
+         weights[0] = nir_imul(b, ix, iy);
+         weights[1] = nir_imul(b, wx, iy);
+         weights[2] = nir_imul(b, ix, wy);
+         weights[3] = nir_imul(b, wx, wy);
+      }
 
       nir_def *zero = nir_imm_int(b, 0);
       nir_def *coords[4] = {
@@ -2384,12 +2426,6 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
          nir_vec3(b, x1, y0, zero),
          nir_vec3(b, x0, y1, zero),
          nir_vec3(b, x1, y1, zero),
-      };
-      nir_def *weights[4] = {
-         nir_imul(b, ix, iy),
-         nir_imul(b, wx, iy),
-         nir_imul(b, ix, wy),
-         nir_imul(b, wx, wy),
       };
       nir_def *texels[4];
       for (unsigned i = 0; i < 4; ++i) {
@@ -2400,79 +2436,117 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
 
       nir_def *packed = NULL;
       for (unsigned c = 0; c < 4; ++c) {
-         nir_def *value = NULL;
-         for (unsigned i = 0; i < 4; ++i) {
-            nir_def *term = nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
-            value = value ? nir_iadd(b, value, term) : term;
-         }
+         nir_def *out;
+         if (key->exact_2x2) {
+            nir_def *sum = nir_iadd(
+               b,
+               nir_iadd(b, nir_channel(b, texels[0], c),
+                        nir_channel(b, texels[1], c)),
+               nir_iadd(b, nir_channel(b, texels[2], c),
+                        nir_channel(b, texels[3], c)));
+            /* Bit-exact match for the general fixed4 ties-toward-128 rounding
+             * when all four weights are 16384 (sum in 0..1020):
+             *   sum <= 511 -> (sum + 2) >> 2 (0.5 ties round up toward 128)
+             *   sum >= 512 -> (sum + 1) >> 2 (0.5 ties round down toward 128) */
+            out = nir_ushr_imm(
+               b, nir_isub(b, nir_iadd_imm(b, sum, 2), nir_ushr_imm(b, sum, 9)),
+               2);
+         } else {
+            nir_def *value = NULL;
+            for (unsigned i = 0; i < 4; ++i) {
+               nir_def *term =
+                  nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
+               value = value ? nir_iadd(b, value, term) : term;
+            }
 
-         /* Rounded to four fractional bits, then to the nearest code with
-          * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
-         nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
-         nir_def *out = nir_ushr_imm(b, fixed4, 4);
-         nir_def *rem = nir_iand_imm(b, fixed4, 15);
-         nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
-                               nir_iand(b, nir_ieq_imm(b, rem, 8),
-                                        nir_ult_imm(b, out, 128)));
-         out = nir_iadd(b, out, nir_b2i32(b, up));
+            /* Rounded to four fractional bits, then to the nearest code with
+             * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
+            nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
+            out = nir_ushr_imm(b, fixed4, 4);
+            nir_def *rem = nir_iand_imm(b, fixed4, 15);
+            nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
+                                  nir_iand(b, nir_ieq_imm(b, rem, 8),
+                                           nir_ult_imm(b, out, 128)));
+            out = nir_iadd(b, out, nir_b2i32(b, up));
+         }
 
          nir_def *byte = nir_ishl_imm(b, out, 8 * c);
          packed = packed ? nir_ior(b, packed, byte) : byte;
       }
 
-      nir_def *tile_width_log2 = mip_push(b, tile_width_log2);
-      nir_def *tile_height_log2 = mip_push(b, tile_height_log2);
-      nir_def *tile_x_mask =
-         nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_width_log2), -1);
-      nir_def *tile_y_mask =
-         nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_height_log2), -1);
-      nir_def *tile = nir_iadd(
-         b, nir_imul(b, nir_ushr(b, y, tile_height_log2),
+      nir_def *element;
+      if (key->tile_64x64) {
+         /* A 16x16 workgroup is already Morton-ordered in index (bits 0..7);
+          * its 2-bit position inside a 64x64 tile supplies Morton bits 8..11,
+          * keeping tile and high Morton bits workgroup-uniform. */
+         nir_def *tile = nir_iadd(
+            b, nir_imul(b, nir_ushr_imm(b, wg_y, 2), mip_push(b, tiles_per_row)),
+            nir_ushr_imm(b, wg_x, 2));
+         nir_def *morton_hi = nir_ior(
+            b,
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 1), 8),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 1), 9)),
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 2), 9),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 2), 10)));
+         element = nir_ior(b, nir_ior(b, nir_ishl_imm(b, tile, 12), morton_hi),
+                           index);
+      } else {
+         nir_def *tile_width_log2 = mip_push(b, tile_width_log2);
+         nir_def *tile_height_log2 = mip_push(b, tile_height_log2);
+         nir_def *tile_x_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_width_log2), -1);
+         nir_def *tile_y_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_height_log2), -1);
+         nir_def *tile = nir_iadd(
+            b,
+            nir_imul(b, nir_ushr(b, y, tile_height_log2),
                      mip_push(b, tiles_per_row)),
-         nir_ushr(b, x, tile_width_log2));
-      nir_def *morton =
-         nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, x, tile_x_mask)),
-                 nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y, tile_y_mask)), 1));
-      nir_def *element = nir_ior(
-         b, nir_ishl(b, tile, nir_iadd(b, tile_width_log2, tile_height_log2)),
-         morton);
+            nir_ushr(b, x, tile_width_log2));
+         nir_def *morton = nir_ior(
+            b, hk_nir_spread_bits(b, nir_iand(b, x, tile_x_mask)),
+            nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y, tile_y_mask)),
+                         1));
+         element = nir_ior(
+            b, nir_ishl(b, tile, nir_iadd(b, tile_width_log2, tile_height_log2)),
+            morton);
+      }
 
       nir_store_global(b, packed,
                        nir_iadd(b, mip_push(b, dst),
                                 nir_u2u64(b, nir_imul_imm(b, element, 4))),
                        .align_mul = 4);
    }
-   nir_pop_if(b, NULL);
+
+   if (!key->aligned_16) {
+      nir_pop_if(b, y_if);
+      nir_pop_if(b, x_if);
+   }
 
    if (key->metadata) {
-      nir_def *x_tl = nir_ushr_imm(b, x, 4);
-      nir_def *y_tl = nir_ushr_imm(b, y, 4);
-      nir_def *origin =
-         nir_ieq_imm(b, nir_iand_imm(b, nir_ior(b, x, y), 15), 0);
-      nir_def *in_grid =
-         nir_iand(b, nir_ult(b, x_tl, mip_push(b, metadata_width_tl)),
-                  nir_ult(b, y_tl, mip_push(b, metadata_height_tl)));
-
-      nir_push_if(b, nir_iand(b, origin, in_grid));
+      /* Each 16x16 workgroup maps 1:1 to metadata tile (wg_x, wg_y), so no
+       * metadata grid bounds compare is needed and only subgroup 0 enters. */
+      nir_if *meta_if = nir_push_if(b, nir_ieq_imm(b, index, 0));
+      meta_if->control = nir_selection_control_dont_flatten;
       {
          nir_def *bits = mip_push(b, metadata_interleave_bits);
          nir_def *mask =
             nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bits), -1);
          nir_def *major = nir_bcsel(
-            b, nir_ine_imm(b, mip_push(b, metadata_major_is_x), 0), x_tl, y_tl);
-         nir_def *index = nir_iadd(
+            b, nir_ine_imm(b, mip_push(b, metadata_major_is_x), 0), wg_x, wg_y);
+         nir_def *meta_idx = nir_iadd(
             b,
-            nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, x_tl, mask)),
-                    nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y_tl, mask)), 1)),
+            nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, wg_x, mask)),
+                    nir_ishl_imm(
+                       b, hk_nir_spread_bits(b, nir_iand(b, wg_y, mask)), 1)),
             nir_ishl(b, nir_iand(b, major, nir_inot(b, mask)), bits));
          nir_def *mode = mip_push(b, uncompressed_mode);
 
          nir_store_global(b, nir_vec2(b, mode, mode),
                           nir_iadd(b, mip_push(b, metadata),
-                                   nir_u2u64(b, nir_imul_imm(b, index, 8))),
+                                   nir_u2u64(b, nir_imul_imm(b, meta_idx, 8))),
                           .align_mul = 8);
       }
-      nir_pop_if(b, NULL);
+      nir_pop_if(b, meta_if);
    }
 
    return b->shader;
@@ -2553,6 +2627,8 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       const uint32_t src_height = (uint32_t)region->srcOffsets[1].y;
       const bool odd = src_width == (uint64_t)width * 2 + 1 ||
                        src_height == (uint64_t)height * 2 + 1;
+      const bool exact_2x2 = !odd && src_width == (uint64_t)width * 2 &&
+                             src_height == (uint64_t)height * 2;
       const bool metadata =
          ail_is_level_logically_compressed(dst_layout, dst_level);
 
@@ -2571,10 +2647,22 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
          return;
       }
 
+      const uint32_t groups_x = DIV_ROUND_UP(width, HK_G17P_MIP_WG_SIZE);
+      const uint32_t groups_y = DIV_ROUND_UP(height, HK_G17P_MIP_WG_SIZE);
+      assert(!metadata ||
+             (groups_x == grid.width_tl && groups_y == grid.height_tl));
+      const bool aligned_16 = groups_x * HK_G17P_MIP_WG_SIZE == width &&
+                              groups_y * HK_G17P_MIP_WG_SIZE == height;
+      const bool tile_64x64 =
+         tiles.tile_width_log2 == 6 && tiles.tile_height_log2 == 6;
+
       const struct hk_g17p_mip_key key = {
          .key_type = HK_META_OBJECT_KEY_G17P_MIP,
          .odd = odd,
+         .exact_2x2 = exact_2x2,
          .metadata = metadata,
+         .aligned_16 = aligned_16,
+         .tile_64x64 = tile_64x64,
       };
       VkPipelineLayout layout;
       VkPipeline pipeline;
@@ -2602,8 +2690,6 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
                          (uint64_t)dst_layer *
                             dst_layout->compression_layer_stride_B +
                          dst_layout->level_offsets_compressed_B[dst_level];
-         push.metadata_width_tl = grid.width_tl;
-         push.metadata_height_tl = grid.height_tl;
          push.metadata_interleave_bits = grid.interleave_bits;
          push.metadata_major_is_x = grid.major_is_x;
          push.uncompressed_mode =
@@ -2671,11 +2757,404 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                              sizeof(push), &push);
 
-      /* Cover the metadata grid too, which may extend past the texels */
-      const uint32_t grid_w = MAX2(width, grid.width_tl * 16);
-      const uint32_t grid_h = MAX2(height, grid.height_tl * 16);
-      disp->CmdDispatch(handle, DIV_ROUND_UP(grid_w, TILE_WIDTH),
-                        DIV_ROUND_UP(grid_h, TILE_HEIGHT), 1);
+      disp->CmdDispatch(handle, groups_x, groups_y, 1);
+   }
+}
+
+/*
+ * AGX3 Gen10 (M5) compute mipmap blit via compressed storage PBE.
+ *
+ * Gen10 storage PBE descriptors write compressed tiles and maintain
+ * compression metadata directly from compute, so linear UNORM8 mipmap
+ * downsamples of both compressed and plain GPU-tiled images execute in a
+ * single CDM stream instead of one graphics render pass per mip level.
+ */
+static bool
+hk_agx3_gen10_mip_blit_supported(const struct hk_device *dev,
+                                 const struct hk_image *src,
+                                 const struct hk_image *dst,
+                                 const VkBlitImageInfo2 *info)
+{
+   if (!agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip)) ||
+       agx_chip_descriptor_generation(dev->dev.chip) !=
+          AGX_DESCRIPTOR_GENERATION_10 ||
+       info->regionCount == 0 ||
+       (dst->planes[0].layout.compressed &&
+        (!hk_chip_supports_compressed_storage_pbe(dev->dev.chip) ||
+         dst->vk.array_layers != 1)))
+      return false;
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkImageBlit2 *region = &info->pRegions[r];
+      if (!hk_g17p_compute_blit_region_supported(src, dst, region,
+                                                 info->filter, true))
+         return false;
+      if (region->srcSubresource.mipLevel >= src->vk.mip_levels ||
+          region->dstSubresource.mipLevel >= dst->vk.mip_levels)
+         return false;
+      if (dst->planes[0].layout.compressed &&
+          region->dstSubresource.baseArrayLayer != 0)
+         return false;
+      if (src == dst &&
+          region->srcSubresource.mipLevel == region->dstSubresource.mipLevel &&
+          region->srcSubresource.baseArrayLayer ==
+             region->dstSubresource.baseArrayLayer)
+         return false;
+   }
+   return true;
+}
+
+struct hk_agx3_gen10_mip_key {
+   enum hk_meta_object_key_type key_type;
+   bool odd;
+};
+
+struct hk_agx3_gen10_mip_push {
+   uint64_t axis;
+   uint32_t width;
+   uint32_t height;
+   uint32_t scale_x;
+   uint32_t scale_y;
+};
+static_assert(sizeof(struct hk_agx3_gen10_mip_push) == 24,
+              "AGX3 Gen10 mip push data must be tightly packed");
+
+#define gen10_mip_push(b, field)                                               \
+   nir_load_push_constant(                                                     \
+      b, 1, sizeof(((struct hk_agx3_gen10_mip_push *)0)->field) * 8,           \
+      nir_imm_int(b, offsetof(struct hk_agx3_gen10_mip_push, field)))
+
+static nir_shader *
+build_agx3_gen10_mip_shader(const struct hk_agx3_gen10_mip_key *key)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "hk-agx3-gen10-mip");
+   nir_builder *b = &build;
+   const unsigned wg_dim = 16;
+   b->shader->info.workgroup_size[0] = wg_dim;
+   b->shader->info.workgroup_size[1] = wg_dim;
+
+   nir_variable *texture = nir_variable_create(
+      b->shader, nir_var_uniform,
+      glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, true, GLSL_TYPE_UINT),
+      "source");
+   texture->data.descriptor_set = 0;
+   texture->data.binding = 0;
+
+   nir_variable *dst_img = nir_variable_create(
+      b->shader, nir_var_image,
+      glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT), "dest");
+   dst_img->data.descriptor_set = 0;
+   dst_img->data.binding = 1;
+   dst_img->data.image.format = PIPE_FORMAT_R8G8B8A8_UINT;
+   dst_img->data.access = ACCESS_NON_READABLE;
+
+   /* Map the 16x16 workgroup in Morton order so each 32-thread subgroup writes
+    * a contiguous 8x4 tile and matches the 16x16 compression block grid. */
+   nir_def *lid = nir_load_local_invocation_id(b);
+   nir_def *index = nir_iadd(b, nir_channel(b, lid, 0),
+                             nir_imul_imm(b, nir_channel(b, lid, 1), wg_dim));
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *x = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 0), wg_dim),
+                         hk_nir_compact_bits_8(b, index));
+   nir_def *y = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 1), wg_dim),
+                         hk_nir_compact_bits_8(b, nir_ushr_imm(b, index, 1)));
+   nir_def *width = gen10_mip_push(b, width);
+   nir_def *height = gen10_mip_push(b, height);
+
+   nir_push_if(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)));
+   {
+      nir_def *x0, *y0, *wx, *wy;
+      if (key->odd) {
+         nir_def *axis = gen10_mip_push(b, axis);
+         nir_def *x_entry = nir_load_global(
+            b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
+            .align_mul = 4);
+         nir_def *y_entry = nir_load_global(
+            b, 1, 32,
+            nir_iadd(b, axis,
+                     nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
+            .align_mul = 4);
+         x0 = nir_iand_imm(b, x_entry, 0xffff);
+         y0 = nir_iand_imm(b, y_entry, 0xffff);
+         wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
+         wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
+      } else {
+         nir_def *scale_x = gen10_mip_push(b, scale_x);
+         nir_def *scale_y = gen10_mip_push(b, scale_y);
+         x0 = nir_imul(b, x, scale_x);
+         y0 = nir_imul(b, y, scale_y);
+         wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
+         wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
+      }
+
+      nir_def *x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
+      nir_def *y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
+      nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
+      nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_def *coords[4] = {
+         nir_vec3(b, x0, y0, zero),
+         nir_vec3(b, x1, y0, zero),
+         nir_vec3(b, x0, y1, zero),
+         nir_vec3(b, x1, y1, zero),
+      };
+      nir_def *weights[4] = {
+         nir_imul(b, ix, iy),
+         nir_imul(b, wx, iy),
+         nir_imul(b, ix, wy),
+         nir_imul(b, wx, wy),
+      };
+      nir_def *texels[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         texels[i] = nir_txf(b, coords[i],
+                             .texture_deref = nir_build_deref_var(b, texture));
+         nir_def_as_tex(texels[i])->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
+      }
+
+      nir_def *chans[4];
+      for (unsigned c = 0; c < 4; ++c) {
+         nir_def *value = NULL;
+         for (unsigned i = 0; i < 4; ++i) {
+            nir_def *term =
+               nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
+            value = value ? nir_iadd(b, value, term) : term;
+         }
+
+         nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
+         nir_def *out = nir_ushr_imm(b, fixed4, 4);
+         nir_def *rem = nir_iand_imm(b, fixed4, 15);
+         nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
+                               nir_iand(b, nir_ieq_imm(b, rem, 8),
+                                        nir_ult_imm(b, out, 128)));
+         chans[c] = nir_iadd(b, out, nir_b2i32(b, up));
+      }
+
+      nir_image_deref_store(
+         b, &nir_build_deref_var(b, dst_img)->def,
+         nir_vec4(b, x, y, zero, zero), zero,
+         nir_vec4(b, chans[0], chans[1], chans[2], chans[3]), zero,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+         .format = PIPE_FORMAT_R8G8B8A8_UINT, .src_type = nir_type_uint32);
+   }
+   nir_pop_if(b, NULL);
+
+   return b->shader;
+}
+
+static VkResult
+hk_agx3_gen10_mip_pipeline(struct hk_device *dev,
+                           const struct hk_agx3_gen10_mip_key *key,
+                           VkPipelineLayout *layout_out,
+                           VkPipeline *pipeline_out)
+{
+   const VkDescriptorSetLayoutBinding bindings[2] = {
+      {
+         .binding = 0,
+         .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      },
+      {
+         .binding = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      },
+   };
+   const VkDescriptorSetLayoutCreateInfo set_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      .bindingCount = ARRAY_SIZE(bindings),
+      .pBindings = bindings,
+   };
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(struct hk_agx3_gen10_mip_push),
+   };
+   static const char layout_key[] = "hk-agx3-gen10-mip-layout";
+
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, &set_info, &push_range, layout_key,
+      sizeof(layout_key), layout_out);
+   if (unlikely(result != VK_SUCCESS))
+      return result;
+
+   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (cached != VK_NULL_HANDLE) {
+      *pipeline_out = cached;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_agx3_gen10_mip_shader(key),
+   };
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .pNext = &nir_info,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pName = "main",
+      },
+      .layout = *layout_out,
+   };
+
+   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info, key,
+                                            sizeof(*key), pipeline_out);
+   ralloc_free(nir_info.nir);
+   return result;
+}
+
+static void
+hk_agx3_gen10_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
+                       struct hk_image *dst, const VkBlitImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer handle = vk_command_buffer_to_handle(&cmd->vk);
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkImageBlit2 *region = &info->pRegions[r];
+      const uint32_t src_level = region->srcSubresource.mipLevel;
+      const uint32_t dst_level = region->dstSubresource.mipLevel;
+      const uint32_t width = (uint32_t)region->dstOffsets[1].x;
+      const uint32_t height = (uint32_t)region->dstOffsets[1].y;
+      const uint32_t src_width = (uint32_t)region->srcOffsets[1].x;
+      const uint32_t src_height = (uint32_t)region->srcOffsets[1].y;
+      const bool odd = src_width == (uint64_t)width * 2 + 1 ||
+                       src_height == (uint64_t)height * 2 + 1;
+
+      const struct hk_agx3_gen10_mip_key key = {
+         .key_type = HK_META_OBJECT_KEY_AGX3_GEN10_MIP,
+         .odd = odd,
+      };
+      VkPipelineLayout layout;
+      VkPipeline pipeline;
+      VkResult result =
+         hk_agx3_gen10_mip_pipeline(dev, &key, &layout, &pipeline);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+
+      struct hk_agx3_gen10_mip_push push = {
+         .width = width,
+         .height = height,
+         .scale_x = src_width == width ? 1 : 2,
+         .scale_y = src_height == height ? 1 : 2,
+      };
+      if (odd) {
+         struct agx_ptr axis =
+            hk_pool_alloc(cmd, (width + height) * sizeof(uint32_t), 4);
+         if (unlikely(axis.cpu == NULL))
+            return;
+
+         uint32_t *entries = axis.cpu;
+         ASSERTED const bool x_ok =
+            hk_g17p_build_mip_axis(src_width, width, entries);
+         ASSERTED const bool y_ok =
+            hk_g17p_build_mip_axis(src_height, height, entries + width);
+         assert(x_ok && y_ok);
+         push.axis = axis.gpu;
+      }
+
+      VkImageView src_view, dst_view;
+      const VkImageViewUsageCreateInfo src_view_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+      const VkImageViewCreateInfo src_view_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+         .pNext = &src_view_usage,
+         .image = hk_image_to_handle(src),
+         .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+         .format = hk_meta_compressed_copy_format(src->vk.format),
+         .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = src_level,
+            .levelCount = 1,
+            .baseArrayLayer = region->srcSubresource.baseArrayLayer,
+            .layerCount = 1,
+         },
+      };
+      result = vk_meta_create_image_view(&cmd->vk, &dev->meta, &src_view_info,
+                                         &src_view);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+
+      const VkImageViewUsageCreateInfo dst_view_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+      };
+      const VkImageViewCreateInfo dst_view_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+         .pNext = &dst_view_usage,
+         .image = hk_image_to_handle(dst),
+         .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = hk_meta_compressed_copy_format(dst->vk.format),
+         .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = dst_level,
+            .levelCount = 1,
+            .baseArrayLayer = region->dstSubresource.baseArrayLayer,
+            .layerCount = 1,
+         },
+      };
+      result = vk_meta_create_image_view(&cmd->vk, &dev->meta, &dst_view_info,
+                                         &dst_view);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+
+      const VkDescriptorImageInfo src_info = {
+         .imageLayout = info->srcImageLayout,
+         .imageView = src_view,
+      };
+      const VkDescriptorImageInfo dst_info = {
+         .imageLayout = info->dstImageLayout,
+         .imageView = dst_view,
+      };
+      const VkWriteDescriptorSet writes[2] = {
+         {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .descriptorCount = 1,
+            .pImageInfo = &src_info,
+         },
+         {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .pImageInfo = &dst_info,
+         },
+      };
+
+      disp->CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+      disp->CmdPushDescriptorSetKHR(handle, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    layout, 0, ARRAY_SIZE(writes), writes);
+      disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                             sizeof(push), &push);
+      disp->CmdDispatch(handle, DIV_ROUND_UP(width, 16),
+                        DIV_ROUND_UP(height, 16), 1);
+
+      if (cmd->current_cs.cs) {
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(src, 0),
+                                   src->planes[0].layout.size_B);
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(dst, 0),
+                                   dst->planes[0].layout.size_B);
+      }
    }
 }
 
@@ -2804,6 +3283,15 @@ hk_xfer_blitimage2(VkCommandBuffer commandBuffer,
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       hk_g17p_compressed_blit(cmd, src_image, dst_image, pBlitImageInfo);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      return;
+   }
+
+   if (hk_agx3_gen10_mip_blit_supported(dev, src_image, dst_image,
+                                        pBlitImageInfo)) {
+      struct hk_meta_save save;
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      hk_agx3_gen10_mip_blit(cmd, src_image, dst_image, pBlitImageInfo);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       return;
    }
@@ -2999,7 +3487,53 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+   /* HAL200 writes a compressed colour array one layer at a time: the
+    * qualified BG/EOT contract is single-layer, so a layered render through
+    * the generic resolve path reaches a compressed source array's
+    * per-layer metadata through hardware stride derivation that is not
+    * reliable at --jobs 4 concurrency. hk_CmdCopyImage and
+    * hk_CmdBlitImage split 2D-array regions into per-slice passes on the
+    * same contract; apply the same split here so the generic resolve runs
+    * one layer at a time whenever either image is a compressed 2D
+    * array. */
+   if (agx_chip_native_agx3(dev->dev.chip) &&
+       src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+       dst_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+       (src_layout->compressed || dst_layout->compressed)) {
+      for (uint32_t r = 0; r < pResolveImageInfo->regionCount; ++r) {
+         const VkImageResolve2 *region = &pResolveImageInfo->pRegions[r];
+         const uint32_t src_slices =
+            vk_image_subresource_layer_count(&src_image->vk,
+                                             &region->srcSubresource);
+         const uint32_t dst_slices =
+            vk_image_subresource_layer_count(&dst_image->vk,
+                                             &region->dstSubresource);
+
+         for (uint32_t slice = 0; slice < src_slices; ++slice) {
+            VkImageResolve2 one;
+            if (!hk_g17p_image_resolve_slice(
+                   dev->dev.chip, src_image->vk.image_type,
+                   dst_image->vk.image_type, src_slices, dst_slices,
+                   region, slice, &one)) {
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FEATURE_NOT_PRESENT);
+               break;
+            }
+
+            VkResolveImageInfo2 info = *pResolveImageInfo;
+            info.regionCount = 1;
+            info.pRegions = &one;
+            vk_meta_resolve_image2(&cmd->vk, &dev->meta, &info);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               break;
+         }
+
+         if (vk_command_buffer_has_error(&cmd->vk))
+            break;
+      }
+   } else {
+      vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
+   }
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
@@ -3022,6 +3556,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
     * that dst, src, and size are all properly aligned. Failing to check for
     * alignment on the buffers causes subtle and hard-to-debug issues!
     */
+   bool ran_uint4 = false;
    if (size >= 16 && (dst & 0xf) == 0 && (src & 0xf) == 0) {
       unsigned uint4s = size / 16;
       unsigned bytes = uint4s * 16;
@@ -3031,6 +3566,25 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
       dst += bytes;
       src += bytes;
       size -= bytes;
+      ran_uint4 = true;
+   }
+
+   /* Use 32-bit copies when 16-byte alignment was unavailable, or when the
+    * remaining tail is a clean 4-byte multiple (avoiding an extra dispatch
+    * before a trailing byte copy). */
+   if (size >= 4 && (dst & 0x3) == 0 && (src & 0x3) == 0 &&
+       (!ran_uint4 || (size & 0x3) == 0)) {
+      size_t uints = size / 4;
+      if (uints <= UINT32_MAX) {
+         size_t bytes = uints * 4;
+
+         libagx_copy_uint(cmd, agx_1d((uint32_t)uints), AGX_BARRIER_ALL, dst,
+                          src);
+
+         dst += bytes;
+         src += bytes;
+         size -= bytes;
+      }
    }
 
    if (size) {
@@ -3394,7 +3948,7 @@ hk_g17p_copy_buffer_to_image_supported(
 static bool
 hk_g17p_block_copy_format(struct hk_device *dev, VkFormat format)
 {
-   if (!dev || !agx_chip_native_or_m5(dev->dev.chip))
+   if (!dev || !agx_chip_agx3_path(dev->dev.chip))
       return false;
 
    switch (hk_g17p_block_format_family(format)) {
@@ -3674,7 +4228,7 @@ hk_g17p_copy_padded_rgb_buffer_image(
    VkImageLayout image_layout, bool to_image)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+   if (!agx_chip_agx3_path(dev->dev.chip) ||
        region_count == 0 ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        (image_layout != (to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
@@ -3969,7 +4523,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || !dest_tiled || !plan->width_el ||
+   if (!agx_chip_agx3_path(dev->dev.chip) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
@@ -4070,7 +4624,7 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
    const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
 {
-   if (!agx_chip_native_or_m5(dev->dev.chip) || info->regionCount == 0)
+   if (!agx_chip_agx3_path(dev->dev.chip) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -4204,6 +4758,499 @@ hk_g17p_copy_uncompressed_buffer_to_image(
       if (tiled && cmd->current_cs.cs)
          hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
                                    base_dst, layout->size_B);
+   }
+}
+
+/*
+ * AGX3 Gen10 compute upload into losslessly compressed 2D colour images.
+ *
+ * Gen10 storage PBE descriptors write compressed 16x16 tiles and maintain
+ * compression metadata directly from compute, so linear-buffer uploads execute
+ * in one CDM dispatch instead of a graphics render pass.
+ *
+ * Each 64-thread workgroup covers 32x16 texels aligned to 16x16 compression
+ * blocks, assigning one entire 16x16 block to each 32-lane warp in 8x4 Morton
+ * order (zero cross-warp contention on compression blocks). For 4-byte formats,
+ * full interior workgroups load 128-byte contiguous rows with 16-byte vector
+ * global loads through a zero-bank-conflict XOR-swizzled shared tile before
+ * issuing Morton-ordered PBE stores.
+ */
+struct hk_agx3_compressed_buf2img_key {
+   enum hk_meta_object_key_type key_type;
+   VkFormat view_format;
+};
+
+struct hk_agx3_compressed_buf2img_push {
+   uint64_t src;
+   uint32_t src_pitch_B;
+   uint32_t x0;
+   uint32_t y0;
+   uint32_t width;
+   uint32_t height;
+   uint32_t tile_x0;
+   uint32_t tile_y0;
+   uint32_t pad;
+};
+static_assert(sizeof(struct hk_agx3_compressed_buf2img_push) == 40,
+              "AGX3 compressed buf2img push data must be tightly packed");
+
+#define compressed_buf2img_push(b, field)                                      \
+   nir_load_push_constant(                                                     \
+      b, 1,                                                                    \
+      sizeof(((struct hk_agx3_compressed_buf2img_push *)0)->field) * 8,        \
+      nir_imm_int(b, offsetof(struct hk_agx3_compressed_buf2img_push, field)))
+
+static nir_def *
+hk_agx3_unpack_compressed_buf2img_texel(nir_builder *b, VkFormat view_format,
+                                        nir_def *raw, nir_def *zero)
+{
+   switch (view_format) {
+   case VK_FORMAT_R16_UINT:
+      return nir_vec4(b, nir_u2u32(b, raw), zero, zero, zero);
+   case VK_FORMAT_R8G8B8A8_UINT:
+      return nir_vec4(b, nir_iand_imm(b, raw, 0xff),
+                      nir_iand_imm(b, nir_ushr_imm(b, raw, 8), 0xff),
+                      nir_iand_imm(b, nir_ushr_imm(b, raw, 16), 0xff),
+                      nir_ushr_imm(b, raw, 24));
+   case VK_FORMAT_R16G16_UINT:
+      return nir_vec4(b, nir_iand_imm(b, raw, 0xffff),
+                      nir_ushr_imm(b, raw, 16), zero, zero);
+   case VK_FORMAT_R32_UINT:
+      return nir_vec4(b, raw, zero, zero, zero);
+   case VK_FORMAT_R16G16B16A16_UINT: {
+      nir_def *w0 = nir_channel(b, raw, 0);
+      nir_def *w1 = nir_channel(b, raw, 1);
+      return nir_vec4(b, nir_iand_imm(b, w0, 0xffff), nir_ushr_imm(b, w0, 16),
+                      nir_iand_imm(b, w1, 0xffff), nir_ushr_imm(b, w1, 16));
+   }
+   case VK_FORMAT_R32G32_UINT:
+      return nir_vec4(b, nir_channel(b, raw, 0), nir_channel(b, raw, 1), zero,
+                      zero);
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return raw;
+   default:
+      UNREACHABLE("unsupported compressed buf2img view format");
+   }
+}
+
+static void
+hk_agx3_emit_compressed_buf2img_direct(nir_builder *b, nir_variable *dst_img,
+                                       VkFormat view_format,
+                                       enum pipe_format p_format,
+                                       uint32_t block_B, nir_def *src,
+                                       nir_def *src_pitch_B, nir_def *x0,
+                                       nir_def *y0, nir_def *width,
+                                       nir_def *height, nir_def *wg_x0,
+                                       nir_def *wg_y0, nir_def *warp_x,
+                                       nir_def *mx, nir_def *my, nir_def *zero)
+{
+   const unsigned bits = MIN2(block_B, 4) * 8;
+   const unsigned comps = MAX2(block_B / 4, 1);
+   const unsigned align_B = MIN2(block_B, 4);
+
+   for (unsigned t = 0; t < 8; ++t) {
+      const unsigned tx = ((t >> 1) & 1u) * 8u;
+      const unsigned ty = ((t & 1u) * 4u) + ((t >> 2) * 8u);
+      nir_def *lx = nir_iadd_imm(b, nir_iadd(b, warp_x, mx), tx);
+      nir_def *ly = nir_iadd_imm(b, my, ty);
+      nir_def *px = nir_iadd(b, wg_x0, lx);
+      nir_def *py = nir_iadd(b, wg_y0, ly);
+      nir_def *rx = nir_isub(b, px, x0);
+      nir_def *ry = nir_isub(b, py, y0);
+
+      nir_push_if(b, nir_iand(b, nir_ult(b, rx, width), nir_ult(b, ry, height)));
+      {
+         nir_def *off =
+            nir_iadd(b, nir_imul(b, ry, src_pitch_B),
+                     nir_imul_imm(b, rx, block_B));
+         nir_def *raw = nir_load_global(
+            b, comps, bits, nir_iadd(b, src, nir_u2u64(b, off)),
+            .align_mul = align_B,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         nir_def *val = hk_agx3_unpack_compressed_buf2img_texel(
+            b, view_format, raw, zero);
+         nir_image_deref_store(
+            b, &nir_build_deref_var(b, dst_img)->def,
+            nir_vec4(b, px, py, zero, zero), zero, val, zero,
+            .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+            .format = p_format, .src_type = nir_type_uint32);
+      }
+      nir_pop_if(b, NULL);
+   }
+}
+
+static nir_shader *
+build_agx3_compressed_buf2img_shader(
+   const struct hk_agx3_compressed_buf2img_key *key)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "hk-agx3-compressed-buf2img");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = 64;
+   b->shader->info.workgroup_size[1] = 1;
+   b->shader->info.workgroup_size[2] = 1;
+
+   const enum pipe_format p_format = hk_format_to_pipe_format(key->view_format);
+   const uint32_t block_B = vk_format_get_blocksize(key->view_format);
+
+   nir_variable *dst_img = nir_variable_create(
+      b->shader, nir_var_image,
+      glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT), "dest");
+   dst_img->data.descriptor_set = 0;
+   dst_img->data.binding = 0;
+   dst_img->data.image.format = p_format;
+   dst_img->data.access = ACCESS_NON_READABLE;
+
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *src = compressed_buf2img_push(b, src);
+   nir_def *src_pitch_B = compressed_buf2img_push(b, src_pitch_B);
+   nir_def *x0 = compressed_buf2img_push(b, x0);
+   nir_def *y0 = compressed_buf2img_push(b, y0);
+   nir_def *width = compressed_buf2img_push(b, width);
+   nir_def *height = compressed_buf2img_push(b, height);
+   nir_def *wg_x0 =
+      nir_iadd(b, compressed_buf2img_push(b, tile_x0),
+               nir_ishl_imm(b, nir_channel(b, wg, 0), 5));
+   nir_def *wg_y0 =
+      nir_iadd(b, compressed_buf2img_push(b, tile_y0),
+               nir_ishl_imm(b, nir_channel(b, wg, 1), 4));
+
+   nir_def *warp_x = nir_ishl_imm(b, nir_ushr_imm(b, lid, 5), 4);
+   nir_def *lane = nir_iand_imm(b, lid, 31);
+   nir_def *mx = hk_nir_compact_bits_8(b, lane);
+   nir_def *my = hk_nir_compact_bits_8(b, nir_ushr_imm(b, lane, 1));
+   nir_def *zero = nir_imm_int(b, 0);
+
+   if (block_B == 4) {
+      nir_variable *tile = nir_variable_create(
+         b->shader, nir_var_mem_shared,
+         glsl_array_type(glsl_vector_type(GLSL_TYPE_UINT, 4), 128, 0), "tile");
+      nir_deref_instr *tile_deref = nir_build_deref_var(b, tile);
+
+      /* Uniform workgroup test: every thread takes the same branch so the
+       * shared-memory barrier inside the full-tile fast path is uniform. */
+      nir_def *rx0 = nir_isub(b, wg_x0, x0);
+      nir_def *ry0 = nir_isub(b, wg_y0, y0);
+      nir_def *full_x = nir_iand(b, nir_uge(b, width, rx0),
+                                 nir_uge_imm(b, nir_isub(b, width, rx0), 32));
+      nir_def *full_y = nir_iand(b, nir_uge(b, height, ry0),
+                                 nir_uge_imm(b, nir_isub(b, height, ry0), 16));
+
+      nir_push_if(b, nir_iand(b, full_x, full_y));
+      {
+         /* Coalesced 128-byte row loads: 8 lanes x 4 texels (16 B) = 32 texels
+          * per row, two rows per thread across the 32x16 tile. */
+         nir_def *c = nir_iand_imm(b, lid, 7);
+         nir_def *r = nir_ushr_imm(b, lid, 3);
+         nir_def *off0 =
+            nir_iadd(b, nir_imul(b, nir_iadd(b, ry0, r), src_pitch_B),
+                     nir_ishl_imm(b, nir_iadd(b, rx0, nir_ishl_imm(b, c, 2)), 2));
+         nir_def *off1 = nir_iadd(b, off0, nir_ishl_imm(b, src_pitch_B, 3));
+         nir_def *v0 = nir_load_global(
+            b, 4, 32, nir_iadd(b, src, nir_u2u64(b, off0)), .align_mul = 4,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         nir_def *v1 = nir_load_global(
+            b, 4, 32, nir_iadd(b, src, nir_u2u64(b, off1)), .align_mul = 4,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+
+         /* XOR-swizzle vector index by (row & 3) << 1 so both the coalesced
+          * vec4 stores and the 8x4 Morton scalar loads are bank-conflict-free. */
+         nir_def *swiz_c = nir_ixor(b, c, nir_ishl_imm(b, nir_iand_imm(b, r, 3), 1));
+         nir_def *swiz0 = nir_ior(b, nir_ishl_imm(b, r, 3), swiz_c);
+         nir_store_deref(b, nir_build_deref_array(b, tile_deref, swiz0), v0,
+                         0xf);
+         nir_store_deref(
+            b, nir_build_deref_array(b, tile_deref, nir_iadd_imm(b, swiz0, 64)),
+            v1, 0xf);
+
+         nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_WORKGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_shared);
+
+         nir_def *my_swiz = nir_ishl_imm(b, my, 3);
+         nir_def *comp_idx = nir_iand_imm(b, mx, 3);
+         for (unsigned t = 0; t < 8; ++t) {
+            const unsigned tx = ((t >> 1) & 1u) * 8u;
+            const unsigned ty = ((t & 1u) * 4u) + ((t >> 2) * 8u);
+            nir_def *lx = nir_iadd_imm(b, nir_iadd(b, warp_x, mx), tx);
+            nir_def *ly = nir_iadd_imm(b, my, ty);
+            nir_def *swiz_lx = nir_ixor(b, lx, my_swiz);
+            nir_def *vec_idx = nir_ior(b, nir_ishl_imm(b, ly, 3),
+                                       nir_ushr_imm(b, swiz_lx, 2));
+            nir_deref_instr *vec_deref =
+               nir_build_deref_array(b, tile_deref, vec_idx);
+            nir_def *word = nir_load_deref(
+               b, nir_build_deref_array(b, vec_deref, comp_idx));
+            nir_def *val = hk_agx3_unpack_compressed_buf2img_texel(
+               b, key->view_format, word, zero);
+            nir_image_deref_store(
+               b, &nir_build_deref_var(b, dst_img)->def,
+               nir_vec4(b, nir_iadd(b, wg_x0, lx), nir_iadd(b, wg_y0, ly), zero,
+                        zero),
+               zero, val, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
+               .image_array = false, .format = p_format,
+               .src_type = nir_type_uint32);
+         }
+      }
+      nir_push_else(b, NULL);
+      {
+         hk_agx3_emit_compressed_buf2img_direct(
+            b, dst_img, key->view_format, p_format, block_B, src, src_pitch_B,
+            x0, y0, width, height, wg_x0, wg_y0, warp_x, mx, my, zero);
+      }
+      nir_pop_if(b, NULL);
+   } else {
+      hk_agx3_emit_compressed_buf2img_direct(
+         b, dst_img, key->view_format, p_format, block_B, src, src_pitch_B, x0,
+         y0, width, height, wg_x0, wg_y0, warp_x, mx, my, zero);
+   }
+
+   return b->shader;
+}
+
+static VkResult
+hk_agx3_compressed_buf2img_pipeline(
+   struct hk_device *dev, const struct hk_agx3_compressed_buf2img_key *key,
+   VkPipelineLayout *layout_out, VkPipeline *pipeline_out)
+{
+   const VkDescriptorSetLayoutBinding binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+   };
+   const VkDescriptorSetLayoutCreateInfo set_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      .bindingCount = 1,
+      .pBindings = &binding,
+   };
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(struct hk_agx3_compressed_buf2img_push),
+   };
+   static const char layout_key[] = "hk-agx3-compressed-buf2img-layout";
+
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, &set_info, &push_range, layout_key,
+      sizeof(layout_key), layout_out);
+   if (unlikely(result != VK_SUCCESS))
+      return result;
+
+   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (cached != VK_NULL_HANDLE) {
+      *pipeline_out = cached;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_agx3_compressed_buf2img_shader(key),
+   };
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .pNext = &nir_info,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pName = "main",
+      },
+      .layout = *layout_out,
+   };
+
+   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info, key,
+                                            sizeof(*key), pipeline_out);
+   ralloc_free(nir_info.nir);
+   return result;
+}
+
+static bool
+hk_agx3_compressed_buffer_to_image_supported(
+   struct hk_device *dev, const struct hk_buffer *buffer,
+   const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
+{
+   if (!agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip)) ||
+       agx_chip_descriptor_generation(dev->dev.chip) !=
+          AGX_DESCRIPTOR_GENERATION_10 ||
+       !hk_chip_supports_compressed_storage_pbe(dev->dev.chip) ||
+       info->regionCount == 0 || image->plane_count != 1 ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       image->vk.array_layers != 1 ||
+       vk_format_is_depth_or_stencil(image->vk.format) ||
+       vk_format_is_block_compressed(image->vk.format) ||
+       vk_format_get_blockwidth(image->vk.format) != 1 ||
+       vk_format_get_blockheight(image->vk.format) != 1)
+      return false;
+
+   const struct ail_layout *layout = &image->planes[0].layout;
+   if (layout->tiling != AIL_TILING_GPU || !layout->compressed)
+      return false;
+
+   const VkFormat view_format = hk_meta_compressed_copy_format(image->vk.format);
+   if (!hk_agx3_compressed_buf2img_view_format_supported(view_format))
+      return false;
+
+   const struct vk_physical_device *pdev = dev->vk.physical;
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      if (region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          region->imageSubresource.baseArrayLayer != 0)
+         return false;
+
+      const struct hk_g17p_buffer_to_image_copy copy =
+         hk_g17p_buffer_upload_desc(dev, image, info, region, 0,
+                                    image->vk.format);
+      struct hk_g17p_uncompressed_copy_plan plan;
+      if (!hk_g17p_uncompressed_buffer_to_image_copy_plan(
+             &copy, region->bufferOffset, buffer->vk.size, &plan))
+         return false;
+
+      if (plan.slice_count != 1 || plan.first_slice != 0 ||
+          plan.buffer_span_B > UINT32_MAX ||
+          plan.buffer_row_stride_B > UINT32_MAX)
+         return false;
+
+      struct hk_agx3_compressed_buf2img_grid grid;
+      if (!hk_agx3_compressed_buf2img_grid_init(
+             plan.base_x_el, plan.base_y_el, plan.width_el, plan.height_el,
+             pdev->properties.maxComputeWorkGroupCount[0],
+             pdev->properties.maxComputeWorkGroupCount[1], &grid))
+         return false;
+   }
+
+   return true;
+}
+
+static void
+hk_agx3_compressed_buffer_to_image(struct hk_cmd_buffer *cmd,
+                                   struct hk_buffer *buffer,
+                                   struct hk_image *image,
+                                   const VkCopyBufferToImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   const struct vk_physical_device *pdev = dev->vk.physical;
+   VkCommandBuffer handle = vk_command_buffer_to_handle(&cmd->vk);
+   const VkFormat view_format = hk_meta_compressed_copy_format(image->vk.format);
+   const struct hk_agx3_compressed_buf2img_key key = {
+      .key_type = HK_META_OBJECT_KEY_AGX3_COMPRESSED_BUF2IMG,
+      .view_format = view_format,
+   };
+
+   VkPipelineLayout layout;
+   VkPipeline pipeline;
+   VkResult result =
+      hk_agx3_compressed_buf2img_pipeline(dev, &key, &layout, &pipeline);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+
+   disp->CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   VkImageView dst_view = VK_NULL_HANDLE;
+   uint32_t bound_level = UINT32_MAX;
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      const uint32_t level = region->imageSubresource.mipLevel;
+      const struct hk_g17p_buffer_to_image_copy copy =
+         hk_g17p_buffer_upload_desc(dev, image, info, region, 0,
+                                    image->vk.format);
+      struct hk_g17p_uncompressed_copy_plan plan;
+      ASSERTED const bool planned =
+         hk_g17p_uncompressed_buffer_to_image_copy_plan(
+            &copy, region->bufferOffset, buffer->vk.size, &plan);
+      assert(planned);
+
+      struct hk_agx3_compressed_buf2img_grid grid;
+      ASSERTED const bool gridded = hk_agx3_compressed_buf2img_grid_init(
+         plan.base_x_el, plan.base_y_el, plan.width_el, plan.height_el,
+         pdev->properties.maxComputeWorkGroupCount[0],
+         pdev->properties.maxComputeWorkGroupCount[1], &grid);
+      assert(gridded);
+
+      if (r > 0) {
+         const VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+         };
+         const VkDependencyInfo dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+         };
+         disp->CmdPipelineBarrier2(handle, &dep);
+      }
+
+      if (level != bound_level) {
+         const VkImageViewUsageCreateInfo dst_view_usage = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+         };
+         const VkImageViewCreateInfo dst_view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+            .pNext = &dst_view_usage,
+            .image = hk_image_to_handle(image),
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = view_format,
+            .subresourceRange = {
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .baseMipLevel = level,
+               .levelCount = 1,
+               .baseArrayLayer = 0,
+               .layerCount = 1,
+            },
+         };
+         result = vk_meta_create_image_view(&cmd->vk, &dev->meta,
+                                            &dst_view_info, &dst_view);
+         if (unlikely(result != VK_SUCCESS)) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
+
+         const VkDescriptorImageInfo dst_info = {
+            .imageLayout = info->dstImageLayout,
+            .imageView = dst_view,
+         };
+         const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .pImageInfo = &dst_info,
+         };
+         disp->CmdPushDescriptorSetKHR(handle, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       layout, 0, 1, &write);
+         bound_level = level;
+      }
+
+      const struct hk_agx3_compressed_buf2img_push push = {
+         .src = hk_buffer_address_ro(buffer, region->bufferOffset),
+         .src_pitch_B = (uint32_t)plan.buffer_row_stride_B,
+         .x0 = plan.base_x_el,
+         .y0 = plan.base_y_el,
+         .width = plan.width_el,
+         .height = plan.height_el,
+         .tile_x0 = grid.tile_x0,
+         .tile_y0 = grid.tile_y0,
+      };
+      disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                             sizeof(push), &push);
+      disp->CmdDispatch(handle, grid.groups_x, grid.groups_y, 1);
+
+      if (cmd->current_cs.cs) {
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(image, 0),
+                                   image->planes[0].layout.size_B);
+      }
    }
 }
 
@@ -4391,7 +5438,7 @@ hk_g17p_raw_image_copy_supported(struct hk_device *dev,
                                  const struct hk_image *dst,
                                  const VkCopyImageInfo2 *info)
 {
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+   if (!agx_chip_agx3_path(dev->dev.chip) ||
        info->regionCount == 0 ||
        src->vk.samples != dst->vk.samples ||
        (src->vk.samples != VK_SAMPLE_COUNT_1_BIT &&
@@ -4550,6 +5597,60 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                                &dst_tile_config));
          assert(addressed);
 
+         const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+         const uint64_t linear_slice_B =
+            (src_level < src_layout->levels && dst_level < dst_layout->levels &&
+             src_level + 1 < ARRAY_SIZE(src_layout->level_offsets_B) &&
+             dst_level + 1 < ARRAY_SIZE(dst_layout->level_offsets_B))
+               ? hk_g17p_linear_tiled_slice_bytes(
+                    &(struct hk_g17p_linear_tiled_slice_copy){
+                       .src_tiled = src_tiled,
+                       .dst_tiled = dst_tiled,
+                       .src_compressed = src_layout->compressed,
+                       .dst_compressed = dst_layout->compressed,
+                       .src_sparse =
+                          (src->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .dst_sparse =
+                          (dst->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .src_type = src->vk.image_type,
+                       .dst_type = dst->vk.image_type,
+                       .src_samples = src->vk.samples,
+                       .dst_samples = dst->vk.samples,
+                       .src_w_el = DIV_ROUND_UP(
+                          u_minify(src_layout->width_px, src_level),
+                          util_format_get_blockwidth(src_layout->format)),
+                       .src_h_el = DIV_ROUND_UP(
+                          u_minify(src_layout->height_px, src_level),
+                          util_format_get_blockheight(src_layout->format)),
+                       .dst_w_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->width_px, dst_level),
+                          util_format_get_blockwidth(dst_layout->format)),
+                       .dst_h_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->height_px, dst_level),
+                          util_format_get_blockheight(dst_layout->format)),
+                       .src_tile_w_el = src_tile.width_el,
+                       .src_tile_h_el = src_tile.height_el,
+                       .dst_tile_w_el = dst_tile.width_el,
+                       .dst_tile_h_el = dst_tile.height_el,
+                       .src_tiles_per_row = src_tile_config.tiles_per_row,
+                       .dst_tiles_per_row = dst_tile_config.tiles_per_row,
+                       .raw_block_size_B = raw_block_size_B,
+                       .src_level = src_level,
+                       .src_levels = src_layout->levels,
+                       .dst_level = dst_level,
+                       .dst_levels = dst_layout->levels,
+                       .src_level_size_B =
+                          ail_get_level_size_B(src_layout, src_level),
+                       .dst_level_size_B =
+                          ail_get_level_size_B(dst_layout, dst_level),
+                       .max_groups_x =
+                          dev->vk.physical->properties.maxComputeWorkGroupCount[0],
+                       .plan = plan,
+                    })
+               : 0;
+
          for (uint32_t slice = 0; slice < src_slices; ++slice) {
             VkImageCopy2 one;
             const bool sliced = hk_g17p_image_copy_slice(
@@ -4564,11 +5665,25 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                dst->vk.image_type == VK_IMAGE_TYPE_3D
                   ? one.dstOffset.z
                   : one.dstSubresource.baseArrayLayer;
+            const uint64_t dst_off =
+               ail_get_layer_level_B(dst_layout, dst_slice, dst_level);
+            const uint64_t src_off =
+               ail_get_layer_level_B(src_layout, src_slice, src_level);
+            const uint64_t dst_addr = hk_image_base_address(dst, dst_plane) + dst_off;
+            const uint64_t src_addr = hk_image_base_address(src, src_plane) + src_off;
+            if (linear_slice_B &&
+                hk_g17p_linear_tiled_slice_addrs_valid(
+                   dst_addr, dst_off, dst_layout->size_B, src_addr, src_off,
+                   src_layout->size_B, linear_slice_B)) {
+               libagx_copy_uint4(cmd, agx_1d((uint32_t)(linear_slice_B >> 4)),
+                                 AGX_BARRIER_NONE, dst_addr, src_addr);
+               if (vk_command_buffer_has_error(&cmd->vk))
+                  return;
+               continue;
+            }
             const struct libagx_copy_image_args args = {
-               .dest = hk_image_base_address(dst, dst_plane) +
-                       ail_get_layer_level_B(dst_layout, dst_slice, dst_level),
-               .src = hk_image_base_address(src, src_plane) +
-                      ail_get_layer_level_B(src_layout, src_slice, src_level),
+               .dest = dst_addr,
+               .src = src_addr,
                .width_el = plan.width_el,
                .height_el = plan.height_el,
                .dest_x_el = plan.dst_x_el,
@@ -4620,9 +5735,9 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, dst_image, pCopyBufferToImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* Share the native raw tiled upload with M5. It preserves partial
-    * rectangles without an imageblock round trip or extra firmware job. */
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   /* Share the native raw tiled upload across HAL300 chips. It preserves
+    * partial rectangles without an imageblock round trip or extra firmware job. */
+   if (agx_chip_hal300_path(dev->dev.chip) &&
        hk_g17p_copy_uncompressed_buffer_to_image_supported(
           dev, src_buffer, dst_image, pCopyBufferToImageInfo)) {
       struct hk_meta_save save;
@@ -4633,12 +5748,20 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   /* On G18G the compute upload's bindless image store compiled but wrote
-    * nothing when tested (with the 64-byte storage-image descriptor; the
-    * cause was not isolated). Its draws work, so upload through the common
-    * graphics copy. */
-   bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   /* On Gen10 storage PBE hardware, upload into losslessly compressed 2D
+    * colour images directly from compute instead of a graphics render pass. */
+   if (hk_agx3_compressed_buffer_to_image_supported(
+          dev, src_buffer, dst_image, pCopyBufferToImageInfo)) {
+      struct hk_meta_save save;
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      hk_agx3_compressed_buffer_to_image(
+         cmd, src_buffer, dst_image, pCopyBufferToImageInfo);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      return;
+   }
+
+   bool gfx = hk_copy_requires_gfx(dst_image);
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
       uint32_t api_block_B, physical_block_B;
@@ -4717,7 +5840,7 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
        * integer alias image copies and readbacks use: through its own
        * format, a normalized view would canonicalize the bits it copies
        * (SNORM -1.0 has two encodings). */
-      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+      const bool m5 = agx_chip_hal300_path(dev->dev.chip);
       const bool m5_split_zs =
          m5 && hk_split_depth_stencil(dst_image->vk.format);
       const bool m5_color =
@@ -4813,7 +5936,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    VkFormat format;
    uint32_t api_block_B, physical_block_B;
    const bool padded_rgb =
-      agx_chip_native_or_m5(dev->dev.chip) &&
+      agx_chip_agx3_path(dev->dev.chip) &&
       pCopyImageToBufferInfo->regionCount > 0 &&
       hk_g17p_buffer_upload_plane(
          src_image,
@@ -4874,11 +5997,11 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_begin(cmd, &save, bind_point);
 
    if (gfx) {
-      const bool native = agx_chip_native_or_m5(dev->dev.chip);
+      const bool native = agx_chip_agx3_path(dev->dev.chip);
       /* Both sides of a depth/stencil copy use the same views: per-plane
        * aliases when either depth plane is compressed. */
       const bool zs_planes =
-         agx_chip_g17_m5(dev->dev.chip) ||
+         agx_chip_hal300_path(dev->dev.chip) ||
          (hk_split_depth_stencil(src_image->vk.format) &&
           (src_image->planes[0].layout.compressed ||
            dst_image->planes[0].layout.compressed));
@@ -4887,10 +6010,19 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image, dev, native, zs_planes);
 
-      const bool compressed_depth_array = agx_chip_g17_m5(dev->dev.chip) &&
+      const bool compressed_depth_array = agx_chip_hal300_path(dev->dev.chip) &&
          vk_format_is_depth_or_stencil(dst_image->vk.format) &&
          dst_image->vk.array_layers > 1 && dst_image->planes[0].layout.compressed;
-      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array) {
+      /* A region between a 2D array and a 3D image (the copier above takes
+       * neither when one of them is compressed) is one layered meta draw
+       * otherwise, which on M5 returns every layer past the first wrong
+       * (dEQP-VK.api.copy_and_blit.core.image_to_image.3d_images.2d_to_3d_whole);
+       * one draw per slice is exact. */
+      const bool array_to_volume = agx_chip_agx3_path(dev->dev.chip) &&
+         (src_image->vk.image_type == VK_IMAGE_TYPE_3D) !=
+            (dst_image->vk.image_type == VK_IMAGE_TYPE_3D);
+      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array ||
+          array_to_volume) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */
@@ -5089,7 +6221,7 @@ hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
 {
    const struct hk_physical_device *pdev =
       (const struct hk_physical_device *)dev->vk.physical;
-   if (dev->dev.chip != AGX_CHIP_G17P || buffer->va ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
        size < (64u << 20) || ((address | offset | size) & 15) ||
        !address || size > UINT64_MAX - address ||
        size / 16 > pdev->vk.properties.maxTexelBufferElements)
@@ -5130,7 +6262,7 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       /* VK_WHOLE_SIZE fills only complete 32-bit words. */
       VkDeviceSize size =
          vk_buffer_range(&buffer->vk, dstOffset, dstRange) & ~(VkDeviceSize)3;
@@ -5203,9 +6335,12 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
       if (pAttachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                         VK_IMAGE_ASPECT_STENCIL_BIT))
          hk_g17p_note_depth_clear(cmd, pAttachments[i].aspectMask);
-      if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-         cmd->state.gfx.render.color_written |=
-            BITFIELD_BIT(pAttachments[i].colorAttachment);
+      if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+         const uint8_t bit = BITFIELD_BIT(pAttachments[i].colorAttachment);
+         cmd->state.gfx.render.color_written |= bit;
+         if (!cmd->in_begin_rendering_clear && cmd->current_cs.gfx)
+            cmd->current_cs.gfx->user_color_written_mask |= bit;
+      }
    }
 
    struct hk_meta_save save;
@@ -5215,8 +6350,10 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
     * rendering command and remains inside an active conditional scope. */
    assert(!cmd->conditional_meta);
    cmd->conditional_meta = true;
+   cmd->in_clear_attachments = true;
    vk_meta_clear_attachments(&cmd->vk, &dev->meta, &render_info,
                              attachmentCount, pAttachments, rectCount, pRects);
+   cmd->in_clear_attachments = false;
    cmd->conditional_meta = false;
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
@@ -5242,6 +6379,10 @@ hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
    const bool device_address =
       (buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
       buffer->va;
+   if (lo_B >= hi_B || lo_B >= buffer->vk.size) {
+      hk_sync_xfer_begin_dst(cmd, 0, 0, device_address);
+      return;
+   }
    hk_sync_xfer_begin_dst(cmd, base + lo_B, base + MIN2(hi_B, buffer->vk.size),
                           device_address);
 }
@@ -5276,6 +6417,9 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (!info->regionCount)
+      return;
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, src, info->srcBuffer);

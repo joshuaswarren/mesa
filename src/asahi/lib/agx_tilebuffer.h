@@ -75,9 +75,14 @@ struct agx_tilebuffer_layout {
     * agx_build_tilebuffer_layout_resident(). */
    uint8_t resident_mask;
 
+   /* Render targets forced ahead of the remaining targets regardless of
+    * spilling (e.g. cleared targets packed into [0, 8) on G16G/G17P). Zero
+    * for the default order. */
+   uint8_t first_mask;
+
    /* Named so that layouts hashed or compared byte-wise have no
     * indeterminate padding. Always zero. */
-   uint8_t reserved[3];
+   uint8_t reserved[2];
 
    /* USC word corresponding to this configuration of the tilebuffer. Zero
     * for native imageblock layouts and for tiles above its 64-KiB limit
@@ -176,6 +181,20 @@ unsigned agx_tilebuffer_compact(const struct agx_tilebuffer_layout *src,
                                 struct agx_tilebuffer_layout *dst,
                                 uint8_t map[AGX_MAX_RENDER_TARGETS]);
 
+unsigned agx_tilebuffer_format_size_B(enum pipe_format format);
+
+/* Re-apply an already chosen first_mask ordering to a non-resident layout. */
+void agx_tilebuffer_apply_first_mask(struct agx_tilebuffer_layout *tib,
+                                     uint8_t first_mask);
+
+/* Try allocating targets in first_mask ahead of the rest so every target in
+ * first_mask fits inside [0, max_first_end_B). Adopts the reordered layout
+ * only when it improves placement, adds no spills, preserves tile_size, and
+ * every target in first_mask ends at or below max_first_end_B. */
+bool agx_tilebuffer_pack_first_if_fits(struct agx_tilebuffer_layout *tib,
+                                       uint8_t first_mask,
+                                       uint32_t max_first_end_B);
+
 void agx_tilebuffer_set_samples(struct agx_tilebuffer_layout *tib,
                                 unsigned nr_samples);
 
@@ -185,6 +204,19 @@ bool agx_nir_lower_tilebuffer(struct nir_shader *shader,
                               struct nir_def *write_samples, bool *translucent,
                               bool preserve_zero_mask,
                               bool lower_g17p_formats);
+
+struct agx_tilebuffer_lower_info {
+   /* True if translucency was required for any reason other than an unwritten
+    * bound attachment (masked/zero colormask, sample mask, tile/memory load,
+    * or spilled tilebuffer). */
+   bool translucent_other;
+
+   /* True if at least one bound attachment was not statically written. */
+   bool has_unwritten_rt;
+
+   /* Bitmask of bound render targets statically written by the shader. */
+   uint8_t outputs_written;
+};
 
 /* As agx_nir_lower_tilebuffer, plus explicit software sRGB and R11G11B10
  * conversions of tile values and, with x_alpha_one, 1.0 stored into the X
@@ -197,6 +229,13 @@ bool agx_nir_lower_tilebuffer_with_conversions(
    bool *translucent, bool preserve_zero_mask, bool lower_srgb,
    bool lower_r11g11b10, bool ms_whole_sample, bool lower_g17p_formats,
    bool x_alpha_one);
+
+bool agx_nir_lower_tilebuffer_with_conversions_info(
+   struct nir_shader *shader, struct agx_tilebuffer_layout *tib,
+   uint8_t *colormasks, unsigned *bindless_base, struct nir_def *write_samples,
+   bool *translucent, bool preserve_zero_mask, bool lower_srgb,
+   bool lower_r11g11b10, bool ms_whole_sample, bool lower_g17p_formats,
+   bool x_alpha_one, struct agx_tilebuffer_lower_info *info_out);
 /* Put spilled render target accesses back on immediate texture state slots
  * after descriptor crawling has run (G17G's bindful image accesses). */
 bool agx_nir_rebind_spilled_rts(struct nir_shader *shader);
@@ -328,6 +367,9 @@ bool agx_nir_unroll_g17p_samples(struct nir_shader *shader,
 bool agx_nir_unroll_g17p_samples_layout(
    struct nir_shader *shader, unsigned nr_samples,
    const struct agx_g17p_colour_layout *layout);
+bool agx_nir_unroll_g17p_samples_equiv(
+   struct nir_shader *shader, unsigned nr_samples,
+   const struct agx_g17p_colour_layout *layout);
 
 bool agx_nir_hoist_g17p_zs_writes(struct nir_shader *shader);
 
@@ -383,6 +425,11 @@ agx_build_tilebuffer_layout_g18_mixed(const enum pipe_format *formats,
 /* The attachment mask of a layout built that way (zero otherwise). */
 unsigned
 agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib);
+/* The attachment mask of any G18 single-sample layout whose offsets, sample
+ * size and formats match the native-1130 layout, including uniform layouts
+ * owned by the word/raw32 paths. */
+unsigned
+agx_g18g_native_mixed_epilog_mask(const struct agx_tilebuffer_layout *tib);
 
 /* The IMGWBLK f29 tile class Apple's end of tile uses for a witnessed format:
  * 0 8-bit integer lanes, 1 16-bit lanes, 2 32-bit lanes, 3 tile bytes in the

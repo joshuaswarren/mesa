@@ -10,6 +10,7 @@
 #include "agx_compile.h"
 #include "agx3_code_container_core.h"
 #include "agx3_tile_core.h"
+#include "agx3_transcode.h"
 #include "agx_device.h"
 #include "agx_linker.h"
 #include "agx_nir.h"
@@ -359,7 +360,8 @@ static struct agx_bg_eot_shader *
 agx_build_background_shader(struct agx_bg_eot_cache *cache,
                             struct agx_bg_eot_key *key)
 {
-   if (agx_chip_g17_m5(cache->dev->chip) && !key->tib.sample_size_B &&
+   const bool g18g = cache->dev->chip == AGX_CHIP_G18G;
+   if (agx_chip_hal300_path(cache->dev->chip) && !key->tib.sample_size_B &&
        key->tib.nr_samples <= 1 && !key->tib.layered &&
        !key->reserved_preamble && !agx_tilebuffer_spills(&key->tib)) {
       bool empty = true;
@@ -368,9 +370,22 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       if (empty) {
          /* Fresh G17G's no-op compute object is exactly END, with common
           * field0=1 GPR dword and absent field38/42 (zero staging bytes).
+          * G18G uses the agx3d equivalent (end; nop), matching
+          * agx3_build_container_stop_program_agx3d().
           * BG and EOT loaders use the same empty executable; their release
           * policy remains in the native stage-specific Ioto program. */
-         uint8_t text[] = {0x0e, 0, 0, 0};
+         uint8_t text[4];
+         if (g18g) {
+            text[0] = 0x08;
+            text[1] = 0x04;
+            text[2] = 0x08;
+            text[3] = 0x00;
+         } else {
+            text[0] = 0x0e;
+            text[1] = 0x00;
+            text[2] = 0x00;
+            text[3] = 0x00;
+         }
          const struct agx_shader_part bin = {
             .binary = text,
             .info = {
@@ -395,6 +410,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "agx_background");
+   b.shader->info.internal = true;
    b.shader->info.fs.untyped_color_outputs = true;
 
    struct agx_shader_key compiler_key = {
@@ -466,8 +482,8 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       bool layered = key->tib.layered;
       assert(nr > 0);
 
-      if (key->g17p_packed_clear && key->op[rt] == AGX_BG_CLEAR &&
-          agx_chip_native_agx3(cache->dev->chip) && rt == 0 &&
+      if (key->packed_clear && key->op[rt] == AGX_BG_CLEAR &&
+          agx_chip_native_or_m5(cache->dev->chip) && rt == 0 &&
           agx_g17p_packed_clear_ok(&key->tib)) {
          /* One raw tile word: the driver packed the clear colour exactly as
           * the R8G8B8A8_UNORM FLTNORM pair would, so store its 32 bits. */
@@ -529,7 +545,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    const bool g18_msaa = agx_g18_msaa4_tib(cache->dev, &key->tib);
    const bool g18_resolve =
       g18_msaa && !key->multisample_store;
-   if (g18g) {
+   if (g18g && !key->mixed_mrt) {
       /* The compiler substitutes Apple's 78-byte native text for the G17G RT0
        * store, and it has that text for a U8NORM imageblock only, so the gate
        * is the block store's physical format rather than a list of logical
@@ -552,7 +568,8 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
           key->tib.spilled[0] ||
           agx_tilebuffer_offset_B(&key->tib, 0) != 0 ||
           (!(cache->dev->chip == AGX_CHIP_G18G &&
-             key->tib.logical_format[0] == PIPE_FORMAT_R11G11B10_FLOAT) &&
+             (key->tib.logical_format[0] == PIPE_FORMAT_R11G11B10_FLOAT ||
+              key->tib.logical_format[0] == PIPE_FORMAT_R9G9B9E5_FLOAT)) &&
            !agx_g17g_rt0_eot_physical_format_supported(
               agx_tilebuffer_physical_format(&key->tib, 0))))
          return NULL;
@@ -567,9 +584,11 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    unsigned m5_stores = 0;
    for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt)
       m5_stores += key->op[rt] == AGX_EOT_STORE;
-   const bool m5_layered_pair = agx_chip_g17_m5(cache->dev->chip) &&
+   const bool m5_layered_pair = agx_chip_hal300_path(cache->dev->chip) &&
       key->tib.layered && key->m5_store_and_resolve;
-   if (agx_chip_g17_m5(cache->dev->chip) && m5_stores &&
+   if ((agx_chip_g17_m5(cache->dev->chip) ||
+        (g18g && (key->mixed_mrt || m5_layered_pair))) &&
+       m5_stores &&
        (m5_stores > 1 || key->op[0] != AGX_EOT_STORE || m5_layered_pair)) {
       if (agx_tilebuffer_spills(&key->tib))
          return NULL;
@@ -585,7 +604,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
             return NULL;
          selectors[active++] = selector;
       }
-      uint8_t text[AGX3_M5_MRT_EOT_MAX_LENGTH];
+      uint8_t text[AGX3_M5_MRT_EOT_MAX_LENGTH * 2];
       size_t size;
       if (m5_layered_pair) {
          if (m5_stores != 1 || !key->multisample_store)
@@ -598,6 +617,25 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       if (!agx3_m5_mrt_eot_generate_sample_mask(m5_stores, selectors,
              sample_mask, key->tib.layered, text, sizeof(text), &size))
          return NULL;
+      if (g18g) {
+         struct util_dynarray code;
+         util_dynarray_init(&code, NULL);
+         memcpy(util_dynarray_grow_bytes(&code, 1, size), text, size);
+         const char *why = NULL;
+         unsigned at = 0;
+         const bool ok = agx3_transcode_agx3d(&code, 0, &why, &at) &&
+                         code.size <= sizeof(text);
+         if (ok) {
+            memcpy(text, code.data, code.size);
+            size = code.size;
+         } else {
+            mesa_loge("asahi: G18G MRT EOT not re-encoded: %s at +0x%x",
+                      why ? why : "exceeds buffer", at);
+         }
+         util_dynarray_fini(&code);
+         if (!ok)
+            return NULL;
+      }
       const struct agx_shader_part bin = {
          .binary = text,
          .info = {
@@ -656,6 +694,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                   &agx_nir_options, "agx_eot");
+   b.shader->info.internal = true;
 
    /* A multisample tile can be written out two ways. The default is to
     * resolve it through an ordinary single-sample PBE target, which is what
@@ -735,11 +774,9 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
          /* M5 reads the packed word as the packed-float tile format and
           * converts it to the R11G11B10 PBE (agx_rt0_pbe_format). */
          physical = (enum pipe_format)AIL_ISA_FORMAT_RG11B10F;
-      } else if ((agx_chip_native_or_m5(cache->dev->chip) &&
-                  (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
-                   key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
-                 (g18g &&
-                  key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT)) {
+      } else if (agx_chip_agx3_path(cache->dev->chip) &&
+                 (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
+                  key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) {
          /* G17P keeps packed-float tiles as one raw 32-bit word. The matching
           * PBE descriptor also uses R32_UINT to preserve those exact bits.
           * G17G stores RG11B10Float and RGB9E5Float tiles the same way: one

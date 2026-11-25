@@ -479,6 +479,7 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
 {
    const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    if ((!m5 && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B) ||
+       agx_is_g18g(&ctx->key->dev) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return false;
 

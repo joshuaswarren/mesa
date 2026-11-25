@@ -181,3 +181,17 @@ struct agx_ppp_hal300_graphics_core {
 bool agx_ppp_hal300_graphics_core_pack(
    enum agx_chip chip, const struct agx_ppp_hal300_graphics_fields *fields,
    struct agx_ppp_hal300_graphics_core *out);
+
+/* Record index and fragment-program pair layout inside the HAL300 PPP update. */
+#define AGX_PPP_HAL300_PROGRAM_RECORD             1
+#define AGX_PPP_HAL300_PROGRAM_RECORD_PAIR_OFFSET 16
+#define AGX_PPP_HAL300_PROGRAM_RECORD_PAIR_SIZE   8
+
+/* Replace the fragment program address in a core packed by
+ * agx_ppp_hal300_graphics_core_pack() for the same chip, keeping the pair's
+ * template bits and every other byte, so it matches a full pack of the same
+ * fields with only fragment_program changed. Returns false, leaving core
+ * untouched, if the address cannot be encoded. */
+bool agx_ppp_hal300_graphics_core_patch_program(
+   enum agx_chip chip, struct agx_ppp_hal300_graphics_core *core,
+   uint64_t fragment_program);

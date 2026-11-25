@@ -356,11 +356,15 @@ build_blit_shader(const struct vk_meta_blit_key *key)
 static VkResult
 get_blit_pipeline_layout(struct vk_device *device,
                          struct vk_meta_device *meta,
+                         bool combined_descriptors,
                          VkPipelineLayout *layout_out)
 {
-   enum vk_meta_object_key_type key = VK_META_OBJECT_KEY_BLIT;
+   const struct {
+      enum vk_meta_object_key_type key_type;
+      uint32_t combined_descriptors;
+   } key = { VK_META_OBJECT_KEY_BLIT, combined_descriptors };
 
-   if (vk_meta_use_combined_blit_descriptors(meta)) {
+   if (combined_descriptors) {
       /* One combined binding per aspect.  A depth/stencil blit pushes two
        * descriptors in the same call, so they cannot share a binding. */
       const VkDescriptorSetLayoutBinding binding[] = {{
@@ -573,7 +577,13 @@ do_blit(struct vk_command_buffer *cmd,
    VkResult result;
 
    VkPipelineLayout pipeline_layout;
-   result = get_blit_pipeline_layout(device, meta, &pipeline_layout);
+   /* Resolves use multisample texel fetches without a sampler. Match the
+    * layout to the descriptor type pushed for this operation.
+    */
+   const bool combined_descriptors =
+      vk_meta_use_combined_blit_descriptors(meta) && sampler != VK_NULL_HANDLE;
+   result = get_blit_pipeline_layout(device, meta, combined_descriptors,
+                                     &pipeline_layout);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(cmd, result);
       return;
@@ -582,13 +592,8 @@ do_blit(struct vk_command_buffer *cmd,
    uint32_t desc_count = 0;
    VkDescriptorImageInfo image_infos[3];
    VkWriteDescriptorSet desc_writes[3];
-   /* Every aspect must agree with the layout, which declares one combined
-    * binding per aspect.  Restricting this to colour left a depth/stencil
-    * blit pushing plain sampled images into combined bindings. */
-   const bool combined_push_diagnostic =
-      vk_meta_use_combined_blit_descriptors(meta) && sampler != VK_NULL_HANDLE;
 
-   if (sampler != VK_NULL_HANDLE && !combined_push_diagnostic) {
+   if (sampler != VK_NULL_HANDLE && !combined_descriptors) {
       image_infos[desc_count] = (VkDescriptorImageInfo) {
          .sampler = sampler,
       };
@@ -635,13 +640,13 @@ do_blit(struct vk_command_buffer *cmd,
       assert(desc_count < ARRAY_SIZE(image_infos));
       assert(desc_count < ARRAY_SIZE(desc_writes));
       image_infos[desc_count] = (VkDescriptorImageInfo) {
-         .sampler = combined_push_diagnostic ? sampler : VK_NULL_HANDLE,
+         .sampler = combined_descriptors ? sampler : VK_NULL_HANDLE,
          .imageView = src_view,
       };
       desc_writes[desc_count] = (VkWriteDescriptorSet) {
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstBinding = aspect_to_tex_binding(aspect),
-         .descriptorType = combined_push_diagnostic
+         .descriptorType = combined_descriptors
                               ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                               : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
          .descriptorCount = 1,
@@ -660,7 +665,7 @@ do_blit(struct vk_command_buffer *cmd,
 
    while (aspects_left) {
       key->aspects = aspects_left;
-      key->combined_descriptors = combined_push_diagnostic;
+      key->combined_descriptors = combined_descriptors;
 
       /* If we need to write stencil via iterative discard, it has to be
        * written by itself because otherwise the discards would also throw

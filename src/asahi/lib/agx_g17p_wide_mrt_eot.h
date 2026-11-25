@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: MIT */
-/* Native G17P EOT texts and metadata captured with MetalToolchain
- * 27.1.5194.15.
- * Every attachment stays in physical imageblock partition zero.
- * EOT partitions are offset/sample-stride quotients, distinct from
- * fragment pixel synchronization classes. Active PBEs are packed. */
+/* G17P wide-MRT EOT shaders: attachments stay in imageblock partition 0
+ * (offset/sample-stride quotients, distinct from pixel sync classes) with
+ * active PBEs packed. */
 #ifndef AGX_G17P_WIDE_MRT_EOT_H
 #define AGX_G17P_WIDE_MRT_EOT_H
 #include <stdbool.h>

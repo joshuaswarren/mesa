@@ -44,8 +44,10 @@ extern "C" {
 /*
  * The megakernel is one compute shader.  Its workgroup is one AGX subgroup
  * wide so that a ray-generation shader's divergence costs at most one
- * subgroup, and flat in Y/Z so the launch index arithmetic is a pure
- * decomposition of the compute global invocation id.
+ * subgroup.  For 2D/3D launches (height > 1), each 32-lane workgroup is
+ * remapped in the shader to an 8x4 2D tile for spatial ray coherence and
+ * G-buffer locality; 1D launches (height <= 1) keep a flat 32x1 strip so no
+ * lanes are wasted on empty rows.
  */
 /*
  * maxRayRecursionDepth.  Recursion is unrolled into the megakernel at compile
@@ -66,6 +68,11 @@ extern "C" {
 #define HK_RT_WORKGROUP_SIZE_X_LOG2 5
 #define HK_RT_WORKGROUP_SIZE_Y 1
 #define HK_RT_WORKGROUP_SIZE_Z 1
+
+#define HK_RT_TILE_2D_X      8
+#define HK_RT_TILE_2D_X_LOG2 3
+#define HK_RT_TILE_2D_Y      4
+#define HK_RT_TILE_2D_Y_LOG2 2
 
 struct hk_ray_tracing_group_handle {
    uint32_t index;
