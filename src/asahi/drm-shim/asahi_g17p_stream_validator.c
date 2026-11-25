@@ -666,6 +666,7 @@ asahi_g17p_compute_validate(
             return fail_at(cursor, "invalid compact compute launch ordering");
 
          local.launches++;
+         local.indirect_launches++;
          need_barrier = true;
          direct_tail = false;
          cursor += AGX3_CDM_INDIRECT_LAUNCH_SIZE;
@@ -731,6 +732,8 @@ asahi_g17p_compute_validate(
 
          local.barriers++;
          local.strong_barriers += record.data.barrier.flags == 0x5;
+         local.indirect_strong_barriers +=
+            !direct_tail && record.data.barrier.flags == 0x5;
          need_barrier = false;
          break;
 
@@ -1055,7 +1058,8 @@ static bool
 validate_bind_tail(const struct asahi_g17p_stream_memory *memory,
                    uint64_t address,
                    struct asahi_g17p_stream_stats *stats,
-                   uint8_t fs_slot_out[AGX_PPP_HAL200_FS_LENGTH])
+                   uint8_t fs_slot_out[AGX_PPP_HAL200_FS_LENGTH],
+                   uint8_t cull_slot_out[AGX_PPP_HAL200_CULL_LENGTH])
 {
    uint32_t controls[8] = {
       0x700, 0x500, 0x700, 0x500, 0, 0x300, 0x200, 0x200,
@@ -1138,6 +1142,8 @@ validate_bind_tail(const struct asahi_g17p_stream_memory *memory,
        !read_owned(memory, compact_address(decoded[1].context_offset),
                    fs_slot_out, AGX_PPP_HAL200_FS_LENGTH))
       return fail_at(address, "fragment bind slot is not readable");
+   if (cull_slot_out)
+      memcpy(cull_slot_out, cull_record, sizeof(cull_record));
 
    return true;
 }
@@ -1170,6 +1176,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
    bool have_latched_vs = false;
    struct agx_vdm_state_update_info latched_vs = {0};
    uint8_t latched_fs_slot[AGX_PPP_HAL200_FS_LENGTH] = {0};
+   uint8_t latched_cull_slot[AGX_PPP_HAL200_CULL_LENGTH] = {0};
    bool tessellation_state_seen = false;
    bool restart_seen = false;
    /* Honeykrisp re-emits the restart State Update only when the restart
@@ -1275,7 +1282,8 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
        * without a preceding VS update. Do not decode its first bind pair as
        * the separate initial 12-byte PPP record. */
       if (have_state && load_le32(bytes) == UINT32_C(0x00000500)) {
-         if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
+         if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot,
+                                 latched_cull_slot))
             return false;
          cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
          pending_selector = true;
@@ -1330,6 +1338,32 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
                               "standalone FS PPP update changed non-program "
                               "state without full bind tail");
             local.incremental_fs_ppp_updates++;
+         } else if (record.data.ppp_state_update.size_words ==
+                    AGX_PPP_HAL200_CULL_LENGTH / 4) {
+            if (!bind_tail_latched)
+               return fail_at(cursor,
+                              "standalone CULL PPP update without latched bind tail");
+            const uint64_t ptr = record.data.ppp_state_update.pointer;
+            if (!ptr || ptr > UINT32_MAX || (ptr & 63) != 0)
+               return fail_at(cursor,
+                              "standalone CULL PPP update has invalid/unaligned pointer");
+            const uint64_t cull_addr = compact_address((uint32_t)ptr);
+            uint8_t cull_bytes[AGX_PPP_HAL200_CULL_LENGTH];
+            if (!validate_slot(memory, 7, cull_addr, AGX_PPP_HAL200_CULL_LENGTH,
+                               &local) ||
+                !read_owned(memory, cull_addr, cull_bytes, sizeof(cull_bytes)))
+               return false;
+            /* Standalone CULL updates may only change cull mode and front-face
+             * winding (bits 0..1 and 16); provoking vertex, depth clip,
+             * primitive MSAA, and rasterizer discard must match the latched
+             * bind tail's CULL slot. */
+            if (load_le32(cull_bytes) != load_le32(latched_cull_slot) ||
+                (load_le32(cull_bytes + 4) & ~UINT32_C(0x10003)) !=
+                   (load_le32(latched_cull_slot + 4) & ~UINT32_C(0x10003)))
+               return fail_at(cursor,
+                              "standalone CULL PPP update changed non-cull "
+                              "state without full bind tail");
+            local.incremental_cull_ppp_updates++;
          } else {
             if (!validate_initial_ppp(
                    memory, record.data.ppp_state_update.pointer,
@@ -1357,7 +1391,8 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          }
          cursor += record.length;
          if (!have_state || !bind_tail_latched) {
-            if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
+            if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot,
+                                    latched_cull_slot))
                return false;
             cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
             pending_selector = true;
@@ -1368,7 +1403,8 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             uint8_t next_word[4];
             if (read_owned(memory, cursor, next_word, sizeof(next_word)) &&
                 load_le32(next_word) == UINT32_C(0x00000500)) {
-               if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
+               if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot,
+                                       latched_cull_slot))
                   return false;
                cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
                pending_selector = true;

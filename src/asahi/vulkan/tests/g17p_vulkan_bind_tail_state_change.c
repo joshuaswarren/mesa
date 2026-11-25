@@ -7,17 +7,22 @@
  * cull mode, depth compare op, and color blend).
  *
  * Driven under asahi_noop_drm_shim with ASAHI_SHIM_VALIDATE_G17P_STREAM=1 and
- * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2:
- *   Draw 0: initial draw                    -> full bind tail (#1)
- *   Draw 1: push-constant-only change       -> elided tail (#1) + 28B FS PPP (#1)
- *   Draw 2: dynamic scissor + push const    -> full bind tail (#2)
- *   Draw 3: dynamic viewport + push const   -> full bind tail (#3)
- *   Draw 4: dynamic cull mode + push const  -> full bind tail (#4)
- *   Draw 5: dynamic depth op + push const   -> full bind tail (#5)
- *   Draw 6: blend-enabled pipe + push const -> full bind tail (#6)
- *   Draw 7: push-constant-only change       -> elided tail (#2) + 28B FS PPP (#2)
+ * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3,4 (or 6,3,0,4 with --vs-only-push):
+ *   Draw 0:  initial draw                    -> full bind tail (#1)
+ *   Draw 1:  push-constant-only change       -> elided tail (#1) + 28B FS PPP (#1)
+ *   Draw 2:  dynamic scissor + push const    -> full bind tail (#2)
+ *   Draw 3:  dynamic viewport + push const   -> full bind tail (#3)
+ *   Draw 4:  dynamic cull mode + push const  -> elided tail (#2) + 28B FS PPP (#2) + 8B CULL PPP (#1)
+ *   Draw 5:  pure cull-mode-only change      -> 8B CULL PPP (#2), no VDM state update
+ *   Draw 6:  pure front-face-only change     -> 8B CULL PPP (#3), no VDM state update
+ *   Draw 7:  dynamic depth op + push const   -> full bind tail (#4)
+ *   Draw 8:  blend-enabled pipe + push const -> full bind tail (#5)
+ *   Draw 9:  push-constant-only change       -> elided tail (#3) + 28B FS PPP (#3)
+ *   Draw 10: pure cull-mode-only change      -> 8B CULL PPP (#4), clears fs_record_in_tail_valid
+ *   Draw 11: new render pass, same state     -> full bind tail (#6) rebuilt after fs_record_in_tail_valid=false
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,6 +264,54 @@ static const uint32_t test_frag_spv[] = {
    0x0000002a, 0x0000003c, 0x000100fd, 0x00010038,
 };
 
+/* Minimal GLSL 450 FS reading a dynamic-indexed set-0 UBO + varyings, without
+ * reading push constants (agx3_uses_root = true, agx3_root_reads = 0). */
+static const uint32_t test_frag_no_push_spv[] = {
+   0x07230203, 0x00010000, 0x0008000b, 0x00000028, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000004,
+   0x00000004, 0x6e69616d, 0x00000000, 0x0000000c, 0x00000018, 0x0000001a,
+   0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2,
+   0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008,
+   0x00786469, 0x00040005, 0x0000000c, 0x76755f76, 0x00000000, 0x00050005,
+   0x00000018, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00040005, 0x0000001a,
+   0x6f635f76, 0x00726f6c, 0x00030005, 0x0000001e, 0x00000055, 0x00050006,
+   0x0000001e, 0x00000000, 0x6f6c6f63, 0x00007372, 0x00030005, 0x00000020,
+   0x00000075, 0x00040047, 0x0000000c, 0x0000001e, 0x00000000, 0x00040047,
+   0x00000018, 0x0000001e, 0x00000000, 0x00040047, 0x0000001a, 0x0000001e,
+   0x00000001, 0x00040047, 0x0000001d, 0x00000006, 0x00000010, 0x00030047,
+   0x0000001e, 0x00000002, 0x00050048, 0x0000001e, 0x00000000, 0x00000023,
+   0x00000000, 0x00040047, 0x00000020, 0x00000021, 0x00000000, 0x00040047,
+   0x00000020, 0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+   0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000,
+   0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00030016, 0x00000009,
+   0x00000020, 0x00040017, 0x0000000a, 0x00000009, 0x00000002, 0x00040020,
+   0x0000000b, 0x00000001, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c,
+   0x00000001, 0x0004002b, 0x00000006, 0x0000000d, 0x00000000, 0x00040020,
+   0x0000000e, 0x00000001, 0x00000009, 0x0004002b, 0x00000009, 0x00000011,
+   0x40400000, 0x0004002b, 0x00000009, 0x00000013, 0x00000000, 0x00040017,
+   0x00000016, 0x00000009, 0x00000004, 0x00040020, 0x00000017, 0x00000003,
+   0x00000016, 0x0004003b, 0x00000017, 0x00000018, 0x00000003, 0x00040020,
+   0x00000019, 0x00000001, 0x00000016, 0x0004003b, 0x00000019, 0x0000001a,
+   0x00000001, 0x0004002b, 0x00000006, 0x0000001c, 0x00000004, 0x0004001c,
+   0x0000001d, 0x00000016, 0x0000001c, 0x0003001e, 0x0000001e, 0x0000001d,
+   0x00040020, 0x0000001f, 0x00000002, 0x0000001e, 0x0004003b, 0x0000001f,
+   0x00000020, 0x00000002, 0x00040015, 0x00000021, 0x00000020, 0x00000001,
+   0x0004002b, 0x00000021, 0x00000022, 0x00000000, 0x00040020, 0x00000024,
+   0x00000002, 0x00000016, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008,
+   0x00000007, 0x00050041, 0x0000000e, 0x0000000f, 0x0000000c, 0x0000000d,
+   0x0004003d, 0x00000009, 0x00000010, 0x0000000f, 0x00050085, 0x00000009,
+   0x00000012, 0x00000010, 0x00000011, 0x0008000c, 0x00000009, 0x00000014,
+   0x00000001, 0x0000002b, 0x00000012, 0x00000013, 0x00000011, 0x0004006d,
+   0x00000006, 0x00000015, 0x00000014, 0x0003003e, 0x00000008, 0x00000015,
+   0x0004003d, 0x00000016, 0x0000001b, 0x0000001a, 0x0004003d, 0x00000006,
+   0x00000023, 0x00000008, 0x00060041, 0x00000024, 0x00000025, 0x00000020,
+   0x00000022, 0x00000023, 0x0004003d, 0x00000016, 0x00000026, 0x00000025,
+   0x00050085, 0x00000016, 0x00000027, 0x0000001b, 0x00000026, 0x0003003e,
+   0x00000018, 0x00000027, 0x000100fd, 0x00010038,
+};
+
 static uint32_t
 find_mem_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits,
               VkMemoryPropertyFlags req)
@@ -339,6 +392,7 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
       VK_DYNAMIC_STATE_VIEWPORT,
       VK_DYNAMIC_STATE_SCISSOR,
       VK_DYNAMIC_STATE_CULL_MODE,
+      VK_DYNAMIC_STATE_FRONT_FACE,
       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
    };
    VkPipelineDynamicStateCreateInfo dyn = {
@@ -368,8 +422,13 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   bool vs_only_push = false;
+   for (int i = 1; i < argc; ++i) {
+      if (!strcmp(argv[i], "--vs-only-push"))
+         vs_only_push = true;
+   }
    VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "g17p_vulkan_bind_tail_state_change",
@@ -558,10 +617,89 @@ main(void)
       dev,
       &(VkShaderModuleCreateInfo){
          .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-         .codeSize = sizeof(test_frag_spv),
-         .pCode = test_frag_spv,
+         .codeSize = vs_only_push ? sizeof(test_frag_no_push_spv)
+                                  : sizeof(test_frag_spv),
+         .pCode = vs_only_push ? test_frag_no_push_spv : test_frag_spv,
       },
       NULL, &fsm));
+
+   VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+   VkDescriptorPool dpool = VK_NULL_HANDLE;
+   VkDescriptorSet dset = VK_NULL_HANDLE;
+   VkBuffer ubo_buf = VK_NULL_HANDLE;
+   VkDeviceMemory ubo_mem = VK_NULL_HANDLE;
+   if (vs_only_push) {
+      VkDescriptorSetLayoutBinding ubo_binding = {
+         .binding = 0,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      };
+      CHECK(vkCreateDescriptorSetLayout(
+         dev,
+         &(VkDescriptorSetLayoutCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &ubo_binding,
+         },
+         NULL, &dsl));
+      CHECK(vkCreateBuffer(
+         dev,
+         &(VkBufferCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = 64,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+         },
+         NULL, &ubo_buf));
+      VkMemoryRequirements umr;
+      vkGetBufferMemoryRequirements(dev, ubo_buf, &umr);
+      CHECK(vkAllocateMemory(
+         dev,
+         &(VkMemoryAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = umr.size,
+            .memoryTypeIndex = find_mem_type(
+               &mp, umr.memoryTypeBits,
+               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+         },
+         NULL, &ubo_mem));
+      CHECK(vkBindBufferMemory(dev, ubo_buf, ubo_mem, 0));
+      VkDescriptorPoolSize pool_size = {
+         .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+      };
+      CHECK(vkCreateDescriptorPool(
+         dev,
+         &(VkDescriptorPoolCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+         },
+         NULL, &dpool));
+      CHECK(vkAllocateDescriptorSets(
+         dev,
+         &(VkDescriptorSetAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = dpool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &dsl,
+         },
+         &dset));
+      VkDescriptorBufferInfo bi = {.buffer = ubo_buf, .offset = 0, .range = 64};
+      vkUpdateDescriptorSets(
+         dev, 1,
+         &(VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = dset,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &bi,
+         },
+         0, NULL);
+   }
 
    VkPushConstantRange pcr = {
       .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -573,6 +711,8 @@ main(void)
       dev,
       &(VkPipelineLayoutCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .setLayoutCount = vs_only_push ? 1 : 0,
+         .pSetLayouts = vs_only_push ? &dsl : NULL,
          .pushConstantRangeCount = 1,
          .pPushConstantRanges = &pcr,
       },
@@ -641,9 +781,14 @@ main(void)
 
    /* Draw 0: initial full bind tail (#1). */
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_opaque);
+   if (vs_only_push) {
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1,
+                              &dset, 0, NULL);
+   }
    vkCmdSetViewport(cmd, 0, 1, &vp0);
    vkCmdSetScissor(cmd, 0, 1, &sc0);
    vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
+   vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -676,7 +821,8 @@ main(void)
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 4: rasterizer cull-mode change -> must re-emit full bind tail (#4). */
+   /* Draw 4: rasterizer cull-mode change + push const -> elided tail (#2) +
+    * 28B FS PPP (#2, or 0 for --vs-only-push) + 8B CULL PPP (#1). */
    vkCmdSetCullMode(cmd, VK_CULL_MODE_FRONT_BIT);
    pc.draw_id = 4;
    pc.color[0] = 0.3f;
@@ -685,32 +831,68 @@ main(void)
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 5: depth-stencil compare-op change -> must re-emit full bind tail (#5). */
+   /* Draw 5: pure bare-CULL-only change (no push-constant update) ->
+    * hk_g17p_flush_dynamic_state_fast() early return emitting ONLY an 8B CULL
+    * PPP update (#2) directly between INDEX_LIST draws with no VDM state
+    * update. */
+   vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   /* Draw 6: pure front-face-only change (no push-constant update) ->
+    * early return emitting ONLY an 8B CULL PPP update (#3). */
+   vkCmdSetFrontFace(cmd, VK_FRONT_FACE_CLOCKWISE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   /* Draw 7: depth-stencil compare-op change -> must re-emit full bind tail (#4). */
    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_GREATER_OR_EQUAL);
-   pc.draw_id = 5;
+   pc.draw_id = 7;
    pc.color[1] = 0.2f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 6: blend state change (pipeline bind) -> must re-emit full bind tail (#6). */
+   /* Draw 8: blend state change (pipeline bind) -> must re-emit full bind tail (#5). */
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_blend);
-   pc.draw_id = 6;
+   pc.draw_id = 8;
    pc.color[2] = 0.1f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-   /* Draw 7: push-constant-only change after blend bind -> elided (#2) + 28B FS PPP (#2). */
-   pc.draw_id = 7;
+   /* Draw 9: push-constant-only change after blend bind -> elided (#3) +
+    * 28B FS PPP (#3, or 0 for --vs-only-push). */
+   pc.draw_id = 9;
    pc.color[0] = 0.95f;
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
+   /* Draw 10: pure bare-CULL-only change -> 8B CULL PPP (#4), leaving
+    * prepared->valid == true and fs_record_in_tail_valid == false in both
+    * normal and --vs-only-push modes. */
+   vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   vkCmdEndRenderPass(cmd);
+
+   /* Draw 11: new render pass (LOAD_OP_CLEAR -> fresh render stream) with
+    * unchanged pipeline, dynamic state, and push constants must rebuild the
+    * full bind tail (#6) because fs_record_in_tail_valid is false. */
+   vkCmdBeginRenderPass(
+      cmd,
+      &(VkRenderPassBeginInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+         .renderPass = rp,
+         .framebuffer = fb,
+         .renderArea = {{0, 0}, {size, size}},
+         .clearValueCount = 2,
+         .pClearValues = clears,
+      },
+      VK_SUBPASS_CONTENTS_INLINE);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
    vkCmdEndRenderPass(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 
@@ -728,6 +910,12 @@ main(void)
    vkDestroyPipeline(dev, pipe_blend, NULL);
    vkDestroyPipeline(dev, pipe_opaque, NULL);
    vkDestroyPipelineLayout(dev, pl, NULL);
+   if (vs_only_push) {
+      vkDestroyDescriptorPool(dev, dpool, NULL);
+      vkDestroyBuffer(dev, ubo_buf, NULL);
+      vkFreeMemory(dev, ubo_mem, NULL);
+      vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+   }
    vkDestroyShaderModule(dev, fsm, NULL);
    vkDestroyShaderModule(dev, vsm, NULL);
    vkDestroyFramebuffer(dev, fb, NULL);

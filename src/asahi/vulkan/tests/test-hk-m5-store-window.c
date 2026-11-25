@@ -161,7 +161,7 @@ check_lowering(enum glsl_sampler_dim dim, bool array, bool window)
       .align_mul = 4, .write_mask = 1);
 
    CHECK(hk_nir_lower_descriptors(b.shader, &vk_robustness_disabled, 1,
-      layouts, false, false, 0, false, false, false, false, window));
+      layouts, false, false, 0, false, false, false, false, window, false));
    nir_validate_shader(b.shader, "after hk_nir_lower_descriptors");
 
    const bool layered = dim == GLSL_SAMPLER_DIM_CUBE || array;
@@ -179,10 +179,28 @@ check_lowering(enum glsl_sampler_dim dim, bool array, bool window)
    free(layout);
 }
 
+static void
+check_m5_chip_predicates(void)
+{
+   CHECK(agx_chip_g17_m5(AGX_CHIP_G17G));
+   CHECK(agx_chip_g17_m5(AGX_CHIP_G17S));
+   CHECK(agx_chip_g17_m5(AGX_CHIP_G17C));
+   CHECK(!agx_chip_g17_m5(AGX_CHIP_G17P));
+   CHECK(!agx_chip_g17_m5(AGX_CHIP_G18G));
+
+   CHECK(agx_chip_g17p_or_m5(AGX_CHIP_G17P));
+   CHECK(agx_chip_g17p_or_m5(AGX_CHIP_G17G));
+   CHECK(agx_chip_g17p_or_m5(AGX_CHIP_G17S));
+   CHECK(agx_chip_g17p_or_m5(AGX_CHIP_G17C));
+   CHECK(!agx_chip_g17p_or_m5(AGX_CHIP_G16G));
+   CHECK(!agx_chip_g17p_or_m5(AGX_CHIP_G18G));
+}
+
 int
 main(void)
 {
    check_record();
+   check_m5_chip_predicates();
 
    glsl_type_singleton_init_or_ref();
    for (unsigned w = 0; w < 2; ++w) {

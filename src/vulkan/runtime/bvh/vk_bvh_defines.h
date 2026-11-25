@@ -464,6 +464,20 @@ struct leaf_args {
    REF(vk_build_range_info) indirect;
 };
 
+#define LEAF_MORTON_WORKGROUP_SIZE 256
+
+#define VK_LEAF_MORTON_BUILD_FLAGS (VK_LEAF_BUILD_FLAGS | VK_MORTON_BUILD_FLAGS)
+
+struct leaf_morton_args {
+   VOID_REF bvh;
+   REF(vk_ir_header) header;
+   VOID_REF ids_dst;
+   VOID_REF hploc_ranges;
+
+   vk_bvh_geometry_data geom_data;
+   uint32_t leaf_count;
+};
+
 #define VK_MORTON_BUILD_FLAGS (VK_BUILD_FLAG_64BIT_KEYS)
 
 struct morton_sort_args {

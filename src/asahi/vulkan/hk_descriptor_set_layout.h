@@ -59,6 +59,10 @@ struct hk_descriptor_set_layout {
     * this ABI because Gen9 covers several distinct chips. */
    bool native_sampler_indices;
 
+   /* Precomputed at layout creation: true if the layout or any binding permits
+    * UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING. */
+   bool has_update_after_bind;
+
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;
@@ -78,6 +82,13 @@ struct hk_descriptor_set_layout {
    /* Bindings in this descriptor set */
    struct hk_descriptor_set_binding_layout binding[0];
 };
+
+static inline bool
+hk_descriptor_set_layout_allows_update_after_bind(
+   const struct hk_descriptor_set_layout *layout)
+{
+   return !layout || layout->has_update_after_bind;
+}
 
 static inline uint16_t
 hk_sampler_descriptor_index(const struct hk_descriptor_set_layout *layout,
@@ -105,6 +116,24 @@ uint32_t hk_descriptor_buffer_size(const struct agx_device *dev,
                                    VkDescriptorType type);
 
 void hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout);
+
+struct blob;
+struct blob_reader;
+
+/* Writes the part of `layout` that compiling a shader against it reads: the
+ * fields hk_descriptor_set_layout_hash() covers. Returns false, and writes
+ * nothing, for a layout with immutable or embedded samplers, which a blob
+ * cannot carry. */
+bool hk_descriptor_set_layout_serialize(
+   struct blob *blob, const struct hk_descriptor_set_layout *layout);
+
+/* Rebuilds a layout that hk_descriptor_set_layout_serialize() wrote, to
+ * compile shaders against; no descriptor set is allocated from it. Returns
+ * NULL if the blob holds no layout of this device. The caller owns the one
+ * reference. */
+struct hk_descriptor_set_layout *
+hk_descriptor_set_layout_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob);
 
 static inline struct hk_descriptor_set_layout *
 vk_to_hk_descriptor_set_layout(struct vk_descriptor_set_layout *layout)

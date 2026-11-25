@@ -693,3 +693,198 @@ TEST_F(FlattenLoadsKeeps, G18GKeepsTheIf)
    EXPECT_FALSE(g18g.empty());
    EXPECT_EQ(g18g, compile_guarded_load(true, true));
 }
+
+static nir_shader *
+make_short_circuit_uniform_load(bool arm_in_then, bool divergent_cond,
+                                bool divergent_addr,
+                                enum gl_access_qualifier access,
+                                bool dont_flatten, bool non_bool_phi,
+                                bool non_const_empty, bool both_arms_non_empty,
+                                bool subgroup_in_arm = false)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "short circuit uniform load");
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *base = nir_load_preamble(&b, 1, 64, .base = SLOT_BASE);
+   nir_def *ucond = nir_ine_imm(&b, nir_load_preamble(&b, 1, 32, .base = SLOT_COND), 0);
+   nir_def *cond = divergent_cond ? nir_ilt_imm(&b, gid, 64) : ucond;
+   nir_def *addr = divergent_addr
+                      ? nir_iadd(&b, base, nir_imul_imm(&b, nir_u2u64(&b, gid), 4))
+                      : base;
+
+   nir_if *nif = nir_push_if(&b, cond);
+   if (dont_flatten)
+      nif->control = nir_selection_control_dont_flatten;
+
+   nir_def *then_val = NULL;
+   nir_def *else_val = NULL;
+   auto build_arm = [&]() -> nir_def * {
+      nir_def *lim = nir_load_global(&b, 1, 32, addr, .access = access, .align_mul = 4);
+      if (non_bool_phi)
+         return lim;
+      nir_def *v = nir_ilt(&b, gid, lim);
+      return subgroup_in_arm ? nir_vote_any(&b, 1, v) : v;
+   };
+   auto build_empty = [&]() -> nir_def * {
+      if (non_bool_phi)
+         return non_const_empty ? gid : nir_imm_int(&b, 0);
+      return non_const_empty ? nir_ilt_imm(&b, gid, 32) : nir_imm_false(&b);
+   };
+
+   if (arm_in_then) {
+      then_val = build_arm();
+      nir_push_else(&b, nif);
+      if (both_arms_non_empty)
+         else_val = nir_ilt_imm(&b, nir_iadd_imm(&b, gid, 1), 16);
+      else
+         else_val = build_empty();
+   } else {
+      if (both_arms_non_empty)
+         then_val = nir_ilt_imm(&b, nir_iadd_imm(&b, gid, 1), 16);
+      else
+         then_val = build_empty();
+      nir_push_else(&b, nif);
+      else_val = build_arm();
+   }
+   nir_pop_if(&b, nif);
+
+   nir_def *res = nir_if_phi(&b, then_val, else_val);
+   nir_def *out_val = non_bool_phi ? res : nir_b2i32(&b, res);
+   nir_store_global(&b, out_val, nir_imm_int64(&b, 8), .align_mul = 4);
+   nir_validate_shader(b.shader, "before short-circuit flattening");
+   return b.shader;
+}
+
+TEST_F(FlattenLoadsKeeps, ShortCircuitUniformLoadFlattensAndRedirects)
+{
+   nir_shader *s = make_short_circuit_uniform_load(
+      true, true, false, ACCESS_NON_WRITEABLE, false, false, false, false);
+   ASSERT_TRUE(agx_nir_opt_flatten_short_circuit_uniform_loads(s));
+   nir_validate_shader(s, "after short-circuit flattening");
+   EXPECT_EQ(count_ifs(s), 0u);
+
+   nir_intrinsic_instr *load = find_load(s, nir_intrinsic_load_global);
+   ASSERT_NE(load, nullptr);
+   /* Redirected via bcsel against AGX_ZERO_PAGE_ADDRESS when not speculatable. */
+   nir_alu_instr *sel = nir_def_as_alu_or_null(load->src[0].ssa);
+   ASSERT_NE(sel, nullptr);
+   EXPECT_EQ(sel->op, nir_op_bcsel);
+   EXPECT_EQ(nir_src_as_uint(sel->src[2].src), AGX_ZERO_PAGE_ADDRESS);
+
+   /* The redirect tests whether any lane takes the arm, so the address of the
+    * uniform load stays uniform. */
+   nir_alu_instr *any = nir_def_as_alu_or_null(sel->src[0].src.ssa);
+   ASSERT_NE(any, nullptr);
+   EXPECT_EQ(any->op, nir_op_ine);
+   nir_instr *ballot = nir_def_instr(any->src[0].src.ssa);
+   ASSERT_EQ(ballot->type, nir_instr_type_intrinsic);
+   EXPECT_EQ(nir_instr_as_intrinsic(ballot)->intrinsic, nir_intrinsic_ballot);
+   nir_divergence_analysis(s);
+   EXPECT_FALSE(load->src[0].ssa->divergent);
+   ralloc_free(s);
+}
+
+/* With the loads in the else arm, the arm is taken when the condition is
+ * false, and the phi becomes bcsel(cond, then value, else value). */
+TEST_F(FlattenLoadsKeeps, ShortCircuitElseArmSelectsInOrder)
+{
+   nir_shader *s = make_short_circuit_uniform_load(
+      false, true, false, ACCESS_NON_WRITEABLE, false, false, false, false);
+   ASSERT_TRUE(agx_nir_opt_flatten_short_circuit_uniform_loads(s));
+   nir_validate_shader(s, "after short-circuit flattening");
+   EXPECT_EQ(count_ifs(s), 0u);
+
+   nir_intrinsic_instr *load = find_load(s, nir_intrinsic_load_global);
+   ASSERT_NE(load, nullptr);
+   nir_alu_instr *addr_sel = nir_def_as_alu_or_null(load->src[0].ssa);
+   ASSERT_NE(addr_sel, nullptr);
+   ASSERT_EQ(addr_sel->op, nir_op_bcsel);
+   nir_alu_instr *any = nir_def_as_alu_or_null(addr_sel->src[0].src.ssa);
+   ASSERT_NE(any, nullptr);
+   ASSERT_EQ(any->op, nir_op_ine);
+   nir_instr *ballot_instr = nir_def_instr(any->src[0].src.ssa);
+   ASSERT_EQ(ballot_instr->type, nir_instr_type_intrinsic);
+   nir_intrinsic_instr *ballot = nir_instr_as_intrinsic(ballot_instr);
+   ASSERT_EQ(ballot->intrinsic, nir_intrinsic_ballot);
+   nir_alu_instr *taken = nir_def_as_alu_or_null(ballot->src[0].ssa);
+   ASSERT_NE(taken, nullptr);
+   EXPECT_EQ(taken->op, nir_op_inot);
+   nir_def *cond = taken->src[0].src.ssa;
+
+   /* The stored value is b2i32(bcsel(cond, false, gid < load)). */
+   nir_alu_instr *result = NULL;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_b2i32)
+            result = nir_def_as_alu_or_null(
+               nir_instr_as_alu(instr)->src[0].src.ssa);
+      }
+   }
+   ASSERT_NE(result, nullptr);
+   ASSERT_EQ(result->op, nir_op_bcsel);
+   EXPECT_EQ(result->src[0].src.ssa, cond);
+   ASSERT_TRUE(nir_src_is_const(result->src[1].src));
+   EXPECT_FALSE(nir_src_as_bool(result->src[1].src));
+   nir_alu_instr *cmp = nir_def_as_alu_or_null(result->src[2].src.ssa);
+   ASSERT_NE(cmp, nullptr);
+   EXPECT_EQ(cmp->op, nir_op_ilt);
+   EXPECT_EQ(cmp->src[1].src.ssa, &load->def);
+   ralloc_free(s);
+}
+
+TEST_F(FlattenLoadsKeeps, ShortCircuitSpeculatableUniformLoadKeepsAddress)
+{
+   nir_shader *s = make_short_circuit_uniform_load(
+      false, true, false,
+      (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_SPECULATE),
+      false, false, false, false);
+   ASSERT_TRUE(agx_nir_opt_flatten_short_circuit_uniform_loads(s));
+   nir_validate_shader(s, "after short-circuit flattening");
+   EXPECT_EQ(count_ifs(s), 0u);
+
+   nir_intrinsic_instr *load = find_load(s, nir_intrinsic_load_global);
+   ASSERT_NE(load, nullptr);
+   /* Already speculatable: address remains the original uniform preamble load. */
+   nir_instr *addr_instr = nir_def_instr(load->src[0].ssa);
+   EXPECT_EQ(addr_instr->type, nir_instr_type_intrinsic);
+   EXPECT_EQ(nir_instr_as_intrinsic(addr_instr)->intrinsic,
+             nir_intrinsic_load_preamble);
+   ralloc_free(s);
+}
+
+TEST_F(FlattenLoadsKeeps, ShortCircuitUniformLoadRejectsUnsafeShapes)
+{
+   struct {
+      const char *name;
+      bool divergent_cond;
+      bool divergent_addr;
+      enum gl_access_qualifier access;
+      bool dont_flatten;
+      bool non_bool_phi;
+      bool non_const_empty;
+      bool both_arms_non_empty;
+      bool subgroup_in_arm;
+   } cases[] = {
+      {"uniform_cond", false, false, ACCESS_NON_WRITEABLE, false, false, false, false},
+      {"divergent_addr", true, true, ACCESS_NON_WRITEABLE, false, false, false, false},
+      {"writable_load", true, false, (enum gl_access_qualifier)0, false, false, false, false},
+      {"coherent_load", true, false, (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_COHERENT), false, false, false, false},
+      {"volatile_load", true, false, (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_VOLATILE), false, false, false, false},
+      {"dont_flatten", true, false, ACCESS_NON_WRITEABLE, true, false, false, false},
+      {"non_bool_phi", true, false, ACCESS_NON_WRITEABLE, false, true, false, false},
+      {"non_const_empty", true, false, ACCESS_NON_WRITEABLE, false, false, true, false},
+      {"both_arms_non_empty", true, false, ACCESS_NON_WRITEABLE, false, false, false, true},
+      {"subgroup_op_in_arm", true, false, ACCESS_NON_WRITEABLE, false, false, false, false, true},
+   };
+
+   for (const auto &c : cases) {
+      nir_shader *s = make_short_circuit_uniform_load(
+         true, c.divergent_cond, c.divergent_addr, c.access, c.dont_flatten,
+         c.non_bool_phi, c.non_const_empty, c.both_arms_non_empty,
+         c.subgroup_in_arm);
+      EXPECT_FALSE(agx_nir_opt_flatten_short_circuit_uniform_loads(s)) << c.name;
+      EXPECT_EQ(count_ifs(s), 1u) << c.name;
+      ralloc_free(s);
+   }
+}

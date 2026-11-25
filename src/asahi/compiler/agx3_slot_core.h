@@ -57,9 +57,57 @@ extern "C" {
  * list; truncating it can drop a late descriptor load's RAW wait. */
 #define AGX3_SLOT_MAX_REGS 32u
 
+/* How emission treats the scoreboard at an instruction. Slot assignment is
+ * linear, so emission retires every outstanding generation before a
+ * draining control-flow boundary (agx3_slot_cf_kind() in
+ * agx3_pack_binary.c). Assignment starts the code after such a boundary from
+ * an empty scoreboard, and agx3_slot_retire_at_cf() reports the drains. */
+enum agx3_slot_cf {
+   AGX3_SLOT_CF_NONE = 0,
+   /* Emission retires everything outstanding before this instruction. */
+   AGX3_SLOT_CF_DRAIN,
+};
+
+/*
+ * The arms of a structured if join. A divergent group runs both arms, one
+ * after the other under complementary exec masks, so the second arm starts
+ * with what the first left in flight; and an instruction no lane executes
+ * does not reliably wait, so an arm that had no lanes may have retired none
+ * of what its waits name. Assignment therefore starts an else's arm from the
+ * state at the if joined with the first arm's end, and the code after the
+ * pop from the second arm's end joined with the first arm's (or, with no
+ * else, with the state at the if). A joined state names, for each register,
+ * every slot whose generation may still write it, and a slot is retired only
+ * where every joined path retired it, so a consumer waits on the union. An
+ * arm's else and pop need no drain. A loop's body is a level too: its pop
+ * joins the state at its entry push.
+ *
+ * A break leaves its loop the same way an arm ends: its lanes skip the rest
+ * of the body and resume at the loop's pop, and when every lane has broken
+ * the rest of the body runs with none, so its waits do not run either. A
+ * break that joins does not drain; the loop's pop joins the state each such
+ * break left, so a consumer after the loop waits for what any break left in
+ * flight. Lanes that stay in the loop wait as before, and the backedge still
+ * drains, so a later iteration never reissues a slot whose generation an
+ * earlier one left in flight.
+ */
+
 struct agx3_slot_instr {
    bool is_async;   /* produces a scoreboard-tracked result */
    bool drain;      /* retire preceding async operations before a fence */
+   uint8_t cf;      /* enum agx3_slot_cf */
+   /* Structured control flow: exec levels this instruction opens (an if or
+    * a loop push) and closes (pop_exec). cf_arm marks an opened level whose
+    * arms join as described above; cf_else ends one arm of the innermost
+    * level and starts the next. */
+   uint8_t cf_push, cf_pop;
+   bool cf_arm, cf_else;
+   /* cf_loop marks an opened level as a loop whose pop joins the states its
+    * breaks left. cf_break, on a break that joins, is the number of levels
+    * it exits: its state joins the loop level that many levels up, which
+    * must be marked cf_loop. */
+   bool cf_loop;
+   uint8_t cf_break;
    /* This asynchronous instruction reads its sources when it retires rather
     * than when it issues, so redefining one of them first changes what it
     * transfers. Set it for device stores, whose payload nothing else tracks:
@@ -148,6 +196,18 @@ struct agx3_slot_live_range {
  */
 bool agx3_slot_assign(const struct agx3_slot_instr *instrs, unsigned n,
                       unsigned nslots, struct agx3_slot_result *out);
+
+/*
+ * After assignment: remove any wait on a generation that a control-flow
+ * drain (instrs[i].cf) already retired, until a later producer reuses the
+ * slot. entry_wait holds the slots pending on entry to the region. When
+ * `drained` is not NULL, drained[i] is set when the drain before instrs[i]
+ * retires a generation instrs[i] does not read; such a drain costs latency
+ * that state carried across the branch would not.
+ */
+void agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
+                            uint16_t entry_wait, struct agx3_slot_result *res,
+                            bool *drained);
 
 /* Import pending results into the same scoreboard ledger as instructions.
  * For example, the G17P loader publishes packed constant-program inputs in

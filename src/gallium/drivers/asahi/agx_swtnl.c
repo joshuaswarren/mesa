@@ -16,6 +16,7 @@
  * build), otherwise on the GPU (agx_draw_patches, agx_m5_gpu_tess()).
  */
 
+#include <math.h>
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_serialize.h"
 #include "gallium/auxiliary/nir/pipe_nir.h"
@@ -25,10 +26,13 @@
 #include "draw/draw_vbuf.h"
 #include "draw/draw_vertex.h"
 #include "nir/nir_to_tgsi.h"
+#include "tgsi/tgsi_exec.h"
 #include "tgsi/tgsi_from_mesa.h"
+#include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/hash_table.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
 #include "util/u_dynarray.h"
@@ -36,10 +40,49 @@
 #include "util/u_upload_mgr.h"
 #include "agx_state.h"
 
+/* Textures of the CPU stages: a linear copy of every level and layer the
+ * view covers, read through the transfer path (which detiles), in the
+ * layout the draw module samples from. */
+struct swtnl_texture {
+   uint8_t *data;
+   enum pipe_texture_target target;
+   enum pipe_format format;
+   unsigned width0, height0, depth0;
+   unsigned first_level, last_level;
+   unsigned layers;
+   unsigned buf_elements;
+   uint32_t row_stride[PIPE_MAX_TEXTURE_LEVELS];
+   uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS];
+   uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS];
+   uint8_t swizzle[4];
+   bool bound;
+};
+
+struct swtnl_tgsi_buffer {
+   struct tgsi_buffer base;
+   void *ptrs[PIPE_MAX_SHADER_BUFFERS];
+   uint32_t sizes[PIPE_MAX_SHADER_BUFFERS];
+};
+
+struct swtnl_tgsi_sampler {
+   struct tgsi_sampler base;
+   const struct swtnl_texture *textures;
+   unsigned nr_textures;
+   const struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS];
+   unsigned nr_samplers;
+};
+
 struct agx_swtnl_render {
    struct vbuf_render base;
    struct agx_context *ctx;
    struct vertex_info vinfo;
+
+   /* TGSI interpreter hooks used when the draw module runs without LLVM.
+    * Index 0 is the vertex stage, index 1 is the geometry stage. */
+   struct swtnl_tgsi_buffer tgsi_buffers[2];
+   struct swtnl_tgsi_sampler tgsi_samplers[2];
+   /* Per-stage detiled texture descriptors kept off the draw stack. */
+   struct swtnl_texture textures[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_SAMPLER_VIEWS];
 
    /* What the GPU's vertex shader receives after the position */
    uint64_t slots;
@@ -482,6 +525,638 @@ swtnl_draw_arrays(struct vbuf_render *render, unsigned start, unsigned nr)
    swtnl_collect(agx_swtnl_render(render), NULL, start, nr);
 }
 
+static void *
+swtnl_tgsi_buffer_lookup(const struct tgsi_buffer *buffer,
+                         uint32_t unit, uint32_t *size)
+{
+   const struct swtnl_tgsi_buffer *buf =
+      (const struct swtnl_tgsi_buffer *)buffer;
+
+   if (unit >= PIPE_MAX_SHADER_BUFFERS || !buf->ptrs[unit]) {
+      *size = 0;
+      return NULL;
+   }
+
+   *size = buf->sizes[unit];
+   return buf->ptrs[unit];
+}
+
+static void
+swtnl_apply_swizzle(const uint8_t swz[4], bool is_int,
+                    const uint32_t in[4], uint32_t out[4])
+{
+   for (unsigned c = 0; c < 4; ++c) {
+      switch (swz[c]) {
+      case PIPE_SWIZZLE_X: out[c] = in[0]; break;
+      case PIPE_SWIZZLE_Y: out[c] = in[1]; break;
+      case PIPE_SWIZZLE_Z: out[c] = in[2]; break;
+      case PIPE_SWIZZLE_W: out[c] = in[3]; break;
+      case PIPE_SWIZZLE_1: out[c] = is_int ? 1u : fui(1.0f); break;
+      default:             out[c] = 0u; break;
+      }
+   }
+}
+
+static void
+swtnl_tgsi_get_dims(struct tgsi_sampler *sampler,
+                    const unsigned sview_index, int level, int dims[4])
+{
+   const struct swtnl_tgsi_sampler *ts =
+      (const struct swtnl_tgsi_sampler *)sampler;
+
+   dims[0] = dims[1] = dims[2] = dims[3] = 0;
+   if (!ts->textures || sview_index >= ts->nr_textures)
+      return;
+
+   const struct swtnl_texture *t = &ts->textures[sview_index];
+   if (!t->data)
+      return;
+
+   if (t->target == PIPE_BUFFER) {
+      dims[0] = t->buf_elements;
+      return;
+   }
+
+   dims[3] = t->last_level - t->first_level + 1;
+   if (level < 0)
+      return;
+
+   unsigned lvl = t->first_level + (unsigned)level;
+   if (lvl > t->last_level)
+      return;
+
+   dims[0] = u_minify(t->width0, lvl);
+   switch (t->target) {
+   case PIPE_TEXTURE_1D:
+      break;
+   case PIPE_TEXTURE_1D_ARRAY:
+      dims[1] = t->layers;
+      break;
+   case PIPE_TEXTURE_2D:
+   case PIPE_TEXTURE_RECT:
+   case PIPE_TEXTURE_CUBE:
+      dims[1] = u_minify(t->height0, lvl);
+      break;
+   case PIPE_TEXTURE_2D_ARRAY:
+      dims[1] = u_minify(t->height0, lvl);
+      dims[2] = t->layers;
+      break;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      dims[1] = u_minify(t->height0, lvl);
+      dims[2] = t->layers / 6;
+      break;
+   case PIPE_TEXTURE_3D:
+      dims[1] = u_minify(t->height0, lvl);
+      dims[2] = u_minify(t->depth0, lvl);
+      break;
+   default:
+      break;
+   }
+}
+
+static bool
+swtnl_fetch_raw_texel(const struct swtnl_texture *t, unsigned lvl,
+                      int x, int y, int z, uint32_t raw[4])
+{
+   if (lvl < t->first_level || lvl > t->last_level)
+      return false;
+
+   const int w = u_minify(t->width0, lvl);
+   const int h = u_minify(t->height0, lvl);
+   const int d = t->target == PIPE_TEXTURE_3D ? (int)u_minify(t->depth0, lvl)
+                                              : (int)t->layers;
+   if (x < 0 || x >= w || y < 0 || y >= h || z < 0 || z >= d)
+      return false;
+
+   const uint8_t *slice =
+      t->data + t->mip_offsets[lvl] + (size_t)t->img_stride[lvl] * z;
+   if (util_format_is_depth_or_stencil(t->format)) {
+      const struct util_format_description *desc =
+         util_format_description(t->format);
+      const unsigned bs = util_format_get_blocksize(t->format);
+      const uint8_t *texel =
+         slice + (size_t)t->row_stride[lvl] * y + (size_t)x * bs;
+      if (util_format_has_depth(desc)) {
+         float zval = 0.0f;
+         util_format_unpack_z_float(t->format, &zval, texel, 1);
+         raw[0] = raw[1] = raw[2] = fui(zval);
+         raw[3] = fui(1.0f);
+      } else {
+         uint8_t sval = 0;
+         util_format_unpack_s_8uint(t->format, &sval, texel, 1);
+         raw[0] = sval;
+         raw[1] = raw[2] = 0;
+         raw[3] = 1;
+      }
+      return true;
+   }
+
+   util_format_read_4(t->format, raw, 16, slice, t->row_stride[lvl],
+                      x, y, 1, 1);
+   return true;
+}
+
+static void
+swtnl_tgsi_get_texel(struct tgsi_sampler *sampler,
+                     const unsigned sview_index,
+                     const int ci[TGSI_QUAD_SIZE],
+                     const int cj[TGSI_QUAD_SIZE],
+                     const int ck[TGSI_QUAD_SIZE],
+                     const int lod[TGSI_QUAD_SIZE],
+                     const int8_t offset[3],
+                     float rgba[TGSI_NUM_CHANNELS][TGSI_QUAD_SIZE])
+{
+   const struct swtnl_tgsi_sampler *ts =
+      (const struct swtnl_tgsi_sampler *)sampler;
+
+   memset(rgba, 0, sizeof(float) * TGSI_NUM_CHANNELS * TGSI_QUAD_SIZE);
+   if (!ts->textures || sview_index >= ts->nr_textures)
+      return;
+
+   const struct swtnl_texture *t = &ts->textures[sview_index];
+   if (!t->data)
+      return;
+
+   const bool is_int = util_format_is_pure_integer(t->format);
+   const unsigned bs = util_format_get_blocksize(t->format);
+
+   for (unsigned q = 0; q < TGSI_QUAD_SIZE; ++q) {
+      uint32_t raw[4] = {0}, swz[4] = {0};
+      bool ok = false;
+
+      if (t->target == PIPE_BUFFER) {
+         int idx = ci[q];
+         if (idx >= 0 && (unsigned)idx < t->buf_elements) {
+            util_format_read_4(t->format, raw, 16, t->data + (size_t)idx * bs,
+                               bs, 0, 0, 1, 1);
+            ok = true;
+         }
+      } else {
+         int rel_lod = t->target == PIPE_TEXTURE_RECT ? 0 : lod[q];
+         if (rel_lod >= 0) {
+            unsigned lvl = t->first_level + (unsigned)rel_lod;
+            int x = ci[q] + offset[0];
+            int y = 0, z = 0;
+            if (t->target == PIPE_TEXTURE_1D_ARRAY) {
+               z = cj[q];
+            } else if (t->target == PIPE_TEXTURE_2D ||
+                       t->target == PIPE_TEXTURE_RECT) {
+               y = cj[q] + offset[1];
+            } else if (t->target == PIPE_TEXTURE_2D_ARRAY) {
+               y = cj[q] + offset[1];
+               z = ck[q];
+            } else if (t->target == PIPE_TEXTURE_3D) {
+               y = cj[q] + offset[1];
+               z = ck[q] + offset[2];
+            }
+            ok = swtnl_fetch_raw_texel(t, lvl, x, y, z, raw);
+         }
+      }
+
+      if (ok) {
+         swtnl_apply_swizzle(t->swizzle, is_int, raw, swz);
+         for (unsigned c = 0; c < 4; ++c)
+            memcpy(&rgba[c][q], &swz[c], sizeof(uint32_t));
+      }
+   }
+}
+
+static int
+swtnl_wrap_int(unsigned wrap, int idx, int size, bool *border)
+{
+   *border = false;
+   if (size <= 0) {
+      *border = true;
+      return 0;
+   }
+
+   switch (wrap) {
+   case PIPE_TEX_WRAP_REPEAT: {
+      int r = idx % size;
+      return r < 0 ? r + size : r;
+   }
+   case PIPE_TEX_WRAP_MIRROR_REPEAT: {
+      int p = 2 * size;
+      int r = idx % p;
+      if (r < 0)
+         r += p;
+      return r >= size ? p - 1 - r : r;
+   }
+   case PIPE_TEX_WRAP_CLAMP:
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      return CLAMP(idx, 0, size - 1);
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      if (idx < 0 || idx >= size) {
+         *border = true;
+         return 0;
+      }
+      return idx;
+   case PIPE_TEX_WRAP_MIRROR_CLAMP:
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE: {
+      int a = idx < 0 ? -idx - 1 : idx;
+      return CLAMP(a, 0, size - 1);
+   }
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_BORDER: {
+      int a = idx < 0 ? -idx - 1 : idx;
+      if (a >= size) {
+         *border = true;
+         return 0;
+      }
+      return a;
+   }
+   default:
+      return CLAMP(idx, 0, size - 1);
+   }
+}
+
+static float
+swtnl_shadow_compare(unsigned func, float ref, float tex)
+{
+   switch (func) {
+   case PIPE_FUNC_NEVER:    return 0.0f;
+   case PIPE_FUNC_LESS:     return ref < tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_EQUAL:    return ref == tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_LEQUAL:   return ref <= tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_GREATER:  return ref > tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_NOTEQUAL: return ref != tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_GEQUAL:   return ref >= tex ? 1.0f : 0.0f;
+   case PIPE_FUNC_ALWAYS:   return 1.0f;
+   default:                 return 0.0f;
+   }
+}
+
+static void
+swtnl_cube_face(float rx, float ry, float rz, float *sc, float *tc, int *face)
+{
+   const float ax = fabsf(rx), ay = fabsf(ry), az = fabsf(rz);
+   float uc, vc, ma;
+
+   if (ax >= ay && ax >= az) {
+      ma = ax;
+      if (rx >= 0.0f) {
+         *face = 0; uc = -rz; vc = -ry;
+      } else {
+         *face = 1; uc = rz; vc = -ry;
+      }
+   } else if (ay >= ax && ay >= az) {
+      ma = ay;
+      if (ry >= 0.0f) {
+         *face = 2; uc = rx; vc = rz;
+      } else {
+         *face = 3; uc = rx; vc = -rz;
+      }
+   } else {
+      ma = az;
+      if (rz >= 0.0f) {
+         *face = 4; uc = rx; vc = -ry;
+      } else {
+         *face = 5; uc = -rx; vc = -ry;
+      }
+   }
+
+   if (ma > 0.0f) {
+      *sc = 0.5f * (uc / ma + 1.0f);
+      *tc = 0.5f * (vc / ma + 1.0f);
+   } else {
+      *sc = *tc = 0.5f;
+   }
+}
+
+static void
+swtnl_sample_texel(const struct swtnl_texture *t,
+                   const struct pipe_sampler_state *samp,
+                   unsigned lvl, int x, int y, int z, bool border,
+                   uint32_t out[4])
+{
+   const bool is_int = util_format_is_pure_integer(t->format);
+   uint32_t raw[4] = {0};
+
+   if (border || !swtnl_fetch_raw_texel(t, lvl, x, y, z, raw)) {
+      for (unsigned c = 0; c < 4; ++c) {
+         if (is_int) {
+            out[c] = samp->border_color.ui[c];
+         } else {
+            float v = samp->border_color.f[c];
+            if (util_format_is_unorm(t->format))
+               v = CLAMP(v, 0.0f, 1.0f);
+            else if (util_format_is_snorm(t->format))
+               v = CLAMP(v, -1.0f, 1.0f);
+            out[c] = fui(v);
+         }
+      }
+      return;
+   }
+
+   swtnl_apply_swizzle(t->swizzle, is_int, raw, out);
+}
+
+static void
+swtnl_sample_level(const struct swtnl_texture *tex,
+                   const struct pipe_sampler_state *samp,
+                   unsigned lvl, float sc, float tc, float rc, int layer,
+                   const int8_t offset[3], bool unnorm, bool shadow,
+                   bool linear, float ref, unsigned wrap_s, unsigned wrap_t,
+                   unsigned wrap_r, uint32_t out[4])
+{
+   const int w = u_minify(tex->width0, lvl);
+   const int h = u_minify(tex->height0, lvl);
+   const int d = tex->target == PIPE_TEXTURE_3D ? (int)u_minify(tex->depth0, lvl)
+                                                : (int)tex->layers;
+
+   if (!linear) {
+      int ix = (int)floorf(unnorm ? sc : sc * w) + offset[0];
+      int iy = (tex->target == PIPE_TEXTURE_1D ||
+                tex->target == PIPE_TEXTURE_1D_ARRAY)
+                  ? 0
+                  : (int)floorf(unnorm ? tc : tc * h) + offset[1];
+      int iz = tex->target == PIPE_TEXTURE_3D
+                  ? (int)floorf(unnorm ? rc : rc * d) + offset[2]
+                  : layer;
+      bool bx = false, by = false, bz = false;
+      int wx = swtnl_wrap_int(wrap_s, ix, w, &bx);
+      int wy = (tex->target == PIPE_TEXTURE_1D ||
+                tex->target == PIPE_TEXTURE_1D_ARRAY)
+                  ? 0
+                  : swtnl_wrap_int(wrap_t, iy, h, &by);
+      int wz = tex->target == PIPE_TEXTURE_3D
+                  ? swtnl_wrap_int(wrap_r, iz, d, &bz)
+                  : iz;
+      uint32_t tx[4];
+      swtnl_sample_texel(tex, samp, lvl, wx, wy, wz, bx || by || bz, tx);
+      if (shadow) {
+         float v = swtnl_shadow_compare(samp->compare_func, ref, uif(tx[0]));
+         out[0] = out[1] = out[2] = fui(v);
+         out[3] = fui(1.0f);
+      } else {
+         memcpy(out, tx, sizeof(tx));
+      }
+      return;
+   }
+
+   float u = (unnorm ? sc : sc * w) - 0.5f;
+   int ix0 = (int)floorf(u);
+   float xw = u - (float)ix0;
+   bool bx0, bx1;
+   int wx0 = swtnl_wrap_int(wrap_s, ix0 + offset[0], w, &bx0);
+   int wx1 = swtnl_wrap_int(wrap_s, ix0 + 1 + offset[0], w, &bx1);
+
+   if (tex->target == PIPE_TEXTURE_1D ||
+       tex->target == PIPE_TEXTURE_1D_ARRAY) {
+      uint32_t t0[4], t1[4];
+      swtnl_sample_texel(tex, samp, lvl, wx0, 0, layer, bx0, t0);
+      swtnl_sample_texel(tex, samp, lvl, wx1, 0, layer, bx1, t1);
+      if (shadow) {
+         float s0 = swtnl_shadow_compare(samp->compare_func, ref, uif(t0[0]));
+         float s1 = swtnl_shadow_compare(samp->compare_func, ref, uif(t1[0]));
+         float v = s0 * (1.0f - xw) + s1 * xw;
+         out[0] = out[1] = out[2] = fui(v);
+         out[3] = fui(1.0f);
+      } else {
+         for (unsigned c = 0; c < 4; ++c)
+            out[c] = fui(uif(t0[c]) * (1.0f - xw) + uif(t1[c]) * xw);
+      }
+      return;
+   }
+
+   float v = (unnorm ? tc : tc * h) - 0.5f;
+   int iy0 = (int)floorf(v);
+   float yw = v - (float)iy0;
+   bool by0, by1;
+   int wy0 = swtnl_wrap_int(wrap_t, iy0 + offset[1], h, &by0);
+   int wy1 = swtnl_wrap_int(wrap_t, iy0 + 1 + offset[1], h, &by1);
+
+   int wz0 = layer, wz1 = layer;
+   float zw = 0.0f;
+   bool bz0 = false, bz1 = false;
+   const bool is_3d = tex->target == PIPE_TEXTURE_3D;
+   if (is_3d) {
+      float p = (unnorm ? rc : rc * d) - 0.5f;
+      int iz0 = (int)floorf(p);
+      zw = p - (float)iz0;
+      wz0 = swtnl_wrap_int(wrap_r, iz0 + offset[2], d, &bz0);
+      wz1 = swtnl_wrap_int(wrap_r, iz0 + 1 + offset[2], d, &bz1);
+   }
+
+   float acc[4] = {0};
+   for (unsigned slice = 0; slice < (is_3d ? 2u : 1u); ++slice) {
+      int wz = slice ? wz1 : wz0;
+      bool bz = slice ? bz1 : bz0;
+      float sw = is_3d ? (slice ? zw : 1.0f - zw) : 1.0f;
+      uint32_t t00[4], t10[4], t01[4], t11[4];
+      swtnl_sample_texel(tex, samp, lvl, wx0, wy0, wz, bx0 || by0 || bz, t00);
+      swtnl_sample_texel(tex, samp, lvl, wx1, wy0, wz, bx1 || by0 || bz, t10);
+      swtnl_sample_texel(tex, samp, lvl, wx0, wy1, wz, bx0 || by1 || bz, t01);
+      swtnl_sample_texel(tex, samp, lvl, wx1, wy1, wz, bx1 || by1 || bz, t11);
+      if (shadow) {
+         float s00 = swtnl_shadow_compare(samp->compare_func, ref, uif(t00[0]));
+         float s10 = swtnl_shadow_compare(samp->compare_func, ref, uif(t10[0]));
+         float s01 = swtnl_shadow_compare(samp->compare_func, ref, uif(t01[0]));
+         float s11 = swtnl_shadow_compare(samp->compare_func, ref, uif(t11[0]));
+         float top = s00 * (1.0f - xw) + s10 * xw;
+         float bot = s01 * (1.0f - xw) + s11 * xw;
+         acc[0] += sw * (top * (1.0f - yw) + bot * yw);
+      } else {
+         for (unsigned c = 0; c < 4; ++c) {
+            float top = uif(t00[c]) * (1.0f - xw) + uif(t10[c]) * xw;
+            float bot = uif(t01[c]) * (1.0f - xw) + uif(t11[c]) * xw;
+            acc[c] += sw * (top * (1.0f - yw) + bot * yw);
+         }
+      }
+   }
+   if (shadow) {
+      out[0] = out[1] = out[2] = fui(acc[0]);
+      out[3] = fui(1.0f);
+   } else {
+      for (unsigned c = 0; c < 4; ++c)
+         out[c] = fui(acc[c]);
+   }
+}
+
+static void
+swtnl_tgsi_get_samples(struct tgsi_sampler *sampler,
+                       const unsigned sview_index,
+                       const unsigned sampler_index,
+                       const float s[TGSI_QUAD_SIZE],
+                       const float t_coord[TGSI_QUAD_SIZE],
+                       const float r[TGSI_QUAD_SIZE],
+                       const float c0[TGSI_QUAD_SIZE],
+                       const float c1[TGSI_QUAD_SIZE],
+                       UNUSED float derivs[3][2][TGSI_QUAD_SIZE],
+                       const int8_t offset[3],
+                       enum tgsi_sampler_control control,
+                       float rgba[TGSI_NUM_CHANNELS][TGSI_QUAD_SIZE])
+{
+   const struct swtnl_tgsi_sampler *ts =
+      (const struct swtnl_tgsi_sampler *)sampler;
+
+   memset(rgba, 0, sizeof(float) * TGSI_NUM_CHANNELS * TGSI_QUAD_SIZE);
+   if (!ts->textures || sview_index >= ts->nr_textures ||
+       sampler_index >= ts->nr_samplers || !ts->samplers[sampler_index])
+      return;
+
+   const struct swtnl_texture *tex = &ts->textures[sview_index];
+   const struct pipe_sampler_state *samp = ts->samplers[sampler_index];
+   if (!tex->data)
+      return;
+
+   const struct util_format_description *fdesc =
+      util_format_description(tex->format);
+   const bool is_int = util_format_is_pure_integer(tex->format) ||
+                       (util_format_is_depth_or_stencil(tex->format) &&
+                        !util_format_has_depth(fdesc));
+   const bool unnorm =
+      samp->unnormalized_coords || tex->target == PIPE_TEXTURE_RECT;
+   const bool is_cube = tex->target == PIPE_TEXTURE_CUBE ||
+                        tex->target == PIPE_TEXTURE_CUBE_ARRAY;
+   const bool shadow = samp->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+   const bool gather = control == TGSI_SAMPLER_GATHER;
+   const unsigned gather_comp = (*(const uint32_t *)c1) & 3u;
+   const bool clamp_ref = util_format_is_unorm(tex->format) ||
+                          (util_format_has_depth(fdesc) &&
+                           !util_format_is_float(tex->format));
+   /* Cube sampling clamps to edge per face; seamless cross-face filtering is
+    * a known limitation of this non-LLVM TGSI fallback path. */
+   const unsigned wrap_s = is_cube ? PIPE_TEX_WRAP_CLAMP_TO_EDGE : samp->wrap_s;
+   const unsigned wrap_t = is_cube ? PIPE_TEX_WRAP_CLAMP_TO_EDGE : samp->wrap_t;
+   const unsigned wrap_r = samp->wrap_r;
+
+   for (unsigned q = 0; q < TGSI_QUAD_SIZE; ++q) {
+      /* tgsi_exec currently passes derivs = NULL for explicit-derivative
+       * fetches in vertex/geometry stages, so only explicit LOD/bias and
+       * sampler lod_bias contribute here. */
+      float lod = samp->lod_bias;
+      if (control == TGSI_SAMPLER_LOD_EXPLICIT)
+         lod = c1[q] + samp->lod_bias;
+      else if (control == TGSI_SAMPLER_LOD_BIAS)
+         lod = c1[q] + samp->lod_bias;
+      else if (control == TGSI_SAMPLER_LOD_ZERO || gather)
+         lod = 0.0f;
+
+      if (samp->min_mip_filter == PIPE_TEX_MIPFILTER_NONE || gather || unnorm) {
+         lod = 0.0f;
+      } else {
+         lod = CLAMP(lod, samp->min_lod, samp->max_lod);
+      }
+
+      const int max_rel = (int)(tex->last_level - tex->first_level);
+
+      float sc = s[q], tc = t_coord[q], rc = r[q];
+      int layer = 0;
+      if (is_cube) {
+         int face = 0;
+         swtnl_cube_face(s[q], t_coord[q], r[q], &sc, &tc, &face);
+         if (tex->target == PIPE_TEXTURE_CUBE_ARRAY) {
+            int cube_idx = CLAMP((int)floorf(c0[q] + 0.5f), 0,
+                                 MAX2((int)(tex->layers / 6) - 1, 0));
+            layer = cube_idx * 6 + face;
+         } else {
+            layer = face;
+         }
+      } else if (tex->target == PIPE_TEXTURE_1D_ARRAY) {
+         layer = CLAMP((int)floorf(tc + 0.5f), 0, MAX2((int)tex->layers - 1, 0));
+         tc = 0.0f;
+      } else if (tex->target == PIPE_TEXTURE_2D_ARRAY) {
+         layer = CLAMP((int)floorf(rc + 0.5f), 0, MAX2((int)tex->layers - 1, 0));
+      }
+
+      float ref = 0.0f;
+      if (shadow) {
+         if (tex->target == PIPE_TEXTURE_2D_ARRAY ||
+             tex->target == PIPE_TEXTURE_CUBE)
+            ref = c0[q];
+         else if (tex->target == PIPE_TEXTURE_CUBE_ARRAY)
+            ref = c1[q];
+         else
+            ref = r[q];
+         if (clamp_ref)
+            ref = CLAMP(ref, 0.0f, 1.0f);
+      }
+
+      const unsigned img_filter =
+         lod <= 0.0f ? samp->mag_img_filter : samp->min_img_filter;
+      const bool linear = !is_int && img_filter == PIPE_TEX_FILTER_LINEAR;
+
+      if (gather) {
+         const unsigned lvl = tex->first_level;
+         const int w = u_minify(tex->width0, lvl);
+         const int h = u_minify(tex->height0, lvl);
+         float u = (unnorm ? sc : sc * w) - 0.5f;
+         float v = (unnorm ? tc : tc * h) - 0.5f;
+         int ix0 = (int)floorf(u) + offset[0];
+         int iy0 = (int)floorf(v) + offset[1];
+         bool bx0, bx1, by0, by1;
+         int wx0 = swtnl_wrap_int(wrap_s, ix0, w, &bx0);
+         int wx1 = swtnl_wrap_int(wrap_s, ix0 + 1, w, &bx1);
+         int wy0 = swtnl_wrap_int(wrap_t, iy0, h, &by0);
+         int wy1 = swtnl_wrap_int(wrap_t, iy0 + 1, h, &by1);
+
+         /* Order matching TGSI/OpenGL textureGather: (0,1), (1,1), (1,0), (0,0). */
+         const int xs[4] = { wx0, wx1, wx1, wx0 };
+         const int ys[4] = { wy1, wy1, wy0, wy0 };
+         const bool bs[4] = { bx0 || by1, bx1 || by1, bx1 || by0, bx0 || by0 };
+         for (unsigned k = 0; k < 4; ++k) {
+            uint32_t tx[4];
+            swtnl_sample_texel(tex, samp, lvl, xs[k], ys[k], layer, bs[k], tx);
+            if (shadow) {
+               rgba[k][q] = swtnl_shadow_compare(samp->compare_func, ref, uif(tx[0]));
+            } else {
+               memcpy(&rgba[k][q], &tx[gather_comp], sizeof(uint32_t));
+            }
+         }
+         continue;
+      }
+
+      if (samp->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR && !is_int &&
+          !unnorm) {
+         const float clamped_lod = CLAMP(lod, 0.0f, (float)max_rel);
+         const int rel0 = CLAMP((int)floorf(clamped_lod), 0, max_rel);
+         const int rel1 = MIN2(rel0 + 1, max_rel);
+         const float frac = clamped_lod - (float)rel0;
+         uint32_t out0[4];
+         swtnl_sample_level(tex, samp, tex->first_level + (unsigned)rel0,
+                            sc, tc, rc, layer, offset, unnorm, shadow, linear,
+                            ref, wrap_s, wrap_t, wrap_r, out0);
+         if (rel1 != rel0 && frac > 0.0f) {
+            uint32_t out1[4];
+            swtnl_sample_level(tex, samp, tex->first_level + (unsigned)rel1,
+                               sc, tc, rc, layer, offset, unnorm, shadow,
+                               linear, ref, wrap_s, wrap_t, wrap_r, out1);
+            for (unsigned c = 0; c < 4; ++c)
+               rgba[c][q] = uif(out0[c]) * (1.0f - frac) + uif(out1[c]) * frac;
+         } else {
+            for (unsigned c = 0; c < 4; ++c)
+               memcpy(&rgba[c][q], &out0[c], sizeof(uint32_t));
+         }
+      } else {
+         const int rel0 = CLAMP((int)floorf(lod + 0.5f), 0, max_rel);
+         uint32_t out0[4];
+         swtnl_sample_level(tex, samp, tex->first_level + (unsigned)rel0,
+                            sc, tc, rc, layer, offset, unnorm, shadow, linear,
+                            ref, wrap_s, wrap_t, wrap_r, out0);
+         for (unsigned c = 0; c < 4; ++c)
+            memcpy(&rgba[c][q], &out0[c], sizeof(uint32_t));
+      }
+   }
+}
+
+static void
+swtnl_tgsi_query_lod(const struct tgsi_sampler *sampler,
+                     const unsigned sview_index,
+                     const unsigned sampler_index,
+                     const float s[TGSI_QUAD_SIZE],
+                     const float t[TGSI_QUAD_SIZE],
+                     const float p[TGSI_QUAD_SIZE],
+                     const float c0[TGSI_QUAD_SIZE],
+                     const enum tgsi_sampler_control control,
+                     float mipmap[TGSI_QUAD_SIZE],
+                     float lod[TGSI_QUAD_SIZE])
+{
+   for (unsigned q = 0; q < TGSI_QUAD_SIZE; ++q) {
+      mipmap[q] = 0.0f;
+      lod[q] = 0.0f;
+   }
+}
+
 static bool
 agx_swtnl_init(struct agx_context *ctx)
 {
@@ -543,6 +1218,23 @@ agx_swtnl_init(struct agx_context *ctx)
    };
    draw_set_viewport_states(draw, 0, 1, &identity);
    draw->pt.no_fse = true;
+
+   if (!draw->llvm) {
+      const mesa_shader_stage stages[2] = {
+         MESA_SHADER_VERTEX,
+         MESA_SHADER_GEOMETRY,
+      };
+      for (unsigned i = 0; i < 2; ++i) {
+         r->tgsi_buffers[i].base.lookup = swtnl_tgsi_buffer_lookup;
+         draw_buffer(draw, stages[i], &r->tgsi_buffers[i].base);
+
+         r->tgsi_samplers[i].base.get_dims = swtnl_tgsi_get_dims;
+         r->tgsi_samplers[i].base.get_samples = swtnl_tgsi_get_samples;
+         r->tgsi_samplers[i].base.get_texel = swtnl_tgsi_get_texel;
+         r->tgsi_samplers[i].base.query_lod = swtnl_tgsi_query_lod;
+         draw_texture_sampler(draw, stages[i], &r->tgsi_samplers[i].base);
+      }
+   }
 
    ctx->swtnl_draw = draw;
    ctx->swtnl_render = &r->base;
@@ -1033,14 +1725,27 @@ agx_swtnl_delete_shader(struct agx_context *ctx, struct agx_uncompiled_shader *s
  * Does this draw take the CPU path? G17G, a geometry stage (or tessellation
  * the draw module can do, see agx_m5_gpu_tess()), and nothing the CPU copy
  * does not see: no textures, images or storage buffers before rasterization.
+ *
+ * A layered framebuffer is drawn a layer at a time (agx_g17g_layered_draw),
+ * so the layer a vertex shader writes reaches the GPU only as the per-layer
+ * subsets drawn here. Without this, every primitive of such a draw (layered
+ * clears and blits through u_blitter, layered PBO transfers in st/mesa,
+ * gl_Layer from a vertex shader) lands in layer 0.
  */
 bool
 agx_swtnl_applies(struct agx_context *ctx)
 {
    if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) ||
-       ctx->swtnl_inner ||
-       (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
-        !ctx->stage[MESA_SHADER_TESS_EVAL].shader))
+       ctx->swtnl_inner)
+      return false;
+
+   const struct agx_uncompiled_shader *vs =
+      ctx->stage[MESA_SHADER_VERTEX].shader;
+   const bool vs_layer =
+      vs && vs->info.writes_layer &&
+      util_framebuffer_get_num_layers(&ctx->framebuffer) > 1;
+   if (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
+       !ctx->stage[MESA_SHADER_TESS_EVAL].shader && !vs_layer)
       return false;
 
    /* The draw module tessellates only with LLVM: without it, tessellation
@@ -1059,12 +1764,10 @@ agx_swtnl_applies(struct agx_context *ctx)
 }
 
 
-/* Textures of the CPU stages: a linear copy of every level and layer the
- * view covers, read through the transfer path (which detiles), in the
- * layout the draw module samples from. */
-struct swtnl_texture {
-   void *data;
-};
+/* The draw module takes 32-bit strides and offsets, and samples with signed
+ * 32-bit offsets: a copy or buffer texture larger than llvmpipe's limit for
+ * the same sampling code (2 GiB) does not fit, so the draw goes without it. */
+#define AGX_SWTNL_MAX_TEXTURE_BYTES (1ull << 31)
 
 static bool
 swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
@@ -1076,8 +1779,55 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS] = {0};
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS] = {0};
 
-   if (tex->target == PIPE_BUFFER || tex->nr_samples > 1)
+   /* Multisampled views are not copied: the draw goes without them. */
+   if (tex->nr_samples > 1)
       return false;
+
+   const enum pipe_format format = view->format;
+   const unsigned bs = util_format_get_blocksize(format);
+
+   if (tex->target == PIPE_BUFFER || view->target == PIPE_BUFFER) {
+      if (!bs)
+         return false;
+      const unsigned avail =
+         agx_buffer_range_in_resource(tex, view->u.buf.offset, view->u.buf.size);
+      /* In elements, clamped to the GPU path's texture-buffer limit so
+       * textureSize() matches across CPU and GPU paths, and sized by what the
+       * shader can sample rather than the whole backing buffer. */
+      const unsigned elems = agx_texture_buffer_size_el(format, avail);
+      const uint64_t copy_size = (uint64_t)elems * bs;
+      if (copy_size > AGX_SWTNL_MAX_TEXTURE_BYTES)
+         return false;
+      uint8_t *data = calloc(1, (size_t)copy_size + 64);
+      if (!data)
+         return false;
+      if (copy_size) {
+         struct pipe_transfer *xfer = NULL;
+         const void *map =
+            pipe_buffer_map_range(pctx, tex, view->u.buf.offset, copy_size,
+                                  PIPE_MAP_READ, &xfer);
+         if (!map) {
+            free(data);
+            return false;
+         }
+         memcpy(data, map, copy_size);
+         pipe_buffer_unmap(pctx, xfer);
+      }
+      row_stride[0] = copy_size;
+      img_stride[0] = copy_size;
+      draw_set_mapped_texture(ctx->swtnl_draw, s, i, elems, 1, 1, 0, 0, 1, 0,
+                              data, row_stride, img_stride, mip_offsets);
+      out->data = data;
+      out->target = PIPE_BUFFER;
+      out->format = format;
+      out->buf_elements = elems;
+      out->swizzle[0] = view->swizzle_r;
+      out->swizzle[1] = view->swizzle_g;
+      out->swizzle[2] = view->swizzle_b;
+      out->swizzle[3] = view->swizzle_a;
+      out->bound = true;
+      return true;
+   }
 
    const unsigned first_level = view->u.tex.first_level;
    const unsigned last_level = view->u.tex.last_level;
@@ -1088,18 +1838,22 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    const unsigned first_layer = array ? view->u.tex.first_layer : 0;
    const unsigned layers =
       array ? view->u.tex.last_layer - view->u.tex.first_layer + 1 : 1;
-   const enum pipe_format format = view->format;
-   const unsigned bs = util_format_get_blocksize(format);
 
-   size_t size = 0;
+   uint64_t size = 0;
    for (unsigned l = first_level; l <= last_level; ++l) {
       const unsigned w = u_minify(tex->width0, l), h = u_minify(tex->height0, l);
       const unsigned d = tex->target == PIPE_TEXTURE_3D ? u_minify(tex->depth0, l)
                                                          : layers;
-      mip_offsets[l] = size;
-      row_stride[l] = util_format_get_stride(format, w);
-      img_stride[l] = row_stride[l] * util_format_get_nblocksy(format, h);
-      size += (size_t)img_stride[l] * d;
+      const uint64_t row_B = util_format_get_stride(format, w);
+      const uint64_t img_B = row_B * util_format_get_nblocksy(format, h);
+
+      size += img_B * d;
+      if (size > AGX_SWTNL_MAX_TEXTURE_BYTES)
+         return false;
+
+      mip_offsets[l] = size - img_B * d;
+      row_stride[l] = row_B;
+      img_stride[l] = img_B;
    }
 
    uint8_t *data = calloc(1, size + 64);
@@ -1140,6 +1894,22 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
                            depth, first_level, last_level, 1, 0, data,
                            row_stride, img_stride, mip_offsets);
    out->data = data;
+   out->target = view->target;
+   out->format = format;
+   out->width0 = tex->width0;
+   out->height0 = tex->height0;
+   out->depth0 = tex->depth0;
+   out->first_level = first_level;
+   out->last_level = last_level;
+   out->layers = layers;
+   memcpy(out->row_stride, row_stride, sizeof(row_stride));
+   memcpy(out->img_stride, img_stride, sizeof(img_stride));
+   memcpy(out->mip_offsets, mip_offsets, sizeof(mip_offsets));
+   out->swizzle[0] = view->swizzle_r;
+   out->swizzle[1] = view->swizzle_g;
+   out->swizzle[2] = view->swizzle_b;
+   out->swizzle[3] = view->swizzle_a;
+   out->bound = true;
    return true;
 }
 
@@ -1182,11 +1952,13 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    uint8_t *ssbo_shadow[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    uint8_t *ssbo_mapped[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    unsigned ssbo_size[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
+   unsigned cb_masks[MESA_SHADER_FRAGMENT] = {0};
    struct pipe_transfer *vb_transfers[PIPE_MAX_ATTRIBS] = {0};
    struct pipe_transfer *so_transfers[PIPE_MAX_SO_BUFFERS] = {0};
    struct pipe_transfer *ib_transfer = NULL;
    struct draw_so_target targets[PIPE_MAX_SO_BUFFERS];
    struct draw_so_target *target_ptrs[PIPE_MAX_SO_BUFFERS] = {0};
+   bool mapped = true;
 
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
    struct agx_uncompiled_shader *tcs = ctx->stage[MESA_SHADER_TESS_CTRL].shader;
@@ -1280,7 +2052,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else if (vb->buffer.resource) {
          ptr = map_buffer(ctx, vb->buffer.resource, PIPE_MAP_READ,
                           &vb_transfers[i]);
-         size = vb->buffer.resource->width0;
+         size = ptr ? vb->buffer.resource->width0 : 0;
+         mapped &= ptr != NULL;
       }
       draw_set_mapped_vertex_buffer(draw, i, ptr, size);
    }
@@ -1293,9 +2066,22 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else {
          indices = map_buffer(ctx, info->index.resource, PIPE_MAP_READ,
                               &ib_transfer);
-         available = info->index.resource->width0;
+         available = indices ? info->index.resource->width0 : 0;
+         mapped &= indices != NULL;
       }
       draw_set_indexes(draw, indices, info->index_size, available);
+   }
+
+   if (!draw->llvm) {
+      for (unsigned t = 0; t < 2; ++t) {
+         memset(r->tgsi_buffers[t].ptrs, 0, sizeof(r->tgsi_buffers[t].ptrs));
+         memset(r->tgsi_buffers[t].sizes, 0, sizeof(r->tgsi_buffers[t].sizes));
+         r->tgsi_samplers[t].textures = NULL;
+         r->tgsi_samplers[t].nr_textures = 0;
+         memset(r->tgsi_samplers[t].samplers, 0,
+                sizeof(r->tgsi_samplers[t].samplers));
+         r->tgsi_samplers[t].nr_samplers = 0;
+      }
    }
 
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {
@@ -1303,28 +2089,29 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       if (!stage->shader)
          continue;
 
-      u_foreach_bit(i, stage->cb_mask) {
-         const struct pipe_constant_buffer *cb = &stage->cb[i];
-         const uint8_t *ptr = cb->user_buffer;
+      const int tgsi_idx = s == MESA_SHADER_VERTEX ? 0
+                         : s == MESA_SHADER_GEOMETRY ? 1 : -1;
 
-         if (!ptr && cb->buffer) {
-            ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, &transfers[s][i]);
-            if (ptr)
-               ptr += cb->buffer_offset;
-         }
-         draw_set_mapped_constant_buffer(draw, s, i, ptr, cb->buffer_size);
+      cb_masks[s] = stage->cb_mask;
+      u_foreach_bit(i, cb_masks[s]) {
+         mapped &= agx_cpu_bind_constant_buffer(ctx, draw, s, i,
+                                                &transfers[s][i]);
       }
 
       /* Storage buffers: the executor's tessellation and geometry stages
        * read their inputs and write their results through them. */
       u_foreach_bit(i, stage->ssbo_mask) {
+         /* The range bound, clamped to the buffer by
+          * agx_set_shader_buffers(). */
          const struct pipe_shader_buffer *sb = &stage->ssbo[i];
+         const unsigned size = sb->buffer ? sb->buffer_size : 0;
          uint8_t *ptr = NULL;
 
-         if (sb->buffer) {
+         if (size) {
             ptr = (uint8_t *)map_buffer(ctx, sb->buffer,
                                         PIPE_MAP_READ | PIPE_MAP_WRITE,
                                         &ssbo_transfers[s][i]);
+            mapped &= ptr != NULL;
             if (ptr)
                ptr += sb->buffer_offset;
          }
@@ -1332,20 +2119,26 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
           * cacheable memory: on the write-combined BO mapping they raised
           * SIGBUS (GLES31 opaque_type_indexing.atomic_counter.*_geometry).
           * Run the stages on a shadow copy and write it back after. */
-         if (ptr && sb->buffer_size) {
-            ssbo_shadow[s][i] = malloc(sb->buffer_size);
+         if (ptr) {
+            ssbo_shadow[s][i] = malloc(size);
             if (ssbo_shadow[s][i]) {
-               memcpy(ssbo_shadow[s][i], ptr, sb->buffer_size);
+               memcpy(ssbo_shadow[s][i], ptr, size);
                ssbo_mapped[s][i] = ptr;
-               ssbo_size[s][i] = sb->buffer_size;
-               ptr = ssbo_shadow[s][i];
+               ssbo_size[s][i] = size;
+            } else {
+               mapped = false;
             }
+            ptr = ssbo_shadow[s][i];
          }
-         draw_set_mapped_shader_buffer(draw, s, i, ptr, sb->buffer_size);
+         draw_set_mapped_shader_buffer(draw, s, i, ptr, ptr ? size : 0);
+         if (!draw->llvm && tgsi_idx >= 0) {
+            r->tgsi_buffers[tgsi_idx].ptrs[i] = ptr;
+            r->tgsi_buffers[tgsi_idx].sizes[i] = ptr ? size : 0;
+         }
       }
    }
 
-   struct swtnl_texture textures[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_SAMPLER_VIEWS] = {0};
+   unsigned mapped_views[MESA_SHADER_FRAGMENT] = {0};
    for (unsigned st = 0; st < MESA_SHADER_FRAGMENT; ++st) {
       struct agx_stage *stage = &ctx->stage[st];
       if (!stage->shader)
@@ -1353,9 +2146,16 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
 
       struct pipe_sampler_view *views[PIPE_MAX_SHADER_SAMPLER_VIEWS] = {0};
       struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS] = {0};
+      /* Only the views the shader can sample, as the GPU path binds them: a
+       * view left bound beyond those is neither copied nor able to leave
+       * the draw out. */
       const unsigned nr_views =
-         MIN2(stage->texture_count, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+         MIN3(stage->texture_count, stage->shader->info.nr_bindful_textures,
+              PIPE_MAX_SHADER_SAMPLER_VIEWS);
       const unsigned nr_samplers = MIN2(stage->sampler_count, PIPE_MAX_SAMPLERS);
+      mapped_views[st] = nr_views;
+      if (nr_views)
+         memset(r->textures[st], 0, nr_views * sizeof(r->textures[st][0]));
       for (unsigned i = 0; i < nr_views; ++i)
          views[i] = stage->textures[i] ? &stage->textures[i]->base : NULL;
       for (unsigned i = 0; i < nr_samplers; ++i)
@@ -1365,7 +2165,17 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_samplers(draw, st, samplers, nr_samplers);
       for (unsigned i = 0; i < nr_views; ++i) {
          if (views[i])
-            swtnl_map_texture(ctx, st, i, views[i], &textures[st][i]);
+            mapped &= swtnl_map_texture(ctx, st, i, views[i], &r->textures[st][i]);
+      }
+
+      const int tgsi_idx = st == MESA_SHADER_VERTEX ? 0
+                         : st == MESA_SHADER_GEOMETRY ? 1 : -1;
+      if (!draw->llvm && tgsi_idx >= 0) {
+         r->tgsi_samplers[tgsi_idx].textures = r->textures[st];
+         r->tgsi_samplers[tgsi_idx].nr_textures = nr_views;
+         for (unsigned i = 0; i < nr_samplers; ++i)
+            r->tgsi_samplers[tgsi_idx].samplers[i] = samplers[i];
+         r->tgsi_samplers[tgsi_idx].nr_samplers = nr_samplers;
       }
    }
 
@@ -1387,6 +2197,7 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                                        &so_transfers[i]),
          .internal_offset = offset_B,
       };
+      mapped &= targets[i].mapping != NULL;
       atgt->stride = last->xfb_strides[i] * 4;
       target_ptrs[i] = &targets[i];
    }
@@ -1401,32 +2212,62 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    util_dynarray_clear(&r->acc_indices);
    r->acc_count = r->cur_base = 0;
 
-   draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
-   draw_flush(draw);
-   agx_swtnl_flush(r);
+   /* A buffer or texture that could not be mapped or copied leaves the draw
+    * out. */
+   if (mapped) {
+      draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
+      draw_flush(draw);
+      agx_swtnl_flush(r);
+   } else {
+      mesa_loge_once("asahi: CPU vertex stages: a buffer or texture could "
+                     "not be mapped, draw skipped");
+   }
 
    for (unsigned i = 0; i < num_targets; ++i) {
       if (!target_ptrs[i])
          continue;
 
       uint32_t offset_B = targets[i].internal_offset;
-      pipe_buffer_write(&ctx->base,
-                        agx_so_target(ctx->streamout.targets[i])->offset, 0, 4,
-                        &offset_B);
+      tc_buffer_write(&ctx->base,
+                      agx_so_target(ctx->streamout.targets[i])->offset, 0, 4,
+                      &offset_B);
    }
 
    draw_set_mapped_so_targets(draw, 0, NULL);
+   if (!draw->llvm) {
+      for (unsigned t = 0; t < 2; ++t) {
+         memset(r->tgsi_buffers[t].ptrs, 0, sizeof(r->tgsi_buffers[t].ptrs));
+         memset(r->tgsi_buffers[t].sizes, 0, sizeof(r->tgsi_buffers[t].sizes));
+         r->tgsi_samplers[t].textures = NULL;
+         r->tgsi_samplers[t].nr_textures = 0;
+         memset(r->tgsi_samplers[t].samplers, 0,
+                sizeof(r->tgsi_samplers[t].samplers));
+         r->tgsi_samplers[t].nr_samplers = 0;
+      }
+   }
    for (unsigned st = 0; st < MESA_SHADER_FRAGMENT; ++st) {
       draw_set_sampler_views(draw, st, NULL, 0);
       draw_set_samplers(draw, st, NULL, 0);
-      for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i)
-         free(textures[st][i].data);
+      for (unsigned i = 0; i < mapped_views[st]; ++i) {
+         struct swtnl_texture *t = &r->textures[st][i];
+         uint32_t strides[PIPE_MAX_TEXTURE_LEVELS] = {0};
+
+         if (t->bound) {
+            draw_set_mapped_texture(draw, st, i, 0, 0, 0, 0, 0, 0, 0, NULL,
+                                    strides, strides, strides);
+         }
+         free(t->data);
+         t->data = NULL;
+         t->bound = false;
+      }
    }
    for (unsigned i = 0; i < nr_vbs; ++i)
       draw_set_mapped_vertex_buffer(draw, i, NULL, 0);
    if (indices)
       draw_set_indexes(draw, NULL, 0, 0);
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {
+      u_foreach_bit(i, cb_masks[s])
+         draw_set_mapped_constant_buffer(draw, s, i, NULL, 0);
       for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
          if (transfers[s][i])
             pipe_buffer_unmap(&ctx->base, transfers[s][i]);

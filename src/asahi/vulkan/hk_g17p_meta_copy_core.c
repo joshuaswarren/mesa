@@ -197,7 +197,7 @@ hk_g17p_compressed_copy_plan(
       memset(plan, 0, sizeof(*plan));
 
    if (!copy || !plan ||
-       !agx_chip_native_or_m5(copy->chip) ||
+       !agx_chip_agx3_path(copy->chip) ||
        hk_g17p_block_format_family(copy->format) ==
           HK_G17P_BLOCK_FORMAT_NONE ||
        !(image_is_source
@@ -471,7 +471,7 @@ hk_g17p_buffer_to_image_copy_supported(
    const bool one_dimensional =
       copy && copy->image_type == VK_IMAGE_TYPE_1D;
    const bool volume = copy && copy->image_type == VK_IMAGE_TYPE_3D;
-   if (!copy || !agx_chip_native_or_m5(copy->chip) ||
+   if (!copy || !agx_chip_agx3_path(copy->chip) ||
        !hk_g17p_transfer_dst_layout_supported(copy->layout) ||
        (!one_dimensional && copy->image_type != VK_IMAGE_TYPE_2D && !volume) ||
        copy->samples != VK_SAMPLE_COUNT_1_BIT ||
@@ -548,7 +548,7 @@ hk_g17p_buffer_to_image_copy_supported(
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
           copy->image_type != VK_IMAGE_TYPE_2D || copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_agx3_path(copy->chip)))
          return false;
       plane_format = (copy->format == VK_FORMAT_D32_SFLOAT ||
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
@@ -561,7 +561,7 @@ hk_g17p_buffer_to_image_copy_supported(
        * bit-compatible R8_UINT view, in the same single-level 2D shapes. */
       if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
           copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_agx3_path(copy->chip)))
          return false;
       plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||
@@ -644,7 +644,7 @@ hk_g17p_image_copy_slice(enum agx_chip chip, VkImageType src_type,
    const bool two_d_three_d = (src_1d_or_2d && dst_3d) ||
                               (dst_1d_or_2d && src_3d);
    const bool valid_pair = same_type || one_d_two_d || two_d_three_d;
-   if (!agx_chip_native_or_m5(chip) ||
+   if (!agx_chip_agx3_path(chip) ||
        !region || !out || !valid_types ||
        !valid_pair || src_layers == 0 ||
        src_layers != dst_layers || slice >= src_layers ||
@@ -706,6 +706,33 @@ hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
 }
 
 bool
+hk_g17p_image_resolve_slice(enum agx_chip chip, VkImageType src_type,
+                            VkImageType dst_type, uint32_t src_layers,
+                            uint32_t dst_layers,
+                            const VkImageResolve2 *region, uint32_t slice,
+                            VkImageResolve2 *out)
+{
+   if (out)
+      *out = (VkImageResolve2){0};
+
+   if (!agx_chip_native_agx3(chip) || !region || !out ||
+       src_type != VK_IMAGE_TYPE_2D || dst_type != VK_IMAGE_TYPE_2D ||
+       src_layers == 0 || src_layers != dst_layers || slice >= src_layers ||
+       region->srcOffset.z != 0 || region->dstOffset.z != 0 ||
+       region->extent.depth != 1 ||
+       slice > UINT32_MAX - region->srcSubresource.baseArrayLayer ||
+       slice > UINT32_MAX - region->dstSubresource.baseArrayLayer)
+      return false;
+
+   *out = *region;
+   out->srcSubresource.baseArrayLayer += slice;
+   out->srcSubresource.layerCount = 1;
+   out->dstSubresource.baseArrayLayer += slice;
+   out->dstSubresource.layerCount = 1;
+   return true;
+}
+
+bool
 hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
                            struct hk_g17p_metadata_grid *grid)
 {
@@ -744,4 +771,130 @@ hk_g17p_metadata_tile_index(const struct hk_g17p_metadata_grid *grid,
    return (hk_g17p_spread_bits(x_tl & mask) |
            (hk_g17p_spread_bits(y_tl & mask) << 1)) +
           ((major & ~mask) << grid->interleave_bits);
+}
+
+bool
+hk_agx3_compressed_buf2img_view_format_supported(VkFormat view_format)
+{
+   switch (view_format) {
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+bool
+hk_agx3_compressed_buf2img_grid_init(
+   uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+   uint32_t max_groups_x, uint32_t max_groups_y,
+   struct hk_agx3_compressed_buf2img_grid *grid)
+{
+   if (grid)
+      memset(grid, 0, sizeof(*grid));
+   if (!grid || !width || !height || width - 1 > UINT32_MAX - x0 ||
+       height - 1 > UINT32_MAX - y0)
+      return false;
+
+   const uint32_t tile_x0 = x0 & ~15u;
+   const uint32_t tile_y0 = y0 & ~15u;
+   const uint32_t x1 = x0 + width - 1;
+   const uint32_t y1 = y0 + height - 1;
+   const uint64_t groups_x = ((uint64_t)x1 - tile_x0) / 32 + 1;
+   const uint64_t groups_y = ((uint64_t)y1 - tile_y0) / 16 + 1;
+   if (groups_x > max_groups_x || groups_y > max_groups_y)
+      return false;
+
+   *grid = (struct hk_agx3_compressed_buf2img_grid){
+      .tile_x0 = tile_x0,
+      .tile_y0 = tile_y0,
+      .groups_x = (uint32_t)groups_x,
+      .groups_y = (uint32_t)groups_y,
+   };
+   return true;
+}
+
+uint64_t
+hk_g17p_linear_tiled_slice_bytes(
+   const struct hk_g17p_linear_tiled_slice_copy *desc)
+{
+   if (!desc || !desc->src_tiled || !desc->dst_tiled || desc->src_compressed ||
+       desc->dst_compressed || desc->src_sparse || desc->dst_sparse)
+      return 0;
+
+   if (desc->src_type == VK_IMAGE_TYPE_3D || desc->dst_type == VK_IMAGE_TYPE_3D)
+      return 0;
+
+   if (desc->src_samples != desc->dst_samples || !desc->raw_block_size_B)
+      return 0;
+
+   if (!desc->src_tile_w_el || !desc->src_tile_h_el ||
+       desc->src_tile_w_el != desc->dst_tile_w_el ||
+       desc->src_tile_h_el != desc->dst_tile_h_el ||
+       !desc->src_tiles_per_row ||
+       desc->src_tiles_per_row != desc->dst_tiles_per_row)
+      return 0;
+
+   if (desc->plan.src_x_el || desc->plan.src_y_el || desc->plan.dst_x_el ||
+       desc->plan.dst_y_el || !desc->plan.width_el || !desc->plan.height_el ||
+       desc->plan.width_el != desc->src_w_el ||
+       desc->plan.width_el != desc->dst_w_el ||
+       desc->plan.height_el != desc->src_h_el ||
+       desc->plan.height_el != desc->dst_h_el)
+      return 0;
+
+   if (desc->src_level >= desc->src_levels ||
+       desc->dst_level >= desc->dst_levels)
+      return 0;
+
+   const uint64_t tile_bytes =
+      (uint64_t)desc->src_tile_w_el * desc->src_tile_h_el *
+      desc->raw_block_size_B;
+   const uint64_t tiles_y = DIV_ROUND_UP(desc->plan.height_el, desc->src_tile_h_el);
+   const uint64_t tiles = tiles_y * desc->src_tiles_per_row;
+   if (!tile_bytes || !tiles || tiles > UINT64_MAX / tile_bytes)
+      return 0;
+
+   const uint64_t slice_B = tiles * tile_bytes;
+   if ((slice_B & 15) != 0)
+      return 0;
+
+   const uint64_t uint4s = slice_B >> 4;
+   if (uint4s == 0 || uint4s > UINT32_MAX)
+      return 0;
+
+   const uint64_t groups_x = DIV_ROUND_UP(uint4s, 32);
+   if (desc->max_groups_x && groups_x > desc->max_groups_x)
+      return 0;
+
+   if (slice_B > desc->src_level_size_B || slice_B > desc->dst_level_size_B)
+      return 0;
+
+   return slice_B;
+}
+
+bool
+hk_g17p_linear_tiled_slice_addrs_valid(uint64_t dst_addr, uint64_t dst_off,
+                                       uint64_t dst_layout_size_B,
+                                       uint64_t src_addr, uint64_t src_off,
+                                       uint64_t src_layout_size_B,
+                                       uint64_t slice_B)
+{
+   if (!slice_B || (dst_addr & 15) != 0 || (src_addr & 15) != 0)
+      return false;
+
+   if (dst_off > dst_layout_size_B || slice_B > dst_layout_size_B - dst_off ||
+       src_off > src_layout_size_B || slice_B > src_layout_size_B - src_off)
+      return false;
+
+   if (dst_addr > UINT64_MAX - slice_B || src_addr > UINT64_MAX - slice_B)
+      return false;
+
+   return dst_addr + slice_B <= src_addr || src_addr + slice_B <= dst_addr;
 }
