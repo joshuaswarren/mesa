@@ -29,6 +29,13 @@ hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
    assert(!"no alias sites are recorded");
 }
 
+void
+hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd, const void *from,
+                                const void *from_end, uint8_t *to, size_t skip)
+{
+   assert(!"no sparse sites are recorded");
+}
+
 /* Merged streams here record no attachments; with more than one merge call
  * the compiler keeps hk_cs_merge_cdm() out of line, with its attachment loop. */
 bool
