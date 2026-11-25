@@ -2069,10 +2069,50 @@ hk_m5_tile_matches(const struct hk_m5_tile_template *t,
 }
 
 static bool
+hk_m5_tile_program_bound(enum agx_chip chip,
+                         const struct agx3_ioto_uniform_range *ranges,
+                         unsigned range_count, size_t *capacity)
+{
+   const bool g18 = chip == AGX_CHIP_G18G;
+   if (!agx3_g17g_graphics_program_bound(g18 ? AGX_CHIP_G17G : chip, ranges,
+                                         range_count, capacity))
+      return false;
+   if (g18)
+      *capacity *= 2;
+   return true;
+}
+
+static bool
 hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
                    const struct agx3_g17p_graphics_program_desc *d, bool store,
                    struct agx3_g17p_graphics_program *program)
 {
+   if (dev->dev.chip == AGX_CHIP_G18G) {
+      if (!agx3_g17g_tile_program_generate(AGX_CHIP_G17G, d, store, program))
+         return false;
+      struct util_dynarray code;
+      util_dynarray_init(&code, NULL);
+      memcpy(util_dynarray_grow_bytes(&code, 1, program->length), program->bytes,
+             program->length);
+      const struct agx3_transcode_ioto ioto = {
+         .api_program = false,
+         .shader_gprs = shader->info.nr_gprs,
+      };
+      const char *why = NULL;
+      unsigned at = 0;
+      const bool ok = agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
+                      code.size <= sizeof(program->bytes);
+      if (ok) {
+         memcpy(program->bytes, code.data, code.size);
+         program->length = code.size;
+      } else {
+         mesa_loge("hk: G18G tile Ioto not re-encoded: %s at +0x%x",
+                   why ? why : "longer than program buffer", at);
+      }
+      util_dynarray_fini(&code);
+      return ok;
+   }
+
    if (!d->fragment || d->writes_sample_mask || d->colour_classes ||
        d->preloaded_root || d->patchable || d->threadgroup_memory_size_B ||
        d->constant_program.code_size || (d->cprog_inputs && d->cprog_inputs->count) ||
@@ -2132,161 +2172,6 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
       }
    }
    return true;
-}
-
-static struct hk_bg_eot
-hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
-                     const VkRenderingInfo *info, bool store)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const bool g18 = dev->dev.chip == AGX_CHIP_G18G;
-   const enum agx_chip ioto_chip = g18 ? AGX_CHIP_G17G : dev->dev.chip;
-   struct hk_rendering_state *render = &cmd->state.gfx.render;
-   /* DONT_CARE allows arbitrary initial tile contents. Reuse the qualified
-    * zero-clear program until an empty background program is available.
-    * Do not apply this to LOAD_OP_NONE, which has different preservation
-    * semantics, or to a render target that needs its previous contents. */
-   const bool clear_dont_care = !store && key->op[0] == AGX_BG_EOT_NONE &&
-      info->colorAttachmentCount == 1 &&
-      info->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-   const enum agx_bg_eot_op op = clear_dont_care ? AGX_BG_CLEAR : key->op[0];
-   struct hk_image_view *view = render->color_att[0].iview;
-   if (!view || info->colorAttachmentCount != 1 || key->tib.layered ||
-       key->tib.nr_samples != 1 || key->tib.sample_size_B != 8 ||
-       key->tib.tile_size != 32 * 32 || agx_tilebuffer_spills(&key->tib) ||
-       agx_tilebuffer_offset_B(&key->tib, 0) ||
-       info->pColorAttachments[0].resolveMode != VK_RESOLVE_MODE_NONE ||
-       (store ? op != AGX_EOT_STORE
-              : (op != AGX_BG_CLEAR && op != AGX_BG_LOAD)))
-      goto unsupported;
-   for (unsigned rt = 1; rt < HK_MAX_RTS; ++rt) {
-      if (key->op[rt] != AGX_BG_EOT_NONE)
-         goto unsupported;
-   }
-   if (clear_dont_care)
-      key->op[0] = op;
-   if (op == AGX_BG_CLEAR)
-      key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
-
-   struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
-   if (!hk_g17p_bg_eot_shader_supported(shader) ||
-       !shader->info.agx3_staging_known)
-      goto unsupported;
-
-   struct agx3_ioto_uniform_range ranges[2];
-   unsigned range_count = 1;
-   if (store) {
-      if (!view->planes[0].eot_pbe_valid ||
-          shader->info.binary_size != (g18 ? 68 : 78) ||
-          shader->info.nr_gprs != 8 || shader->info.agx3_staging_halfs != 8)
-         goto unsupported;
-      const uint64_t pbe = hk_pool_upload(cmd, &view->planes[0].eot,
-                                          sizeof(view->planes[0].eot), 32);
-      if (!pbe)
-         return (struct hk_bg_eot){0};
-      /* Native builtin binding0x32 supplies the PBE table address in u0..3;
-       * driver argument5 supplies the zero tile offset in u4..5. */
-      const uint64_t arguments[2] = {pbe, 0};
-      const uint64_t table = hk_pool_upload(cmd, arguments, sizeof(arguments), 16);
-      if (!table)
-         return (struct hk_bg_eot){0};
-      ranges[0] = (struct agx3_ioto_uniform_range){0, 6, table};
-   } else if (op == AGX_BG_CLEAR) {
-      if (shader->info.push_count != AGX3_G17P_RT0_CLEAR_PUSH_HALFS ||
-          shader->info.uses_txf)
-         goto unsupported;
-      const VkClearColorValue zero = {0};
-      const uint64_t clear = hk_pool_upload(
-         cmd, clear_dont_care ? &zero : &info->pColorAttachments[0].clearValue.color,
-         16, 16);
-      if (!clear)
-         return (struct hk_bg_eot){0};
-      ranges[0] = (struct agx3_ioto_uniform_range){4, 8, clear};
-   } else {
-      if (shader->info.push_count || !shader->info.uses_txf ||
-          !dev->rodata.bo || !dev->rodata.bo->va)
-         goto unsupported;
-      const uint64_t texture = hk_pool_upload(cmd, &view->planes[0].background,
-                                              sizeof(view->planes[0].background), 32);
-      if (!texture)
-         return (struct hk_bg_eot){0};
-      const uint64_t pointers[2] = {texture, dev->rodata.bo->va->addr};
-      const uint64_t table = hk_pool_upload(cmd, pointers, sizeof(pointers), 8);
-      if (!table)
-         return (struct hk_bg_eot){0};
-      ranges[0] = (struct agx3_ioto_uniform_range){0, 4, table};
-      ranges[1] = (struct agx3_ioto_uniform_range){4, 4, table + 8};
-      range_count = 2;
-   }
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(ioto_chip, ranges, range_count, &capacity))
-      goto unsupported;
-   if (g18)
-      capacity *= 2;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 native tile Ioto",
-                                    &reservation))
-      return (struct hk_bg_eot){0};
-   void *map = reservation.map;
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = reservation.va,
-      .shader_va = shader->ptr + shader->info.main_offset,
-      .shader_binary_size = shader->info.binary_size,
-      .scratch_size = shader->info.scratch_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = shader->info.agx3_staging_known,
-      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
-      .uniform_ranges = ranges,
-      .uniform_range_count = range_count,
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!agx3_g17g_tile_program_generate(ioto_chip, &desc, store, &program))
-      goto unsupported;
-   if (g18) {
-      struct util_dynarray code;
-      util_dynarray_init(&code, NULL);
-      memcpy(util_dynarray_grow_bytes(&code, 1, program.length), program.bytes,
-             program.length);
-      const struct agx3_transcode_ioto ioto = {
-         .api_program = false,
-         .shader_gprs = shader->info.nr_gprs,
-      };
-      const char *why = NULL;
-      unsigned at = 0;
-      const bool ok = agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
-                      code.size <= capacity && code.size <= sizeof(program.bytes);
-      if (ok) {
-         memcpy(program.bytes, code.data, code.size);
-         program.length = code.size;
-      } else {
-         mesa_loge("hk: G18G tile Ioto not re-encoded: %s at +0x%x",
-                   why ? why : "longer than the reservation", at);
-      }
-      util_dynarray_fini(&code);
-      if (!ok)
-         goto unsupported;
-   }
-   if (program.length > capacity)
-      goto unsupported;
-   memcpy(map, program.bytes, program.length);
-   hk_cmd_buffer_retain_bo(cmd, shader->bo);
-   const uint64_t published =
-      hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
-   if (!published)
-      return (struct hk_bg_eot){0};
-   return (struct hk_bg_eot){
-      .usc = published,
-      .rsrc_spec = store ? 0 : UINT64_C(0xffff800000000040),
-   };
-
-unsupported:
-   mesa_loge("M5 tile operation %u exceeds native RT0 support (store=%u load_op=%u)",
-             op, store, info->colorAttachmentCount == 1
-                ? info->pColorAttachments[0].loadOp : UINT32_MAX);
-   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-   return (struct hk_bg_eot){0};
 }
 
 static struct hk_bg_eot
@@ -2454,7 +2339,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       }
    }
    size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, range_count, &capacity))
+   if (!hk_m5_tile_program_bound(dev->dev.chip, ranges, range_count, &capacity))
       goto unsupported;
    struct hk_ioto_reservation reservation;
    if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 MRT tile program", &reservation))
@@ -2531,7 +2416,7 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
       goto unsupported;
 
    size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, NULL, 0, &capacity))
+   if (!hk_m5_tile_program_bound(dev->dev.chip, NULL, 0, &capacity))
       goto unsupported;
    struct hk_ioto_reservation reservation;
    if (!hk_cmd_reserve_ioto_program(cmd, capacity,
@@ -2648,7 +2533,9 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       key->multisample_store = store && (!final_resolve || store_source);
    key->m5_store_and_resolve = final_resolve && store_source;
    key->packed_clear =
-      !store && op == AGX_BG_CLEAR && agx_g17p_packed_clear_ok(&key->tib);
+      !store && op == AGX_BG_CLEAR &&
+      agx_chip_native_or_m5(dev->dev.chip) &&
+      agx_g17p_packed_clear_ok(&key->tib);
    if (op == AGX_BG_CLEAR)
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
    shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
@@ -2720,8 +2607,7 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       range_count = 2;
    }
    size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, range_count,
-                                        &capacity))
+   if (!hk_m5_tile_program_bound(dev->dev.chip, ranges, range_count, &capacity))
       goto unsupported;
    struct hk_ioto_reservation reservation;
    if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 tile program", &reservation))
@@ -2813,7 +2699,7 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
        * there's nothing to do.
        */
       if (key.tib.spilled[i] &&
-          (partial_render || store || agx_chip_native_or_m5(dev->dev.chip)))
+          (partial_render || store || agx_chip_agx3_path(dev->dev.chip)))
          continue;
 
       if (store) {
@@ -2952,10 +2838,7 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       }
       return program;
    }
-   if (dev->dev.chip == AGX_CHIP_G18G)
-      return hk_build_g17g_bg_eot(cmd, &key, info, store);
-
-   if (agx_chip_g17_m5(dev->dev.chip))
+   if (agx_chip_hal300_path(dev->dev.chip))
       return hk_build_m5_bg_eot(cmd, &key, info, store, partial_render);
 
    const unsigned descriptor_generation =

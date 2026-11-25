@@ -5,6 +5,7 @@
 #include "agx_test.h"
 #include "agx3_copy_core.h"
 #include "agx3_tile_core.h"
+#include "agx3_transcode.h"
 #include "agx3_alu_core.h"
 #include "agx3_atomic_core.h"
 #include "agx3_tex_core.h"
@@ -1545,6 +1546,25 @@ int main(void)
                 agx3_m5_mrt_eot_nr_gprs(targets) != 8 ||
                 agx3_m5_mrt_eot_staging_halfs(targets) != targets * 8)
                return 133;
+            /* G18G re-encodes every M5 MRT EOT shape directly to agx3d. */
+            {
+               struct util_dynarray code;
+               util_dynarray_init(&code, NULL);
+               memcpy(util_dynarray_grow_bytes(&code, 1, length), generated,
+                      length);
+               const char *why = NULL;
+               unsigned at = 0;
+               const bool ok = agx3_transcode_agx3d(&code, 0, &why, &at) &&
+                               code.size > 0 &&
+                               code.size <= AGX3_M5_MRT_EOT_MAX_LENGTH * 2;
+               util_dynarray_fini(&code);
+               if (!ok) {
+                  fprintf(stderr,
+                          "G18G MRT EOT transcode failed (targets=%u ms=%u layered=%u): %s at +0x%x\n",
+                          targets, ms, layered, why ? why : "size", at);
+                  return 134;
+               }
+            }
             if (targets != 1)
                continue;
             nir_builder b = nir_builder_init_simple_shader(
