@@ -304,8 +304,9 @@ struct agx_compiled_shader {
     * native texture and sampler table pointers when they access resources. */
    bool g17p_texture_resources;
 
-   /* Exact G17P compute write-only image protocol: PBE pointer and native
-    * write-control record occupy uniform halves 0..15. */
+   /* Native compute write-only image protocol (currently enabled only on
+    * G18G): PBE pointer and write-control record occupy the reserved low
+    * uniform root halves. */
    bool g17p_storage_write;
 
    /* The variant contains Honeykrisp-style custom-border emulation. */

@@ -9749,7 +9749,6 @@ agx_g18_append_compute(struct agx_batch *batch,
                        size_t range_count, unsigned variable_shared_mem)
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
-   const bool g17g = dev->chip == AGX_CHIP_G18G;
    const bool g18 = dev->chip == AGX_CHIP_G18G;
    /* Mode 2 reads the whole grid -- three global thread counts then three
     * local sizes -- from six u32 in GPU memory, so the workgroup this call
@@ -9773,24 +9772,20 @@ agx_g18_append_compute(struct agx_batch *batch,
       !info ? 0
       : linked ? MAX2(linked->scratch_size, linked->agx3_spectpr_scratch_size)
                : MAX2(info->scratch_size, info->agx3_spectpr_scratch_size);
-   /* G18G takes both of Apple's indirect records; G17G has no witness of
-    * either and stays direct. */
-   const bool g18_indirect =
-      dev->chip == AGX_CHIP_G18G && agx_is_indirect(grid);
-   if ((!agx_chip_native_hal200(dev->chip) && !g17g) ||
-       (g17g && grid.mode != AGX_CDM_MODE_DIRECT && !g18_indirect) ||
+   /* G18G takes both of Apple's indirect records. */
+   const bool g18_indirect = g18 && agx_is_indirect(grid);
+   if ((!agx_chip_native_hal200(dev->chip) && !g18) ||
        !info || !binary ||
        (grid.mode == AGX_CDM_MODE_INDIRECT_GLOBAL && !g18_indirect) ||
        (agx_is_indirect(grid) &&
         (!grid.ptr || grid.ptr >= (UINT64_C(1) << 48) || (grid.ptr & 3))) ||
        !info->main_size || !info->nr_gprs ||
        info->preamble_scratch_size ||
-       (g17g && !g18 && info->scratch_size) ||
        (agx_chip_native_hal200(dev->chip) &&
         (info->has_preamble || tps_size > AGX3_G17P_MAX_SPILL_B ||
          (tps_size & 3))) ||
        !info->agx3_staging_known ||
-       (g17g
+       (g18
            ? (info->rodata.size_16
                  ? (!constant_bo || info->rodata.offset != 0 ||
                     info->main_offset !=
@@ -9805,8 +9800,7 @@ agx_g18_append_compute(struct agx_batch *batch,
        (!indirect_local && (!wg.x || !wg.y || !wg.z)) ||
        (linked && (!linked->bo || !linked->bo->va || !linked->size ||
                    !linked->nr_gprs || !linked->g17p_compiler_d_valid ||
-                   (g17g && (linked->g17p_compiler_d & 1)) ||
-                   (g17g && !g18 && linked->scratch_size)))) {
+                   (g18 && (linked->g17p_compiler_d & 1))))) {
       if (info) {
          mesa_loge("asahi: rejected G17P compute metadata: grid=%u "
                    "preamble=%u scratch=%u/%u main=%u+%u/%u "
@@ -9913,8 +9907,7 @@ agx_g18_append_compute(struct agx_batch *batch,
     * Apple's G18 reduction kernel publishes f18 = bytes, f24 = 1 (native
     * kick 18). G17G itself has no such witness, so keep declining it there
     * rather than running a kernel without its threadgroup memory. */
-   if (shared > UINT32_MAX || (g17g && shared > 32768) ||
-       (g17g && shared && dev->chip != AGX_CHIP_G18G))
+   if (shared > UINT32_MAX || (g18 && shared > 32768))
       return agx_g17p_compute_failed("shared memory size");
    const struct agx3_g17p_compute_program_desc desc = {
       .program_va = program.gpu,
@@ -9946,17 +9939,17 @@ agx_g18_append_compute(struct agx_batch *batch,
    struct agx3_g17p_compute_program native;
    struct agx3_compute_program g17g_launch;
    size_t program_length;
-   if (g17g) {
+   if (g18) {
       const struct agx3_g17p_graphics_program_desc g17g_desc = {
          .program_va = program.gpu,
          .shader_va = shader_va,
          .uniform_ranges = ranges,
          .uniform_range_count = range_count,
-         .shader_binary_size = g18 ? shader_binary_size : info->main_size,
-         .scratch_size = g18 ? scratch_bytes : 0,
-         .nr_gprs = g18 ? nr_gprs : info->nr_gprs,
-         .compiler_d_valid = g18 || info->agx3_staging_known,
-         .compiler_d = g18 ? compiler_d : (uint32_t)info->agx3_staging_halfs * 2,
+         .shader_binary_size = shader_binary_size,
+         .scratch_size = scratch_bytes,
+         .nr_gprs = nr_gprs,
+         .compiler_d_valid = true,
+         .compiler_d = compiler_d,
          /* G18 load/store indices now count scalar elements, so SPECLM
           * needs the actual byte footprint, as in the native reduction. */
          .threadgroup_memory_size_B =
@@ -9968,11 +9961,8 @@ agx_g18_append_compute(struct agx_batch *batch,
          .shader_va = shader_va,
          .launch_sources = launch_sources,
       };
-      if (!(g18 ? agx3_g18g_compute_program_generate(&g17g_desc, &g17g_program)
-                 : agx3_g17g_compute_program_generate(agx_ioto_chip(dev), &g17g_desc,
-                                                       &g17g_program)) ||
-          !agx_g18g_reencode_program(dev, &g17g_program, true,
-                                     g18 ? nr_gprs : info->nr_gprs) ||
+      if (!agx3_g18g_compute_program_generate(&g17g_desc, &g17g_program) ||
+          !agx_g18g_reencode_program(dev, &g17g_program, true, nr_gprs) ||
           g17g_program.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE ||
           !agx3_g17g_native_compute_program_bind(&bind_desc, &g17g_launch))
          return false;
@@ -10045,7 +10035,7 @@ agx_g18_append_compute(struct agx_batch *batch,
       if (dev->chip == AGX_CHIP_G18G && shared)
          g17g_launch.launch_template.word0 |= UINT32_C(1) << 23;
 
-      if (!(g17g ? agx3_g17g_native_compute_dispatch_append(
+      if (!(g18 ? agx3_g17g_native_compute_dispatch_append(
                       &g17g_launch, &direct, agx_m5_dispatch_barrier_flags(dev),
                       &sink)
                   : agx3_g17p_native_compute_dispatch_append(&native.launch, &direct, &sink)))
@@ -10057,7 +10047,7 @@ agx_g18_append_compute(struct agx_batch *batch,
     * dispatch here too: the M5 profile covers one dispatch per command, and
     * agx_batch_submit() sends each recorded extent as its own submission. A
     * dispatch left unrecorded is a batch with no submittable compute. */
-   if (g17g) {
+   if (g18) {
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
       if (!agx3_cdm_stream_terminate_pack(dev->chip, terminate) ||
           (size_t)(batch->cdm.end - batch->cdm.current) < sizeof(terminate))
