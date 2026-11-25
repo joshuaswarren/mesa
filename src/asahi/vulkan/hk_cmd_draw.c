@@ -3529,16 +3529,18 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
     * particular 16x16 at 4x may occupy the full 32 KiB, while 32x32 at 4x
     * exceeds the sample budget even for an eight-byte sample. */
    const bool imageblock = agx_chip_native_imageblock(dev->dev.chip);
+   const bool hal300 = agx_chip_hal300_path(dev->dev.chip);
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
    const uint8_t max_sample_size_B =
       m5 ? AGX_MAX_RENDER_TARGETS * 16 :
+      hal300 ? (layered ? 32 : 64) :
       !imageblock              ? 0
       : g17p_wide_ms_to_memory ? AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE
                                : AGX_G17P_MAX_BYTES_PER_SAMPLE;
-   if (m5) {
+   if (hal300) {
       return agx_build_tilebuffer_layout_resident(
-         formats, count, samples, layered, max_sample_size_B, 65536, 2048,
-         resident_mask);
+         formats, count, samples, layered, max_sample_size_B,
+         (!m5 && layered) ? 32768 : 65536, 2048, resident_mask);
    }
    return agx_build_tilebuffer_layout_with_limits_resident(
       formats, count, samples, layered, max_sample_size_B,
