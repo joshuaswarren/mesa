@@ -1845,3 +1845,169 @@ hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
    return true;
 }
 
+static bool
+addr_matches_ssbo(nir_def *addr, unsigned set, unsigned binding)
+{
+   nir_intrinsic_instr *ba = intr(addr, nir_intrinsic_deref_buffer_address);
+   if (!ba)
+      return false;
+   nir_deref_instr *d = nir_src_as_deref(ba->src[0]);
+   while (d && d->deref_type != nir_deref_type_cast)
+      d = nir_deref_instr_parent(d);
+   if (!d || d->deref_type != nir_deref_type_cast)
+      return false;
+   nir_intrinsic_instr *desc = intr(d->parent.ssa, nir_intrinsic_load_vulkan_descriptor);
+   if (!desc || nir_intrinsic_desc_type(desc) != nir_descriptor_type_storage_buffer)
+      return false;
+   nir_intrinsic_instr *res = intr(desc->src[0].ssa, nir_intrinsic_vulkan_resource_index);
+   if (!res || nir_intrinsic_desc_type(res) != nir_descriptor_type_storage_buffer)
+      return false;
+   return nir_intrinsic_desc_set(res) == set &&
+          nir_intrinsic_binding(res) == binding;
+}
+
+static nir_def *
+push_u64(nir_builder *b, uint16_t off, uint16_t range)
+{
+   nir_def *lo = push_u32(b, off, range);
+   nir_def *hi = push_u32(b, off + 4u, range);
+   return nir_pack_64_2x32_split(b, lo, hi);
+}
+
+bool
+hk_nir_apply_gemm_fadd(struct nir_shader *nir,
+                       const struct hk_nir_gemm_output *info,
+                       enum hk_compute_pair_dual_write dual_write)
+{
+   if (!nir || !info || !hk_compute_pair_dual_is_fadd(dual_write))
+      return false;
+
+   const bool inplace = dual_write == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
+                        dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
+   const bool has_copy = dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE ||
+                         dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+   const uint32_t dual_off = hk_dual_write_push_offset(info->push_bytes);
+   const uint32_t extra = has_copy ? sizeof(struct hk_dual_fadd_push)
+                                   : (inplace ? 8u : 16u);
+   if (dual_off + extra > 256u)
+      return false;
+
+   const uint16_t pb = (uint16_t)MAX2((uint32_t)nir->num_uniforms, dual_off + extra);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_def *res_delta = push_u64(
+      &b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, res_delta_lo)), pb);
+   nir_def *dst1_delta =
+      !inplace
+         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst1_delta_lo)), pb)
+         : NULL;
+   nir_def *dst2_delta =
+      has_copy
+         ? push_u64(&b, (uint16_t)(dual_off + offsetof(struct hk_dual_fadd_push, dst2_delta_lo)), pb)
+         : NULL;
+
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   unsigned transformed = 0;
+
+   nir_foreach_block(block, impl) {
+      nir_intrinsic_instr *stores[16];
+      unsigned nstores = 0;
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *st = nir_instr_as_intrinsic(instr);
+         if (st->intrinsic != nir_intrinsic_store_global)
+            continue;
+         if (nstores >= ARRAY_SIZE(stores))
+            return false;
+         if (!addr_matches_ssbo(st->src[1].ssa, info->output.set, info->output.binding))
+            return false;
+         nir_def *val = st->src[0].ssa;
+         const unsigned comps = val->num_components;
+         if (val->bit_size != 32 || (comps != 1 && comps != 2 && comps != 4) ||
+             nir_intrinsic_write_mask(st) != BITFIELD_MASK(comps))
+            return false;
+         stores[nstores++] = st;
+      }
+      if (!nstores)
+         continue;
+
+      /* Phase 1: Batch all residual loads upfront before any store in the block
+       * so DRAM load latency overlaps across tiles. */
+      nir_def *res_vals[16];
+      nir_def *sums[16];
+      nir_def *out_addrs[16];
+      unsigned comps_arr[16];
+      unsigned align_arr[16];
+      for (unsigned i = 0; i < nstores; ++i) {
+         nir_intrinsic_instr *st = stores[i];
+         nir_def *val = st->src[0].ssa;
+         comps_arr[i] = val->num_components;
+         align_arr[i] = MAX2(nir_intrinsic_align_mul(st), 4u);
+         out_addrs[i] = st->src[1].ssa;
+         b.cursor = nir_before_instr(&stores[0]->instr);
+         /* Make sure out_addrs[i] dominates stores[0]; if not, insert right
+          * before st itself. */
+         if (i > 0 && nir_def_instr(out_addrs[i])->block == block) {
+            bool after_first = false;
+            nir_foreach_instr(scan, block) {
+               if (scan == &stores[0]->instr) {
+                  after_first = true;
+               } else if (scan == nir_def_instr(out_addrs[i])) {
+                  if (after_first)
+                     b.cursor = nir_before_instr(&st->instr);
+                  break;
+               }
+            }
+         }
+         nir_def *res_addr = nir_iadd(&b, out_addrs[i], res_delta);
+         res_vals[i] = nir_load_global(&b, comps_arr[i], 32, res_addr,
+                                       .align_mul = align_arr[i], .access = read);
+      }
+
+      /* Phase 2: Compute sums after all loads have been issued, and emit stores
+       * de-interleaved by destination buffer (all out1, then dst1, then dst2). */
+      nir_intrinsic_instr *last_st = stores[nstores - 1];
+      if (inplace) {
+         for (unsigned i = 0; i < nstores; ++i) {
+            b.cursor = nir_before_instr(&stores[i]->instr);
+            sums[i] = nir_fadd(&b, stores[i]->src[0].ssa, res_vals[i]);
+            nir_src_rewrite(&stores[i]->src[0], sums[i]);
+         }
+         b.cursor = nir_after_instr(&last_st->instr);
+      } else {
+         b.cursor = nir_after_instr(&last_st->instr);
+         for (unsigned i = 0; i < nstores; ++i)
+            sums[i] = nir_fadd(&b, stores[i]->src[0].ssa, res_vals[i]);
+         for (unsigned i = 0; i < nstores; ++i) {
+            nir_def *d1_addr = nir_iadd(&b, out_addrs[i], dst1_delta);
+            nir_store_global(&b, sums[i], d1_addr, .align_mul = align_arr[i],
+                             .write_mask = (uint32_t)BITFIELD_MASK(comps_arr[i]),
+                             .access = ACCESS_NON_READABLE);
+         }
+      }
+
+      if (has_copy) {
+         for (unsigned i = 0; i < nstores; ++i) {
+            nir_def *d2_addr = nir_iadd(&b, out_addrs[i], dst2_delta);
+            nir_store_global(&b, sums[i], d2_addr, .align_mul = align_arr[i],
+                             .write_mask = (uint32_t)BITFIELD_MASK(comps_arr[i]),
+                             .access = ACCESS_NON_READABLE);
+         }
+      }
+
+      transformed += nstores;
+   }
+
+   if (!transformed)
+      return false;
+
+   nir->num_uniforms = pb;
+   const char *suffix = has_copy ? (inplace ? "_fadd_in_dcopy" : "_fadd_out_dcopy")
+                                 : (inplace ? "_fadd_in" : "_fadd_out");
+   nir->info.name = ralloc_asprintf(nir, "%s%s", nir->info.name ? nir->info.name : "gemm", suffix);
+   nir_opt_dce(nir);
+   nir_shader_gather_info(nir, impl);
+   return true;
+}

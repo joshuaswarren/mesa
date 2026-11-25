@@ -10386,21 +10386,33 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    }
 
    nir_shader *fused_nir = NULL;
+   const enum hk_compute_pair_dual_write base_dual =
+      hk_compute_pair_dual_is_fadd(dual_write) ? HK_COMPUTE_PAIR_DUAL_NONE : dual_write;
    if (alt_kind == HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4) {
-      fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
-                                              epilogue, dual_write);
+      if (hk_compute_pair_dual_is_fadd(dual_write))
+         fused_nir = NULL;
+      else
+         fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
+                                                 epilogue, dual_write);
    } else if (hk_compute_pair_alt_is_gemm_cmat(alt_kind)) {
       struct hk_nir_gemm_output gemm_info = prod->info.gemm;
       if (hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
          gemm_info.is_guarded = false;
       fused_nir = hk_nir_build_gemm_cmat(prod->nir, &gemm_info,
                                          hk_compute_pair_alt_gemm_tile_n(alt_kind),
-                                         epilogue, dual_write);
+                                         epilogue, base_dual);
    } else if (has_ep) {
       const struct hk_nir_clamp_buffer out_buf =
          prod->info.role == HK_COMPUTE_PAIR_DEPTHWISE ? prod->info.depthwise.output
                                                       : prod->info.gemm.output;
       fused_nir = hk_nir_splice_epilogue(prod->nir, out_buf, epilogue);
+   }
+
+   if (fused_nir && hk_compute_pair_dual_is_fadd(dual_write)) {
+      if (!hk_nir_apply_gemm_fadd(fused_nir, &prod->info.gemm, dual_write)) {
+         ralloc_free(fused_nir);
+         fused_nir = NULL;
+      }
    }
 
    struct hk_shader *shader = NULL;

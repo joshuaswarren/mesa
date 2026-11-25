@@ -520,6 +520,158 @@ test_resample_nearest(void)
    ralloc_free(bad);
 }
 
+static nir_shader *
+build_mock_gemm_cmat(uint16_t push_bytes)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "mock_gemm_cmat");
+   b.shader->info.workgroup_size[0] = 8;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 4;
+   b.shader->num_uniforms = push_bytes;
+
+   nir_def *gx = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *n = load_push_u32(&b, 0, push_bytes);
+   nir_def *idx0 = nir_ishl_imm(&b, gx, 1);
+
+   const struct glsl_type *arr_t = glsl_array_type(glsl_float_type(), 0, 4);
+   nir_def *r_in = nir_vulkan_resource_index(
+      &b, 3, 32, nir_imm_int(&b, 0),
+      .desc_set = 0, .binding = 0,
+      .desc_type = nir_descriptor_type_storage_buffer,
+      .resource_type = nir_resource_type_read_only_storage_buffer);
+   nir_def *d_in = nir_load_vulkan_descriptor(
+      &b, 3, 32, r_in, .desc_type = nir_descriptor_type_storage_buffer);
+   nir_deref_instr *a_in =
+      nir_build_deref_cast_with_alignment(&b, d_in, nir_var_mem_ssbo, arr_t, 0, 4, 0);
+
+   nir_def *r_out = nir_vulkan_resource_index(
+      &b, 3, 32, nir_imm_int(&b, 0),
+      .desc_set = 0, .binding = 3,
+      .desc_type = nir_descriptor_type_storage_buffer,
+      .resource_type = nir_resource_type_read_write_storage_buffer);
+   nir_def *d_out = nir_load_vulkan_descriptor(
+      &b, 3, 32, r_out, .desc_type = nir_descriptor_type_storage_buffer);
+   nir_deref_instr *a_out =
+      nir_build_deref_cast_with_alignment(&b, d_out, nir_var_mem_ssbo, arr_t, 0, 4, 0);
+
+   /* Fast vec2 store path when idx0 + 2 <= n, scalar tail otherwise. */
+   nir_if *fast = nir_push_if(&b, nir_uge(&b, n, nir_iadd_imm(&b, idx0, 2)));
+   {
+      nir_deref_instr *ei = nir_build_deref_array(&b, a_in, idx0);
+      nir_def *v = nir_load_global(
+         &b, 2, 32,
+         nir_deref_buffer_address(&b, 1, 64, &ei->def,
+                                  .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+      nir_deref_instr *eo = nir_build_deref_array(&b, a_out, idx0);
+      nir_store_global(
+         &b, v,
+         nir_deref_buffer_address(&b, 1, 64, &eo->def, .access = ACCESS_NON_READABLE),
+         .align_mul = 4, .write_mask = 3, .access = ACCESS_NON_READABLE);
+   }
+   nir_push_else(&b, fast);
+   {
+      nir_if *ok = nir_push_if(&b, nir_ult(&b, idx0, n));
+      {
+         nir_deref_instr *ei = nir_build_deref_array(&b, a_in, idx0);
+         nir_def *v = nir_load_global(
+            &b, 1, 32,
+            nir_deref_buffer_address(&b, 1, 64, &ei->def,
+                                     .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         nir_deref_instr *eo = nir_build_deref_array(&b, a_out, idx0);
+         nir_store_global(
+            &b, v,
+            nir_deref_buffer_address(&b, 1, 64, &eo->def, .access = ACCESS_NON_READABLE),
+            .align_mul = 4, .write_mask = 1, .access = ACCESS_NON_READABLE);
+      }
+      nir_pop_if(&b, ok);
+   }
+   nir_pop_if(&b, fast);
+
+   nir_validate_shader(b.shader, "mock_gemm_cmat");
+   return b.shader;
+}
+
+static void
+test_gemm_fadd_postpass(void)
+{
+   const enum hk_compute_pair_dual_write modes[4] = {
+      HK_COMPUTE_PAIR_DUAL_FADD_INPLACE,
+      HK_COMPUTE_PAIR_DUAL_FADD_OUT,
+      HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE,
+      HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT,
+   };
+   const uint32_t n = 19; /* exercises both vec2 fast path and scalar tail */
+   const uint16_t base_pb = 16;
+   struct hk_nir_gemm_output info = {
+      .output = { .set = 0, .binding = 3, .offset_B = 0 },
+      .push_bytes = base_pb,
+   };
+
+   float in_a[24], res[24], out1[24], dst1[24], dst2[24];
+   for (unsigned i = 0; i < 24; ++i) {
+      in_a[i] = (float)(i + 1) * 0.25f;
+      res[i] = (float)(24 - i) * -0.5f;
+   }
+
+   for (unsigned m = 0; m < 4; ++m) {
+      const enum hk_compute_pair_dual_write mode = modes[m];
+      const bool inplace = mode == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
+                           mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
+      const bool has_copy = mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE ||
+                            mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+      nir_shader *s = build_mock_gemm_cmat(base_pb);
+      HK_EVAL_CHECK(hk_nir_apply_gemm_fadd(s, &info, mode));
+      nir_validate_shader(s, "gemm_fadd");
+
+      memset(out1, 0, sizeof(out1));
+      memset(dst1, 0, sizeof(dst1));
+      memset(dst2, 0, sizeof(dst2));
+      const struct hk_eval_ssbo bufs[5] = {
+         { .set = 0, .binding = 0, .data = in_a, .size = sizeof(in_a) },
+         { .set = 0, .binding = 3, .data = out1, .size = sizeof(out1) },
+         { .set = 1, .binding = 0, .data = res, .size = sizeof(res) },
+         { .set = 1, .binding = 1, .data = dst1, .size = sizeof(dst1) },
+         { .set = 1, .binding = 2, .data = dst2, .size = sizeof(dst2) },
+      };
+      const uint64_t out_va = hk_eval_make_vaddr(1, 0);
+      const uint64_t res_delta = hk_eval_make_vaddr(2, 0) - out_va;
+      const uint64_t dst1_delta = hk_eval_make_vaddr(3, 0) - out_va;
+      const uint64_t dst2_delta = hk_eval_make_vaddr(4, 0) - out_va;
+
+      uint8_t push[64] = {0};
+      memcpy(push, &n, 4);
+      struct hk_dual_fadd_push dp = {
+         .res_delta_lo = (uint32_t)res_delta,
+         .res_delta_hi = (uint32_t)(res_delta >> 32),
+         .dst1_delta_lo = (uint32_t)dst1_delta,
+         .dst1_delta_hi = (uint32_t)(dst1_delta >> 32),
+         .dst2_delta_lo = (uint32_t)dst2_delta,
+         .dst2_delta_hi = (uint32_t)(dst2_delta >> 32),
+      };
+      memcpy(push + hk_dual_write_push_offset(base_pb), &dp, sizeof(dp));
+
+      const uint32_t grid[3] = { DIV_ROUND_UP(DIV_ROUND_UP(n, 2u), 8u), 1, 1 };
+      hk_eval_dispatch(s, grid, bufs, 5, push, sizeof(push));
+
+      for (unsigned i = 0; i < n; ++i) {
+         const float sum = in_a[i] + res[i];
+         if (inplace) {
+            HK_EVAL_CHECK(hk_eval_f2u(out1[i]) == hk_eval_f2u(sum));
+         } else {
+            HK_EVAL_CHECK(hk_eval_f2u(out1[i]) == hk_eval_f2u(in_a[i]));
+            HK_EVAL_CHECK(hk_eval_f2u(dst1[i]) == hk_eval_f2u(sum));
+         }
+         if (has_copy)
+            HK_EVAL_CHECK(hk_eval_f2u(dst2[i]) == hk_eval_f2u(sum));
+      }
+      ralloc_free(s);
+   }
+}
+
 int
 main(void)
 {
@@ -527,6 +679,7 @@ main(void)
    test_concat_x();
    test_concat_y();
    test_resample_nearest();
+   test_gemm_fadd_postpass();
    glsl_type_singleton_decref();
    printf("PASS: hk_tensor_ops\n");
    return 0;

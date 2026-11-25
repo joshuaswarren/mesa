@@ -124,7 +124,18 @@ enum hk_compute_pair_dual_write {
    HK_COMPUTE_PAIR_DUAL_NONE = 0,
    HK_COMPUTE_PAIR_DUAL_COPY = 1,
    HK_COMPUTE_PAIR_DUAL_PAD4 = 2,
+   HK_COMPUTE_PAIR_DUAL_FADD_INPLACE = 3,
+   HK_COMPUTE_PAIR_DUAL_FADD_OUT = 4,
+   HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE = 5,
+   HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT = 6,
 };
+
+static inline bool
+hk_compute_pair_dual_is_fadd(enum hk_compute_pair_dual_write dual)
+{
+   return dual >= HK_COMPUTE_PAIR_DUAL_FADD_INPLACE &&
+          dual <= HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+}
 
 static inline uint32_t
 hk_dual_write_push_offset(uint32_t push_bytes)
@@ -135,6 +146,15 @@ hk_dual_write_push_offset(uint32_t push_bytes)
 struct hk_dual_copy_push {
    uint32_t dst2_va_lo;
    uint32_t dst2_va_hi;
+};
+
+struct hk_dual_fadd_push {
+   uint32_t res_delta_lo;
+   uint32_t res_delta_hi;
+   uint32_t dst1_delta_lo;
+   uint32_t dst1_delta_hi;
+   uint32_t dst2_delta_lo;
+   uint32_t dst2_delta_hi;
 };
 
 struct hk_dual_pad4_push {

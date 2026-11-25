@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "hk_nir_match_pointwise_clamp.h"
 
 struct nir_shader;
 
@@ -60,5 +61,12 @@ bool hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
                                       struct hk_tensor_op_info *info_out,
                                       struct nir_shader **alt_primary_out,
                                       struct nir_shader **alt_secondary_out);
+
+/* Post-pass over a DUAL_NONE cooperative-matrix GEMM NIR shader that fuses a
+ * trailing element-wise FP32 residual addition (and optional linear copy) at
+ * every output store using 64-bit VA deltas supplied in push constants. */
+bool hk_nir_apply_gemm_fadd(struct nir_shader *nir,
+                            const struct hk_nir_gemm_output *info,
+                            enum hk_compute_pair_dual_write dual_write);
 
 #endif
