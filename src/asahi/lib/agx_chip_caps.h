@@ -108,7 +108,7 @@ enum agx_chip_cap {
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
