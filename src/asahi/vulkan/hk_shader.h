@@ -860,6 +860,9 @@ extern const struct vk_device_shader_ops hk_device_shader_ops;
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev);
 
+uint32_t
+hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage);
+
 /* The bounded native CProg shape both graphics stages admit: imported
  * uniform inputs stored in, and exactly filling, the preamble's TPS frame,
  * with a known staging footprint. */
