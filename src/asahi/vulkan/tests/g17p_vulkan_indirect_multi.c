@@ -2,15 +2,15 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Exercise AGX3 multi-draw indirect recording fast paths across:
+ * Exercise multi-draw indirect recording across:
  *   - vkCmdDrawIndirect (non-indexed, bind-tail elision + chunk rollover)
  *   - vkCmdDrawIndexedIndirect (both robustBufferAccess on and off)
- *   - vkCmdDrawIndexedIndirectCount (GPU count predication + robust batch)
+ *   - indexed and non-indexed indirect count, including command buffer reuse
  *   - VS with neither base params nor gl_DrawID (fixed loader reuse)
  *   - VS with gl_InstanceIndex + gl_VertexIndex (dynamic DRAW_PARAMS reloc)
  *   - VS with gl_DrawID + gl_InstanceIndex (dynamic DRAW_PARAMS + DRAW_ID)
  *   - Non-standard strides, empty draws (empty_draw_jump), edge counts 0..3,
- *     and 1200-draw loops that cross multiple 64 KiB VDM chunks and trigger
+ *     and 2048-draw loops that cross multiple 64 KiB VDM chunks and trigger
  *     Ioto arena growth.
  *
  * Pass --shim under asahi_noop_drm_shim to validate command streams without
@@ -28,7 +28,7 @@
 
 #define IMG_W 64u
 #define IMG_H 64u
-#define DRAW_COUNT 1200u
+#define DRAW_COUNT 2048u
 #define INDIRECT_COUNT_ACTUAL 1050u
 
 #define CHECK(expr)                                                            \
@@ -196,6 +196,18 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
 }
 
 static void
+submit_and_wait(VkQueue queue, VkCommandBuffer cmd)
+{
+   VkSubmitInfo si = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &cmd,
+   };
+   CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
+}
+
+static void
 begin_pass_and_submit(VkQueue queue, VkCommandBuffer cmd,
                       VkRenderPass rp, VkFramebuffer fb, VkImage img,
                       VkBuffer readback,
@@ -203,7 +215,6 @@ begin_pass_and_submit(VkQueue queue, VkCommandBuffer cmd,
 {
    VkCommandBufferBeginInfo bi = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
    };
    CHECK(vkResetCommandBuffer(cmd, 0));
    CHECK(vkBeginCommandBuffer(cmd, &bi));
@@ -260,13 +271,7 @@ begin_pass_and_submit(VkQueue queue, VkCommandBuffer cmd,
 
    CHECK(vkEndCommandBuffer(cmd));
 
-   VkSubmitInfo si = {
-      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-      .commandBufferCount = 1,
-      .pCommandBuffers = &cmd,
-   };
-   CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
-   CHECK(vkQueueWaitIdle(queue));
+   submit_and_wait(queue, cmd);
 }
 
 struct draw_ctx {
@@ -302,9 +307,12 @@ record_draws(VkCommandBuffer cmd, void *opaque)
       return;
    }
 
-   if (c->use_count) {
+   if (c->use_count && c->indexed) {
       vkCmdDrawIndexedIndirectCount(cmd, c->indirect_buf, 0, c->count_buf, 0,
                                     c->draw_count, c->stride);
+   } else if (c->use_count) {
+      vkCmdDrawIndirectCount(cmd, c->indirect_buf, 0, c->count_buf, 0,
+                             c->draw_count, c->stride);
    } else if (c->indexed) {
       vkCmdDrawIndexedIndirect(cmd, c->indirect_buf, 0, c->draw_count,
                                c->stride);
@@ -339,6 +347,26 @@ verify_pixels(const char *label, const uint32_t *px, uint32_t active_draws,
    }
 }
 
+/* Reuse the same recording while the GPU-visible count moves across chunk
+ * boundaries, drops to zero, and exceeds maxDrawCount. Each submit clears
+ * the image, so skipped draws must leave their pixels clear.
+ */
+static void
+verify_count_replay(VkQueue queue, VkCommandBuffer cmd, uint32_t *count,
+                    const uint32_t *pixels, uint32_t vertex_mod,
+                    const char *label)
+{
+   const uint32_t counts[] = {0, DRAW_COUNT - 3, 1, DRAW_COUNT + 1, 7};
+   for (unsigned i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+      *count = counts[i];
+      submit_and_wait(queue, cmd);
+      verify_pixels(label, pixels,
+                    *count < DRAW_COUNT ? *count : DRAW_COUNT, 200u,
+                    vertex_mod, 0u, 3u);
+   }
+   *count = INDIRECT_COUNT_ACTUAL;
+}
+
 static void
 run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
           bool shim, bool non_indexed_only)
@@ -361,6 +389,7 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
    };
    VkPhysicalDeviceFeatures feats = {
       .multiDrawIndirect = VK_TRUE,
+      .drawIndirectFirstInstance = VK_TRUE,
       .robustBufferAccess = robust_buffer_access ? VK_TRUE : VK_FALSE,
    };
    VkDeviceCreateInfo dci = {
@@ -537,20 +566,24 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          .pipe = pipe_plain,
          .index_buf = idx_buf.buf,
          .indirect_buf = ind_buf.buf,
+         .count_buf = count_buf.buf,
          .draw_count = DRAW_COUNT,
          .stride = stride,
          .indexed = false,
       };
-      begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
-                            record_draws, &ctx);
-      if (!shim) {
-         const uint32_t *px = readback.map;
-         const uint32_t *center = px + 4 * ((IMG_H / 2) * IMG_W + (IMG_W / 2));
-         if (center[0] != 42 || center[1] != 7 || center[2] != 99 ||
-             center[3] != 1) {
-            fprintf(stderr, "FAIL plain non-indexed center=(%u,%u,%u,%u)\n",
-                    center[0], center[1], center[2], center[3]);
-            exit(1);
+      for (unsigned counted = 0; counted <= 1; ++counted) {
+         ctx.use_count = counted;
+         begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
+                               record_draws, &ctx);
+         if (!shim) {
+            const uint32_t *px = readback.map;
+            const uint32_t *center = px + 4 * ((IMG_H / 2) * IMG_W + IMG_W / 2);
+            if (center[0] != 42 || center[1] != 7 || center[2] != 99 ||
+                center[3] != 1) {
+               fprintf(stderr, "FAIL plain non-indexed center=(%u,%u,%u,%u)\n",
+                       center[0], center[1], center[2], center[3]);
+               exit(1);
+            }
          }
       }
    }
@@ -647,6 +680,18 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          verify_pixels("draw_id non-indexed", readback.map, DRAW_COUNT, 200u,
                        5u, 0u, 3u);
 
+      ctx.use_count = true;
+      ctx.count_buf = count_buf.buf;
+      begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
+                            record_draws, &ctx);
+      if (!shim) {
+         verify_pixels("draw_id non-indexed count", readback.map,
+                       INDIRECT_COUNT_ACTUAL, 200u, 5u, 0u, 3u);
+         verify_count_replay(queue, cmd, count_buf.map, readback.map, 5u,
+                             "non-indexed count replay");
+      }
+      ctx.use_count = false;
+
       /* Edge drawCounts 0, 1, 2, 3 (non-indexed). */
       ctx.edge_counts = true;
       begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
@@ -685,9 +730,12 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
       };
       begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
                             record_draws, &ctx);
-      if (!shim)
+      if (!shim) {
          verify_pixels("draw_id indexed_count", readback.map,
                        INDIRECT_COUNT_ACTUAL, 200u, 13u, 0u, 3u);
+         verify_count_replay(queue, cmd, count_buf.map, readback.map, 13u,
+                             "indexed count replay");
+      }
 
       /* 6. Edge drawCounts 0, 1, 2, 3 (indexed). */
       ctx.use_count = false;
