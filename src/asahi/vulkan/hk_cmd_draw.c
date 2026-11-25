@@ -13333,7 +13333,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             t.cpu, &gfx->linked_varyings, hw_vs->info.uvs.user_size,
             &linked_fs->b.cf, gfx->provoking, 0, &gfx->generate_primitive_id);
 
-         if (dev->dev.chip == AGX_CHIP_G17G)
+         if (agx_chip_hal300_path(dev->dev.chip))
             agx_cf_bindings_select_perspective(t.cpu, &linked_fs->b.cf);
 
          gfx->varyings = native_vit ? t.gpu : agx_usc_addr(&dev->dev, t.gpu);
