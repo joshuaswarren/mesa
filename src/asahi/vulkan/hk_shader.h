@@ -1073,6 +1073,12 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
 
+/* Lower provably non-overflowing 32-bit scalar uadd_sat(term, k) to iadd.nuw. */
+bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
+
+/* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
+bool hk_nir_merge_buffer_words(nir_shader *nir);
+
 /* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
  * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
  * or compilation fails. */

@@ -1125,24 +1125,28 @@ m5_offset_aligned(nir_scalar s, uint32_t mask, unsigned depth)
    if (!depth || s.def->bit_size != 32 || !nir_scalar_is_alu(s))
       return false;
    const nir_op op = nir_scalar_alu_op(s);
-   if (op == nir_op_mov)
-      return m5_offset_aligned(nir_scalar_chase_alu_src(s, 0), mask, depth - 1);
-   nir_scalar x = nir_scalar_chase_alu_src(s, 0);
-   nir_scalar y;
    switch (op) {
-   case nir_op_iadd: case nir_op_isub: case nir_op_ior: case nir_op_ixor:
-      y = nir_scalar_chase_alu_src(s, 1);
+   case nir_op_mov:
+      return m5_offset_aligned(nir_scalar_chase_alu_src(s, 0), mask, depth - 1);
+   case nir_op_iadd: case nir_op_isub: case nir_op_ior: case nir_op_ixor: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return m5_offset_aligned(x, mask, depth - 1) &&
              m5_offset_aligned(y, mask, depth - 1);
-   case nir_op_imul: case nir_op_amul: case nir_op_iand:
-      y = nir_scalar_chase_alu_src(s, 1);
+   }
+   case nir_op_imul: case nir_op_amul: case nir_op_iand: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return m5_offset_aligned(x, mask, depth - 1) ||
              m5_offset_aligned(y, mask, depth - 1);
-   case nir_op_ishl:
-      y = nir_scalar_chase_alu_src(s, 1);
+   }
+   case nir_op_ishl: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return nir_scalar_is_const(y) &&
              m5_offset_aligned(x, mask >> (nir_scalar_as_uint(y) & 31),
                                depth - 1);
+   }
    case nir_op_bcsel:
       return m5_offset_aligned(nir_scalar_chase_alu_src(s, 1), mask, depth - 1) &&
              m5_offset_aligned(nir_scalar_chase_alu_src(s, 2), mask, depth - 1);
@@ -1195,6 +1199,45 @@ struct m5_bounded_offset {
    uint32_t scale;
    bool valid;
 };
+
+static bool
+lower_aligned_uadd_sat_instr(nir_builder *b, nir_alu_instr *alu,
+                             UNUSED void *data)
+{
+   if (alu->op != nir_op_uadd_sat || alu->def.bit_size != 32 ||
+       alu->def.num_components != 1)
+      return false;
+
+   nir_scalar s0 = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+   nir_scalar s1 = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+   if (nir_scalar_is_const(s0) == nir_scalar_is_const(s1))
+      return false;
+
+   uint32_t k = nir_scalar_as_uint(nir_scalar_is_const(s0) ? s0 : s1);
+   nir_scalar term = nir_scalar_is_const(s0) ? s1 : s0;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   if (k == 0) {
+      nir_def_replace(&alu->def, nir_mov_scalar(b, term));
+      return true;
+   }
+
+   uint32_t mask = UINT32_MAX >> (32 - util_last_bit(k));
+   if (!m5_offset_aligned(term, mask, 12))
+      return false;
+
+   nir_def *sum = nir_iadd(b, nir_mov_scalar(b, term), nir_imm_int(b, k));
+   nir_instr_as_alu(nir_def_instr(sum))->no_unsigned_wrap = true;
+   nir_def_replace(&alu->def, sum);
+   return true;
+}
+
+bool
+hk_nir_lower_aligned_uadd_sat(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, lower_aligned_uadd_sat_instr,
+                              nir_metadata_control_flow, NULL);
+}
 
 static struct m5_bounded_offset
 m5_bounded_offset(nir_scalar s, unsigned depth)
@@ -1310,7 +1353,95 @@ static bool
 m5_word_reads_adjacent(const struct m5_word_read *a, const struct m5_word_read *b)
 {
    return m5_word_reads_same_record(a, b) &&
+          a->offset.constant <= UINT32_MAX - 4 &&
           b->offset.constant == a->offset.constant + 4;
+}
+
+/* Prove that r[0].offset_def + 4 * j does not wrap 32-bit unsigned arithmetic
+ * for any 0 <= j < count, so each merged lane's address and bounds_agx end
+ * uadd_sat(r[0].offset_def, 4 * (j + 1)) match its original separate load.
+ * Unbounded descriptor-relative loads (load_global_constant_offset) have no
+ * bounds check and wrapping past 4 GiB is out-of-bounds UB without robustness;
+ * robust loads and raw physical load_global / load_global_constant require the
+ * proof. */
+static bool
+m5_word_group_no_wrap(const struct m5_word_read *r, unsigned count)
+{
+   if (count <= 1 ||
+       r[0].load->intrinsic == nir_intrinsic_load_global_constant_offset)
+      return true;
+
+   const uint32_t c0 = r[0].offset.constant;
+   const uint32_t span = 4 * (count - 1);
+   const bool is_const = !r[0].offset.term.def || r[0].offset.scale == 0;
+
+   /* Constant-offset robust loads whose exclusive end exceeds UINT32_MAX
+    * evaluate to zero in lower_load_global_constant_offset_instr(), whereas
+    * merged loads saturate the end to UINT32_MAX (which passes if size is
+    * UINT32_MAX). Keep overflowing constant lanes separate. */
+   if (is_const) {
+      if (r[0].bound)
+         return c0 <= UINT32_MAX - 4 * count;
+      return c0 <= UINT32_MAX - span;
+   }
+
+   if (c0 <= UINT32_MAX - span) {
+      const uint32_t diff = c0 ^ (c0 + span);
+      const uint32_t mask = UINT32_MAX >> (32 - util_last_bit(diff));
+      const uint32_t scale = r[0].offset.scale;
+      const unsigned tz = util_last_bit(scale & -scale) - 1;
+      if (m5_offset_aligned(r[0].offset.term, mask >> tz, 12))
+         return true;
+   }
+
+   /* Even without power-of-two alignment, if the highest lane's offset is
+    * iadd.nuw(r[0].offset_def, span), or if r[0] and r[count - 1] are
+    * iadd.nuw(base, k0) and iadd.nuw(base, k0 + span) on the same base, then
+    * r[0].offset_def + span cannot wrap, and neither can any earlier lane. */
+   nir_scalar last = nir_scalar_resolved(r[count - 1].offset_def, 0);
+   if (is_op(last, nir_op_iadd) &&
+       nir_instr_as_alu(nir_def_instr(last.def))->no_unsigned_wrap) {
+      nir_scalar a = nir_scalar_chase_alu_src(last, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(last, 1);
+      nir_scalar last_base;
+      uint32_t last_k;
+      if (nir_scalar_is_const(b)) {
+         last_base = a;
+         last_k = nir_scalar_as_uint(b);
+      } else if (nir_scalar_is_const(a)) {
+         last_base = b;
+         last_k = nir_scalar_as_uint(a);
+      } else {
+         return false;
+      }
+
+      nir_scalar first = nir_scalar_resolved(r[0].offset_def, 0);
+      if (nir_scalar_equal(last_base, first) && last_k == span)
+         return true;
+
+      if (is_op(first, nir_op_iadd) &&
+          nir_instr_as_alu(nir_def_instr(first.def))->no_unsigned_wrap) {
+         nir_scalar fa = nir_scalar_chase_alu_src(first, 0);
+         nir_scalar fb = nir_scalar_chase_alu_src(first, 1);
+         nir_scalar first_base;
+         uint32_t first_k;
+         if (nir_scalar_is_const(fb)) {
+            first_base = fa;
+            first_k = nir_scalar_as_uint(fb);
+         } else if (nir_scalar_is_const(fa)) {
+            first_base = fb;
+            first_k = nir_scalar_as_uint(fa);
+         } else {
+            return false;
+         }
+         if (nir_scalar_equal(last_base, first_base) &&
+             first_k <= UINT32_MAX - span &&
+             last_k == first_k + span)
+            return true;
+      }
+   }
+
+   return false;
 }
 
 /* Match a 64-bit address base + u2u64(offset) with a 32-bit offset. */
@@ -1367,6 +1498,11 @@ m5_has_mergeable_buffer_words(nir_shader *nir)
    return false;
 }
 
+struct m5_word_replace {
+   nir_intrinsic_instr *load;
+   nir_def *word;
+};
+
 /* Load the words of a robust uniform buffer read at constant offsets
  * r[g..g_end) through the aligned 16-byte windows that hold them.
  *
@@ -1380,7 +1516,8 @@ m5_has_mergeable_buffer_words(nir_shader *nir)
  * Each word keeps its own exact check against the descriptor's byte size, and
  * soft fault covers the window's unread words. */
 static bool
-m5_load_uniform_windows(struct m5_word_read *r, unsigned g, unsigned g_end)
+m5_load_uniform_windows(struct m5_word_read *r, unsigned g, unsigned g_end,
+                        struct util_dynarray *replacements)
 {
    bool progress = false;
    for (unsigned i = g; i < g_end;) {
@@ -1419,7 +1556,11 @@ m5_load_uniform_windows(struct m5_word_read *r, unsigned g, unsigned g_end)
          nir_def *word = nir_channel(&b, v, (offset - window) / 4);
          word = nir_bounds_agx(&b, word, nir_imm_int(&b, offset + 4),
                                r[k].bound);
-         nir_def_replace(&r[k].load->def, word);
+         struct m5_word_replace rep = {
+            .load = r[k].load,
+            .word = word,
+         };
+         util_dynarray_append(replacements, rep);
       }
       progress = true;
       i = j;
@@ -1427,39 +1568,38 @@ m5_load_uniform_windows(struct m5_word_read *r, unsigned g, unsigned g_end)
    return progress;
 }
 
-/* M5: a structure read field by field (a light record in a loop) issues one
- * load per 32-bit word, each with its own address. Merge the reads of up to
- * four consecutive words at one base and offset term into one vector load.
+/* Merge up to four consecutive 32-bit reads of one record (one base, size and
+ * offset term) into a single vector load.
  *
- * Buffer reads address base + u2u64(X + c) with a 32-bit offset, so the words
- * of one vector load differ from their separate reads only where X + c wraps
- * 2^32. Such an offset lies past the end of any buffer: undefined without
- * robustness, and zeroed by the robust forms here. A robust read (soft fault:
- * load, then zero the word when its end lies past the descriptor's byte size)
- * keeps each word's own check:
+ * Buffer reads address base + u2u64(offset) with a 32-bit offset. Unbounded
+ * descriptor-relative reads (load_global_constant_offset) have undefined
+ * behavior if a 32-bit offset wraps past 4 GiB; robust reads and raw physical
+ * load_global / load_global_constant require a proof (m5_word_group_no_wrap)
+ * that start + 4 * j cannot wrap 2^32 for any lane j < count, so every lane's
+ * 64-bit address and exclusive-end check
  *
  *    word j of a load at X: bounds_agx(v.j, uadd_sat(X, 4 * (j + 1)), size)
  *
- * which is exact, except that a word whose offset wraps is now zeroed instead
- * of read at its wrapped offset. Only such a word's address differs from its
- * separate read, and soft fault covers it.
+ * are exact matches for the original separate loads.
  *
  * Robust uniform buffer reads at constant offsets reach this pass as single
  * words too: the vectorizer cannot prove that their offsets do not wrap. Their
  * windows are fixed instead of following each block's reads
  * (m5_load_uniform_windows). */
-static bool
-m5_merge_buffer_words(nir_shader *nir)
+bool
+hk_nir_merge_buffer_words(nir_shader *nir)
 {
    bool any = false;
-   struct util_dynarray reads;
+   struct util_dynarray reads, replacements;
    util_dynarray_init(&reads, NULL);
+   util_dynarray_init(&replacements, NULL);
    nir_foreach_function_impl(impl, nir) {
       bool progress = false;
       nir_index_ssa_defs(impl);
       nir_index_instrs(impl);
       nir_foreach_block(block, impl) {
          util_dynarray_clear(&reads);
+         util_dynarray_clear(&replacements);
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
@@ -1509,7 +1649,7 @@ m5_merge_buffer_words(nir_shader *nir)
 
             if (r[g].bound && !r[g].offset.term.def &&
                 r[g].load->intrinsic == nir_intrinsic_load_global_constant_bounded) {
-               progress |= m5_load_uniform_windows(r, g, g_end);
+               progress |= m5_load_uniform_windows(r, g, g_end, &replacements);
                g = g_end;
                continue;
             }
@@ -1519,7 +1659,8 @@ m5_merge_buffer_words(nir_shader *nir)
             for (unsigned i = g; i < g_end && nr_units < ARRAY_SIZE(units);) {
                unsigned count = 1;
                while (i + count < g_end && count < 4 &&
-                      m5_word_reads_adjacent(&r[i + count - 1], &r[i + count]))
+                      m5_word_reads_adjacent(&r[i + count - 1], &r[i + count]) &&
+                      m5_word_group_no_wrap(&r[i], count + 1))
                   count++;
                while (count > 1) {
                   unsigned first = i, last = i;
@@ -1592,15 +1733,26 @@ m5_merge_buffer_words(nir_shader *nir)
                      nir_def *end = nir_uadd_sat(&b, x, nir_imm_int(&b, 4 * (j + 1)));
                      word = nir_bounds_agx(&b, word, end, r[i].bound);
                   }
-                  nir_def_replace(&r[i + j].load->def, word);
+                  struct m5_word_replace rep = {
+                     .load = r[i + j].load,
+                     .word = word,
+                  };
+                  util_dynarray_append(&replacements, rep);
                }
             }
             progress = true;
             g = g_end;
          }
+         /* Apply replacements after all groups in the block are emitted so
+          * cached bound/offset definitions from earlier groups stay live and
+          * get rewritten cleanly to their merged results. */
+         util_dynarray_foreach(&replacements, struct m5_word_replace, rep) {
+            nir_def_replace(&rep->load->def, rep->word);
+         }
       }
       any |= nir_progress(progress, impl, nir_metadata_control_flow);
    }
+   util_dynarray_fini(&replacements);
    util_dynarray_fini(&reads);
    return any;
 }
@@ -1663,13 +1815,179 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
    }
 
-   nir_def *val = nir_load_global(
-      b, intr->def.num_components, intr->def.bit_size,
-      nir_iadd(b, base, nir_u2u64(b, offset)),
-      .align_mul = nir_intrinsic_align_mul(intr),
-      .align_offset = nir_intrinsic_align_offset(intr), .access = access);
+   nir_def *address = nir_iadd(b, base, nir_u2u64(b, offset));
+   nir_def *val =
+      intr->intrinsic == nir_intrinsic_load_global_constant_bounded
+         ? nir_load_global_constant(
+              b, intr->def.num_components, intr->def.bit_size, address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access)
+         : nir_load_global(
+              b, intr->def.num_components, intr->def.bit_size, address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
    nir_def_replace(&intr->def, val);
+}
+
+static bool
+hk_ubo_offset_is_const(nir_def *def, unsigned depth)
+{
+   if (nir_def_is_const(def))
+      return true;
+   if (depth == 0)
+      return false;
+
+   nir_alu_instr *alu = nir_def_as_alu_or_null(def);
+   if (!alu)
+      return false;
+
+   const unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < num_inputs; ++i) {
+      if (!hk_ubo_offset_is_const(alu->src[i].src.ssa, depth - 1))
+         return false;
+   }
+   return num_inputs > 0;
+}
+
+/* Return whether a uniform buffer descriptor can be prefetched by uniform DMA
+ * (root-table dynamic UBO, inline uniform block, or constant-index UBO in a
+ * static descriptor set). Bindless/mutable or dynamically-indexed UBO
+ * descriptors cannot be prefetched by uniform DMA. */
+static bool
+hk_ubo_desc_can_uniform_dma(nir_def *desc, uint8_t static_set_mask)
+{
+   nir_scalar s = nir_scalar_resolved(desc, 0);
+   nir_intrinsic_instr *load = nir_def_as_intrinsic_or_null(s.def);
+   if (!load)
+      return true;
+
+   if (load->intrinsic == nir_intrinsic_load_global_constant_offset) {
+      if (!hk_ubo_offset_is_const(load->src[1].ssa, 4))
+         return false;
+      nir_intrinsic_instr *set_load = nir_src_as_intrinsic(load->src[0]);
+      if (set_load &&
+          set_load->intrinsic == nir_intrinsic_load_descriptor_set_agx) {
+         const unsigned set = nir_intrinsic_desc_set(set_load);
+         return set < 8 && (static_set_mask & BITFIELD_BIT(set));
+      }
+      return false;
+   }
+
+   /* Dynamic UBOs load from the root table via load_global_constant. */
+   return true;
+}
+
+/* Keep naturally aligned robustBufferAccess2 UBO loads as base-plus-index
+ * global constant loads. Constant-offset loads from uniform-DMA-eligible
+ * descriptors are left for nir_lower_explicit_io + uniform DMA prefetching so
+ * static UBO contents stay in uniform registers.
+ *
+ * Both maxUniformBufferRange and AGX_ZERO_PAGE_SIZE are 64 KiB, and
+ * robustUniformBufferAccessSizeAlignment equals HK_MIN_UBO_ALIGNMENT (64 B).
+ * Checking the 64-byte record offset against the descriptor bound lets
+ * neighboring fields share one bounds check and base select, while masking the
+ * offset into the 64 KiB zero page keeps out-of-bounds loads within the zero
+ * page without clamping the offset inside the select. */
+static bool
+hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const uint8_t static_set_mask = *(const uint8_t *)data;
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       intr->def.bit_size != 32 ||
+       intr->num_components > 4 ||
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+      return false;
+
+   nir_deref_instr *leaf = nir_src_as_deref(intr->src[0]);
+   if (leaf->modes != nir_var_mem_ubo ||
+       (glsl_get_explicit_stride(leaf->type) != 0 &&
+        glsl_get_explicit_stride(leaf->type) != 4))
+      return false;
+
+   uint32_t mul, disp;
+   if (!nir_get_explicit_deref_align(leaf, true, &mul, &disp) ||
+       mul < 4 || (disp & 3) || (mul & (mul - 1)))
+      return false;
+
+   const uint32_t size = intr->num_components * 4u;
+   if ((disp & 63u) + size > 64u || (mul < 64u && (disp % mul) + size > mul))
+      return false;
+
+   nir_deref_path path;
+   nir_deref_path_init(&path, leaf, NULL);
+   nir_deref_instr *root = path.path[0];
+   if (root->deref_type != nir_deref_type_cast ||
+       root->parent.ssa->num_components != 4 ||
+       root->parent.ssa->bit_size != 32) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Require a zero base offset on the bounded descriptor so the deref
+    * alignment matches the byte offset from the descriptor base. */
+   nir_scalar base_off = nir_scalar_resolved(root->parent.ssa, 3);
+   if (!nir_scalar_is_const(base_off) || nir_scalar_as_uint(base_off) != 0) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Inline uniform blocks in descriptor buffers may exceed 64 KiB; their full
+    * binding size is a constant in channel 2. Fall back to explicit I/O so
+    * offsets >= AGX_ZERO_PAGE_SIZE are not masked. */
+   nir_scalar root_bound = nir_scalar_resolved(root->parent.ssa, 2);
+   if (nir_scalar_is_const(root_bound) &&
+       nir_scalar_as_uint(root_bound) > AGX_ZERO_PAGE_SIZE) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Preserve constant-offset UBO loads on uniform-DMA-eligible descriptors
+    * for uniform DMA prefetching. */
+   bool const_offset = true;
+   for (unsigned i = 1; const_offset && path.path[i]; ++i) {
+      nir_deref_instr *d = path.path[i];
+      if ((d->deref_type == nir_deref_type_array ||
+           d->deref_type == nir_deref_type_ptr_as_array) &&
+          !nir_src_is_const(d->arr.index))
+         const_offset = false;
+   }
+   if (const_offset &&
+       hk_ubo_desc_can_uniform_dma(root->parent.ssa, static_set_mask)) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *addr = root->parent.ssa;
+   for (unsigned i = 1; path.path[i]; ++i)
+      addr = nir_explicit_io_address_from_deref(
+         b, path.path[i], addr, nir_address_format_64bit_bounded_global);
+   nir_deref_path_finish(&path);
+
+   nir_def *base = nir_pack_64_2x32_split(b, nir_channel(b, addr, 0),
+                                          nir_channel(b, addr, 1));
+   nir_def *off = nir_channel(b, addr, 3);
+   nir_def *bound = nir_channel(b, addr, 2);
+
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT == 64);
+   STATIC_ASSERT(AGX_ZERO_PAGE_SIZE == 65536);
+   nir_def *record = nir_iand_imm(b, off, ~63u);
+   nir_def *valid = nir_ult(b, record, bound);
+   const unsigned alignment = MIN2(mul, 64u);
+   nir_def *safe = nir_bcsel(b, valid, base,
+                             nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   nir_def *index =
+      nir_iand_imm(b, off, (AGX_ZERO_PAGE_SIZE - 1u) & ~(alignment - 1u));
+   index = nir_ior_imm(b, index, disp % alignment);
+   nir_def *address = nir_iadd(b, safe, nir_u2u64(b, index));
+   nir_def *value = nir_load_global_constant(
+      b, intr->num_components, 32, address,
+      .align_mul = alignment, .align_offset = disp % alignment,
+      .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE |
+                ACCESS_CAN_REORDER);
+   nir_def_replace(&intr->def, value);
+   return true;
 }
 
 struct global_load_lowering {
@@ -3217,6 +3535,10 @@ hk_coherent_images_in_memory(const struct agx_device *dev)
           dev->params.num_clusters_total > 1;
 }
 
+static uint8_t
+hk_static_set_mask(uint32_t set_layout_count,
+                   struct vk_descriptor_set_layout *const *set_layouts);
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3502,6 +3824,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,
                                   agx_chip_g17_m5(dev->dev.chip)));
+   if (rs->uniform_buffers ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
+      uint8_t static_set_mask =
+         hk_static_set_mask(set_layout_count, set_layouts);
+      NIR_PASS(lowered_buf_io, nir, nir_shader_intrinsics_pass,
+               hk_lower_aligned_ubo, nir_metadata_control_flow,
+               &static_set_mask);
+   }
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
@@ -3592,9 +3922,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
       if (global_loads.storage_result_select && global_loads.soft_fault &&
           m5_has_mergeable_buffer_words(nir)) {
+         /* Lower provably non-overflowing uadd_sat(aligned, k) before CSE
+          * and word merging so robust structured-buffer fields coalesce. */
+         NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
          /* Reads of one descriptor share its base and size only after CSE. */
          NIR_PASS(_, nir, nir_opt_cse);
-         NIR_PASS(_, nir, m5_merge_buffer_words);
+         NIR_PASS(_, nir, hk_nir_merge_buffer_words);
       }
    } else if (lowered_push_const) {
       NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -3605,6 +3938,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
+
+   if (global_loads.soft_fault) {
+      NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
+   }
 
    bool lowered_shared_io = false;
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
@@ -9654,27 +9991,37 @@ hk_compute_pair_producer_destroy(struct hk_compute_pair_producer *p)
 }
 
 static struct hk_compute_pair_producer *
-hk_compute_pair_producer_create(struct hk_device *dev,
-                                const struct vk_shader_compile_info *info,
-                                enum hk_feature_key features,
-                                const struct hk_compute_pair_info *pair,
-                                const nir_shader *nir)
+hk_compute_pair_producer_alloc(struct hk_device *dev,
+                               const struct hk_compute_pair_info *pair)
 {
-   if (info->set_layout_count > HK_MAX_SETS)
-      return NULL;
    struct hk_compute_pair_producer *p = calloc(1, sizeof(*p));
    if (!p)
       return NULL;
-   p->nir = nir_shader_clone(NULL, nir);
-   if (!p->nir) {
-      free(p);
-      return NULL;
-   }
    pipe_reference_init(&p->ref, 1);
    p->destroy = hk_compute_pair_producer_destroy;
    p->dev = dev;
    simple_mtx_init(&p->lock, mtx_plain);
    p->info = *pair;
+   return p;
+}
+
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_create(struct hk_device *dev,
+                                const struct vk_shader_compile_info *info,
+                                uint32_t features,
+                                const struct hk_compute_pair_info *pair,
+                                const nir_shader *nir)
+{
+   if (info->set_layout_count > HK_MAX_SETS)
+      return NULL;
+   struct hk_compute_pair_producer *p = hk_compute_pair_producer_alloc(dev, pair);
+   if (!p)
+      return NULL;
+   p->nir = nir_shader_clone(NULL, nir);
+   if (!p->nir) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
+   }
    p->flags = info->flags;
    if (info->robustness)
       p->robustness = *info->robustness;
@@ -9684,6 +10031,82 @@ hk_compute_pair_producer_create(struct hk_device *dev,
    for (uint32_t i = 0; i < info->set_layout_count; ++i) {
       if (info->set_layouts[i])
          p->set_layouts[i] = vk_descriptor_set_layout_ref(info->set_layouts[i]);
+   }
+   return p;
+}
+
+bool
+hk_compute_pair_producer_serialize(struct blob *blob,
+                                   const struct hk_compute_pair_producer *p)
+{
+   if (!p->nir || (p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
+                   p->info.role != HK_COMPUTE_PAIR_GEMM))
+      return false;
+
+   blob_write_uint32(blob, p->flags);
+   blob_write_bytes(blob, &p->robustness, sizeof(p->robustness));
+   blob_write_uint32(blob, p->next_stage_mask);
+   blob_write_uint32(blob, p->features);
+   blob_write_uint32(blob, p->set_layout_count);
+   for (uint32_t i = 0; i < p->set_layout_count; ++i) {
+      blob_write_uint8(blob, p->set_layouts[i] != NULL);
+      if (p->set_layouts[i] &&
+          !hk_descriptor_set_layout_serialize(
+             blob, vk_to_hk_descriptor_set_layout(p->set_layouts[i])))
+         return false;
+   }
+   nir_serialize(blob, p->nir, false);
+   return !blob->out_of_memory;
+}
+
+struct hk_compute_pair_producer *
+hk_compute_pair_producer_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob,
+                                     const struct hk_compute_pair_info *pair)
+{
+   if (pair->role != HK_COMPUTE_PAIR_DEPTHWISE &&
+       pair->role != HK_COMPUTE_PAIR_GEMM)
+      return NULL;
+
+   const VkShaderCreateFlagsEXT flags = blob_read_uint32(blob);
+   struct vk_pipeline_robustness_state robustness;
+   blob_copy_bytes(blob, &robustness, sizeof(robustness));
+   const VkShaderStageFlags next_stage_mask = blob_read_uint32(blob);
+   const uint32_t features = blob_read_uint32(blob);
+   const uint32_t set_layout_count = blob_read_uint32(blob);
+   if (blob->overrun || set_layout_count > HK_MAX_SETS)
+      return NULL;
+
+   struct hk_compute_pair_producer *p = hk_compute_pair_producer_alloc(dev, pair);
+   if (!p)
+      return NULL;
+   p->flags = flags;
+   p->robustness = robustness;
+   p->next_stage_mask = next_stage_mask;
+   p->features = features;
+   p->set_layout_count = set_layout_count;
+   for (uint32_t i = 0; i < set_layout_count; ++i) {
+      if (!blob_read_uint8(blob))
+         continue;
+      struct hk_descriptor_set_layout *layout =
+         hk_descriptor_set_layout_deserialize(dev, blob);
+      if (!layout) {
+         hk_compute_pair_producer_unref(p);
+         return NULL;
+      }
+      p->set_layouts[i] = &layout->vk;
+   }
+
+   /* An overrun reads as no layout: refuse before reading NIR from it. */
+   if (blob->overrun) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
+   }
+   p->nir = nir_deserialize(NULL, &agx_nir_options, blob);
+   if (blob->overrun || !p->nir ||
+       p->nir->info.stage != MESA_SHADER_COMPUTE) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
    }
    return p;
 }
@@ -10969,6 +11392,23 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
+
+      const uint32_t producer_size = blob_read_uint32(blob);
+      const void *producer_data = blob_read_bytes(blob, producer_size);
+      if (blob->overrun) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+      if (producer_size) {
+         struct blob_reader producer;
+         blob_reader_init(&producer, producer_data, producer_size);
+         obj->compute_pair_producer =
+            hk_compute_pair_producer_deserialize(dev, &producer, &pair);
+         if (!obj->compute_pair_producer || producer.current != producer.end) {
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+         }
+      }
    }
 
    bool has_fadd_dual = false;
@@ -11615,6 +12055,24 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
    blob_write_bytes(blob, shader->data_ptr, shader->data_size);
 }
 
+/* A compute-pair producer follows its pair's info, size-prefixed: size 0 for
+ * a shader without one, which then is not fused at submission. A
+ * serialization a producer refuses leaves size 0 too. */
+static bool
+hk_write_compute_pair_producer(struct blob *blob,
+                               const struct hk_compute_pair_producer *p)
+{
+   struct blob payload;
+   blob_init(&payload);
+   const bool written = p && hk_compute_pair_producer_serialize(&payload, p) &&
+                        payload.size <= UINT32_MAX;
+   blob_write_uint32(blob, written ? payload.size : 0);
+   if (written)
+      blob_write_bytes(blob, payload.data, payload.size);
+   blob_finish(&payload);
+   return !blob->out_of_memory;
+}
+
 static bool
 hk_api_shader_serialize(struct vk_device *vk_dev,
                         const struct vk_shader *vk_shader, struct blob *blob)
@@ -11659,8 +12117,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->gemm_cmat32 ? 4 : 0) |
                              (obj->gemm_cmat64 ? 8 : 0) |
                              (obj->gemm_cmat16 ? 16 : 0));
-   if (obj->compute_pair)
+   if (obj->compute_pair) {
       hk_compute_pair_info_serialize(blob, obj->compute_pair);
+      if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
+         return false;
+   }
    struct hk_shader *fadd_dual =
       (obj->identity_copy4 &&
        obj->identity_copy4_info.kind == HK_IDENTITY_COPY4_LINEAR_FADD &&

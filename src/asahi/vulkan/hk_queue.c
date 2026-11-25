@@ -2947,22 +2947,26 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
  * single active kernel queue, which runs its commands in order. On G17P,
  * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
- * whenever the single-active-kernel-queue invariant holds: no sibling kernel
- * queue is in flight (hk_sibling_in_flight()), sibling routing stays off
- * until any packed atomic submission completes (packed_atomic_point), and no
- * other VkQueue or host-AS queue on the device has a kernel queue. A second
- * kernel queue created while a packet runs is not covered; unpacked atomic
- * work has the same exposure. The G16 kernel puts every compute command of a
- * VM on its one firmware compute queue and never runs one beside another
- * VM's: several commands of one VM may be in flight there, but the firmware
- * runs them one after another, never beside a packet. G16G packs them unless
- * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
- * G16G, which no uAPI feature reports yet; the chip stands for it until one
- * does (hk_pack_atomics_choice()). */
+ * whenever the single-kernel-queue invariant holds for the lifetime of the
+ * device: no sibling kernel queue is in flight (hk_sibling_in_flight()),
+ * sibling routing stays off until any packed atomic submission completes
+ * (packed_atomic_point), and no other non-emulated VkQueue, host-AS queue,
+ * or compute-kick queue exists on the device. Because kernel queues are
+ * admitted lazily on first submission, checking only whether another queue
+ * already has a kernel queue ID leaves a race where a second queue admits
+ * and submits concurrently before an in-flight packed atomic chain finishes
+ * (and waiting for packed_atomic_point at admission would deadlock valid
+ * wait-before-signal timeline semaphore submits). The G16 kernel puts every
+ * compute command of a VM on its one firmware compute queue and never runs
+ * one beside another VM's: several commands of one VM may be in flight there,
+ * but the firmware runs them one after another, never beside a packet. G16G
+ * packs them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel,
+ * the only one for G16G, which no uAPI feature reports yet; the chip stands
+ * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
-static bool
+bool
 hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
@@ -2970,7 +2974,7 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
       opt = debug_get_option_m5_pack_atomics_opt();
 
    const struct hk_queue *as = dev->host_as.queue;
-   if (as && as != queue && p_atomic_read(&as->drm.id) != UINT32_MAX)
+   if (as && as != queue && !vk_queue_is_emulated(&as->vk))
       return false;
 
    if (dev->dev.chip == AGX_CHIP_G16G)
@@ -2981,14 +2985,14 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
    const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
    if (!hk_pack_atomics_choice(default_on, opt, 1))
       return false;
-   if (hk_sibling_in_flight(dev, queue))
+   if (queue->kick.watched || hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && p_atomic_read(&other->drm.id) != UINT32_MAX)
+      if (other != queue)
          return false;
    }
    return true;

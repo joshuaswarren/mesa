@@ -916,6 +916,7 @@ print_access(enum gl_access_qualifier access, print_state *state, const char *se
       { ACCESS_ESTREAM_PAN, "estream-pan" },
       { ACCESS_BUFFER_AGX, "buffer-agx" },
       { ACCESS_BUFFER_DESCRIPTOR_AGX, "buffer-descriptor-agx" },
+      { ACCESS_BUFFER_BINDING_AGX, "buffer-binding-agx" },
    };
 
    bool first = true;
