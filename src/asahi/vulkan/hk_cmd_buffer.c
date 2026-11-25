@@ -5396,10 +5396,10 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->end = cs->current + size;
    cs->chunk = T;
    cs->stream_linked |= linked;
-   /* Conservative: G17P and the M5 re-emit their restart state after a
+   /* Conservative: AGX3 path chips re-emit their restart state after a
     * link, and HAL200 re-publishes its full bind tail before relying on
     * incremental FS PPP updates or tail elision in the new chunk. */
-   if (vdm && agx_chip_g17p_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+   if (vdm && agx_chip_agx3_path(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->restart_index_set = false;
    if (vdm && agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_bind_tail.valid = false;

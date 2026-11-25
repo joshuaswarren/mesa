@@ -787,9 +787,8 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
- *   - G18G uses HAL300 records too, but has no stream-link continuation for
- *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
- *     out-of-range index behaviour is unmeasured, so it stays off.
+ *   - G18G uses HAL300 records too, but its out-of-range hardware index
+ *     behaviour is unmeasured, so it keeps the software rewrite.
  *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
  *     hardware rows (M3, M4) prove zero substitution past the size word.
  *   - AGX2 does not have it: its Index List does not read out-of-range

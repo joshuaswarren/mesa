@@ -13276,8 +13276,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
  * record predicated off by an indirect count) has somewhere to continue.
  * The G17P and HAL300 record families replace such a draw with a stream link
  * (agx_vdm_draw_robust_index), whose target hk_emit_robust_index() computes
- * only for native AGX3 and M5. G18G writes HAL300 records but has no such
- * target yet, so it must not be sent through the rewrite by default. */
+ * for every AGX3 path chip (native AGX3, M5, and G18G). */
 static bool
 hk_robust_index_has_empty_continuation(const struct hk_device *dev)
 {
@@ -13285,7 +13284,7 @@ hk_robust_index_has_empty_continuation(const struct hk_device *dev)
       agx_vdm_index_list_record_chip(agx_chip_record_family(dev->dev.chip));
    const bool links = records == AGX_CHIP_G17P ||
                       agx_vdm_index_list_direct_is_hal300_inline(records);
-   return !links || agx_chip_native_or_m5(dev->dev.chip);
+   return !links || agx_chip_agx3_path(dev->dev.chip);
 }
 
 /* Whether a draw already converted to the rewrite's indexed-indirect form
@@ -13338,7 +13337,7 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
     * page instead.
     */
    if (draw->index_buffer_range_B == 0 ||
-       (agx_chip_native_or_m5(dev->dev.chip) &&
+       (agx_chip_agx3_path(dev->dev.chip) &&
         draw->index_buffer == AGX_ZERO_PAGE_ADDRESS &&
         draw->index_buffer_range_B == 4)) {
       draw->index_buffer = AGX_ZERO_PAGE_ADDRESS;
@@ -13696,7 +13695,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * dereference the heap. Direct adjacency without restart uses no heap. */
    const bool needs_heap = geom || tess || (*needs_idx_robust && !adj) ||
       (adj && (draw->restart ||
-               (agx_chip_native_or_m5(dev->dev.chip) &&
+               (agx_chip_agx3_path(dev->dev.chip) &&
                 agx_is_indirect(draw->b))));
    if (needs_heap && !hk_cmd_ensure_geometry_heap(cmd))
       return NULL;
@@ -13707,7 +13706,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * publication path as well; the generated body carries the matching
     * context-relative selector when that publication is fresh. */
    const bool g17p_robust_index_path =
-      agx_chip_native_or_m5(dev->dev.chip) &&
+      agx_chip_agx3_path(dev->dev.chip) &&
       *needs_idx_robust;
    const bool ordinary_draw_path =
       !geom && !tess && !adj &&
@@ -13723,7 +13722,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * adjacency topology failed at vkEndCommandBuffer with
     * VK_ERROR_FEATURE_NOT_PRESENT. */
    const bool g17p_transformed_path =
-      agx_chip_native_or_m5(dev->dev.chip) &&
+      agx_chip_agx3_path(dev->dev.chip) &&
       (geom || tess || adj);
    if (desc->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, desc);
@@ -13788,7 +13787,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * record. Geometry/XFB lowers even a non-indexed API draw to that packet,
     * so emitting the legacy state here as well produces two consecutive
     * restart records before the synthetic indexed draw. */
-   if ((draw->restart || geom) && !agx_chip_native_or_m5(dev->dev.chip))
+   if ((draw->restart || geom) && !agx_chip_agx3_path(dev->dev.chip))
       hk_flush_index(cmd, cs);
 
    /* Everything that can dirty render state for this draw has now run, so
@@ -14307,7 +14306,7 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          return;
       }
       empty_draw_jump = compact;
-   } else if (agx_chip_g17_m5(dev->dev.chip)) {
+   } else if (agx_chip_hal300_path(dev->dev.chip)) {
       if (!agx_m5_vdm_compact(target + size_B, &empty_draw_jump)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return;
@@ -14404,7 +14403,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
     * older path does in hk_needs_index_robustness. The one-dword range bounds
     * hardware fetches to the zero page; it is not a count limit.
     */
-   if (agx_chip_native_or_m5(dev->dev.chip) &&
+   if (agx_chip_agx3_path(dev->dev.chip) &&
        draw_.indexed && draw_.index_buffer_range_B == 0) {
       draw_.index_buffer = AGX_ZERO_PAGE_ADDRESS;
       draw_.index_buffer_range_B = 4;
@@ -14620,7 +14619,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
             uint64_t out_draw = hk_pool_alloc(cmd, size, 4).gpu;
             struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-            if (agx_chip_native_or_m5(dev->dev.chip)) {
+            if (agx_chip_agx3_path(dev->dev.chip)) {
                /* As in the direct case above, a G17P hardware vertex shader
                 * never sees the prolog's remap, so the mapping has to reach
                 * the input assembler as real indices.  The output count is
@@ -14663,7 +14662,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
              * mapping as an index buffer instead and let the input assembler
              * apply it, which is the one path the vertex stage does see. */
             if (count > 0 &&
-                agx_chip_native_or_m5(dev->dev.chip)) {
+                agx_chip_agx3_path(dev->dev.chip)) {
                unsigned ib_B = count * sizeof(uint32_t);
                uint64_t ib = hk_pool_alloc(cmd, ib_B, 4).gpu;
 
@@ -14736,7 +14735,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
          /* The kernel writes the M5 Index List into a slot reserved after
           * this point; its restart state goes before it. */
-         if (agx_chip_g17_m5(dev->dev.chip) && draw.restart)
+         if (agx_chip_hal300_path(dev->dev.chip) && draw.restart)
             out = hk_m5_emit_restart_index(cmd, cs, out, draw);
          cs->current = out;
 
@@ -14751,7 +14750,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          /* G17P: its GPU-written indexed indirect packets set the restart
           * index. M5: for an empty draw the kernel writes a Stream Link over
           * the slot, which counts as a link (hk_cmd_buffer.c). */
-         if (agx_chip_native_or_m5(dev->dev.chip))
+         if (agx_chip_agx3_path(dev->dev.chip))
             cs->restart_index_set = false;
       } else {
          if (agx_chip_native_agx3(dev->dev.chip)) {
@@ -14762,14 +14761,14 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
             /* HAL300 direct Index Lists consume persistent restart state;
              * the indirect packet carries its own state update. Geometry
              * may have synthesized an index width unrelated to the API IB. */
-            if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed &&
+            if (agx_chip_hal300_path(dev->dev.chip) && draw.indexed &&
                 draw.restart && !agx_is_indirect(draw.b))
                out = hk_m5_emit_restart_index(cmd, cs, out, draw);
             cs->current = (void *)agx_vdm_draw(
                (uint32_t *)out, agx_vdm_index_list_record_chip(dev->dev.chip),
                draw, topology, hk_draw_restart_index(cmd, draw));
             /* The indirect packet's own state update replaced it. */
-            if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed &&
+            if (agx_chip_hal300_path(dev->dev.chip) && draw.indexed &&
                 agx_is_indirect(draw.b))
                cs->restart_index_set = false;
          }
@@ -15561,7 +15560,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       /* G17P: its GPU-written indexed indirect packets set the restart
        * index. M5: for an empty draw the kernel writes a Stream Link over
        * the slot, which counts as a link (hk_cmd_buffer.c). */
-      if (agx_chip_native_or_m5(dev->dev.chip))
+      if (agx_chip_agx3_path(dev->dev.chip))
          cs->restart_index_set = false;
    } else if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip)) {
       if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
@@ -15574,7 +15573,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          (uint32_t *)cs->current,
          agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip),
          draw, gfx->topology, hk_draw_restart_index(cmd, draw));
-      if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed)
+      if (agx_chip_hal300_path(dev->dev.chip) && draw.indexed)
          cs->restart_index_set = false;
    }
    hk_note_attachmentless_draw(cmd, cs);
@@ -16123,7 +16122,7 @@ hk_agx3_vdm_stream_target(struct hk_cmd_buffer *cmd, uint64_t addr,
       compact = hk_g17p_vdm_compact(cmd, addr);
       if (!compact)
          return false;
-   } else if (agx_chip_g17_m5(dev->dev.chip)) {
+   } else if (agx_chip_hal300_path(dev->dev.chip)) {
       if (!agx_m5_vdm_compact(addr, &compact))
          return false;
    }
