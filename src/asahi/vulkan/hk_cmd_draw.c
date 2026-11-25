@@ -13373,8 +13373,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
  * record predicated off by an indirect count) has somewhere to continue.
  * The G17P and HAL300 record families replace such a draw with a stream link
  * (agx_vdm_draw_robust_index), whose target hk_emit_robust_index() computes
- * only for native AGX3 and M5. G18G writes HAL300 records but has no such
- * target yet, so it must not be sent through the rewrite by default. */
+ * for every AGX3 path chip (native AGX3, M5, and G18G). */
 static bool
 hk_robust_index_has_empty_continuation(const struct hk_device *dev)
 {
@@ -13382,7 +13381,7 @@ hk_robust_index_has_empty_continuation(const struct hk_device *dev)
       agx_vdm_index_list_record_chip(agx_chip_record_family(dev->dev.chip));
    const bool links = records == AGX_CHIP_G17P ||
                       agx_vdm_index_list_direct_is_hal300_inline(records);
-   return !links || agx_chip_native_or_m5(dev->dev.chip);
+   return !links || agx_chip_agx3_path(dev->dev.chip);
 }
 
 /* Whether a draw already converted to the rewrite's indexed-indirect form
