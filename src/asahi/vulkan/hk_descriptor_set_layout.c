@@ -14,6 +14,7 @@
 #include "hk_sampler.h"
 #include "hk_native_descriptor.h"
 
+#include "util/blob.h"
 #include "vk_pipeline_layout.h"
 
 static bool
@@ -27,6 +28,22 @@ binding_has_immutable_samplers(const VkDescriptorSetLayoutBinding *binding)
    default:
       return false;
    }
+}
+
+/* Converted immutable samplers reserve one native record per image plane. */
+static unsigned
+binding_plane_count(const VkDescriptorSetLayoutBinding *binding)
+{
+   unsigned planes = 1;
+   if (binding_has_immutable_samplers(binding)) {
+      for (uint32_t i = 0; i < binding->descriptorCount; i++) {
+         VK_FROM_HANDLE(hk_sampler, sampler, binding->pImmutableSamplers[i]);
+         if (sampler->vk.ycbcr_conversion)
+            planes = MAX2(planes, vk_format_get_plane_count(
+                                     sampler->vk.ycbcr_conversion->state.format));
+      }
+   }
+   return planes;
 }
 
 void
@@ -375,25 +392,12 @@ hk_CreateDescriptorSetLayout(VkDevice device,
                                             binding->descriptorType,
                                             type_list, &stride, &alignment);
 
-      uint8_t max_plane_count = 1;
-
       if (binding_has_immutable_samplers(binding)) {
          layout->binding[b].immutable_samplers = samplers;
-         samplers += binding->descriptorCount;
-         for (uint32_t i = 0; i < binding->descriptorCount; i++) {
-            VK_FROM_HANDLE(hk_sampler, sampler, binding->pImmutableSamplers[i]);
-            layout->binding[b].immutable_samplers[i] = sampler;
-            const uint8_t sampler_plane_count =
-               sampler->vk.ycbcr_conversion
-                  ? vk_format_get_plane_count(
-                       sampler->vk.ycbcr_conversion->state.format)
-                  : 1;
-            if (max_plane_count < sampler_plane_count)
-               max_plane_count = sampler_plane_count;
-         }
+         for (uint32_t i = 0; i < binding->descriptorCount; i++)
+            *samplers++ = hk_sampler_from_handle(binding->pImmutableSamplers[i]);
       }
-
-      stride *= max_plane_count;
+      stride *= binding_plane_count(binding);
 
       if (stride > 0) {
          assert(stride <= UINT16_MAX);
@@ -485,7 +489,7 @@ hk_GetDescriptorSetLayoutSupport(
    uint32_t variable_stride = 0;
    uint32_t variable_count = 0;
    bool variable_is_inline_uniform_block = false;
-   uint8_t dynamic_buffer_count = 0;
+   uint64_t dynamic_buffer_count = 0;
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[i];
@@ -504,6 +508,8 @@ hk_GetDescriptorSetLayoutSupport(
       hk_descriptor_stride_align_for_layout(pdev, pCreateInfo->flags,
                                             binding->descriptorType,
                                             type_list, &stride, &alignment);
+
+      stride *= binding_plane_count(binding);
 
       if (stride > 0) {
          assert(stride <= UINT16_MAX);
@@ -527,7 +533,7 @@ hk_GetDescriptorSetLayoutSupport(
              * check for whether or not the max buffer size is big enough, we
              * keep non_variable_size aligned to max_align.
              */
-            non_variable_size += stride * binding->descriptorCount;
+            non_variable_size += (uint64_t)stride * binding->descriptorCount;
             non_variable_size = align64(non_variable_size, max_align);
          }
       }
@@ -535,7 +541,7 @@ hk_GetDescriptorSetLayoutSupport(
 
    uint64_t buffer_size = non_variable_size;
    if (variable_stride > 0) {
-      buffer_size += variable_stride * variable_count;
+      buffer_size += (uint64_t)variable_stride * variable_count;
       buffer_size = align64(buffer_size, max_align);
    }
 
@@ -555,7 +561,7 @@ hk_GetDescriptorSetLayoutSupport(
          VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          uint32_t max_var_count;
 
-         if (variable_stride > 0) {
+         if (variable_stride > 0 && non_variable_size < max_buffer_size) {
             max_var_count =
                (max_buffer_size - non_variable_size) / variable_stride;
          } else {
@@ -597,4 +603,96 @@ hk_GetDescriptorSetLayoutBindingOffsetEXT(VkDevice device,
    VK_FROM_HANDLE(hk_descriptor_set_layout, layout, _layout);
 
    *pOffset = layout->binding[binding].offset;
+}
+
+bool
+hk_descriptor_set_layout_serialize(struct blob *blob,
+                                   const struct hk_descriptor_set_layout *layout)
+{
+   if (layout->embedded_samplers)
+      return false;
+   for (uint32_t b = 0; b < layout->binding_count; ++b) {
+      if (layout->binding[b].immutable_samplers)
+         return false;
+   }
+
+   blob_write_uint32(blob, layout->vk.flags);
+   blob_write_uint32(blob, layout->vk.dynamic_descriptor_count);
+   blob_write_uint8(blob, layout->descriptor_generation);
+   blob_write_uint8(blob, layout->native_sampler_indices);
+   blob_write_uint32(blob, layout->non_variable_descriptor_buffer_size);
+   blob_write_uint32(blob, layout->max_buffer_size);
+   blob_write_uint32(blob, layout->binding_count);
+   for (uint32_t b = 0; b < layout->binding_count; ++b) {
+      const struct hk_descriptor_set_binding_layout *binding =
+         &layout->binding[b];
+      blob_write_uint32(blob, binding->type);
+      blob_write_uint32(blob, binding->flags);
+      blob_write_uint32(blob, binding->array_size);
+      blob_write_uint32(blob, binding->offset);
+      blob_write_uint16(blob, binding->stride);
+      blob_write_uint8(blob, binding->dynamic_buffer_index);
+   }
+   return !blob->out_of_memory;
+}
+
+/* The fewest bytes hk_descriptor_set_layout_serialize() writes per binding. */
+#define HK_SERIALIZED_BINDING_MIN_SIZE (4 * sizeof(uint32_t) + sizeof(uint16_t) + 1)
+
+struct hk_descriptor_set_layout *
+hk_descriptor_set_layout_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob)
+{
+   const enum agx_chip chip = hk_device_physical(dev)->dev.chip;
+   const VkDescriptorSetLayoutCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = blob_read_uint32(blob),
+   };
+   const uint32_t dynamic_descriptor_count = blob_read_uint32(blob);
+   const uint8_t descriptor_generation = blob_read_uint8(blob);
+   const uint8_t native_sampler_indices = blob_read_uint8(blob);
+   const uint32_t non_variable_size = blob_read_uint32(blob);
+   const uint32_t max_buffer_size = blob_read_uint32(blob);
+   const uint32_t binding_count = blob_read_uint32(blob);
+
+   /* Every layout of this device has the generation and sampler indices
+    * hk_CreateDescriptorSetLayout() gives it. A binding count the rest of the
+    * blob cannot hold was not written by the serializer. */
+   if (blob->overrun ||
+       descriptor_generation != agx_chip_descriptor_generation(chip) ||
+       native_sampler_indices != agx_chip_native_or_m5(chip) ||
+       binding_count > (size_t)(blob->end - blob->current) /
+                          HK_SERIALIZED_BINDING_MIN_SIZE)
+      return NULL;
+
+   struct hk_descriptor_set_layout *layout = vk_descriptor_set_layout_zalloc(
+      &dev->vk,
+      sizeof(*layout) + binding_count * sizeof(layout->binding[0]), &info);
+   if (!layout)
+      return NULL;
+
+   layout->vk.dynamic_descriptor_count = dynamic_descriptor_count;
+   layout->vk.destroy = hk_descriptor_set_layout_destroy;
+   layout->descriptor_generation = descriptor_generation;
+   layout->native_sampler_indices = native_sampler_indices;
+   layout->non_variable_descriptor_buffer_size = non_variable_size;
+   layout->max_buffer_size = max_buffer_size;
+   layout->binding_count = binding_count;
+   for (uint32_t b = 0; b < binding_count; ++b) {
+      struct hk_descriptor_set_binding_layout *binding = &layout->binding[b];
+      binding->type = blob_read_uint32(blob);
+      binding->flags = blob_read_uint32(blob);
+      binding->array_size = blob_read_uint32(blob);
+      binding->offset = blob_read_uint32(blob);
+      binding->stride = blob_read_uint16(blob);
+      binding->dynamic_buffer_index = blob_read_uint8(blob);
+   }
+
+   if (blob->overrun) {
+      vk_descriptor_set_layout_unref(&dev->vk, &layout->vk);
+      return NULL;
+   }
+
+   hk_descriptor_set_layout_hash(layout);
+   return layout;
 }

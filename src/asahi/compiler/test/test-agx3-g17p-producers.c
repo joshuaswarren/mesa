@@ -504,6 +504,63 @@ test_agx3c_and_normflt(void)
                              &d, o, &l);
       check(v->n, v->hex, o, l, ok);
    }
+
+   /* AGX3B and AGX3C f16 destination (f10 = 1) permit odd half destinations
+    * while f32 destination (f10 = 2) still requires an even register pair, and
+    * AGX3D refuses f16 normflt destinations. Compare directly against the
+    * `r0<-h5` witnesses above: on AGX3B f10 = 2 -> 1 clears word 3 bit 2
+    * (byte 6: 0x14 -> 0x10), and on AGX3C it clears word 1 bit 9
+    * (byte 3: 0x3a -> 0x38). */
+   static const struct {
+      const char *name;
+      enum agx_isa_encoding enc;
+      uint16_t dest;
+      const char *hex;
+   } nf16_vs[] = {
+      {"agx3b normflt.f16 h0<-h5", B,                      0, "17045400010a10ea"},
+      {"agx3b normflt.f16 h1<-h5", B,                      1, "17045401010a10ea"},
+      {"agx3b normflt.f16 h2<-h5", B,                      2, "17045402010a10ea"},
+      {"agx3b normflt.f16 h3<-h5", B,                      3, "17045403010a10ea"},
+      {"agx3c normflt.f16 h0<-h5", AGX_ISA_ENCODING_AGX3C, 0, "270100382d00a802d000"},
+      {"agx3c normflt.f16 h1<-h5", AGX_ISA_ENCODING_AGX3C, 1, "270100392d00a802d000"},
+      {"agx3c normflt.f16 h2<-h5", AGX_ISA_ENCODING_AGX3C, 2, "370100382d00a802d000"},
+      {"agx3c normflt.f16 h3<-h5", AGX_ISA_ENCODING_AGX3C, 3, "370100392d00a802d000"},
+   };
+   for (unsigned i = 0; i < sizeof(nf16_vs) / sizeof(*nf16_vs); ++i) {
+      const struct agx3_normflt_desc d16 = {
+         .dest = nf16_vs[i].dest,
+         .dest_16 = true,
+         .dest_hint = true,
+         .src = 5,
+         .two_lanes = true,
+      };
+      const bool ok = agx3_normflt_encode(nf16_vs[i].enc, &d16, o, &l);
+      check(nf16_vs[i].name, nf16_vs[i].hex, o, l, ok);
+   }
+   checks++;
+   const struct agx3_normflt_desc d16_3d = {
+      .dest = 0,
+      .dest_16 = true,
+      .dest_hint = true,
+      .src = 2,
+      .two_lanes = true,
+   };
+   if (agx3_normflt_encode(AGX_ISA_ENCODING_AGX3D, &d16_3d, o, &l)) {
+      fprintf(stderr, "normflt f16 accepted on AGX3D\n");
+      failures++;
+   }
+   checks++;
+   const struct agx3_normflt_desc d32_odd = {
+      .dest = 1,
+      .dest_16 = false,
+      .dest_hint = true,
+      .src = 2,
+      .two_lanes = true,
+   };
+   if (agx3_normflt_encode(B, &d32_odd, o, &l)) {
+      fprintf(stderr, "normflt f32 accepted odd dest\n");
+      failures++;
+   }
 }
 
 static void

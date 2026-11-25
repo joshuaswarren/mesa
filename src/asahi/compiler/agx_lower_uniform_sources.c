@@ -732,14 +732,155 @@ m5_canonicalize_isel_uniform_cmp(const agx_context *ctx, agx_instr *I)
    I->icond = rev;
 }
 
+/*
+ * The ICMPSEL operands that read the uniform file in place. G17P reads an
+ * aligned 32-bit uniform directly as one comparand beside a 32-bit register
+ * (f36/f42 = 3, f51/f57 = 3) or as either select (f66/f72 = 3, f83/f89 = 3),
+ * 32-bit result (agx3_isel_core.c witnesses); M5's forms are queried from its
+ * encoder. Prefer the selects when both kinds are present, since a uniform
+ * comparand is only witnessed beside register selects.
+ */
+static void
+agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
+                        bool keep[4])
+{
+   memset(keep, 0, 4 * sizeof(*keep));
+   if (m5_native_isel_uniform(ctx, I)) {
+      for (unsigned i = 0; i < 4; ++i)
+         keep[i] = I->src[i].type == AGX_INDEX_UNIFORM;
+      return;
+   }
+
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->is_preamble || I->op != AGX_OPCODE_ICMPSEL ||
+       I->nr_dests != 1 || I->nr_srcs != 4 ||
+       I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
+       I->src[0].size != AGX_SIZE_32 || I->src[1].size != AGX_SIZE_32)
+      return;
+
+   bool uniform_ok[4], reg32[4];
+   for (unsigned j = 0; j < 4; ++j) {
+      const agx_index x = I->src[j];
+      uniform_ok[j] = x.type == AGX_INDEX_UNIFORM &&
+                      x.size == AGX_SIZE_32 && !(x.value & 1) &&
+                      x.value + 2 <= 256 && !x.abs && !x.neg && !x.memory;
+      reg32[j] = x.type == AGX_INDEX_NORMAL && x.size == AGX_SIZE_32 &&
+                 !x.abs && !x.neg && agx_channels(x) == 1;
+   }
+   if (uniform_ok[2] || uniform_ok[3]) {
+      keep[2] = uniform_ok[2];
+      keep[3] = uniform_ok[3];
+   } else if (uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
+      keep[0] = true;
+   } else if (uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
+      keep[1] = true;
+   }
+}
+
+/* A select alternative that equals its value zero-extended to 32 bits. */
+static bool
+agx3_zext_select(agx_index x, const agx_index *widened, unsigned nr_widened,
+                 agx_index *wide)
+{
+   if (x.abs || x.neg || x.memory)
+      return false;
+   if (x.type == AGX_INDEX_IMMEDIATE && x.value <= UINT8_MAX) {
+      *wide = x;
+      return true;
+   }
+   if (x.type == AGX_INDEX_NORMAL && x.value < nr_widened &&
+       widened[x.value].type == AGX_INDEX_NORMAL) {
+      *wide = widened[x.value];
+      return true;
+   }
+   return false;
+}
+
+/*
+ * Every native uniform ISEL form writes a 32-bit result, so a comparison
+ * producing a 16-bit boolean (an ICMP, or an ICMPSEL selecting halves) copied
+ * its uniform comparand into a GPR at each use. When the 32-bit select of the
+ * same comparison reads that uniform in place, compute it instead and take
+ * its low half. Its alternatives are 8-bit immediates or 16-bit results
+ * widened here, so its upper half is zero and its lower half is exactly the
+ * 16-bit result; they are the same register, so allocation coalesces the
+ * split and no copy remains. `widened` maps those results to the 32-bit
+ * values, for comparisons selecting them.
+ */
+static agx_instr *
+agx3_widen_uniform_compare(agx_context *ctx, agx_instr *I, agx_index *widened,
+                           unsigned nr_widened)
+{
+   const bool icmp = I->op == AGX_OPCODE_ICMP && I->nr_srcs == 2;
+   if ((!icmp && !(I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4)) ||
+       I->nr_dests != 1 || I->saturate ||
+       I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].memory ||
+       I->dest[0].size != AGX_SIZE_16 || agx_channels(I->dest[0]) != 1 ||
+       (I->src[0].type != AGX_INDEX_UNIFORM &&
+        I->src[1].type != AGX_INDEX_UNIFORM))
+      return I;
+
+   /* agx_lower_pseudo() selects 1 or 0 for a comparison; an inverted
+    * condition exchanges the alternatives. */
+   agx_index src[4] = {I->src[0], I->src[1],
+                       icmp ? agx_immediate(1) : I->src[2],
+                       icmp ? agx_immediate(0) : I->src[3]};
+   if (I->invert_cond) {
+      const agx_index t = src[2];
+      src[2] = src[3];
+      src[3] = t;
+   }
+   for (unsigned i = 2; i < 4; ++i) {
+      if (!agx3_zext_select(src[i], widened, nr_widened, &src[i]))
+         return I;
+   }
+
+   agx_index dest = I->dest[0];
+   dest.size = AGX_SIZE_32;
+   agx_instr candidate = *I;
+   candidate.op = AGX_OPCODE_ICMPSEL;
+   candidate.nr_srcs = 4;
+   candidate.invert_cond = false;
+   candidate.dest = &dest;
+   candidate.src = src;
+   m5_canonicalize_isel_uniform_cmp(ctx, &candidate);
+
+   bool keep[4];
+   agx3_isel_uniforms_kept(ctx, &candidate, keep);
+   for (unsigned i = 0; i < 2; ++i) {
+      if (src[i].type == AGX_INDEX_UNIFORM && !keep[i])
+         return I;
+   }
+
+   agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+   const agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+   agx_instr *select = agx_icmpsel_to(&b, wide, src[0], src[1], src[2],
+                                      src[3], candidate.icond);
+   agx_instr *split = agx_split(&b, 2, wide);
+   split->dest[0] = I->dest[0];
+   split->dest[1] = agx_temp(ctx, AGX_SIZE_16);
+   if (I->dest[0].value < nr_widened)
+      widened[I->dest[0].value] = wide;
+   agx_remove_instruction(I);
+   return select;
+}
+
 void
 agx_lower_uniform_sources(agx_context *ctx)
 {
+   const unsigned nr_widened = ctx->alloc;
+   agx_index *widened =
+      agx_isa_is_agx3(ctx->key->dev.encoding)
+         ? calloc(nr_widened, sizeof(*widened)) : NULL;
+
    agx_foreach_instr_global_safe(ctx, I) {
       agx3_lower_m5_modified_fma_immediates(ctx, I);
 
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
          I = agx3_move_uniform_negation(ctx, I);
+
+      if (widened)
+         I = agx3_widen_uniform_compare(ctx, I, widened, nr_widened);
 
       agx_instr *at = I;
       struct agx3_uniform_integer_desc integer_desc;
@@ -772,6 +913,13 @@ agx_lower_uniform_sources(agx_context *ctx)
       }
       const bool both_minmax_uniform = native_minmax &&
          I->src[0].type == AGX_INDEX_UNIFORM && I->src[1].type == AGX_INDEX_UNIFORM;
+      /* Native AGX3B uniform-comparand fsel witnesses only select registers
+       * or immediate zero (never non-zero integer immediates such as the
+       * #1/#0 produced when agx_lower_pseudo() lowers AGX_OPCODE_FCMP). */
+      const bool fsel_shape =
+         I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
+         !(I->src[2].type == AGX_INDEX_IMMEDIATE && I->src[2].value != 0) &&
+         !(I->src[3].type == AGX_INDEX_IMMEDIATE && I->src[3].value != 0);
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (half_float || full_float)) {
          const enum agx_size size = half_float ? AGX_SIZE_16 : AGX_SIZE_32;
@@ -803,13 +951,7 @@ agx_lower_uniform_sources(agx_context *ctx)
             half_uniforms > 1 || (half_uniforms && I->saturate);
       }
 
-      /* G17P ISEL reads an aligned 32-bit uniform directly as one comparand
-       * beside a 32-bit register (f36/f42 = 3, f51/f57 = 3) or as either
-       * select (f66/f72 = 3, f83/f89 = 3), 32-bit result (agx3_isel_core.c
-       * witnesses). Keep those uniforms instead of copying each one into a
-       * GPR per use; prefer the selects when both kinds are present, since
-       * a uniform comparand is only witnessed beside register selects. */
-      bool keep_isel_uniform[4] = {false};
+      bool keep_isel_uniform[4];
       unsigned m5_fsel_cond;
       bool m5_fsel_swap;
       const bool m5_fsel_uniform =
@@ -817,36 +959,7 @@ agx_lower_uniform_sources(agx_context *ctx)
          !ctx->is_preamble &&
          agx3_m5_fcmpsel_uniform_cmp0(I, &m5_fsel_cond, &m5_fsel_swap);
       m5_canonicalize_isel_uniform_cmp(ctx, I);
-      if (m5_native_isel_uniform(ctx, I)) {
-         for (unsigned i = 0; i < 4; ++i)
-            keep_isel_uniform[i] = I->src[i].type == AGX_INDEX_UNIFORM;
-      }
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          !ctx->is_preamble &&
-          I->op == AGX_OPCODE_ICMPSEL && I->nr_dests == 1 &&
-          I->nr_srcs == 4 && I->dest[0].size == AGX_SIZE_32 &&
-          agx_channels(I->dest[0]) == 1 &&
-          I->src[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32) {
-         bool uniform_ok[4], reg32[4];
-         for (unsigned j = 0; j < 4; ++j) {
-            const agx_index x = I->src[j];
-            uniform_ok[j] = x.type == AGX_INDEX_UNIFORM &&
-                            x.size == AGX_SIZE_32 && !(x.value & 1) &&
-                            x.value + 2 <= 256 && !x.abs && !x.neg &&
-                            !x.memory;
-            reg32[j] = x.type == AGX_INDEX_NORMAL &&
-                       x.size == AGX_SIZE_32 && !x.abs && !x.neg &&
-                       agx_channels(x) == 1;
-         }
-         if (uniform_ok[2] || uniform_ok[3]) {
-            keep_isel_uniform[2] = uniform_ok[2];
-            keep_isel_uniform[3] = uniform_ok[3];
-         } else if (uniform_ok[0] && reg32[1]) {
-            keep_isel_uniform[0] = true;
-         } else if (uniform_ok[1] && reg32[0]) {
-            keep_isel_uniform[1] = true;
-         }
-      }
+      agx3_isel_uniforms_kept(ctx, I, keep_isel_uniform);
 
       /* An unwitnessed descriptor pair (agx3_tex_uniform_pair_unwitnessed)
        * materializes its uniform operand, keeping the register form. */
@@ -963,8 +1076,8 @@ agx_lower_uniform_sources(agx_context *ctx)
           * f42 = 3). */
          const bool select_uniform_flag =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-            !ctx->is_preamble && I->op == AGX_OPCODE_FCMPSEL &&
-            I->nr_dests == 1 && I->nr_srcs == 4 && !I->saturate &&
+            !ctx->is_preamble && fsel_shape &&
+            I->nr_dests == 1 && !I->saturate &&
             I->fcond != AGX_FCOND_LTN && I->fcond != AGX_FCOND_GTN &&
             (I->dest[0].size == AGX_SIZE_16 ||
              I->dest[0].size == AGX_SIZE_32) &&
@@ -983,14 +1096,15 @@ agx_lower_uniform_sources(agx_context *ctx)
           * comparand beside a register is exchanged into that shape below. */
          const bool select_uniform_comparand =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-            !ctx->is_preamble && I->op == AGX_OPCODE_FCMPSEL &&
-            I->nr_dests == 1 && I->nr_srcs == 4 && !I->saturate &&
+            !ctx->is_preamble && fsel_shape &&
+            I->nr_dests == 1 && !I->saturate &&
             (I->dest[0].size == AGX_SIZE_16 ||
              I->dest[0].size == AGX_SIZE_32) &&
             agx_channels(I->dest[0]) == 1 && !native_minmax && s < 2 &&
             I->src[s].type == AGX_INDEX_UNIFORM &&
-            /* slot 1 (f53) holds half indices up to 511, slot 0 (f36) 255 */
-            I->src[s].value < (s == 1 ? 512 : 256) && !I->src[s].memory &&
+            /* slot 1 (f53) holds half indices up to 511; a slot-0 uniform
+             * is always exchanged into it below */
+            I->src[s].value < 512 && !I->src[s].memory &&
             (I->src[s].size == AGX_SIZE_16 ||
              (I->src[s].size == AGX_SIZE_32 && !(I->src[s].value & 1))) &&
             !I->src[s].abs && !I->src[s].neg &&
@@ -1093,6 +1207,7 @@ agx_lower_uniform_sources(agx_context *ctx)
          }
       }
    }
+   free(widened);
 
    agx3_fold_m5_constant_lods(ctx);
 

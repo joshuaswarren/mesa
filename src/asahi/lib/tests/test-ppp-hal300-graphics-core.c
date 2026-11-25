@@ -399,6 +399,128 @@ main(void)
    f.vertex_varying_components = 2;
    f.fragment_varying_components = 3;
    CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &f, &out));
+
+   /* Patching the fragment program of a packed core must give the bytes of a
+    * full pack with only fragment_program changed, on each HAL300 graphics
+    * layout: the G17G family's TI-spill template and G18G's depth-write one.
+    * Addresses the pair cannot encode, and chips without the pair codec, are
+    * refused without touching the core. */
+   {
+      const struct {
+         enum agx_chip chip;
+         struct agx_ppp_hal300_graphics_fields fields;
+      } layouts[] = {
+         {AGX_CHIP_G17S,
+          {
+             .fragment_program = UINT64_C(0x10000170700),
+             .varying_table = UINT64_C(0x100000004c0),
+             .cf_binding_count = 2,
+             .point_size_output = true,
+             .vertex_varying_components = 4,
+             .fragment_varying_components = 4,
+             .fragment_writes_depth = true,
+             .fragment_ti_spill_B = 0x120,
+          }},
+         {AGX_CHIP_G18G,
+          {
+             .fragment_program = UINT64_C(0x10000170700),
+             .fragment_writes_depth = true,
+          }},
+      };
+      const uint64_t new_addrs[] = {
+         UINT64_C(0x100001b8700),
+         UINT64_C(0xa5c001234540),
+         UINT64_C(0x0000ffffffffffc0),
+      };
+
+      for (unsigned l = 0; l < sizeof(layouts) / sizeof(layouts[0]); ++l) {
+         const enum agx_chip chip = layouts[l].chip;
+         struct agx_ppp_hal300_graphics_fields pf = layouts[l].fields;
+         struct agx_ppp_hal300_graphics_core packed, patched;
+         CHECK(agx_ppp_hal300_graphics_core_pack(chip, &pf, &patched));
+
+         for (unsigned i = 0; i < sizeof(new_addrs) / sizeof(new_addrs[0]);
+              ++i) {
+            pf.fragment_program = new_addrs[i];
+            CHECK(agx_ppp_hal300_graphics_core_pack(chip, &pf, &packed));
+            CHECK(agx_ppp_hal300_graphics_core_patch_program(chip, &patched,
+                                                             new_addrs[i]));
+            CHECK(memcmp(&packed, &patched, sizeof(packed)) == 0);
+         }
+
+         const struct agx_ppp_hal300_graphics_core saved = patched;
+         CHECK(!agx_ppp_hal300_graphics_core_patch_program(chip, &patched, 0));
+         CHECK(!agx_ppp_hal300_graphics_core_patch_program(
+            chip, &patched, UINT64_C(0x100001b8701)));
+         CHECK(!agx_ppp_hal300_graphics_core_patch_program(
+            chip, &patched, UINT64_C(1) << 48));
+         CHECK(!agx_ppp_hal300_graphics_core_patch_program(
+            AGX_CHIP_G13G, &patched, UINT64_C(0x100001b8700)));
+         CHECK(!agx_ppp_hal300_graphics_core_patch_program(
+            chip, NULL, UINT64_C(0x100001b8700)));
+         CHECK(memcmp(&saved, &patched, sizeof(saved)) == 0);
+      }
+   }
+
+   /* G18G carries depth_clip_disable, polygon_mode, viewport_count,
+    * layer_output, tag_write_disable, no_color_writes, primitive_msaa, and
+    * full clip_distance_words masks in the same HAL300 PPP words as M5. */
+   {
+      struct agx_ppp_hal300_graphics_fields g = {
+         .fragment_program = UINT64_C(0x10000170700),
+         .depth_clip_disable = true,
+         .polygon_mode = 1,
+         .viewport_count = 4,
+         .layer_output = true,
+         .clip_distance_words = 3,
+         .tag_write_disable = true,
+         .no_color_writes = true,
+         .primitive_msaa = true,
+      };
+      struct agx_ppp_hal300_graphics_core g_out;
+      CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &g, &g_out));
+
+      const uint8_t *r3 = g_out.bytes + g_out.offsets[3];
+      const uint32_t osel = r3[4] | ((uint32_t)r3[5] << 8) |
+                            ((uint32_t)r3[6] << 16) | ((uint32_t)r3[7] << 24);
+      const uint32_t vp_count = r3[12] | ((uint32_t)r3[13] << 8) |
+                                ((uint32_t)r3[14] << 16) | ((uint32_t)r3[15] << 24);
+      const uint32_t uvs = r3[16] | ((uint32_t)r3[17] << 8) |
+                           ((uint32_t)r3[18] << 16) | ((uint32_t)r3[19] << 24);
+      CHECK(osel == (0x180000u | 0x7u));
+      CHECK(vp_count == 3u);
+      CHECK(uvs == 8u);
+
+      const uint8_t *r4 = g_out.bytes + g_out.offsets[4];
+      const uint32_t face = r4[8] | ((uint32_t)r4[9] << 8) |
+                            ((uint32_t)r4[10] << 16) | ((uint32_t)r4[11] << 24);
+      CHECK(((face >> 18) & 0x3u) == 1u);
+
+      const uint8_t *r5 = g_out.bytes + g_out.offsets[5];
+      const uint32_t isp = r5[4] | ((uint32_t)r5[5] << 8) |
+                           ((uint32_t)r5[6] << 16) | ((uint32_t)r5[7] << 24);
+      const uint32_t mask = r5[16] | ((uint32_t)r5[17] << 8) |
+                            ((uint32_t)r5[18] << 16) | ((uint32_t)r5[19] << 24);
+      CHECK((isp & 0x00200000u) != 0);
+      CHECK((isp & 0x04000000u) != 0);
+      CHECK(mask == 0u);
+
+      const uint8_t *r7 = g_out.bytes + g_out.offsets[7];
+      const uint32_t cull = r7[4] | ((uint32_t)r7[5] << 8) |
+                            ((uint32_t)r7[6] << 16) | ((uint32_t)r7[7] << 24);
+      CHECK((cull & 0xc00u) == 0x800u);
+      CHECK((cull & 0x8000u) != 0);
+
+      g.viewport_count = 17;
+      CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &g, &g_out));
+      g.viewport_count = 1;
+      g.polygon_mode = 3;
+      CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &g, &g_out));
+      g.polygon_mode = 0;
+      g.clip_distance_words = 9;
+      CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &g, &g_out));
+   }
+
    puts("M5 native PPP graphics records: PASS");
    return 0;
 }

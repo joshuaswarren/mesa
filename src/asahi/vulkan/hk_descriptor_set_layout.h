@@ -106,6 +106,24 @@ uint32_t hk_descriptor_buffer_size(const struct agx_device *dev,
 
 void hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout);
 
+struct blob;
+struct blob_reader;
+
+/* Writes the part of `layout` that compiling a shader against it reads: the
+ * fields hk_descriptor_set_layout_hash() covers. Returns false, and writes
+ * nothing, for a layout with immutable or embedded samplers, which a blob
+ * cannot carry. */
+bool hk_descriptor_set_layout_serialize(
+   struct blob *blob, const struct hk_descriptor_set_layout *layout);
+
+/* Rebuilds a layout that hk_descriptor_set_layout_serialize() wrote, to
+ * compile shaders against; no descriptor set is allocated from it. Returns
+ * NULL if the blob holds no layout of this device. The caller owns the one
+ * reference. */
+struct hk_descriptor_set_layout *
+hk_descriptor_set_layout_deserialize(struct hk_device *dev,
+                                     struct blob_reader *blob);
+
 static inline struct hk_descriptor_set_layout *
 vk_to_hk_descriptor_set_layout(struct vk_descriptor_set_layout *layout)
 {

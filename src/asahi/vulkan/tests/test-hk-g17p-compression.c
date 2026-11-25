@@ -60,8 +60,12 @@ check_formats(void)
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
-      CHECK(ELIGIBLE(i) == (c || d));
+      CHECK(ELIGIBLE(i) == (c || c16 || d));
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO,
+                                           0, &i) == (c || c16 || d));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_M4_PRO,
+                                           0, &i) == (c || c16 || d));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_M4_MAX,
                                            0, &i) == (c || c16 || d));
    }
    CHECK(color == 46);
@@ -178,12 +182,24 @@ check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
    i = base; i.extent.depth = 2;
    CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
+   CHECK(CHIP_ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
-   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
+   CHECK(CHIP_ELIGIBLE(i));
+   /* Mipmapped 2D arrays and mipmapped cubemaps compress for 1-8B and 16B
+    * colour; depth and mipmapped 3D stay plain. */
+   i = base; i.arrayLayers = 4; i.mipLevels = 4;
+   CHECK(CHIP_ELIGIBLE(i) == !is_depth);
+   i = base; i.extent.width = 256; i.extent.height = 256;
+   i.arrayLayers = 6; i.mipLevels = 4;
+   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(CHIP_ELIGIBLE(i) == !is_depth);
+   i = base; i.imageType = VK_IMAGE_TYPE_3D; i.extent.depth = 4; i.mipLevels = 2;
+   CHECK(!CHIP_ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(CHIP_ELIGIBLE(i) == (is_depth && (s == 2 || s == 4)));
+      CHECK(CHIP_ELIGIBLE(i) == (!is_color_16b && (s == 2 || s == 4)));
+      i.arrayLayers = 4;
+      CHECK(CHIP_ELIGIBLE(i) == (!is_color_16b && (s == 2 || s == 4)));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!CHIP_ELIGIBLE(i));
@@ -347,7 +363,18 @@ check_zink(void)
    CHECK(!ELIGIBLE(depth));
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
-   depth.samples = VK_SAMPLE_COUNT_4_BIT;
+   /* The same depth buffer at 2x/4x MSAA, with zink's feedback-loop usage
+    * and sample-location flag: its depth plane compresses, the S8 plane and
+    * input-attachment use stay plain. */
+   for (unsigned s = 2; s <= 4; s <<= 1) {
+      VkImageCreateInfo ms = depth;
+      ms.samples = (VkSampleCountFlagBits)s;
+      CHECK(ELIGIBLE(ms));
+      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &ms));
+      ms.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+      CHECK(!ELIGIBLE(ms));
+   }
+   depth.samples = VK_SAMPLE_COUNT_8_BIT;
    CHECK(!ELIGIBLE(depth));
    const VkImageCreateInfo d32 = image(VK_FORMAT_D32_SFLOAT, 2408, 1506, 1, ds);
    CHECK(ELIGIBLE(d32));
@@ -651,6 +678,11 @@ check_m5_color(void)
    c = i;
    c.format = VK_FORMAT_R8G8_UNORM;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* B10G11R11_UFLOAT_PACK32 stays plain on M5 (compressed tiles lose NaN). */
+   c = i;
+   c.mipLevels = 1;
+   c.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 
    /* A placed alias of identical parameters gets the same layout on every M5
     * part. A single-plane alias of a multi-planar plane needs DISJOINT, which
@@ -757,15 +789,21 @@ check_m5_msaa_color(void)
       VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    VkImageCreateInfo i = image(VK_FORMAT_R16G16B16A16_SFLOAT, 3024, 1964, 1,
                                usage);
-   for (unsigned samples = 1; samples <= 8; samples *= 2) {
-      i.samples = (VkSampleCountFlagBits)samples;
-      CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &i) ==
-            (samples == 2 || samples == 4));
+   static const enum agx_chip m5_chips[] = {
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned m = 0; m < sizeof(m5_chips) / sizeof(m5_chips[0]); ++m) {
+      for (unsigned samples = 1; samples <= 8; samples *= 2) {
+         i.samples = (VkSampleCountFlagBits)samples;
+         CHECK(hk_m5_msaa_color_compression_eligible(m5_chips[m], 0, &i) ==
+               (samples == 2 || samples == 4));
+      }
    }
    i.samples = VK_SAMPLE_COUNT_4_BIT;
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; chip++)
       CHECK(hk_m5_msaa_color_compression_eligible(
-               (enum agx_chip)chip, 0, &i) == (chip == AGX_CHIP_G17S));
+               (enum agx_chip)chip, 0, &i) ==
+            agx_chip_g17_m5((enum agx_chip)chip));
    CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 1, &i));
    CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, NULL));
    VkImageCreateInfo c = i;
@@ -774,6 +812,11 @@ check_m5_msaa_color(void)
    /* A mutable format is admitted here; hk_can_compress() then requires a
     * format list of compatible views. Aliasing is not. */
    c = i; c.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
    CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i; c.flags = VK_IMAGE_CREATE_ALIAS_BIT;
    CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
@@ -827,12 +870,17 @@ check_g16g_msaa_depth(void)
          VkImageCreateInfo x = d;
          x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
          CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         /* Zink's feedback-loop usage and sample-location flag on every
+          * depth attachment leave the depth plane's storage unchanged. */
          x = d;
          x.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         x.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 1, &x));
          x = d;
          x.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
-         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
          x = d;
          x.arrayLayers = 2;
          CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));

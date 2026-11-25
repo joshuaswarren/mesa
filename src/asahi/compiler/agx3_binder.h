@@ -2,14 +2,9 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Shared "template + override" helper over the generated AGX3 encoder.
- *
- * Most AGX3 forms carry a fixed set of selector/context field values plus a
- * handful of operand fields. A binder starts from a per-form baseline (the
- * constants, recovered by decoding a witnessed instruction), overrides the
- * operand fields with the caller's values, and asks the composer to encode. The
- * composer fails closed on any contradiction, so a wrong override cannot
- * silently produce a valid-looking instruction.
+ * Template-plus-override helper over the generated AGX3 composer: applies
+ * caller operand overrides to a per-form baseline and fails closed on any
+ * field contradiction.
  */
 
 #pragma once
