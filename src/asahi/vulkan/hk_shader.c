@@ -6978,6 +6978,10 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       hk_shader_destroy(dev, &obj->stencil_2d->shader, owns_payload);
       free(obj->stencil_2d);
    }
+   if (obj->compute_opt) {
+      hk_shader_destroy(dev, &obj->compute_opt->shader, owns_payload);
+      free(obj->compute_opt);
+   }
 
    ralloc_free(obj->compute_pair);
    hk_compute_pair_producer_unref(obj->compute_pair_producer);
@@ -8662,6 +8666,33 @@ hk_maybe_build_2d_stencil(struct hk_device *dev, const nir_shader *nir,
    return out->tiled_nir != NULL;
 }
 
+struct hk_compute_opt_candidate {
+   struct hk_compute_opt_plan plan;
+   nir_shader *opt_nir;
+};
+
+static bool
+hk_maybe_build_compute_opt(struct hk_device *dev, const nir_shader *nir,
+                           const struct vk_shader_compile_info *info,
+                           struct hk_compute_opt_candidate *out)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
+       !info || !info->robustness)
+      return false;
+
+   if (!hk_nir_match_compute_opt(nir, info->set_layout_count, info->set_layouts,
+                                 &out->plan))
+      return false;
+
+   const nir_address_format ssbo_addr_format = hk_buffer_addr_format(
+      info->robustness->storage_buffers,
+      info->robustness->null_storage_buffer_descriptor,
+      hk_ssbo_addr_has_map(dev->dev.chip));
+   out->opt_nir = hk_nir_build_compute_opt(NULL, nir, &out->plan,
+                                           ssbo_addr_format);
+   return out->opt_nir != NULL;
+}
+
 /* twin_of: compile a twin of the shader that saved these inputs, with
  * custom-border emulation; mesh_fs: the twin is the fragment shader for a
  * G17P mesh shader with these per-primitive records (hk_mesh_fs_twin());
@@ -8681,6 +8712,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   bool twin_has_vertex_robustness,
                   struct hk_byte_stencil_candidate *bs_cand,
                   struct hk_2d_stencil_candidate *s2d_cand,
+                  struct hk_compute_opt_candidate *co_cand,
                   nir_shader *lr_nir,
                   const struct hk_local_read_info *lr_info_in,
                   bool has_ia_in,
@@ -9745,6 +9777,29 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             ralloc_free(tiled_nir);
          }
       }
+      if (co_cand && co_cand->opt_nir && sw_stage == MESA_SHADER_COMPUTE) {
+         nir_shader *opt_nir = co_cand->opt_nir;
+         co_cand->opt_nir = NULL;
+         struct hk_compute_opt_variant *co = calloc(1, sizeof(*co));
+         if (co) {
+            co->plan = co_cand->plan;
+            hk_lower_nir(dev, opt_nir, info->robustness, false,
+                         info->next_stage_mask, info->set_layout_count,
+                         info->set_layouts, features);
+            VkResult co_res = hk_compile_nir(
+               dev, pAllocator, opt_nir, info->flags, info->robustness, key,
+               features, &co->shader, sw_stage, true, NULL,
+               info->set_layout_count, static_set_mask);
+            if (co_res == VK_SUCCESS) {
+               obj->compute_opt = co;
+            } else {
+               hk_shader_destroy(dev, &co->shader, true);
+               free(co);
+            }
+         } else {
+            ralloc_free(opt_nir);
+         }
+      }
       if (sw_stage == MESA_SHADER_FRAGMENT) {
          shader->info.fs.has_input_attachments |= has_ia;
          if (lr_nir) {
@@ -9786,21 +9841,28 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    struct hk_byte_stencil_candidate *bs_ptr = NULL;
    struct hk_2d_stencil_candidate s2d_cand = {0};
    struct hk_2d_stencil_candidate *s2d_ptr = NULL;
+   struct hk_compute_opt_candidate co_cand = {0};
+   struct hk_compute_opt_candidate *co_ptr = NULL;
    if (info && info->nir) {
       if (hk_maybe_build_byte_stencil(dev, info->nir, info, &bs_cand))
          bs_ptr = &bs_cand;
       else if (hk_maybe_build_2d_stencil(dev, info->nir, info, &s2d_cand))
          s2d_ptr = &s2d_cand;
+      else if (hk_maybe_build_compute_opt(dev, info->nir, info, &co_cand))
+         co_ptr = &co_cand;
    }
 
    VkResult result = hk_compile_shader_impl(dev, info, state, features,
                                             allocator, NULL, NULL, false, false,
                                             -1, false, false, bs_ptr, s2d_ptr,
-                                            NULL, NULL, false, shader_out);
+                                            co_ptr, NULL, NULL, false,
+                                            shader_out);
    if (bs_cand.tiled_nir)
       ralloc_free(bs_cand.tiled_nir);
    if (s2d_cand.tiled_nir)
       ralloc_free(s2d_cand.tiled_nir);
+   if (co_cand.opt_nir)
+      ralloc_free(co_cand.opt_nir);
    return result;
 }
 
@@ -9839,7 +9901,8 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                                             mesh_fs, false, false, -1,
                                             m5_no_grid_record,
                                             twin_has_vertex_robustness, NULL,
-                                            NULL, NULL, NULL, has_ia, &shader);
+                                            NULL, NULL, NULL, NULL, has_ia,
+                                            &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -10447,8 +10510,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    int vs_covers[shader_count];
    struct hk_byte_stencil_candidate bs_cands[shader_count];
    struct hk_2d_stencil_candidate s2d_cands[shader_count];
+   struct hk_compute_opt_candidate co_cands[shader_count];
    memset(bs_cands, 0, sizeof(bs_cands));
    memset(s2d_cands, 0, sizeof(s2d_cands));
+   memset(co_cands, 0, sizeof(co_cands));
    memset(lr_nirs, 0, sizeof(lr_nirs));
    memset(lr_infos, 0, sizeof(lr_infos));
    memset(has_ias, 0, sizeof(has_ias));
@@ -10504,6 +10569,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             ralloc_free(infos[j].nir);
             ralloc_free(bs_cands[j].tiled_nir);
             ralloc_free(s2d_cands[j].tiled_nir);
+            ralloc_free(co_cands[j].opt_nir);
          }
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
@@ -10519,14 +10585,16 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             ralloc_free(infos[j].nir);
             ralloc_free(bs_cands[j].tiled_nir);
             ralloc_free(s2d_cands[j].tiled_nir);
+            ralloc_free(co_cands[j].opt_nir);
          }
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "cooperative matrix size or operation not supported");
       }
       if (nir->info.stage == MESA_SHADER_COMPUTE) {
-         if (!hk_maybe_build_byte_stencil(dev, nir, info, &bs_cands[i]))
-            hk_maybe_build_2d_stencil(dev, nir, info, &s2d_cands[i]);
+         if (!hk_maybe_build_byte_stencil(dev, nir, info, &bs_cands[i]) &&
+             !hk_maybe_build_2d_stencil(dev, nir, info, &s2d_cands[i]))
+            hk_maybe_build_compute_opt(dev, nir, info, &co_cands[i]);
       }
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          const bool lr_ok =
@@ -10784,6 +10852,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 vs_covers[i], no_grid_record, false,
                                 bs_cands[i].tiled_nir ? &bs_cands[i] : NULL,
                                 s2d_cands[i].tiled_nir ? &s2d_cands[i] : NULL,
+                                co_cands[i].opt_nir ? &co_cands[i] : NULL,
                                 lr_nirs[i], &lr_infos[i], has_ias[i],
                                 (struct hk_api_shader **)&shaders_out[i]);
       if (bs_cands[i].tiled_nir) {
@@ -10793,6 +10862,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (s2d_cands[i].tiled_nir) {
          ralloc_free(s2d_cands[i].tiled_nir);
          s2d_cands[i].tiled_nir = NULL;
+      }
+      if (co_cands[i].opt_nir) {
+         ralloc_free(co_cands[i].opt_nir);
+         co_cands[i].opt_nir = NULL;
       }
       lr_nirs[i] = NULL;
       if (result != VK_SUCCESS) {
@@ -10823,6 +10896,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             ralloc_free(infos[j].nir);
             ralloc_free(bs_cands[j].tiled_nir);
             ralloc_free(s2d_cands[j].tiled_nir);
+            ralloc_free(co_cands[j].opt_nir);
          }
 
          /* Memset the output array */
@@ -11453,13 +11527,14 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_gemm_cmat32 = (variant_flags3 & 4) != 0;
    const bool has_gemm_cmat64 = (variant_flags3 & 8) != 0;
    const bool has_gemm_cmat16 = (variant_flags3 & 16) != 0;
+   const bool has_compute_opt = (variant_flags3 & 32) != 0;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags3 & ~31u) ||
+       (variant_flags3 & ~63u) ||
        (has_im2col_vec4 && !has_identity_copy4) ||
        (has_depthwise_vec4 && !has_compute_pair) ||
        ((has_gemm_cmat16 || has_gemm_cmat32 || has_gemm_cmat64) &&
@@ -11469,6 +11544,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_byte_stencil && stage != MESA_SHADER_COMPUTE) ||
        (has_stencil_2d && stage != MESA_SHADER_COMPUTE) ||
+       (has_compute_opt && stage != MESA_SHADER_COMPUTE) ||
        (has_local_read && (stage != MESA_SHADER_FRAGMENT ||
                            !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
        (has_sample_lr && (!has_source || stage != MESA_SHADER_FRAGMENT ||
@@ -11759,6 +11835,29 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       obj->stencil_2d = s2d;
    }
 
+   if (has_compute_opt) {
+      struct hk_compute_opt_variant *co = calloc(1, sizeof(*co));
+      if (!co) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      blob_copy_bytes(blob, &co->plan, sizeof(co->plan));
+      if (blob->overrun) {
+         free(co);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+      VkResult co_res =
+         hk_deserialize_shader(dev, blob, &co->shader, false, cache_candidate);
+      if (co_res != VK_SUCCESS) {
+         hk_shader_destroy(dev, &co->shader, true);
+         free(co);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return co_res;
+      }
+      obj->compute_opt = co;
+   }
+
    if (has_sample_lr) {
       struct hk_fs_sample_source *src = obj->sample_source;
       blob_copy_bytes(blob, &src->lr_info, sizeof(src->lr_info));
@@ -11891,6 +11990,12 @@ hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
    if (obj->stencil_2d && obj->stencil_2d->shader.compiled) {
       const struct hk_shader *s2d = &obj->stencil_2d->shader;
       if (s2d->bo || s2d->only_linked || !s2d->linked.ht)
+         return false;
+   }
+
+   if (obj->compute_opt && obj->compute_opt->shader.compiled) {
+      const struct hk_shader *co = &obj->compute_opt->shader;
+      if (co->bo || co->only_linked || !co->linked.ht)
          return false;
    }
 
@@ -12080,6 +12185,27 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       simple_mtx_init(&dst->linked.lock, mtx_plain);
       dst->linked.lazy_ht = src->compiled;
       obj->stencil_2d = s2d;
+   }
+
+   if (src_obj->compute_opt) {
+      struct hk_compute_opt_variant *co = calloc(1, sizeof(*co));
+      if (!co) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      co->plan = src_obj->compute_opt->plan;
+      struct hk_shader *dst = &co->shader;
+      const struct hk_shader *src = &src_obj->compute_opt->shader;
+      *dst = *src;
+      memset(&dst->linked, 0, sizeof(dst->linked));
+      dst->only_linked = NULL;
+      dst->uvs_linked = NULL;
+      dst->bo = NULL;
+      dst->g17p_mono_nir = NULL;
+      dst->g17p_mono_nir_size = 0;
+      simple_mtx_init(&dst->linked.lock, mtx_plain);
+      dst->linked.lazy_ht = src->compiled;
+      obj->compute_opt = co;
    }
 
    *shader_out = &obj->vk;
@@ -12300,7 +12426,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->depthwise_vec4 ? 2 : 0) |
                              (obj->gemm_cmat32 ? 4 : 0) |
                              (obj->gemm_cmat64 ? 8 : 0) |
-                             (obj->gemm_cmat16 ? 16 : 0));
+                             (obj->gemm_cmat16 ? 16 : 0) |
+                             (obj->compute_opt ? 32 : 0));
    if (obj->compute_pair) {
       hk_compute_pair_info_serialize(blob, obj->compute_pair);
       if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
@@ -12422,6 +12549,12 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       blob_write_bytes(blob, &obj->stencil_2d->plan,
                        sizeof(obj->stencil_2d->plan));
       hk_shader_serialize(vk_dev, &obj->stencil_2d->shader, blob);
+   }
+
+   if (obj->compute_opt) {
+      blob_write_bytes(blob, &obj->compute_opt->plan,
+                       sizeof(obj->compute_opt->plan));
+      hk_shader_serialize(vk_dev, &obj->compute_opt->shader, blob);
    }
 
    if (sample_lr) {

@@ -14,6 +14,7 @@
 #include "hk_buffer.h"
 #include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
 #include "hk_compute_pair.h"
@@ -4500,7 +4501,8 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 
    if (!cmd->in_meta && cmd->state.cs.shader &&
        (cmd->state.cs.shader->byte_stencil ||
-        cmd->state.cs.shader->stencil_2d) &&
+        cmd->state.cs.shader->stencil_2d ||
+        cmd->state.cs.shader->compute_opt) &&
        !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
                                         cmd->conditional_meta) &&
        !hk_stat_enabled(hk_pipeline_stat_addr(
@@ -4520,6 +4522,12 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                     baseGroupX, baseGroupY, baseGroupZ, groupCountX,
                     groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
          tiled_shader = &cmd->state.cs.shader->stencil_2d->shader;
+      } else if (cmd->state.cs.shader->compute_opt &&
+                 hk_compute_opt_validate_dispatch(
+                    dev, desc, &cmd->state.cs.shader->compute_opt->plan,
+                    baseGroupX, baseGroupY, baseGroupZ, groupCountX,
+                    groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
+         tiled_shader = &cmd->state.cs.shader->compute_opt->shader;
       }
       if (tiled_shader) {
          desc->root.cs.base_group[0] = 0;
