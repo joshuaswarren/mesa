@@ -199,14 +199,15 @@ enum agx_chip_record {
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR |                                 \
     AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY | AGX_RECORD_CDM_SECONDARY_BARRIER)
 
-/* G18G has the records its J873 native captures contain. The codecs of the
- * other G15-G17 records refuse it: the VDM stream link and tessellate codecs
- * because no capture contains the record, the rest as their lists stood
- * before this table (see each codec). */
+/* G18G has the records its J873 native captures contain plus the direct 8-byte
+ * HAL300 VDM stream link verified on J873g hardware. The tessellate codec
+ * still refuses it because no capture contains that record, and the rest stay
+ * as their lists stood before this table (see each codec). */
 #define AGX_RECORDS_G18G                                                       \
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
-    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_VIEWPORT |                \
-    AGX_RECORD_PPP_W_CLAMP_CULL2 | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |       \
+    AGX_RECORD_VDM_STREAM_LINK | AGX_RECORD_VDM_STREAM_TERMINATE |             \
+    AGX_RECORD_PPP_VIEWPORT | AGX_RECORD_PPP_W_CLAMP_CULL2 |                   \
+    AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |                                      \
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR | AGX_RECORD_CDM_LAUNCH |         \
     AGX_RECORD_CDM_INDIRECT_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH_36 |       \
     AGX_RECORD_CDM_BARRIER | AGX_RECORD_HAL300_NATIVE_CAPTURE)

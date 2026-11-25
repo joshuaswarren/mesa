@@ -816,7 +816,7 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
 
    if (vdm && hk_g17p_vdm_low_window_enabled(&dev->dev))
       target = hk_g17p_vdm_compact(cmd, target);
-   else if (vdm && agx_chip_g17_m5(dev->dev.chip)) {
+   else if (vdm && agx_chip_hal300_path(dev->dev.chip)) {
       if (!agx_m5_vdm_compact(target, &target)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return current;
