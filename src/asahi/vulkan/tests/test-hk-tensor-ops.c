@@ -637,20 +637,19 @@ test_gemm_fadd_postpass(void)
          { .set = 1, .binding = 1, .data = dst1, .size = sizeof(dst1) },
          { .set = 1, .binding = 2, .data = dst2, .size = sizeof(dst2) },
       };
-      const uint64_t out_va = hk_eval_make_vaddr(1, 0);
-      const uint64_t res_delta = hk_eval_make_vaddr(2, 0) - out_va;
-      const uint64_t dst1_delta = hk_eval_make_vaddr(3, 0) - out_va;
-      const uint64_t dst2_delta = hk_eval_make_vaddr(4, 0) - out_va;
+      const uint64_t res_va = hk_eval_make_vaddr(2, 0);
+      const uint64_t dst1_va = hk_eval_make_vaddr(3, 0);
+      const uint64_t dst2_va = hk_eval_make_vaddr(4, 0);
 
       uint8_t push[64] = {0};
       memcpy(push, &n, 4);
       struct hk_dual_fadd_push dp = {
-         .res_delta_lo = (uint32_t)res_delta,
-         .res_delta_hi = (uint32_t)(res_delta >> 32),
-         .dst1_delta_lo = (uint32_t)dst1_delta,
-         .dst1_delta_hi = (uint32_t)(dst1_delta >> 32),
-         .dst2_delta_lo = (uint32_t)dst2_delta,
-         .dst2_delta_hi = (uint32_t)(dst2_delta >> 32),
+         .res_va_lo = (uint32_t)res_va,
+         .res_va_hi = (uint32_t)(res_va >> 32),
+         .dst1_va_lo = (uint32_t)dst1_va,
+         .dst1_va_hi = (uint32_t)(dst1_va >> 32),
+         .dst2_va_lo = (uint32_t)dst2_va,
+         .dst2_va_hi = (uint32_t)(dst2_va >> 32),
       };
       memcpy(push + hk_dual_write_push_offset(base_pb), &dp, sizeof(dp));
 

@@ -1623,7 +1623,8 @@ endif
 
 if with_tests
   test('hk_compute_pair', executable('hk_compute_pair_test',
-    files('tests/test-hk-compute-pair.c', 'hk_nir_match_pointwise_clamp.c'),
+    files('tests/test-hk-compute-pair.c', 'hk_nir_match_pointwise_clamp.c',
+      'hk_nir_tensor_ops.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi],
     dependencies : [idep_nir, idep_mesautil, idep_libagx],

@@ -6253,36 +6253,34 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                            tmp_disp.exec_threads[2] = 1u;
                         }
                      } else if (hk_compute_pair_dual_is_fadd(pl->dual_write)) {
-                        const uint64_t out_va =
-                           p_disp->bindings[3].address + p_disp->info.gemm.output.offset_B;
+                        /* The addresses of the output's first element in the
+                         * residual and destination buffers
+                         * (hk_nir_apply_gemm_fadd()). */
                         const uint64_t res_va =
                            d_disp->bindings[pl->fadd_add_src_binding].address +
                            d_disp->extra.copy4.src_start;
                         const uint64_t dst1_va =
                            d_disp->bindings[2].address + d_disp->extra.copy4.dst_start;
-                        const uint64_t res_delta = res_va - out_va;
-                        const uint64_t dst1_delta = dst1_va - out_va;
-                        uint64_t dst2_delta = 0;
+                        uint64_t dst2_va = 0;
                         if (pl->dual2_idx_off) {
                            const struct hk_cmd_buffer *c_src =
                               (const void *)submit->command_buffers[idx + pl->dual2_idx_off];
                            const struct hk_cs *c_cs =
                               list_first_entry(&c_src->control_streams, struct hk_cs, node);
                            const struct hk_compute_pair_dispatch *c_disp = c_cs->compute_pair;
-                           const uint64_t dst2_va =
+                           dst2_va =
                               c_disp->bindings[1].address + c_disp->extra.copy4.dst_start;
-                           dst2_delta = dst2_va - out_va;
                         }
                         const bool inplace =
                            pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
                            pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
                         struct hk_dual_fadd_push dp = {
-                           .res_delta_lo = (uint32_t)res_delta,
-                           .res_delta_hi = (uint32_t)(res_delta >> 32),
-                           .dst1_delta_lo = (uint32_t)dst1_delta,
-                           .dst1_delta_hi = (uint32_t)(dst1_delta >> 32),
-                           .dst2_delta_lo = (uint32_t)dst2_delta,
-                           .dst2_delta_hi = (uint32_t)(dst2_delta >> 32),
+                           .res_va_lo = (uint32_t)res_va,
+                           .res_va_hi = (uint32_t)(res_va >> 32),
+                           .dst1_va_lo = (uint32_t)dst1_va,
+                           .dst1_va_hi = (uint32_t)(dst1_va >> 32),
+                           .dst2_va_lo = (uint32_t)dst2_va,
+                           .dst2_va_hi = (uint32_t)(dst2_va >> 32),
                         };
                         const size_t dp_sz =
                            pl->dual2_idx_off ? sizeof(dp) : (inplace ? 8u : 16u);
