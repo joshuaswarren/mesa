@@ -64,7 +64,10 @@ bool hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
 
 /* Post-pass over a DUAL_NONE cooperative-matrix GEMM NIR shader that fuses a
  * trailing element-wise FP32 residual addition (and optional linear copy) at
- * every output store using 64-bit VA deltas supplied in push constants. */
+ * every output store. The residual and destination addresses are the
+ * struct hk_dual_fadd_push addresses in push constants plus the store's byte
+ * offset from the output's first element, so they never depend on the
+ * output descriptor's address. */
 bool hk_nir_apply_gemm_fadd(struct nir_shader *nir,
                             const struct hk_nir_gemm_output *info,
                             enum hk_compute_pair_dual_write dual_write);

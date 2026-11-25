@@ -20,6 +20,7 @@
 #include "hk_nir_fast_udiv.h"
 #include "hk_nir_wgid.h"
 #include "hk_nir_loop_bound.h"
+#include "hk_nir_tensor_ops.h"
 #include "util/blob.h"
 
 static nir_shader *
@@ -4712,6 +4713,285 @@ check_gemm_warm_fusion(const struct gemm_test_opts *opts)
    ralloc_free(cold);
 }
 
+/* Whether `def` is computed from the descriptor of storage buffer
+ * (set, binding). Walks ALU, intrinsic and deref sources, phis included. */
+static bool
+def_reads_ssbo_descriptor(nir_def *def, unsigned set, unsigned binding,
+                          BITSET_WORD *seen)
+{
+   if (BITSET_TEST(seen, def->index))
+      return false;
+   BITSET_SET(seen, def->index);
+
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i) {
+         if (def_reads_ssbo_descriptor(alu->src[i].src.ssa, set, binding, seen))
+            return true;
+      }
+      return false;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      if (in->intrinsic == nir_intrinsic_vulkan_resource_index &&
+          nir_intrinsic_desc_set(in) == set && nir_intrinsic_binding(in) == binding)
+         return true;
+      for (unsigned i = 0; i < nir_intrinsic_infos[in->intrinsic].num_srcs; ++i) {
+         if (def_reads_ssbo_descriptor(in->src[i].ssa, set, binding, seen))
+            return true;
+      }
+      return false;
+   }
+   case nir_instr_type_deref: {
+      nir_deref_instr *d = nir_instr_as_deref(instr);
+      if (d->deref_type != nir_deref_type_var &&
+          def_reads_ssbo_descriptor(d->parent.ssa, set, binding, seen))
+         return true;
+      return (d->deref_type == nir_deref_type_array ||
+              d->deref_type == nir_deref_type_ptr_as_array) &&
+             def_reads_ssbo_descriptor(d->arr.index.ssa, set, binding, seen);
+   }
+   case nir_instr_type_phi: {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      nir_foreach_phi_src(src, phi) {
+         if (def_reads_ssbo_descriptor(src->src.ssa, set, binding, seen))
+            return true;
+      }
+      return false;
+   }
+   default:
+      return false;
+   }
+}
+
+/* The global accesses the residual-FADD post-pass adds: its residual loads
+ * and destination stores, which, unlike the GEMM's own accesses, are not
+ * deref_buffer_address of a descriptor. Each must take its address from push
+ * constants, never from the output descriptor: an address formed as the
+ * output's address plus a push-constant difference is only as right as the
+ * output base the compiled shader forms, and on G16G, which has no soft
+ * faults, a wrong one faulted Background Blur (write unmapped at wrapped
+ * addresses 0x7fffffca3c0.., i.e. about -0x35c40). */
+static unsigned
+check_gemm_fadd_epilogue_addresses(nir_shader *nir,
+                                   const struct hk_nir_gemm_output *m)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_index_ssa_defs(impl);
+   unsigned epilogue = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         nir_def *addr;
+         if (in->intrinsic == nir_intrinsic_load_global)
+            addr = in->src[0].ssa;
+         else if (in->intrinsic == nir_intrinsic_store_global)
+            addr = in->src[1].ssa;
+         else
+            continue;
+         nir_instr *ai = nir_def_instr(addr);
+         if (ai->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(ai)->intrinsic ==
+                nir_intrinsic_deref_buffer_address)
+            continue;
+         BITSET_WORD *seen = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
+         HK_EVAL_CHECK(seen);
+         HK_EVAL_CHECK(!def_reads_ssbo_descriptor(addr, m->output.set,
+                                                  m->output.binding, seen));
+         free(seen);
+         epilogue++;
+      }
+   }
+   return epilogue;
+}
+
+static bool
+compile_gemm_fadd_native(nir_shader *nir, enum agx_chip chip)
+{
+   uint32_t max_half = 24u;
+   nir_shader_intrinsics_pass(nir, lower_hk_compute_intr_for_g17p,
+                              nir_metadata_control_flow, &max_half);
+   nir_opt_dce(nir);
+   nir_lower_vars_to_explicit_types(nir, nir_var_mem_shared,
+                                    test_g17p_shared_var_info);
+   nir_lower_explicit_io(nir, nir_var_mem_shared, nir_address_format_32bit_offset);
+   nir->info.io_lowered = true;
+   agx_preprocess_nir_native(nir, chip);
+
+   /* The compute constant-program contract native AGX3 launches use
+    * (hk_compile_nir()), with each chip's soft-fault state: G16 has none. */
+   struct agx_shader_key key = {
+      .reserved_preamble = (max_half + 3u) & ~3u,
+      .dev = {
+         .chip = chip,
+         .encoding = agx_chip_isa_encoding(chip),
+         .soft_fault = chip != AGX_CHIP_G16G,
+      },
+      .has_scratch = true,
+      .promote_constants = true,
+      .promote_textures = true,
+      .agx3_native_cprog = true,
+   };
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(nir, &key, &part) &&
+                   part.binary != NULL && part.info.binary_size > 0 &&
+                   part.info.scratch_size == 0;
+   free(part.binary);
+   return ok;
+}
+
+/* GEMM + residual FADD post-pass (hk_nir_apply_gemm_fadd()) over the real
+ * cooperative-matrix GEMM builder: every epilogue address comes from push
+ * constants, the epilogue lands bit-exact when the residual and destinations
+ * sit below the output (the J773g Background Blur layout) and when the output
+ * buffer is at an address no push value was computed from, and each variant
+ * compiles natively for G16G, G17P and G17S. */
+static void
+test_gemm_fadd_postpass_g16g_addresses(void)
+{
+   const struct {
+      bool guarded;
+      uint32_t M, N, K, tile_n, offset_B;
+   } shapes[] = {
+      { true, 35, 13, 19, 16, 0 },
+      { true, 67, 29, 23, 32, 16 },
+      { true, 37, 61, 35, 64, 0 },
+      { false, 64, 32, 32, 16, 16 },
+      { false, 64, 32, 32, 32, 0 },
+      { false, 64, 64, 32, 64, 16 },
+   };
+   const enum hk_compute_pair_dual_write modes[] = {
+      HK_COMPUTE_PAIR_DUAL_FADD_INPLACE, HK_COMPUTE_PAIR_DUAL_FADD_OUT,
+      HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE, HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT,
+   };
+   const enum agx_chip chips[] = { AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17S };
+
+   for (unsigned sh = 0; sh < ARRAY_SIZE(shapes); ++sh) {
+      const uint32_t M = shapes[sh].M, N = shapes[sh].N, K = shapes[sh].K;
+      const uint32_t tile_n = shapes[sh].tile_n;
+      const struct gemm_test_opts opts = {
+         .guarded = shapes[sh].guarded, .has_bias_buf = true,
+         .has_bias_mode = true, .use_ffma = true, .offset_B = shapes[sh].offset_B,
+      };
+      nir_shader *orig = build_tiled_gemm_nir_opts(&opts);
+      nir_shader *pre = nir_shader_clone(NULL, orig);
+      run_hk_preprocess_for_test(pre, false);
+      struct hk_nir_gemm_output m = {0};
+      HK_EVAL_CHECK(hk_nir_match_gemm_output(
+         pre, nir_address_format_64bit_global_32bit_offset, &m));
+      HK_EVAL_CHECK(m.cmat_valid && m.output.offset_B == shapes[sh].offset_B);
+
+      const uint32_t off_elems = m.output.offset_B / 4u;
+      const size_t mn = (size_t)M * N;
+      const size_t a_elems = (size_t)M * K + off_elems;
+      const size_t b_elems = (size_t)K * N + off_elems;
+      const size_t bias_elems = (size_t)MAX2(M, N) + off_elems + 1;
+      const size_t c_elems = mn + off_elems;
+      float *a = calloc(a_elems, 4), *bb = calloc(b_elems, 4);
+      float *bias = calloc(bias_elems, 4), *c_ref = calloc(c_elems, 4);
+      float *c = calloc(c_elems, 4), *res = calloc(mn, 4);
+      float *d1 = calloc(mn, 4), *d2 = calloc(mn, 4);
+      HK_EVAL_CHECK(a && bb && bias && c_ref && c && res && d1 && d2);
+      uint32_t rng = 0x4c16u + sh;
+      for (size_t i = off_elems; i < a_elems; ++i) a[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = off_elems; i < b_elems; ++i) bb[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = off_elems; i < bias_elems; ++i) bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < mn; ++i) res[i] = gemm_test_rand_f32(&rng);
+
+      struct gemm_push_layout push = {
+         .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = 1,
+      };
+      const uint32_t og[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
+      const struct hk_eval_ssbo so[4] = {
+         { 0, 0, a, a_elems * 4, 0 }, { 0, 1, bb, b_elems * 4, 0 },
+         { 0, 2, bias, bias_elems * 4, 0 }, { 0, 3, c_ref, c_elems * 4, 0 },
+      };
+      hk_eval_dispatch_wg(orig, og, so, 4, &push, sizeof(push));
+
+      for (unsigned mo = 0; mo < ARRAY_SIZE(modes); ++mo) {
+         const enum hk_compute_pair_dual_write mode = modes[mo];
+         const bool inplace = mode == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
+                              mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
+         const bool copy = mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE ||
+                           mode == HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+         nir_shader *alt = hk_nir_build_gemm_cmat(pre, &m, tile_n, NULL,
+                                                  HK_COMPUTE_PAIR_DUAL_NONE);
+         HK_EVAL_CHECK(alt && hk_nir_apply_gemm_fadd(alt, &m, mode));
+         nir_validate_shader(alt, "gemm_fadd_postpass");
+         HK_EVAL_CHECK(check_gemm_fadd_epilogue_addresses(alt, &m) > 0);
+
+         /* The residual and destinations take the lowest addresses, below
+          * the output, as on J773g. The push words name them by address only,
+          * so the output may then move to an address none of them was
+          * computed from (slot 6 instead of 3) and the epilogue must still
+          * land exactly in them. */
+         const uint64_t res_va = hk_eval_make_vaddr(0, 0);
+         const uint64_t d1_va = hk_eval_make_vaddr(1, 0);
+         const uint64_t d2_va = hk_eval_make_vaddr(2, 0);
+         uint8_t push_buf[256] = {0};
+         memcpy(push_buf, &push, sizeof(push));
+         const struct hk_dual_fadd_push dp = {
+            .res_va_lo = (uint32_t)res_va, .res_va_hi = (uint32_t)(res_va >> 32),
+            .dst1_va_lo = (uint32_t)d1_va, .dst1_va_hi = (uint32_t)(d1_va >> 32),
+            .dst2_va_lo = (uint32_t)d2_va, .dst2_va_hi = (uint32_t)(d2_va >> 32),
+         };
+         memcpy(push_buf + hk_dual_write_push_offset(m.push_bytes), &dp, sizeof(dp));
+         const uint32_t ag[3] = { DIV_ROUND_UP(N, tile_n),
+                                  DIV_ROUND_UP(M, hk_gemm_cmat_tile_m(tile_n)), 1u };
+         for (unsigned moved = 0; moved < 2; ++moved) {
+            memset(c, 0, c_elems * 4);
+            for (size_t i = 0; i < mn; ++i) { d1[i] = -41.0f; d2[i] = -82.0f; }
+            const struct hk_eval_ssbo out = { 0, 3, c, c_elems * 4, 0 };
+            const struct hk_eval_ssbo fixed[6] = {
+               { 1, 0, res, mn * 4, 0 }, { 1, 1, d1, mn * 4, 0 },
+               { 1, 2, d2, mn * 4, 0 }, { 0, 0, a, a_elems * 4, 0 },
+               { 0, 1, bb, b_elems * 4, 0 }, { 0, 2, bias, bias_elems * 4, 0 },
+            };
+            struct hk_eval_ssbo sa[7];
+            memcpy(sa, fixed, 3 * sizeof(sa[0]));
+            if (moved) {
+               memcpy(sa + 3, fixed + 3, 3 * sizeof(sa[0]));
+               sa[6] = out;
+            } else {
+               sa[3] = out;
+               memcpy(sa + 4, fixed + 3, 3 * sizeof(sa[0]));
+            }
+            hk_eval_dispatch_wg(alt, ag, sa, 7, push_buf, sizeof(push_buf));
+            for (size_t i = 0; i < mn; ++i) {
+               const float prod = c_ref[off_elems + i];
+               const float sum = prod + res[i];
+               HK_EVAL_CHECK(hk_eval_f2u(c[off_elems + i]) ==
+                             hk_eval_f2u(inplace ? sum : prod));
+               HK_EVAL_CHECK(hk_eval_f2u(d1[i]) ==
+                             hk_eval_f2u(inplace ? -41.0f : sum));
+               HK_EVAL_CHECK(hk_eval_f2u(d2[i]) ==
+                             hk_eval_f2u(copy ? sum : -82.0f));
+            }
+         }
+
+         for (unsigned ci = 0; ci < ARRAY_SIZE(chips); ++ci) {
+            nir_shader *native = nir_shader_clone(NULL, alt);
+            const bool ok = compile_gemm_fadd_native(native, chips[ci]);
+            if (!ok) {
+               fprintf(stderr, "gemm fadd post-pass: %s%u mode %u fails on chip %u\n",
+                       shapes[sh].guarded ? "grd" : "ug", tile_n, mode, chips[ci]);
+            }
+            HK_EVAL_CHECK(ok);
+            ralloc_free(native);
+         }
+         ralloc_free(alt);
+      }
+      free(a); free(bb); free(bias); free(c_ref); free(c);
+      free(res); free(d1); free(d2);
+      ralloc_free(pre);
+      ralloc_free(orig);
+   }
+}
+
 static void
 test_warm_cache_producer_fusion(void)
 {
@@ -4787,6 +5067,7 @@ main(void)
    test_fast_udivmod_general();
    test_depthwise_shape_sweep_cpu_ref();
    test_g17p_compile_occupancy();
+   test_gemm_fadd_postpass_g16g_addresses();
    test_warm_cache_producer_fusion();
    glsl_type_singleton_decref();
    printf("test-hk-compute-pair: PASS\n");
