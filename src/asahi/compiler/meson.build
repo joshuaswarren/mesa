@@ -793,6 +793,7 @@ if with_tests
          'test/test-agx3c-collect-split.cpp',
          'test/test-opt-licm.cpp',
          'test/test-g17p-mod3-ra.cpp',
+         'test/test-nir-integer-licm.cpp',
          'test/test-ra-early-kill.cpp',
          'test/test-ra-uniform-phi.cpp',
          'test/test-rt-register-pressure.cpp',
