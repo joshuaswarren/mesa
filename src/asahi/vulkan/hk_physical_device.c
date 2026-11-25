@@ -345,7 +345,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
-      .EXT_sample_locations = true,
+      /* The G18G kernel admission only accepts standard MSAA sample
+       * positions; custom sample locations are rejected with ENOTSUPP. */
+      .EXT_sample_locations = dev->chip != AGX_CHIP_G18G,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
@@ -1173,19 +1175,17 @@ hk_get_device_properties(const struct agx_device *dev,
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
-      dev->chip == AGX_CHIP_G18G
-         ? VK_SAMPLE_COUNT_1_BIT
-         : (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
-            VK_SAMPLE_COUNT_4_BIT |
-            (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0));
+      VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
+      (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0);
 
    /* Integer colour attachments and sampled multisample images use the same
     * native tile store/reload and texel-fetch paths as other colour formats.
     * Storage-image multisampling is an independent capability: keep its
-    * G17P restriction until that image descriptor path is qualified.
+    * G17P/G18G restriction until that image descriptor path is qualified.
     */
    const VkSampleCountFlagBits storage_sample_counts =
-      agx_chip_native_agx3(dev->chip) ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
+      agx_chip_native_or_g18g(dev->chip) ? VK_SAMPLE_COUNT_1_BIT
+                                         : sample_counts;
 
    uint64_t os_page_size = 16384;
    os_get_page_size(&os_page_size);

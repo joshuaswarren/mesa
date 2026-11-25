@@ -735,7 +735,7 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->g17p_samples = state->ms->rasterization_samples;
 
-   if (agx_chip_g17_m5(chip) && state->ms != NULL &&
+   if (agx_chip_hal300_path(chip) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
@@ -4757,13 +4757,14 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
 static unsigned
 hk_native_fs_samples(enum agx_chip chip, const struct hk_fs_key *key)
 {
-   return agx_chip_g17_m5(chip) ? key->m5_position_samples : key->g17p_samples;
+   return agx_chip_hal300_path(chip) ? key->m5_position_samples
+                                     : key->g17p_samples;
 }
 
 static unsigned
 hk_native_fs_registers(enum agx_chip chip)
 {
-   return agx_chip_g17_m5(chip) ? AGX_NUM_REGS : AGX3B_NUM_REGS;
+   return agx_chip_hal300_path(chip) ? AGX_NUM_REGS : AGX3B_NUM_REGS;
 }
 
 static bool
@@ -5940,7 +5941,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * to unroll here (inlined with its epilog at draw time) keeps the
        * lowering before that unroll. */
       const bool m5_test_once =
-         agx_chip_g17_m5(dev->dev.chip) && nir->info.fs.uses_sample_shading &&
+         agx_chip_hal300_path(dev->dev.chip) && nir->info.fs.uses_sample_shading &&
          !nir->info.fs.early_fragment_tests;
 
       bool a2c_in_main = false;
@@ -5954,7 +5955,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
       NIR_PASS(_, nir, agx_nir_lower_fs_output_to_epilog_for_device,
                dev->dev.chip, &shader->info.fs.epilog_key);
-      if (agx_chip_g17_m5(dev->dev.chip)) {
+      if (agx_chip_hal300_path(dev->dev.chip)) {
          if (!m5_test_once)
             NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
       } else if (dev->dev.chip == AGX_CHIP_G17P) {
@@ -5992,7 +5993,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       NIR_PASS(_, nir, agx_nir_apply_api_mask_to_force_early, dev->dev.chip);
 
       if (nir->info.fs.uses_sample_shading &&
-          agx_chip_native_or_m5(dev->dev.chip)) {
+          agx_chip_agx3_path(dev->dev.chip)) {
          /* A split shader exports each sample through fixed registers. M5
           * fragments that exceed that file retain one sample's NIR until
           * the epilog can be inlined, then unroll the complete body. */
@@ -6001,11 +6002,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          assert(raster_samples == 2 || raster_samples == 4 ||
                 (agx_chip_g17_m5(dev->dev.chip) && raster_samples == 8));
 
-         /* M5 unrolls up to eight samples in its larger register file, the
-          * same count and file hk_native_sample_shading_supported() admitted. */
+         /* M5/G18G unroll in the larger HAL300 register file, matching what
+          * hk_native_sample_shading_supported() admitted. */
          if (!agx_nir_lower_g17p_sample_shading_file(
                 nir, &shader->info.fs.epilog_key, raster_samples, registers,
-                agx_chip_g17_m5(dev->dev.chip))) {
+                agx_chip_hal300_path(dev->dev.chip))) {
             if (agx_chip_g17_m5(dev->dev.chip) && raster_samples == 8) {
                shader->info.fs.m5_inline_sample_shading = true;
                /* Not unrolled here: lower as before. */
@@ -6084,7 +6085,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * refuses it. M5 keys the count as m5_position_samples. */
       const unsigned native_samples =
          hk_native_fs_samples(dev->dev.chip, &key->fs);
-      if (agx_chip_native_or_m5(dev->dev.chip) &&
+      if (agx_chip_agx3_path(dev->dev.chip) &&
           native_samples)
          NIR_PASS(_, nir, agx_nir_specialize_sample_count, native_samples);
 
@@ -6418,7 +6419,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       backend_key.fs.inside_sample_loop = true;
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT && key)
-      backend_key.fs.nr_samples = agx_chip_g17_m5(dev->dev.chip)
+      backend_key.fs.nr_samples = agx_chip_hal300_path(dev->dev.chip)
                                     ? key->fs.m5_position_samples
                                     : key->fs.g17p_samples;
 
@@ -7591,7 +7592,7 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
    const unsigned i = util_logbase2(samples);
    union hk_key key = src->key;
    key.fs.g17p_samples = samples;
-   if (agx_chip_g17_m5(dev->dev.chip))
+   if (agx_chip_hal300_path(dev->dev.chip))
       key.fs.m5_position_samples = samples;
 
    if (samples > 1 && nir->info.fs.uses_sample_shading &&
@@ -8926,7 +8927,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
           (nir->info.outputs_written &
            (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
             BITFIELD64_BIT(FRAG_RESULT_STENCIL))));
-      sample_variants = agx_chip_native_or_m5(dev->dev.chip) &&
+      sample_variants = agx_chip_agx3_path(dev->dev.chip) &&
          hk_native_fs_samples(dev->dev.chip, &key_tmp.fs) == 0 &&
          (nir->info.fs.uses_sample_shading || key_tmp.fs.force_sample_shading ||
           coverage_updates || agx_nir_needs_sample_count(nir));
@@ -9658,7 +9659,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          const unsigned max_samples = agx_chip_g17_m5(dev->dev.chip) ? 8 : 4;
          for (unsigned samples = 2; samples <= max_samples; samples *= 2) {
             key->fs.g17p_samples = samples;
-            if (agx_chip_g17_m5(dev->dev.chip))
+            if (agx_chip_hal300_path(dev->dev.chip))
                key->fs.m5_position_samples = samples;
             if (!hk_native_sample_shading_supported(nir, &key->fs, dev->dev.chip)) {
                ralloc_free(lr_nir);
@@ -9671,7 +9672,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          }
       }
       key->fs.g17p_samples = 0;
-      if (agx_chip_g17_m5(dev->dev.chip))
+      if (agx_chip_hal300_path(dev->dev.chip))
          key->fs.m5_position_samples = 0;
 
       result = hk_fs_sample_source_init(obj, nir, lr_nir, &lr_info, has_ia,
@@ -11481,7 +11482,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        (sample_variants && (stage != MESA_SHADER_FRAGMENT ||
                             (agx_chip_g17_m5(dev->dev.chip)
                                 ? !m5_sample_variants
-                                : !agx_chip_native_agx3(dev->dev.chip)))) ||
+                                : !agx_chip_native_or_g18g(dev->dev.chip)))) ||
        (has_mono && (stage != MESA_SHADER_FRAGMENT ||
                      !agx_chip_native_or_m5(dev->dev.chip))))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
