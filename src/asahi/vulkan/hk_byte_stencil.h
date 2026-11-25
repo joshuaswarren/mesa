@@ -22,8 +22,8 @@ struct vk_descriptor_set_layout;
 #define HK_BYTE_STENCIL_MAX_DIAMETER  57u
 #define HK_BYTE_STENCIL_MAX_RADIUS    28u
 
-/* The decoded RGBA tiles include a halo of up to 64 pixels on either side.
- * Four horizontal rows need 8 KiB and 16 padded vertical columns need 24,704 B.
+/* The RGBA tiles include a halo of up to 64 pixels on either side.
+ * Decoded horizontal rows need 8 KiB. Packed vertical columns need 12.25 KiB.
  */
 #define HK_RGBA8_STENCIL_MAX_DIAMETER 129u
 #define HK_RGBA8_STENCIL_MAX_RADIUS   64u

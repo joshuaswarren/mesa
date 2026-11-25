@@ -4086,6 +4086,16 @@ build_vert_tiled_kernel(nir_builder *b, const struct hk_byte_stencil_plan *plan,
    nir_pop_if(b, NULL);
 }
 
+static nir_def *
+decode_rgba8(nir_builder *b, nir_def *pixel)
+{
+   nir_def *channels[4];
+   for (unsigned ch = 0; ch < 4; ch++)
+      channels[ch] =
+         nir_u2f32(b, nir_ubitfield_extract_imm(b, pixel, 8 * ch, 8));
+   return nir_vec(b, channels, 4);
+}
+
 /* A byte is exactly representable as binary16. Convert once as each pixel
  * enters the shared tile and widen only the input to each FP32 FMA.
  */
@@ -4129,7 +4139,7 @@ pack_rgba8_sum(nir_builder *b, nir_def *sum,
 static nir_def *
 emit_rgba8_edge_1px_stencil(nir_builder *b, nir_deref_instr *tile,
                             nir_deref_instr *w_base, nir_def *sh_start,
-                            nir_def *n_taps,
+                            nir_def *n_taps, bool packed,
                             enum hk_byte_stencil_store_conv conv)
 {
    nir_variable *index =
@@ -4147,7 +4157,10 @@ emit_rgba8_edge_1px_stencil(nir_builder *b, nir_deref_instr *tile,
       nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
-      nir_def *pixel = load_rgba8(b, tile, nir_iadd(b, sh_start, i));
+      nir_def *sample_index = nir_iadd(b, sh_start, i);
+      nir_def *pixel = packed
+                          ? decode_rgba8(b, load_sh_vec4_scalar(b, tile, sample_index))
+                          : load_rgba8(b, tile, sample_index);
       nir_def *w = load_ssbo_f32(b, w_base, i);
       nir_store_var(b, sum, nir_ffma(b, pixel, w, nir_load_var(b, sum)), 0xf);
       nir_store_var(b, index, nir_iadd_imm(b, i, 1), 1);
@@ -4407,7 +4420,7 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
                nir_def *sh_start =
                   nir_iadd(b, sh_row_off, nir_isub(b, c_min, x_start));
                nir_def *out_px = emit_rgba8_edge_1px_stencil(
-                  b, tile, w_base, sh_start, n_taps, plan->store_conv);
+                  b, tile, w_base, sh_start, n_taps, false, plan->store_conv);
                store_ssbo_u32(b, dst_base, nir_iadd(b, row_base, xp), out_px);
             }
             nir_pop_if(b, NULL);
@@ -4421,9 +4434,106 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
+/* Walk the input pixels once, distributing each decoded sample to the four
+ * neighboring outputs. At a block boundary the first samples still contribute
+ * to the preceding weight block. Carry those coefficients across iterations.
+ */
+static void
+rgba8_accumulate_block(nir_builder *b, nir_def *pixels, nir_def *prev,
+                       nir_def *weights, unsigned count, unsigned samples,
+                       nir_variable *sums[4])
+{
+   for (unsigned k = 0; k < samples; k++) {
+      nir_def *pixel = decode_rgba8(b, nir_channel(b, pixels, k));
+      for (unsigned p = 0; p < 4; p++) {
+         int t = (int)k - (int)p;
+         if (t >= (int)count)
+            continue;
+
+         nir_def *w =
+            t < 0 ? nir_channel(b, prev, 4 + t) : nir_channel(b, weights, t);
+         nir_store_var(b, sums[p],
+                       nir_ffma(b, pixel, w, nir_load_var(b, sums[p])), 0xf);
+      }
+   }
+}
+
+static void
+emit_rgba8_packed_stencil(nir_builder *b, nir_deref_instr *sh_tile_u4,
+                          nir_deref_instr *w_base, nir_deref_instr *w_base_v4,
+                          nir_def *base_v4, nir_def *tap_count,
+                          enum hk_byte_stencil_store_conv conv,
+                          nir_def *out_pixels[4])
+{
+   nir_def *n4 = nir_ishr_imm(b, tap_count, 2);
+   nir_variable *i4_var =
+      nir_local_variable_create(b->impl, glsl_int_type(), "ri4");
+   nir_variable *trailing =
+      nir_local_variable_create(b->impl, glsl_vec4_type(), "weights");
+   nir_variable *sums[4];
+   for (unsigned p = 0; p < 4; p++) {
+      sums[p] = nir_local_variable_create(b->impl, glsl_vec4_type(), "sum");
+      nir_store_var(b, sums[p], nir_imm_zero(b, 4, 32), 0xf);
+   }
+   /* Before the first tap the inputs are finite bytes and every sum is +0. */
+   nir_store_var(b, trailing, nir_imm_zero(b, 4, 32), 0xf);
+   nir_store_var(b, i4_var, nir_imm_int(b, 0), 0x1);
+
+   /* Four taps across four pixels already expose independent work for all
+    * 16 channel accumulators. Another copy increases register pressure. */
+   nir_loop *taps = nir_push_loop(b);
+   taps->control = nir_loop_control_dont_unroll;
+   {
+      nir_def *i4 = nir_load_var(b, i4_var);
+      nir_push_if(b, nir_ige(b, i4, n4));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, NULL);
+
+      nir_def *wv = load_ssbo_f32x4(b, w_base_v4, i4);
+      nir_def *pixels = load_sh_vec4(b, sh_tile_u4, nir_iadd(b, base_v4, i4));
+      rgba8_accumulate_block(b, pixels, nir_load_var(b, trailing), wv, 4, 4,
+                             sums);
+      nir_store_var(b, trailing, wv, 0xf);
+      nir_store_var(b, i4_var, nir_iadd_imm(b, i4, 1), 0x1);
+   }
+   nir_pop_loop(b, NULL);
+
+   /* One or three coefficients remain. Only the three-tap tail reaches the
+    * next shared vector. Read exactly the valid weights in either case. */
+   nir_def *last = nir_iand_imm(b, tap_count, ~3);
+   nir_def *pos = nir_iadd(b, base_v4, n4);
+   nir_def *pixels = load_sh_vec4(b, sh_tile_u4, pos);
+   nir_def *prev = nir_load_var(b, trailing);
+   nir_def *w0 = load_ssbo_f32(b, w_base, last);
+   rgba8_accumulate_block(b, pixels, prev, w0, 1, 4, sums);
+   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, tap_count, 2), 0));
+   {
+      nir_def *end = nir_iadd_imm(b, tap_count, -1);
+      nir_def *w1 =
+         load_ssbo_f32(b, w_base, nir_umin(b, end, nir_iadd_imm(b, last, 1)));
+      nir_def *w2 = load_ssbo_f32(b, w_base, end);
+      nir_def *pair[2] = {pixels,
+                          load_sh_vec4(b, sh_tile_u4, nir_iadd_imm(b, pos, 1))};
+      for (unsigned p = 0; p < 4; p++) {
+         nir_def *x1 =
+            decode_rgba8(b, nir_channel(b, pair[(p + 1) / 4], (p + 1) % 4));
+         nir_def *x2 =
+            decode_rgba8(b, nir_channel(b, pair[(p + 2) / 4], (p + 2) % 4));
+         nir_def *sum = nir_ffma(b, x1, w1, nir_load_var(b, sums[p]));
+         nir_store_var(b, sums[p], nir_ffma(b, x2, w2, sum), 0xf);
+      }
+   }
+   nir_pop_if(b, NULL);
+
+   for (unsigned p = 0; p < 4; p++)
+      out_pixels[p] = pack_rgba8_sum(b, nir_load_var(b, sums[p]), conv);
+}
+
 /* Vertical packed-RGBA8 tiled clamped stencil: 16x16 threads (256/WG),
  * 16x64 pixel tile (4 vertical pixels/thread), 64-byte coalesced X loads &
- * stores, column-major FP16 RGBA shared staging, and uniform f32x4 weights. */
+ * stores, column-major uvec4 shared staging (16 x 49 uvec4 = 12.25 KiB, odd
+ * column stride -> zero bank conflicts), uniform f32x4 weights, and 4-pixel
+ * sliding register window. */
 static void
 build_rgba8_vert_tiled_kernel(nir_builder *b,
                               const struct hk_byte_stencil_plan *plan,
@@ -4433,7 +4543,9 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
    const unsigned WG_Y = 16;
    const unsigned TILE_W = 16;
    const unsigned TILE_H = 64;
-   const unsigned SH_COL_STRIDE = TILE_H + 2 * HK_RGBA8_STENCIL_MAX_RADIUS + 1;
+   const unsigned SH_COL_U4 =
+      49; /* 49 * 4 = 196 >= 64 + 2 * 64; odd -> 0 bank conflicts */
+   const unsigned SH_COL_STRIDE = SH_COL_U4 * 4;
 
    b->shader->info.workgroup_size[0] = WG_X;
    b->shader->info.workgroup_size[1] = WG_Y;
@@ -4443,10 +4555,8 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
 
    nir_variable *sh_tile_var = nir_variable_create(
       b->shader, nir_var_mem_shared,
-      glsl_array_type(glsl_vector_type(GLSL_TYPE_FLOAT16, 4),
-                      TILE_W * SH_COL_STRIDE, 0),
-      "sh_tile");
-   nir_deref_instr *tile = nir_build_deref_var(b, sh_tile_var);
+      glsl_array_type(glsl_uvec4_type(), TILE_W * SH_COL_U4, 0), "sh_tile");
+   nir_deref_instr *sh_tile_u4 = nir_build_deref_var(b, sh_tile_var);
 
    nir_deref_instr *src_base = build_ssbo_base_deref_aligned(
       b, &plan->src, ssbo_addr_format, glsl_uint_type(), 4, 4);
@@ -4474,6 +4584,7 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
    nir_def *tile_y = nir_imul_imm(b, nir_channel(b, wgid, 1), TILE_H);
    nir_def *valid_x = nir_ilt(b, gx, width);
 
+   nir_def *sh_col_u4 = nir_imul_imm(b, tx, SH_COL_U4);
    nir_def *sh_col_off = nir_imul_imm(b, tx, SH_COL_STRIDE);
 
    nir_def *total_rows = nir_iadd_imm(b, nir_ishl_imm(b, radius, 1), TILE_H);
@@ -4508,7 +4619,7 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
 
             nir_def *off = nir_load_var(b, off_var);
             nir_def *px = load_ssbo_u32(b, src_base, off);
-            stage_rgba8(b, tile, nir_iadd(b, sh_col_off, r), px);
+            store_sh_vec4_scalar(b, sh_tile_u4, nir_iadd(b, sh_col_off, r), px);
 
             nir_store_var(b, off_var, nir_iadd(b, off, row_step), 0x1);
             nir_store_var(b, r_var, nir_iadd_imm(b, r, WG_Y), 0x1);
@@ -4534,7 +4645,8 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
             {
                nir_def *px = load_ssbo_u32(
                   b, src_base, nir_iadd(b, nir_imul(b, gy, stride), gx));
-               stage_rgba8(b, tile, nir_iadd(b, sh_col_off, r), px);
+               store_sh_vec4_scalar(b, sh_tile_u4, nir_iadd(b, sh_col_off, r),
+                                    px);
             }
             nir_pop_if(b, NULL);
 
@@ -4560,9 +4672,9 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
       nir_push_if(b, all_interior);
       {
          nir_def *outs[4];
-         emit_rgba8_sliding_stencil(b, tile, w_base, w_base_v4,
-                                    nir_iadd(b, sh_col_off, ly4), tap_count,
-                                    plan->store_conv, outs);
+         emit_rgba8_packed_stencil(b, sh_tile_u4, w_base, w_base_v4,
+                                   nir_iadd(b, sh_col_u4, ly), tap_count,
+                                   plan->store_conv, outs);
          nir_def *dst_off = nir_iadd(b, nir_imul(b, y0, stride), gx);
          for (unsigned p = 0; p < 4; p++) {
             store_ssbo_u32(b, dst_base, dst_off, outs[p]);
@@ -4593,8 +4705,9 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
                nir_def *n_taps = nir_iadd_imm(b, nir_isub(b, c_max, c_min), 1);
                nir_def *sh_start =
                   nir_iadd(b, sh_col_off, nir_isub(b, c_min, y_start));
-               nir_def *out_px = emit_rgba8_edge_1px_stencil(
-                  b, tile, w_base, sh_start, n_taps, plan->store_conv);
+               nir_def *out_px =
+                  emit_rgba8_edge_1px_stencil(b, sh_tile_u4, w_base, sh_start,
+                                              n_taps, true, plan->store_conv);
                store_ssbo_u32(
                   b, dst_base, nir_iadd(b, nir_imul(b, yp, stride), gx), out_px);
             }
