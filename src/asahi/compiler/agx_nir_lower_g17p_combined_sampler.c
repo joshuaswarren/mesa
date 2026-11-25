@@ -1481,7 +1481,7 @@ g17p_storage_image_shape(const nir_intrinsic_instr *intr, bool load,
       dim == GLSL_SAMPLER_DIM_2D && !nir_intrinsic_image_array(intr);
    if (intr->intrinsic != (load ? nir_intrinsic_bindless_image_load
                                 : nir_intrinsic_bindless_image_store) ||
-       (nir_intrinsic_access(intr) & ACCESS_BUFFER_AGX) ||
+       ((nir_intrinsic_access(intr) & ACCESS_BUFFER_AGX) && !any_format) ||
        (!plain_2d && !g18_dim_ok) || !format_ok ||
        nir_src_num_components(intr->src[1]) != 4 ||
        nir_src_bit_size(intr->src[1]) != 32 ||

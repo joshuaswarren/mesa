@@ -412,6 +412,53 @@ hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
    hk_device_free_span(dev, allocation);
 }
 
+VkResult
+hk_cmd_pool_alloc_vdm_span(struct hk_cmd_pool *pool, uint64_t size,
+                           uint64_t alignment, struct agx_ptr *ptr,
+                           struct hk_vdm_allocation **allocation)
+{
+   if (size == HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       alignment <= HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       !list_is_empty(&pool->free_vdm_spans)) {
+      struct hk_vdm_allocation *span = list_first_entry(
+         &pool->free_vdm_spans, struct hk_vdm_allocation, link);
+      list_del(&span->link);
+      pool->num_free_vdm_spans--;
+      *ptr = (struct agx_ptr){
+         .gpu = span->addr,
+         .cpu = span->slab->map
+                   ? (uint8_t *)span->slab->map +
+                        (span->addr - span->slab->bo->va->addr)
+                   : NULL,
+      };
+      *allocation = span;
+      return VK_SUCCESS;
+   }
+
+   return hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_VDM, size, alignment, ptr,
+                                 allocation);
+}
+
+void
+hk_cmd_pool_free_vdm_span(struct hk_cmd_pool *pool,
+                          struct hk_vdm_allocation *allocation)
+{
+   if (!allocation)
+      return;
+
+   struct hk_device *dev = hk_cmd_pool_device(pool);
+   const unsigned max_free = hk_cmd_pool_vdm_span_cache_max(&dev->dev);
+   if (allocation->slab->class == HK_CMD_SLAB_VDM &&
+       allocation->size == HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       pool->num_free_vdm_spans < max_free) {
+      list_add(&allocation->link, &pool->free_vdm_spans);
+      pool->num_free_vdm_spans++;
+      return;
+   }
+
+   hk_device_free_span(dev, allocation);
+}
+
 void
 hk_device_free_span(struct hk_device *dev, struct hk_vdm_allocation *allocation)
 {
@@ -479,6 +526,10 @@ hk_CreateCommandPool(VkDevice _device,
    }
    list_inithead(&pool->free_ioto_spans);
    pool->num_free_ioto_spans = 0;
+   list_inithead(&pool->free_vdm_spans);
+   pool->num_free_vdm_spans = 0;
+   list_inithead(&pool->free_cs);
+   pool->num_free_cs = 0;
 
    *pCmdPool = hk_cmd_pool_to_handle(pool);
 
@@ -512,6 +563,21 @@ hk_cmd_pool_destroy_bos(struct hk_cmd_pool *pool)
    }
    list_inithead(&pool->free_ioto_spans);
    pool->num_free_ioto_spans = 0;
+
+   list_for_each_entry_safe(struct hk_vdm_allocation, span,
+                            &pool->free_vdm_spans, link) {
+      list_del(&span->link);
+      hk_device_free_span(dev, span);
+   }
+   list_inithead(&pool->free_vdm_spans);
+   pool->num_free_vdm_spans = 0;
+
+   list_for_each_entry_safe(struct hk_cs, cs, &pool->free_cs, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   list_inithead(&pool->free_cs);
+   pool->num_free_cs = 0;
 }
 
 VkResult

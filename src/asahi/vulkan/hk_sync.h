@@ -396,13 +396,20 @@ struct hk_sync_state {
    struct hk_cs *xfer_any;
    uint32_t xfer_version;
 
-   /* The draw state the last draw-time check found no noted write in: valid
-    * while xfer_version, the descriptor and vertex buffer generations and the
-    * index buffer are unchanged (hk_cmd_draw.c). */
+   /* Draw-state slices the last draw-time check found no noted write in:
+    * each slice stays valid independently while xfer_version and that
+    * slice's resource identity are unchanged (hk_cmd_draw.c). */
    struct {
-      bool valid;
-      uint32_t version;
-      uint64_t descriptors, vertex_buffers, index;
+      uint32_t desc_version;
+      uint32_t vb_version;
+      uint32_t index_version;
+      bool desc_valid;
+      bool vb_valid;
+      bool index_valid;
+      uint64_t descriptors;
+      uint64_t vertex_buffers;
+      uint64_t index_addr;
+      uint64_t index_range;
    } xfer_clean;
 
    /* A top-of-pipe timestamp waiting for the next stream to carry it as its
