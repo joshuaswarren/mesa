@@ -20,7 +20,6 @@
 bool
 agx_vdm_stream_link_core_supported(enum agx_chip chip)
 {
-   /* G18G: no J873 native capture contains this record yet. */
    return agx_chip_has_record(chip, AGX_RECORD_VDM_STREAM_LINK);
 }
 

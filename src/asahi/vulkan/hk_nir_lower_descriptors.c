@@ -57,6 +57,10 @@ struct lower_descriptors_ctx {
    /* Layered stores and atomics check the M5 store window record
     * (lower_m5_store_window()). */
    bool m5_store_window;
+   /* AGX3D hardware LOD queries do not support array or cube textures;
+    * lower fragment array/cube nir_texop_lod from derivatives and sampler
+    * descriptor fields. */
+   bool lower_array_cube_lod_query;
    mesa_shader_stage stage;
 };
 
@@ -1200,14 +1204,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx);
 
 static nir_def *
-compute_lod_lambda(nir_builder *b, nir_tex_instr *tex, nir_def *size)
+compute_lod_lambda(nir_builder *b, nir_tex_instr *tex, nir_def *size,
+                   bool fragment)
 {
    const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   const unsigned comps = tex->coord_components - (tex->is_array ? 1 : 0);
+   /* nir_texop_lod coordinates never carry an array layer component. */
+   const unsigned comps = tex->coord_components;
    nir_def *c = nir_f2f32(b, nir_trim_vector(b, tex->src[coord_idx].src.ssa,
                                              comps));
-   nir_def *dx = agx_nir_quad_ddx(b, c);
-   nir_def *dy = agx_nir_quad_ddy(b, c);
+   nir_def *dx = fragment ? nir_ddx(b, c) : agx_nir_quad_ddx(b, c);
+   nir_def *dy = fragment ? nir_ddy(b, c) : agx_nir_quad_ddy(b, c);
 
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
       nir_def *abs_p = nir_fabs(b, c);
@@ -1256,12 +1262,20 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
                         const struct lower_descriptors_ctx *ctx)
 {
    /* Task and mesh shaders with a derivative group take the compute
-    * derivatives (meshAndTaskShaderDerivatives). */
+    * derivatives (meshAndTaskShaderDerivatives). AGX3D fragment shaders
+    * also use this path for array/cube LOD queries, which hardware SMP
+    * does not encode. */
+   const bool compute_like =
+      mesa_shader_stage_uses_workgroup(b->shader->info.stage) &&
+      b->shader->info.derivative_group != DERIVATIVE_GROUP_NONE;
+   const bool frag_array_cube =
+      b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+      ctx->lower_array_cube_lod_query &&
+      (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE);
    if (tex->op != nir_texop_lod ||
        (!hk_descriptor_generation_is_agx2(ctx->descriptor_generation) &&
         ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
-       !mesa_shader_stage_uses_workgroup(b->shader->info.stage) ||
-       b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE)
+       (!compute_like && !frag_array_cube))
       return false;
 
    const int sampler_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
@@ -1311,7 +1325,12 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
          nir_imul_imm(b, nir_u2u64(b, index),
                       agx_chip_sampler_heap_element_size(AGX_CHIP_G13G)));
       word = load_speculatable(b, 1, 32, addr, 8);
-   } else if (ctx->descriptor_generation == 9) {
+   } else {
+      /* Both Gen9 and Gen10 descriptors store the unbiased sampler indices and
+       * float API bias in sw.g17p (overlapping sw.sampler), while the hardware
+       * sampler state word lives in the 32-byte-per-entry native sampler heap. */
+      static_assert(AGX_SAMPLER_GEN5_LENGTH <= HK_NATIVE_SAMPLER_MAX_ELEMENT_SIZE,
+                    "Gen5 sampler fits in native heap slot");
       nir_def *index = load_resource_deref_desc(
          b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
       api_bias = load_resource_deref_desc(
@@ -1324,20 +1343,8 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
          nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)), 8);
       nir_def *addr = nir_iadd(
          b, heap,
-         nir_imul_imm(b, nir_u2u64(b, index),
-                      agx_chip_sampler_heap_element_size(AGX_CHIP_G17P)));
+         nir_imul_imm(b, nir_u2u64(b, index), HK_NATIVE_SAMPLER_MAX_ELEMENT_SIZE));
       word = load_speculatable(b, 1, 32, addr, 8);
-   } else {
-      /* A Gen10 descriptor carries its plane's Gen5 sampler word itself
-       * (hk_rc_sampler::key, the heap entry's packed state), with the API
-       * bias in the word's signed 5:6 LOD bias field at bits 43..53 --
-       * the bias Gen5 hardware applies when sampling with this sampler. */
-      nir_def *packed = load_resource_deref_desc(
-         b, 2, 32, sampler, plane_offset_B + native.sampler, ctx);
-      word = nir_channel(b, packed, 0);
-      nir_def *bias_fixed =
-         nir_ishr_imm(b, nir_ishl_imm(b, nir_channel(b, packed, 1), 10), 21);
-      api_bias = nir_fmul_imm(b, nir_i2f32(b, bias_fixed), 1.0 / 64.0);
    }
    nir_def *min_lod =
       nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, word, 0x3ff)), 1.0 / 64.0);
@@ -1347,7 +1354,8 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
    nir_def *mip_filter = nir_iand_imm(b, nir_ushr_imm(b, word, 27), 3);
 
    nir_def *lambda = nir_fadd(
-      b, compute_lod_lambda(b, tex, nir_i2f32(b, size)), api_bias);
+      b, compute_lod_lambda(b, tex, nir_i2f32(b, size), frag_array_cube),
+      api_bias);
    nir_def *clamped = nir_fclamp(b, lambda, min_lod, max_lod);
    nir_def *nearest =
       nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, clamped, 0.5)), -1.0);
@@ -1365,7 +1373,9 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
                          lambda);
    }
 
-   nir_def *result = nir_vec2(b, level, lambda);
+   nir_def *result = nir_bcsel(b, nir_ieq_imm(b, levels, 0),
+                               nir_imm_zero(b, 2, 32),
+                               nir_vec2(b, level, lambda));
    if (tex->def.bit_size != 32)
       result = nir_f2fN(b, result, tex->def.bit_size);
    nir_def_replace(&tex->def, result);
@@ -1480,7 +1490,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       /* G17P carries API LOD bias in its native sampler word. Avoid a
        * redundant software load, including for dynamically indexed sets.
        * A Gen4 sampler has no such field, so the shader loads the bias. */
-      if (ctx->descriptor_generation == 9 && ctx->sampler_has_lod_bias &&
+      if ((ctx->descriptor_generation == 9 ||
+           ctx->descriptor_generation == 10) &&
+          ctx->sampler_has_lod_bias &&
           !(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS)) {
          nir_def_replace(&tex->def, nir_imm_float16(b, 0.0));
          return true;
@@ -1631,7 +1643,8 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
          offs = native.clamp_0_sampler_index;
       }
 
-      if (ctx->descriptor_generation == 9 &&
+      if ((ctx->descriptor_generation == 9 ||
+           ctx->descriptor_generation == 10) &&
           (tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS)) {
          offs = native.sampler +
                 (clamp_to_0
@@ -2158,12 +2171,14 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
                          bool coherent_images_in_memory,
-                         bool m5_store_window)
+                         bool m5_store_window,
+                         bool lower_array_cube_lod_query)
 {
    struct lower_descriptors_ctx ctx = {
       .stage = nir->info.stage,
       .coherent_images_in_memory = coherent_images_in_memory,
       .m5_store_window = m5_store_window,
+      .lower_array_cube_lod_query = lower_array_cube_lod_query,
       .scaled_sampling = scaled_sampling,
       .sampler_has_lod_bias = sampler_has_lod_bias,
       .d3d_nearest_mip = d3d_nearest_mip,

@@ -977,6 +977,7 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->sync.seq = st->next_seq;
    } else if (pre_gfx) {
       cs->sync.seq = gfx->sync.seq - 1;
+      cs->sync.pre_seq = ++gfx->sync.pre_count;
    } else {
       cs->sync.seq = ++st->next_seq;
    }
@@ -1376,7 +1377,7 @@ static void
 stamp_carrier_launch(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) || !cs ||
+   if (!agx_chip_native_or_g18g(hk_cmd_buffer_device(cmd)->dev.chip) || !cs ||
        (!cs->timestamp.start.handle && !cs->timestamp.end.handle) ||
        cs->stats.cmds || cs->stats.flushes || cs->imm_writes.size)
       return;

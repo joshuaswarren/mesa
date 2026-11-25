@@ -383,7 +383,8 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * the raw word. */
    const bool lower_r11g11b10 =
       ctx->lower_r11g11b10 &&
-      logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
+      (logical_format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       logical_format == PIPE_FORMAT_R9G9B9E5_FLOAT);
    const bool native_r11g11b10 =
       ctx->lower_g17p_formats && logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
    const bool raw_r11g11b10 = lower_r11g11b10 || native_r11g11b10;
@@ -659,8 +660,11 @@ agx_nir_lower_tilebuffer_with_conversions_info(
          nir_function_impl *impl = nir_shader_get_entrypoint(shader);
          nir_builder b = nir_builder_at(nir_after_impl(impl));
          enum pipe_format logical = tib->logical_format[i];
-         const bool raw_r11g11b10 = (lower_r11g11b10 || lower_g17p_formats) &&
-                                  logical == PIPE_FORMAT_R11G11B10_FLOAT;
+         const bool raw_r11g11b10 =
+            (lower_r11g11b10 &&
+             (logical == PIPE_FORMAT_R11G11B10_FLOAT ||
+              logical == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
+            (lower_g17p_formats && logical == PIPE_FORMAT_R11G11B10_FLOAT);
          enum pipe_format format = raw_r11g11b10 ? PIPE_FORMAT_R32_UINT :
             (lower_srgb || lower_g17p_formats) && util_format_is_srgb(logical)
                ? (enum pipe_format)AIL_ISA_FORMAT_U8NORM

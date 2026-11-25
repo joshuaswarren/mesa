@@ -67,8 +67,8 @@ enum agx_chip_cap {
     * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
     * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
     * launch-rate floor on large grids. Measured and qualified on G17P
-    * (HAL200); off on M5 (G17G/G17S/G17C/G17D), G15, G16, G18G, and AGX2 until
-    * per-generation hardware A/B and CTS rows are collected. */
+    * (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G17D, G15, G16, G18G,
+    * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 
    /* A compute or transfer barrier between work of one CDM stream that makes
@@ -91,12 +91,68 @@ enum agx_chip_cap {
     * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
     * hardware A/B and CTS rows are collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
+
+   /* Private Gen10 colour and depth compression. In Gallium: single-level,
+    * single-layer 2D colour at 1x and 2x/4x, and Z32_FLOAT/Z16_UNORM depth at
+    * 1x through the compressed Gen10 PBE, texture and ZLS forms. 2x/4x
+    * Z32_FLOAT depth additionally needs the kernel to report
+    * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION. Measured on M5 (G17S,
+    * G17C). In Borealis also single-sample colour 2D arrays, cube maps and
+    * single-level 3D (1-8 byte texels), mipmapped one-byte 2D, and 16-byte
+    * single-layer 2D, whose spilled attachments decompress in place
+    * (libagx_agx3_decompress); measured on G17S. Off on G18G until measured
+    * there. */
+   AGX_CAP_GEN10_2D_COMPRESSION = 1u << 14,
+
+   /* Sparse resource binding, aliased residency, 2D sparse images, sparse
+    * buffers, and shaderResourceResidency are qualified on this chip.
+    * Qualified on AGX2, G17P, and M5; off on G15, G16, and G18G (no SSTT
+    * flush record or sparse texture ISA). */
+   AGX_CAP_SPARSE_BINDING = 1u << 15,
+
+   /* The render-submit ABI validates that packed ZLS depth_dimensions match
+    * the render command's (width_px - 1) | ((height_px - 1) << 16) whenever
+    * a depth or stencil attachment is bound, so render bounds must be at
+    * least the ZLS surface dimensions even for sub-rectangle render areas. */
+   AGX_CAP_ZLS_FULL_RENDER_BOUNDS = 1u << 16,
+
+   /* The render ABI supports the native1130 mixed-format single-sample
+    * fragment epilog encoding (skipping empty-mask targets and encoding
+    * per-format partial channel masks natively). Verified on G18G. */
+   AGX_CAP_NATIVE_MIXED_EPILOG = 1u << 17,
+
+   /* HAL200/Gen9 lossless colour and depth/stencil compression in Borealis:
+    * single-sample 1-8B colour (2D, arrays, cubemaps, single-mip 3D), 16B
+    * colour (single-sample 2D, arrays, cubemaps), single-level 1x/2x/4x depth
+    * and 1x stencil, shared DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED colour
+    * images, in-place spill decompression via libagx_agx3_decompress, and Gen9
+    * compressed compute mip blits. Enabled across native HAL200 AGX3B parts
+    * (G16G and G17P), which share the Gen9 PBE/texture/ZLS/AIL metadata
+    * contract; off on G15* (M3, G15/RTKit 2419 CS generation), M5 HAL300
+    * (Gen10, gated separately), G18G, and AGX2. 2x/4x MSAA colour compression
+    * is gated separately by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION. */
+   AGX_CAP_HAL200_LOSSLESS_COMPRESSION = 1u << 18,
+
+   /* HAL200/Gen9 lossless 2x/4x MSAA colour compression in Borealis: 1-8B
+    * colour attachments (including arrays, input attachments, multiview, and
+    * MRT spills decompressed in place by libagx_agx3_decompress). Enabled
+    * across native HAL200 AGX3B parts (G16G and G17P), which share the Gen9
+    * PBE/texture/AIL metadata contract and per-layer compressed resolve split.
+    * Off on every chip without AGX_CAP_HAL200_LOSSLESS_COMPRESSION. */
+   AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION = 1u << 19,
+
+   /* A signed-zero preserving fp32 fmin/fmax may be lowered to the hardware
+    * min/max, with an integer min/max of the bits when the operands compare
+    * equal (agx_nir_lower_fminmax_signed_zero). That needs the fp32 compares
+    * to order denormals exactly whenever the shader preserves them. Measured
+    * on G17P and on M5 (G17S); the M5 parts share one instruction set. */
+   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT = 1u << 20,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
 #define AGX_CAPS_AGX2                                                          \
-   (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER |                  \
-    AGX_CAP_COOPERATIVE_MATRIX)
+   (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -107,26 +163,32 @@ enum agx_chip_cap {
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
-    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA)
+    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_BINDING |           \
+    AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
+    AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 /* What the single-die M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
+    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 /* G17D partitions AGX_CAPS_M5 into measured capabilities (enabled) and
  * unmeasured exclusions (kept off until measured on J775D). test-chip-caps.c
  * asserts the two sets are disjoint and cover AGX_CAPS_M5, so adding a new
  * capability to AGX_CAPS_M5 forces an explicit decision for G17D. */
 #define AGX_CAPS_G17D_MEASURED                                                 \
-   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX)
+   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
+    AGX_CAP_SPARSE_BINDING | AGX_CAP_GEN10_2D_COMPRESSION)
 
 #define AGX_CAPS_G17D_EXCLUDED                                                 \
    (AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS | AGX_CAP_HW_TXF_BOUNDS |                \
-    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |      \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 #define AGX_CAPS_G17D AGX_CAPS_G17D_MEASURED
 
@@ -148,7 +210,11 @@ enum agx_chip_cap {
    X(G15C, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15D, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16P, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
-   X(G16G, AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE, __VA_ARGS__)             \
+   X(G16G,                                                                     \
+     AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                               \
+        AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                                  \
+        AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION,                                 \
+     __VA_ARGS__)                                                              \
    X(G16S, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16C, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17P, AGX_CAPS_G17P, __VA_ARGS__)                                         \
@@ -157,7 +223,8 @@ enum agx_chip_cap {
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
-   X(G18G, 0, __VA_ARGS__)
+   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
+     __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so
  * the precompiled OpenCL kernels can call it and the C units run the same

@@ -107,7 +107,7 @@ check(bool coherent_images_in_memory, enum pipe_format format)
 
    CHECK(hk_nir_lower_descriptors(b.shader, &vk_robustness_disabled, 1,
       layouts, false, false, 0, false, false, false,
-      coherent_images_in_memory, false));
+      coherent_images_in_memory, false, false));
    nir_validate_shader(b.shader, "after hk_nir_lower_descriptors");
 
    const bool memory = coherent_images_in_memory &&

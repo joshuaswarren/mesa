@@ -2156,6 +2156,43 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       pipe_resource_reference(&big_tex, NULL);
       return false;
    }
+   /* For 2560x1440, level 1 decodes compressed level 0 via the sampled shader
+    * and levels 2..11 use precompiled libagx_mipmap_unorm8x4{,_2level,_odd}
+    * (with two fused 16x8 2-level dispatches for 2+3 and 4+5) plus one
+    * libagx_fill_uint4 for levels 2..6 metadata. */
+   if (chain_compresses) {
+      const uint8_t *cdm_base = agx_bo_map(mctx->batch->cdm.bo);
+      const size_t cdm_len = (size_t)(mctx->batch->cdm.current - cdm_base);
+      size_t off = 0;
+      unsigned launches = 0, fused_launches = 0;
+      while (off < cdm_len) {
+         struct agx3_cdm_decoded_record rec;
+         if (!agx3_cdm_decode_one(mdev->chip, cdm_base + off, cdm_len - off,
+                                  &rec) ||
+             !rec.length) {
+            fprintf(stderr, "compressed mipchain CDM decode failed at +%zu/%zu\n",
+                    off, cdm_len);
+            pipe_resource_reference(&big_tex, NULL);
+            return false;
+         }
+         if (rec.kind == AGX3_CDM_RECORD_LAUNCH) {
+            ++launches;
+            if (rec.data.launch.local_size[0] == 16 &&
+                rec.data.launch.local_size[1] == 8 &&
+                rec.data.launch.local_size[2] == 1)
+               ++fused_launches;
+         }
+         off += rec.length;
+      }
+      if (fused_launches < 2 || launches >= 11) {
+         fprintf(stderr,
+                 "compressed 2560x1440 mipchain did not take precompiled tail "
+                 "(fused=%u launches=%u)\n",
+                 fused_launches, launches);
+         pipe_resource_reference(&big_tex, NULL);
+         return false;
+      }
+   }
    pctx->flush(pctx, NULL, 0);
    pipe_resource_reference(&big_tex, NULL);
 
@@ -3677,17 +3714,19 @@ main(void)
           agx_chip_name(dev->chip), vs_ok ? "ok" : "refused",
           fs_ok ? "ok" : "refused", linked_ok ? "ok" : "refused");
 
-   /* Gen9 colour-compression parts (G17P, G16G) compress this 2408x1506 RGBA8
+   /* Gen9 colour-compression parts (G17P, G16G) and Gen10 ones
+    * (AGX_CAP_GEN10_2D_COMPRESSION, the M5) compress this 2408x1506 RGBA8
     * render target, so the clear, the flush and the blit above took the
     * compressed end-of-tile PBE and background texture; an unencodable
     * descriptor would have aborted in agx_native_descriptor_rejected(). Other
     * AGX3 parts keep it plain. */
    if (!agx2 &&
        agx_resource(dst)->layout.compressed !=
-          agx_chip_gen9_color_compression(dev->chip)) {
+          (agx_chip_gen9_color_compression(dev->chip) ||
+           agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION))) {
       fprintf(stderr,
-              "AGX3 render target compression does not follow the Gen9 colour "
-              "policy\n");
+              "AGX3 render target compression does not follow the colour "
+              "compression policy\n");
       status = 1;
    }
 

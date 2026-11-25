@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include <math.h>
 #include "libagx/query.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_helpers.h"
@@ -14,12 +15,14 @@
 #include "hk_buffer.h"
 #include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
 #include "hk_compute_pair.h"
 #include "hk_nir_match_pointwise_clamp.h"
 #include "hk_nir_root_size.h"
 #include "hk_nir_wgid.h"
+#include "hk_pack.h"
 #include "hk_g17p_storage_image.h"
 #include "hk_frame_anatomy.h"
 #include "hk_sampler_index.h"
@@ -560,6 +563,10 @@ hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd)
    memcpy(push, cmd->state.cs.descriptors.push, sizeof(push));
    memset(&cmd->state.cs, 0, sizeof(cmd->state.cs));
    memcpy(cmd->state.cs.descriptors.push, push, sizeof(push));
+   for (unsigned i = 0; i < HK_MAX_SETS; i++) {
+      if (cmd->state.cs.descriptors.push[i])
+         hk_push_descriptor_set_reset_upload(cmd->state.cs.descriptors.push[i]);
+   }
 }
 
 void
@@ -635,8 +642,29 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    case AGX_CS_GENERATION_AGX2:
       if (cs->current == cs->strong_flush_end)
          return;
-      cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
-      cs->strong_flush_end = cs->current;
+
+      {
+         /* The only Borealis AGX2 barrier-word path: the reduced word on
+          * the dies it was measured on (hk_device::cdm_barrier_default_mask,
+          * agx2_cdm_barrier_default_word()), the full word on every other
+          * chip, under fullcdmbarrier, and once the device holds a sparse
+          * resource -- the reduced set leaves page remappings behind the
+          * launches unordered. Gallium keeps agx_cdm_barrier()'s full
+          * record. */
+         const uint32_t mask = agx2_cdm_barrier_emit_word(
+            dev->cdm_barrier_default_mask, p_atomic_read(&dev->sparse_used),
+            HK_PERF(dev, FULLCDMBARRIER));
+
+         uint32_t *word = cs->current;
+         *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+         cs->strong_flush_end = cs->current;
+
+         /* A sparse resource created between recording and submission
+          * still upgrades this record at submit. */
+         if (mask != AGX_CDM_BARRIER_FULL_WORD)
+            hk_cdm_note_sparse_site(cs, word);
+      }
       break;
 
    case AGX_CS_GENERATION_G15:
@@ -1720,11 +1748,6 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    cs->stats.cmds++;
 }
 
-/* Largest per-thread scratch frame of a kernel that may overlap the
- * application dispatches around it. 64 unordered dispatches of 4096 threads
- * take as long as ordered ones with 512 bytes per thread and five times as
- * long with 1 KB. */
-#define HK_M5_OVERLAP_MAX_SCRATCH_B 512
 
 static void
 hk_m5_compute_resources(struct hk_cs *cs, uint32_t scratch_B,
@@ -2520,10 +2543,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 (const uint8_t *)texture_set->mapped_ptr +
                    binding->sampler_index_offset_B,
                 sizeof(sampler_index));
-         /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
-          * in hk_descriptor_set_layout.c). */
-         if (dev->dev.chip == AGX_CHIP_G18G)
-            sampler_index = hk_sampler_heap_index(false, sampler_index);
+         sampler_index = hk_sampler_heap_index(
+            texture_set->layout->native_sampler_indices, sampler_index);
          const uint64_t write_control = hk_pool_upload(
             cmd, hk_g17p_native_write_control,
             sizeof(hk_g17p_native_write_control), 32);
@@ -2603,10 +2624,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 (const uint8_t *)set->mapped_ptr +
                    binding->sampler_index_offset_B,
                 sizeof(sampler_index));
-         /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
-          * in hk_descriptor_set_layout.c). */
-         if (dev->dev.chip == AGX_CHIP_G18G)
-            sampler_index = hk_sampler_heap_index(false, sampler_index);
+         sampler_index = hk_sampler_heap_index(
+            set->layout->native_sampler_indices, sampler_index);
          if (!dev->samplers.table.bo || !dev->samplers.table.bo->va) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
@@ -2838,25 +2857,44 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_linked_shader *linked = s ? s->only_linked : NULL;
+   if (s && !linked && s->info.stage == MESA_SHADER_VERTEX)
+      linked = cmd->state.gfx.linked[MESA_SHADER_VERTEX];
    const bool g18 = dev->dev.chip == AGX_CHIP_G18G;
+   const bool internal = s && s->info.stage != MESA_SHADER_COMPUTE;
+   const uint32_t scratch_bytes =
+      (s && linked)
+         ? MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+                MAX2(s->b.info.agx3_spectpr_scratch_size,
+                     linked->b.agx3_spectpr_scratch_size))
+         : 0;
+   const uint32_t max_spill = g18 ? (1u << 16) : AGX3_G17P_MAX_SPILL_B;
+   const bool g18_indirect = g18 && agx_is_indirect(grid);
+   const bool sparse_indirect =
+      g18_indirect && !internal &&
+      cmd->state.cs.descriptors.root.cs.grid_helper_sparse_map_addr != 0;
    if ((!g18 && dev->dev.chip != AGX_CHIP_G17G) || cs->type != HK_CS_CDM ||
-       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
-                                         AGX3_G17P_MAX_SPILL_B) ||
-       s->info.stage != MESA_SHADER_COMPUTE || agx_is_indirect(grid) ||
-      (!g18 && s->b.info.local_size) || s->b.info.uses_ray_traversal ||
-       (g18 && (s->b.info.scratch_size || linked->b.scratch_size ||
-                s->b.info.agx3_spectpr_scratch_size ||
-                s->b.info.nr_preamble_gprs)) ||
+       (g18 && cs->g18_dispatch_sealed) ||
+       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill) ||
+       (!g18 && (internal || s->b.info.local_size)) ||
+       (internal && s->info.stage != MESA_SHADER_VERTEX && s->data_size) ||
+       (!g18 && agx_is_indirect(grid)) ||
+       (g18_indirect && (!grid.ptr || sparse_indirect)) ||
+       s->b.info.uses_ray_traversal ||
+       (g18 && (s->b.info.nr_preamble_gprs ||
+                scratch_bytes > max_spill ||
+                s->b.info.local_size > 32768u)) ||
        (g18 && s->info.g18_unlowered_image) ||
        s->info.agx3_txf_texture_valid ||
        (s->info.agx3_storage_image_valid && !g18) ||
        s->info.agx3_sampled_storage_valid || s->info.agx3_indexed_storage_valid ||
-       !local_size.x || !local_size.y || !local_size.z ||
-       (uint64_t)local_size.x * local_size.y * local_size.z > 1024) {
+       (grid.mode != AGX_CDM_MODE_INDIRECT_LOCAL &&
+        (!local_size.x || !local_size.y || !local_size.z ||
+         (uint64_t)local_size.x * local_size.y * local_size.z > 1024))) {
       mesa_loge(
          "AGX3 native compute: unsupported shader or indirect/shared-memory launch"
-         " (scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
+         " (stage=%u indirect=%u scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
          " unlowered image access %d, shared memory %u B)",
+         s ? s->info.stage : 0, agx_is_indirect(grid),
          s ? s->b.info.scratch_size : 0, linked ? linked->b.scratch_size : 0,
          s ? s->b.info.agx3_spectpr_scratch_size : 0,
          s ? s->b.info.nr_preamble_gprs : 0,
@@ -2864,17 +2902,24 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (!grid.count[0] || !grid.count[1] || !grid.count[2])
+   if (!agx_is_indirect(grid) &&
+       (!grid.count[0] || !grid.count[1] || !grid.count[2]))
       return;
 
-   struct hk_descriptor_state *descriptors = &cmd->state.cs.descriptors;
-   descriptors->root.cs.constant_data_addr = s->data_size
-      ? hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT) : 0;
-   if (s->data_size && !descriptors->root.cs.constant_data_addr) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      return;
+   struct hk_descriptor_state *descriptors =
+      internal ? &cmd->state.gfx.descriptors : &cmd->state.cs.descriptors;
+   if (!internal) {
+      descriptors->root.cs.constant_data_addr = s->data_size
+         ? hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT)
+         : 0;
+      if (s->data_size && !descriptors->root.cs.constant_data_addr) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
    }
-   const uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   const uint64_t root = internal
+      ? cmd->state.gfx.root
+      : hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    uint64_t texture_pointers = 0;
    if (s->info.agx3_indexed_sampler_valid) {
       /* The sampled-image heap may be a chunked table (no single BO): its
@@ -2935,6 +2980,11 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          }
          memcpy(&published, (const uint8_t *)set->mapped_ptr + e->offset_B,
                 sizeof(published));
+         if (e->clamp_0) {
+            if ((int16_t)published < 0)
+               continue;
+            published &= HK_BORDER_IS_INT_BIT - 1;
+         }
          const uint16_t native = hk_sampler_heap_index(
             set->layout->native_sampler_indices, published);
          if (native >= dev->samplers.table.alloc) {
@@ -3001,8 +3051,13 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
    struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
    size_t range_count;
-   if (!hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root,
-                                       texture_pointers, ranges, &range_count)) {
+   const bool ranges_ok = internal
+      ? hk_g17p_internal_graphics_uniform_ranges(cmd, s, linked, root,
+                                                 texture_pointers, ranges,
+                                                 &range_count)
+      : hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root,
+                                       texture_pointers, ranges, &range_count);
+   if (!ranges_ok) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -3032,7 +3087,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct agx3_g17p_graphics_program_desc desc = {
       .program_va = program_t.gpu, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
-      .shader_binary_size = linked->b.size, .nr_gprs = linked->b.nr_gprs,
+      .shader_binary_size = linked->b.size,
+      .scratch_size = g18 ? scratch_bytes : 0,
+      .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = s->b.info.agx3_staging_known,
       .compiler_d = (uint32_t)s->b.info.agx3_staging_halfs * 2,
       .threadgroup_memory_size_B = threadgroup_bytes,
@@ -3089,6 +3146,34 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (s->b.info.rodata.size_16)
       hk_cmd_buffer_retain_bo(cmd, s->bo);
 
+   if (g18_indirect) {
+      if (s->b.info.local_size)
+         launch.launch_template.word0 |= UINT32_C(1) << 23;
+      const uint32_t main_scratch =
+         MAX2(s->b.info.scratch_size, linked->b.scratch_size);
+      const uint32_t spectpr_scratch =
+         MAX2(s->b.info.agx3_spectpr_scratch_size,
+              linked->b.agx3_spectpr_scratch_size);
+      const struct drm_asahi_g18_compute_resources target_res = {
+         .version = 2,
+         .flags = 1u,
+         .registers_16 = linked->b.nr_gprs,
+         .scratch_bytes = main_scratch,
+         .spectpr_scratch_bytes = spectpr_scratch,
+         .staging_16 = s->b.info.agx3_staging_halfs,
+         .local_bytes = s->b.info.local_size,
+         .imageblock_stride = s->b.info.imageblock_stride,
+         .local_size = {local_size.x, local_size.y, local_size.z},
+      };
+      struct hk_cs **target =
+         cs == cmd->current_cs.pre_gfx    ? &cmd->current_cs.pre_gfx
+         : cs == cmd->current_cs.post_gfx ? &cmd->current_cs.post_gfx
+                                          : &cmd->current_cs.cs;
+      hk_g18_emit_indirect_launch(cmd, target, &launch, grid, local_size,
+                                  &target_res);
+      return;
+   }
+
    /* (rel28b: the native-path homogeneity seal is REVERTED — batching mixed
  * descriptors is where the 3.4x came from; only the precomp helper is
  * sealed away now, in hk_dispatch_precomp.) */
@@ -3110,6 +3195,12 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * The flags=5 chaining is grounded on hardware (rel24b+), unlike the
     * standalone flush word in hk_cdm_cache_flush, whose only grounded G18G
     * encoding is the flag-free tail. */
+   if (g18) {
+      if (direct.size[1] < 2 && direct.size[2] < 2)
+         launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
+      if (s->b.info.local_size)
+         launch.launch_template.word0 |= UINT32_C(1) << 23;
+   }
    if (!agx3_g17g_native_compute_dispatch_append(&launch, &direct, 5, &sink)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -3128,9 +3219,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * resource words alone, and last-wins under-sizes a stream whose
        * big launches precede a small last launch (job 131: 1024-thread
        * launches + the small helper last = small plan = stall). Every
-       * scalar field takes the running max; local dims and local_bytes
-       * come from the launch with the LARGEST x*y*z product (a per-axis
-       * max can exceed the validator's 1024-thread bound, w7P check c). */
+       * scalar field takes the running max; local dims come from the launch
+       * with the LARGEST x*y*z product (a per-axis max can exceed the
+       * validator's 1024-thread bound, w7P check c). */
       const uint32_t prod =
          local_size.x * local_size.y * local_size.z;
       const uint32_t prev_prod = cs->g18_compute_resources.local_size[0] *
@@ -3144,18 +3235,34 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const uint32_t stride =
          MAX2(cs->g18_compute_resources.imageblock_stride,
               s->b.info.imageblock_stride);
+      const uint32_t local_bytes =
+         MAX2(cs->g18_compute_resources.local_bytes, s->b.info.local_size);
+      const uint32_t main_scratch =
+         MAX2(cs->g18_compute_resources.scratch_bytes,
+              MAX2(s->b.info.scratch_size, linked->b.scratch_size));
+      const uint32_t spectpr_scratch =
+         MAX2(cs->g18_compute_resources.spectpr_scratch_bytes,
+              MAX2(s->b.info.agx3_spectpr_scratch_size,
+                   linked->b.agx3_spectpr_scratch_size));
       if (prod >= prev_prod || cs->stats.cmds == 0) {
          cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
-            .version = 1,
-            .flags = 1,
+            .version = 2,
+            .flags = 1u,
             .registers_16 = regs,
+            .scratch_bytes = main_scratch,
+            .spectpr_scratch_bytes = spectpr_scratch,
             .staging_16 = staging,
+            .local_bytes = local_bytes,
             .imageblock_stride = stride,
             .local_size = {local_size.x, local_size.y, local_size.z},
          };
       } else {
+         cs->g18_compute_resources.version = 2;
          cs->g18_compute_resources.registers_16 = regs;
+         cs->g18_compute_resources.scratch_bytes = main_scratch;
+         cs->g18_compute_resources.spectpr_scratch_bytes = spectpr_scratch;
          cs->g18_compute_resources.staging_16 = staging;
+         cs->g18_compute_resources.local_bytes = local_bytes;
          cs->g18_compute_resources.imageblock_stride = stride;
       }
       /* Launch-count cap only (the rel30 code cap is retired: the gate
@@ -3177,10 +3284,26 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stats.cmds++;
 }
 
+static bool
+hk_compute_shader_overlap_safe(const struct hk_shader *s,
+                               const struct hk_descriptor_state *desc)
+{
+   const struct hk_linked_shader *linked = s ? s->only_linked : NULL;
+   return s && linked && s->info.stage == MESA_SHADER_COMPUTE &&
+          !s->b.info.uses_ray_traversal &&
+          !s->b.info.uses_global_atomics &&
+          !desc->root.cs.trace_rays_addr &&
+          MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+               linked->b.agx3_spectpr_scratch_size) <=
+             HK_M5_OVERLAP_MAX_SCRATCH_B;
+}
+
 static void
 hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct hk_api_shader *api,
                        const struct hk_shader *selected,
+                       enum hk_compute_pair_alt_kind alt_kind,
+                       const uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT],
                        const uint32_t orig_groups[3], struct agx_grid exec_grid)
 {
    const struct hk_compute_pair_info *info = api ? api->compute_pair : NULL;
@@ -3253,16 +3376,11 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.cs_base_group, desc->root.cs.base_group,
           sizeof(record.cs_base_group));
    record.printf_buffer_address = desc->root.printf_buffer_address;
-   if (selected == api->depthwise_vec4)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
-   else if (selected == api->gemm_cmat16)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
-   else if (selected == api->gemm_cmat32)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
-   else if (selected == api->gemm_cmat64)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
-   else
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   record.alt_kind = alt_kind;
+   record.overlap_safe = hk_compute_shader_overlap_safe(selected, desc);
+   if (pack_loop_params)
+      memcpy(record.pack_loop_params, pack_loop_params,
+             sizeof(record.pack_loop_params));
 
    cs->compute_pair = malloc(sizeof(record));
    if (!cs->compute_pair)
@@ -3349,10 +3467,12 @@ hk_fused_launch_local(const struct hk_shader *s)
                         s->b.info.workgroup_size[2]);
 }
 
-bool
-hk_fused_compute_shader_eligible(const struct hk_device *dev,
-                                 struct hk_shader *s,
-                                 const struct hk_compute_pair_dispatch *p)
+static bool
+hk_fused_compute_shader_eligible_ranges(
+   const struct hk_device *dev, struct hk_shader *s,
+   const struct hk_compute_pair_dispatch *p,
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES],
+   size_t *range_count)
 {
    if (!dev || !s || !p || !agx_chip_native_or_m5(dev->dev.chip))
       return false;
@@ -3375,6 +3495,9 @@ hk_fused_compute_shader_eligible(const struct hk_device *dev,
        (p->exec_threads[2] % local.z))
       return false;
 
+   if (s->b.info.has_preamble && (!s->bo || !s->bo->va))
+      return false;
+
    if (is_m5) {
       if ((s->b.info.scratch_size || linked->b.scratch_size) &&
           !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES))
@@ -3382,14 +3505,51 @@ hk_fused_compute_shader_eligible(const struct hk_device *dev,
       if (s->b.info.uses_matrix16 &&
           !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
          return false;
-      if (s->b.info.has_preamble && (!s->bo || !s->bo->va))
-         return false;
    }
+
+   return hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
+                                          range_count);
+}
+
+bool
+hk_fused_compute_shader_eligible(const struct hk_device *dev,
+                                 struct hk_shader *s,
+                                 const struct hk_compute_pair_dispatch *p)
+{
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
+   size_t range_count = 0;
+   return hk_fused_compute_shader_eligible_ranges(dev, s, p, ranges,
+                                                  &range_count);
+}
+
+size_t
+hk_fused_compute_ioto_bound(const struct hk_device *dev, struct hk_shader *s,
+                            const struct hk_compute_pair_dispatch *p)
+{
+   const size_t fallback = ALIGN_POT(
+      MAX2(HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+           HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE),
+      64u);
+   if (!dev || !s || !p || !agx_chip_native_or_m5(dev->dev.chip))
+      return fallback;
 
    struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
    size_t range_count = 0;
-   return hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
-                                          &range_count);
+   if (!hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
+                                        &range_count))
+      return fallback;
+
+   size_t body_bound = 0, chunk_count = 0;
+   if (range_count &&
+       !agx3_ioto_uniform_program_body_bound(dev->dev.chip, ranges, range_count,
+                                             &body_bound, &chunk_count))
+      return fallback;
+
+   /* Include state tail, profile suffix, external constant-program branch,
+    * and potential independent-base relocation overhead. */
+   const size_t fixed_overhead = agx_chip_g17_m5(dev->dev.chip) ? 512u : 256u;
+   const size_t est = ALIGN_POT(body_bound + fixed_overhead, 64u);
+   return MIN2(est, fallback);
 }
 
 bool
@@ -3399,23 +3559,20 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
                                uint8_t *ioto_map, uint64_t ioto_va,
                                size_t ioto_cap, size_t *ioto_used_out)
 {
-   if (!hk_fused_compute_shader_eligible(dev, s, p) || !cs || !ioto_map ||
-       !ioto_va || !ioto_used_out ||
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
+   size_t range_count = 0;
+   if (!cs || !ioto_map || !ioto_va || !ioto_used_out ||
        !hk_cs_space_fits((uint8_t *)cs->end - (uint8_t *)cs->current,
                          AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE,
-                         AGX_CDM_STREAM_LINK_LENGTH))
+                         AGX_CDM_STREAM_LINK_LENGTH) ||
+       !hk_fused_compute_shader_eligible_ranges(dev, s, p, ranges,
+                                                &range_count))
       return false;
 
    struct hk_linked_shader *linked = s->only_linked;
    const uint64_t shader_va = linked->b.bo->va->addr + linked->b.entry_offset;
    if (!agx_va_in_usc_window(&dev->dev, ioto_va) ||
        !agx_va_in_usc_window(&dev->dev, shader_va))
-      return false;
-
-   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
-   size_t range_count = 0;
-   if (!hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
-                                        &range_count))
       return false;
 
    const struct agx_workgroup local = hk_fused_launch_local(s);
@@ -3464,11 +3621,6 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
             desc.cprog_inputs = &s->b.info.agx3_preamble_inputs;
       }
 
-      struct agx3_g17p_graphics_program program;
-      if (!hk_m5_compute_program_generate(dev, &desc, &program) ||
-          program.length > ioto_cap)
-         return false;
-
       struct agx3_g17p_native_compute_program_desc launch_desc = {
          .program_va = ioto_va,
          .shader_va = shader_va,
@@ -3484,42 +3636,90 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
          launch_desc.launch_sources.ti_spill_bytes =
             MAX2(launch_desc.launch_sources.ti_spill_bytes, cprog_frame);
       }
-      struct agx3_compute_program launch;
-      if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch) ||
-          !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
-         return false;
 
-      memcpy(ioto_map, program.bytes, program.length);
-      ioto_used = program.length;
+      const struct hk_m5_compute_loader *ml = hk_m5_loader_get(dev, linked, &desc);
+      if (ml) {
+         if (ml->length > ioto_cap)
+            return false;
+         struct agx3_compute_program launch;
+         if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch) ||
+             !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
+            return false;
+         memcpy(ioto_map, ml->bytes, ml->length);
+         hk_g17p_patch_plan_apply(&ml->plan, ranges, ioto_map);
+         ioto_used = ml->length;
+      } else {
+         struct agx3_g17p_graphics_program program;
+         if (!hk_m5_compute_program_generate(dev, &desc, &program) ||
+             program.length > ioto_cap)
+            return false;
+         struct agx3_compute_program launch;
+         if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch) ||
+             !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
+            return false;
+         memcpy(ioto_map, program.bytes, program.length);
+         ioto_used = program.length;
+      }
       cs->m5_matrix_ops |= s->b.info.uses_matrix16;
       hk_m5_compute_resources(cs, desc.scratch_size, 0,
                               desc.threadgroup_memory_size_B,
                               (uint32_t)local.x * local.y * local.z);
    } else {
-      /* The loader a dispatch of the fused shader would get, constant
-       * program included, composed at this submission's address. */
-      struct agx3_g17p_compute_program_desc desc;
-      if (!hk_g17p_linked_program_desc(
-             s, linked, AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3, ranges,
-             range_count, &desc))
+      struct agx3_g17p_compute_program_desc desc = {0};
+      if (!agx3_cdm_direct_template_sources_compute(
+             s->b.info.uses_resource_info_query, false, false,
+             &desc.launch_sources))
          return false;
-      desc.program_va = ioto_va;
-
-      struct agx3_g17p_compute_program *program = malloc(sizeof(*program));
-      if (!program)
-         return false;
-      const bool ok =
-         agx3_g17p_compute_program_generate(dev->dev.chip, &desc, program) &&
-         program->length <= ioto_cap &&
-         hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
-            &program->launch, &direct, 0, &sink);
-      if (ok) {
-         memcpy(ioto_map, program->bytes, program->length);
-         ioto_used = program->length;
+      if (s->b.info.has_preamble) {
+         if (!s->bo || !s->bo->va ||
+             !hk_agx3_g17p_constant_program_from_binary(
+                s->code_ptr, s->code_size, s->b.info.preamble_offset,
+                s->b.info.preamble_size, hk_shader_code_va(s),
+                s->b.info.binary_size, &desc.constant_program))
+            return false;
+         desc.constant_program.force_external = true;
+         desc.constant_program.absolute_branch = true;
+         desc.constant_program.request_prelude =
+            s->b.info.agx3_preamble_uniform_inputs;
+         if (s->b.info.agx3_preamble_tps_inputs)
+            desc.cprog_inputs = &s->b.info.agx3_preamble_inputs;
+         const unsigned cprog_frame =
+            ALIGN_POT(MAX2((unsigned)s->b.info.agx3_preamble_inputs.storage_bytes,
+                           s->b.info.preamble_scratch_size), 16);
+         desc.launch_sources.ti_spill_bytes =
+            MAX2(desc.launch_sources.ti_spill_bytes, cprog_frame);
+         desc.launch_sources.ti_largest_ipr_bytes =
+            MAX2(desc.launch_sources.ti_largest_ipr_bytes,
+                 (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2u);
       }
-      free(program);
-      if (!ok)
+      desc.shader_va = shader_va;
+      desc.uniform_ranges = ranges;
+      desc.uniform_range_count = range_count;
+      desc.shader_binary_size = linked->b.size;
+      desc.scratch_size =
+         MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size);
+      desc.nr_gprs = MAX2(linked->b.nr_gprs, s->b.info.nr_preamble_gprs);
+      desc.compiler_d_valid = s->b.info.agx3_staging_known;
+      desc.compiler_d = MAX2((uint32_t)s->b.info.agx3_staging_halfs * 2,
+                             (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2);
+      desc.threadgroup_memory_size_B = s->b.info.local_size
+         ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u)) : 0;
+      desc.ldshdr_f1 = AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3;
+
+      const struct hk_g17p_loader *l =
+         hk_g17p_loader_get(dev, &linked->g17p_compute_templates, &desc);
+      if (!l || l->length > ioto_cap)
          return false;
+
+      struct agx3_compute_program launch = l->launch;
+      launch.program_va = ioto_va;
+      if (!hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
+             &launch, &direct, 0, &sink))
+         return false;
+
+      memcpy(ioto_map, l->bytes, l->length);
+      hk_g17p_patch_plan_apply(&l->plan, ranges, ioto_map);
+      ioto_used = l->length;
    }
 
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
@@ -3533,8 +3733,8 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
    if (unlikely(dev->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, s);
       const uint64_t wg = agx_workgroup_threads(local);
-      const uint64_t threads = (uint64_t)p->exec_threads[0] *
-                               p->exec_threads[1] * p->exec_threads[2];
+      const uint64_t threads =
+         (uint64_t)p->exec_threads[0] * p->exec_threads[1] * p->exec_threads[2];
       hk_frame_anatomy_note_grid(cs, s, threads, wg ? threads / wg : 0, false);
    }
    *ioto_used_out = ioto_used;
@@ -3630,15 +3830,32 @@ hk_check_storage_backing(const struct hk_descriptor_state *desc,
    return true;
 }
 
+struct hk_copy4_dispatch_cert {
+   enum hk_compute_pair_role role;
+   struct hk_storage_backing bindings[3];
+   union {
+      struct hk_compute_pair_copy4 copy4;
+      struct hk_compute_pair_pad4 pad4;
+      struct hk_compute_pair_im2col im2col;
+   } extra;
+};
+
 static struct hk_shader *
 hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
-                      struct hk_shader *normal, struct agx_grid *grid)
+                      struct hk_shader *normal, struct agx_grid *grid,
+                      struct hk_copy4_dispatch_cert *cert_out,
+                      uint64_t *loop_bound_out,
+                      bool *im2col_push_valid_out,
+                      uint32_t *im2col_push_off_out,
+                      struct hk_im2col_push *im2col_push_out)
 {
    struct hk_shader *alt = api->im2col_vec4;
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_identity_copy4 *info = &api->identity_copy4_info;
    if (!alt || !info->im2col_vec4_ok ||
+       info->push_bytes > HK_COMPUTE_OPT_PUSH_BYTES ||
+       hk_im2col_push_offset(info->push_bytes) + sizeof(struct hk_im2col_push) > HK_MAX_PUSH_SIZE ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
        alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||
        alt->b.info.workgroup_size[2] == 0)
@@ -3721,27 +3938,56 @@ hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (!hk_intervals_disjoint(&src_b, 0, src_bytes, &dst_b, 0, dst_bytes))
       return normal;
 
-   const uint32_t x_units = use_vec4 ? ((uint32_t)kw / 4) : (uint32_t)kw;
+   const uint32_t x_units = DIV_ROUND_UP((uint32_t)kw, 4u);
    const uint64_t gx = DIV_ROUND_UP(x_units, alt->b.info.workgroup_size[0]);
    const uint64_t gy = DIV_ROUND_UP(cols, alt->b.info.workgroup_size[1]);
-   const uint64_t gz = DIV_ROUND_UP(rows_y, alt->b.info.workgroup_size[2]);
+   const uint64_t gz = DIV_ROUND_UP(DIV_ROUND_UP(rows_y, 4u), alt->b.info.workgroup_size[2]);
    if (gx > 65535 || gy > 65535 || gz > 65535)
       return normal;
 
    grid->count[0] = (uint32_t)gx;
    grid->count[1] = (uint32_t)gy;
    grid->count[2] = (uint32_t)gz;
+   if (im2col_push_valid_out && im2col_push_off_out && im2col_push_out) {
+      *im2col_push_valid_out = true;
+      *im2col_push_off_out = hk_im2col_push_offset(info->push_bytes);
+      *im2col_push_out = (struct hk_im2col_push){
+         .cols = (uint32_t)cols,
+         .rows_y = (uint32_t)rows_y,
+         .kh = (uint32_t)kh,
+      };
+   }
+   if (loop_bound_out) {
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_IM2COL_KH] = kh;
+      hk_pack_eval_effective_instrs(&alt->pack_loop_bound,
+                                    alt->b.info.stats.instrs, params,
+                                    loop_bound_out);
+   }
+   if (cert_out) {
+      const bool unit = (sw == 1 && sh == 1);
+      cert_out->role = HK_COMPUTE_PAIR_IM2COL;
+      cert_out->bindings[0] = src_b;
+      cert_out->bindings[1] = dst_b;
+      cert_out->extra.im2col = (struct hk_compute_pair_im2col){
+         .src_bytes = src_bytes,
+         .dst_bytes = dst_bytes,
+         .iw = (uint32_t)iw,
+         .ih = has_border ? (uint32_t)ih : (uint32_t)req_ih,
+         .kw = (uint32_t)kw,
+         .cols = (uint32_t)cols,
+         .step_x = (uint32_t)step_x,
+         .sh = (uint32_t)sh,
+         .pad_x = (has_border && unit)
+                     ? (uint32_t)((uint64_t)(uint32_t)bw * (uint32_t)ch)
+                     : 0u,
+         .pad_y = (has_border && unit) ? (uint32_t)bh : 0u,
+         .pw = (uint32_t)pw,
+         .ph = (uint32_t)ph,
+      };
+   }
    return alt;
 }
-
-struct hk_copy4_dispatch_cert {
-   enum hk_compute_pair_role role;
-   struct hk_storage_backing bindings[3];
-   union {
-      struct hk_compute_pair_copy4 copy4;
-      struct hk_compute_pair_pad4 pad4;
-   } extra;
-};
 
 static void
 hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
@@ -3776,8 +4022,15 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (cert->role == HK_COMPUTE_PAIR_PAD4) {
       record->extra.pad4 = cert->extra.pad4;
       memcpy(record->bindings, cert->bindings, 3 * sizeof(record->bindings[0]));
+   } else if (cert->role == HK_COMPUTE_PAIR_IM2COL) {
+      record->extra.im2col = cert->extra.im2col;
+      memcpy(record->bindings, cert->bindings, 2 * sizeof(record->bindings[0]));
    } else if (cert->role == HK_COMPUTE_PAIR_FADD) {
-      record->info.fadd_push_bytes = api->identity_copy4_info.push_bytes;
+      record->info.fadd.push_bytes = api->identity_copy4_info.push_bytes;
+      record->info.fadd.fp_math_ctrl = api->identity_copy4_info.fadd_fp_math_ctrl;
+      record->info.fadd.float_controls_execution_mode =
+         api->identity_copy4_info.fadd_float_controls_execution_mode;
+      record->info.fadd.meta_valid = api->identity_copy4_info.fadd_meta_valid;
       record->extra.copy4 = cert->extra.copy4;
       memcpy(record->bindings, cert->bindings, 3 * sizeof(record->bindings[0]));
       memcpy(record->exec_local, selected->b.info.workgroup_size,
@@ -3797,13 +4050,280 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
    memcpy(record->groups, orig_groups, sizeof(record->groups));
    memcpy(record->exec_threads, exec_grid.count, sizeof(record->exec_threads));
+   record->overlap_safe = hk_compute_shader_overlap_safe(selected, desc);
    cs->compute_pair = record;
+}
+
+static struct hk_shader *
+hk_select_tensor_op(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                    struct hk_shader *normal, struct agx_grid *grid)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   const struct hk_tensor_op_info *info = &api->tensor_op_info;
+
+   if (!api->tensor_op_primary || !agx_chip_native_or_m5(dev->dev.chip) ||
+       cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+       grid->mode != AGX_CDM_MODE_DIRECT ||
+       !hk_nir_dispatch_zero_base(desc->root.cs.base_group) ||
+       !hk_identity_copy4_supported_local(info->local) ||
+       memcmp(info->local, normal->b.info.workgroup_size, sizeof(info->local)) ||
+       grid->count[2] != 1)
+      return normal;
+
+   if ((uint64_t)grid->count[0] * info->local[0] > (uint64_t)INT32_MAX ||
+       (uint64_t)grid->count[1] * info->local[1] > (uint64_t)INT32_MAX)
+      return normal;
+
+   struct hk_shader *alt = NULL;
+   uint32_t new_grid[3] = {0, 0, 0};
+   uint64_t src_bytes = 0, dst_start = 0, dst_bytes = 0;
+   unsigned align = 4;
+
+   if (info->kind == HK_TENSOR_OP_CONCAT_X) {
+      int32_t dim_n = 1, dim_h = 0, dim_q = 0, dim_c = 0;
+      int32_t dst_sy = 0, dst_sq = 0, dst_ox = 0;
+      if ((info->dim_n_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dim_n_off, &dim_n)) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &dim_h) ||
+          !hk_read_push_i32(desc, info->dim_q_off, &dim_q) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &dim_c) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &dst_sy) ||
+          !hk_read_push_i32(desc, info->dst_stride_q_off, &dst_sq) ||
+          (info->dst_off_x_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dst_off_x_off, &dst_ox)))
+         return normal;
+
+      if (dim_n <= 0 || dim_h <= 0 || dim_q <= 0 || dim_c <= 0 ||
+          dst_sy < 0 || dst_sq < 0 || dst_ox < 0)
+         return normal;
+
+      uint64_t x_lim = 0, y_lim = 0, src_elems = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)dim_q, (uint64_t)(uint32_t)dim_c, &x_lim) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dim_n, (uint64_t)(uint32_t)dim_h, &y_lim) ||
+          x_lim > (uint64_t)INT32_MAX || y_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow(y_lim, x_lim, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)y_lim, info->local[1]))
+         return normal;
+
+      /* Require distinct destination elements so vectorized stores match scalar order. */
+      uint64_t q_span = 0, y_span = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)(dim_q - 1), (uint64_t)(uint32_t)dst_sq, &q_span) ||
+          __builtin_mul_overflow(y_lim - 1, (uint64_t)(uint32_t)dst_sy, &y_span))
+         return normal;
+      const bool non_overlap_qy =
+         (dim_q == 1 || (uint64_t)(uint32_t)dst_sq >= (uint64_t)(uint32_t)dim_c) &&
+         (y_lim == 1 || (uint64_t)(uint32_t)dst_sy >= q_span + (uint64_t)(uint32_t)dim_c);
+      const bool non_overlap_yq =
+         (y_lim == 1 || (uint64_t)(uint32_t)dst_sy >= (uint64_t)(uint32_t)dim_c) &&
+         (dim_q == 1 || (uint64_t)(uint32_t)dst_sq >= y_span + (uint64_t)(uint32_t)dim_c);
+      if (!non_overlap_qy && !non_overlap_yq)
+         return normal;
+
+      uint64_t dst_max = 0;
+      if (__builtin_add_overflow(q_span, y_span, &dst_max) ||
+          __builtin_add_overflow(dst_max, (uint64_t)(uint32_t)dst_ox, &dst_max) ||
+          __builtin_add_overflow(dst_max, (uint64_t)(uint32_t)(dim_c - 1), &dst_max) ||
+          dst_max >= (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      const bool contig = (dst_sq == dim_c);
+      if (contig || dim_c == 1 || dim_c == 2 || dim_c == 4) {
+         alt = api->tensor_op_primary;
+         const uint32_t or_row = (uint32_t)x_lim | (uint32_t)dst_ox | (uint32_t)dst_sy;
+         const uint32_t or_str = (uint32_t)dst_ox | (uint32_t)dst_sy | (uint32_t)dst_sq;
+         const bool is_v4 = contig ? ((or_row & 3u) == 0) : (dim_c == 4 && (or_str & 3u) == 0);
+         const bool is_v2 = contig ? ((or_row & 1u) == 0) : (dim_c == 2 && (or_str & 1u) == 0);
+         const unsigned vec = is_v4 ? 4u : (is_v2 ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t x_cnt = contig ? (uint32_t)(x_lim / vec) : (uint32_t)dim_q;
+         if (!alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             alt->b.info.workgroup_size[2] != 1)
+            return normal;
+         new_grid[0] = DIV_ROUND_UP(x_cnt, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)y_lim, alt->b.info.workgroup_size[1]);
+         new_grid[2] = 1;
+      } else {
+         alt = api->tensor_op_secondary;
+         if (!alt || !alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             !alt->b.info.workgroup_size[2])
+            return normal;
+         const uint32_t or_all =
+            (uint32_t)dim_c | (uint32_t)dst_ox | (uint32_t)dst_sy | (uint32_t)dst_sq;
+         const unsigned vec = ((or_all & 3u) == 0) ? 4u : (((or_all & 1u) == 0) ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t c_units = (uint32_t)dim_c / vec;
+         new_grid[0] = DIV_ROUND_UP(c_units, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)dim_q, alt->b.info.workgroup_size[1]);
+         new_grid[2] = DIV_ROUND_UP((uint32_t)y_lim, alt->b.info.workgroup_size[2]);
+      }
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = (uint64_t)(uint32_t)dst_ox * sizeof(uint32_t);
+      dst_bytes = (dst_max - (uint64_t)(uint32_t)dst_ox + 1u) * sizeof(uint32_t);
+   } else if (info->kind == HK_TENSOR_OP_CONCAT_Y) {
+      int32_t dim_n = 0, dim_h = 0, dim_w = 1, dim_c = 0;
+      int32_t dst_sn = 0, dst_yo = 0;
+      if (!hk_read_push_i32(desc, info->dim_n_off, &dim_n) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &dim_h) ||
+          (info->dim_q_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dim_q_off, &dim_w)) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &dim_c) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &dst_sn) ||
+          (info->dst_off_x_off != UINT16_MAX &&
+           !hk_read_push_i32(desc, info->dst_off_x_off, &dst_yo)))
+         return normal;
+
+      if (dim_n <= 0 || dim_h <= 0 || dim_w <= 0 || dim_c <= 0 ||
+          dst_sn < 0 || dst_yo < 0 || (dim_n > 1 && dst_sn < dim_h))
+         return normal;
+
+      uint64_t x_lim = 0, y_lim = 0, src_elems = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)dim_w, (uint64_t)(uint32_t)dim_c, &x_lim) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dim_n, (uint64_t)(uint32_t)dim_h, &y_lim) ||
+          x_lim > (uint64_t)INT32_MAX || y_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow(y_lim, x_lim, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)y_lim, info->local[1]))
+         return normal;
+
+      uint64_t dst_row_max = 0, dst_min_el = 0, dst_end_el = 0;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)(dim_n - 1), (uint64_t)(uint32_t)dst_sn, &dst_row_max) ||
+          __builtin_add_overflow(dst_row_max, (uint64_t)(uint32_t)dst_yo, &dst_row_max) ||
+          __builtin_add_overflow(dst_row_max, (uint64_t)(uint32_t)(dim_h - 1), &dst_row_max) ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)dst_yo, x_lim, &dst_min_el) ||
+          __builtin_mul_overflow(dst_row_max + 1u, x_lim, &dst_end_el) ||
+          dst_end_el > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      bool use_1d = false;
+      if (dim_n == 1 && ((src_elems & 3u) == 0) && ((dst_min_el & 3u) == 0) &&
+          api->tensor_op_primary->b.info.workgroup_size[0] > 0 &&
+          api->tensor_op_primary->b.info.workgroup_size[1] == 1 &&
+          api->tensor_op_primary->b.info.workgroup_size[2] == 1) {
+         const uint64_t total4 = src_elems / 4u;
+         const uint64_t wg_chunk =
+            (uint64_t)api->tensor_op_primary->b.info.workgroup_size[0] * 4u;
+         const uint64_t gx_1d = DIV_ROUND_UP(total4, wg_chunk);
+         if (gx_1d > 0 && gx_1d <= 65535u) {
+            alt = api->tensor_op_primary;
+            align = 16;
+            new_grid[0] = (uint32_t)gx_1d;
+            new_grid[1] = 1;
+            new_grid[2] = 1;
+            use_1d = true;
+         }
+      }
+      if (!use_1d) {
+         alt = api->tensor_op_secondary;
+         if (!alt || !alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+             !alt->b.info.workgroup_size[2])
+            return normal;
+         const unsigned vec = ((x_lim & 3u) == 0) ? 4u : (((x_lim & 1u) == 0) ? 2u : 1u);
+         align = vec * 4u;
+         const uint32_t x_units = (uint32_t)(x_lim / vec);
+         new_grid[0] = DIV_ROUND_UP(x_units, alt->b.info.workgroup_size[0]);
+         new_grid[1] = DIV_ROUND_UP((uint32_t)dim_h, alt->b.info.workgroup_size[1]);
+         new_grid[2] = DIV_ROUND_UP((uint32_t)dim_n, alt->b.info.workgroup_size[2]);
+      }
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = dst_min_el * sizeof(uint32_t);
+      dst_bytes = (dst_end_el - dst_min_el) * sizeof(uint32_t);
+   } else if (info->kind == HK_TENSOR_OP_RESAMPLE_NEAREST) {
+      int32_t out_w = 0, out_h = 0, ch = 0, in_w = 0;
+      int32_t sx_bits = 0, sy_bits = 0;
+      if (!hk_read_push_i32(desc, info->dim_q_off, &out_w) ||
+          !hk_read_push_i32(desc, info->dim_h_off, &out_h) ||
+          !hk_read_push_i32(desc, info->dim_c_off, &ch) ||
+          !hk_read_push_i32(desc, info->dst_stride_y_off, &in_w) ||
+          !hk_read_push_i32(desc, info->dst_stride_q_off, &sx_bits) ||
+          !hk_read_push_i32(desc, info->scale_y_off, &sy_bits))
+         return normal;
+
+      float scale_x = 0.0f, scale_y = 0.0f;
+      memcpy(&scale_x, &sx_bits, sizeof(scale_x));
+      memcpy(&scale_y, &sy_bits, sizeof(scale_y));
+      if (out_w <= 0 || out_h <= 0 || ch <= 0 || in_w <= 0 ||
+          !isfinite(scale_x) || !isfinite(scale_y) ||
+          scale_x < 0.0f || scale_y < 0.0f)
+         return normal;
+
+      const float max_sx_f = floorf((float)(out_w - 1) * scale_x);
+      const float max_sy_f = floorf((float)(out_h - 1) * scale_y);
+      if (!isfinite(max_sx_f) || !isfinite(max_sy_f) ||
+          max_sx_f < 0.0f || max_sx_f >= (float)in_w ||
+          max_sy_f < 0.0f || max_sy_f > (float)(INT32_MAX / 4))
+         return normal;
+
+      uint64_t x_lim = 0, dst_elems = 0, src_px = 0, src_elems = 0;
+      const uint64_t max_sx = (uint64_t)(int32_t)max_sx_f;
+      const uint64_t max_sy = (uint64_t)(int32_t)max_sy_f;
+      if (__builtin_mul_overflow((uint64_t)(uint32_t)out_w, (uint64_t)(uint32_t)ch, &x_lim) ||
+          x_lim > (uint64_t)INT32_MAX ||
+          __builtin_mul_overflow((uint64_t)(uint32_t)out_h, x_lim, &dst_elems) ||
+          dst_elems > (uint64_t)INT32_MAX / 4u ||
+          __builtin_mul_overflow(max_sy, (uint64_t)(uint32_t)in_w, &src_px) ||
+          __builtin_add_overflow(src_px, max_sx + 1u, &src_px) ||
+          __builtin_mul_overflow(src_px, (uint64_t)(uint32_t)ch, &src_elems) ||
+          src_elems > (uint64_t)INT32_MAX / 4u)
+         return normal;
+
+      if (grid->count[0] < DIV_ROUND_UP((uint32_t)x_lim, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)out_h, info->local[1]))
+         return normal;
+
+      alt = api->tensor_op_primary;
+      if (!alt->b.info.workgroup_size[0] || !alt->b.info.workgroup_size[1] ||
+          !alt->b.info.workgroup_size[2])
+         return normal;
+      const unsigned vec = ((ch & 3) == 0) ? 4u : (((ch & 1) == 0) ? 2u : 1u);
+      align = vec * 4u;
+      const uint32_t c_units = (uint32_t)ch / vec;
+      new_grid[0] = DIV_ROUND_UP(c_units, alt->b.info.workgroup_size[0]);
+      new_grid[1] = DIV_ROUND_UP((uint32_t)out_w, alt->b.info.workgroup_size[1]);
+      new_grid[2] = DIV_ROUND_UP((uint32_t)out_h, alt->b.info.workgroup_size[2]);
+
+      src_bytes = src_elems * sizeof(uint32_t);
+      dst_start = 0;
+      dst_bytes = dst_elems * sizeof(uint32_t);
+   } else {
+      return normal;
+   }
+
+   if (!alt || !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
+       !new_grid[0] || new_grid[0] > 65535u ||
+       !new_grid[1] || new_grid[1] > 65535u ||
+       !new_grid[2] || new_grid[2] > 65535u)
+      return normal;
+
+   struct hk_storage_backing src_b, dst_b;
+   if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, src_bytes, align, &src_b) ||
+       !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, dst_start, dst_bytes, align, &dst_b) ||
+       !hk_intervals_disjoint(&src_b, 0, src_bytes, &dst_b, dst_start, dst_bytes))
+      return normal;
+
+   grid->count[0] = new_grid[0];
+   grid->count[1] = new_grid[1];
+   grid->count[2] = new_grid[2];
+   return alt;
 }
 
 static struct hk_shader *
 hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                          struct hk_shader *normal, struct agx_grid *grid,
-                         struct hk_copy4_dispatch_cert *cert_out)
+                         struct hk_copy4_dispatch_cert *cert_out,
+                         uint64_t *loop_bound_out,
+                         bool *im2col_push_valid_out,
+                         uint32_t *im2col_push_off_out,
+                         struct hk_im2col_push *im2col_push_out)
 {
    struct hk_shader *copy = api->identity_copy4;
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
@@ -3813,8 +4333,8 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
       return normal;
-   if (grid->mode != AGX_CDM_MODE_DIRECT ||
-       !hk_nir_dispatch_zero_base(desc->root.cs.base_group))
+   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
+       desc->root.cs.base_group[1] || desc->root.cs.base_group[2])
       return normal;
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, copy, copy->only_linked, 1u << 16))
       return normal;
@@ -3904,7 +4424,9 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (info->kind == HK_IDENTITY_COPY4_IM2COL_1X1) {
       uint32_t k;
       if (!hk_identity_copy4_required_bytes(desc, info, *grid, info->local, &bytes, &k))
-         return hk_select_im2col_vec4(cmd, api, normal, grid);
+         return hk_select_im2col_vec4(cmd, api, normal, grid, cert_out,
+                                      loop_bound_out, im2col_push_valid_out,
+                                      im2col_push_off_out, im2col_push_out);
    } else if (info->kind == HK_IDENTITY_COPY4_LINEAR_COPY ||
               info->kind == HK_IDENTITY_COPY4_LINEAR_OFFSET ||
               info->kind == HK_IDENTITY_COPY4_LINEAR_FADD) {
@@ -3993,7 +4515,9 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
 
 static struct hk_shader *
 hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
-                         struct hk_shader *normal, struct agx_grid *grid)
+                         struct hk_shader *normal, struct agx_grid *grid,
+                         uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT],
+                         uint64_t *loop_bound_out)
 {
    struct hk_shader *alt = api->depthwise_vec4;
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
@@ -4104,12 +4628,27 @@ hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    grid->count[0] = gx;
    grid->count[1] = gy;
    grid->count[2] = gz;
+   if (pack_loop_params) {
+      pack_loop_params[HK_PACK_LOOP_PARAM_DW_KH] = (uint32_t)kh;
+      pack_loop_params[HK_PACK_LOOP_PARAM_DW_KW] = (uint32_t)kw;
+   }
+   if (loop_bound_out) {
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_DW_KH] = (uint32_t)kh;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = (uint32_t)kw;
+      hk_pack_eval_effective_instrs(&alt->pack_loop_bound,
+                                    alt->b.info.stats.instrs, params,
+                                    loop_bound_out);
+   }
    return alt;
 }
 
 static struct hk_shader *
 hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
-                    struct hk_shader *normal, struct agx_grid *grid)
+                    struct hk_shader *normal, struct agx_grid *grid,
+                    enum hk_compute_pair_alt_kind *alt_kind_out,
+                    uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT],
+                    uint64_t *loop_bound_out)
 {
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -4167,46 +4706,18 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                                       (uint32_t)k_i, grid->count))
       return normal;
 
-   struct hk_shader *alt = NULL;
-   uint32_t tile_n = 0;
-   if (!gemm->is_guarded) {
-      if (((uint32_t)n_i % 64) == 0 && api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat32) {
-         alt = api->gemm_cmat32;
-         tile_n = 32;
-      }
-   } else {
-      /* Guarded tile-width selection:
-       * - N <= 16: cmat16 (32x16, K_step=32) avoids 50-75% N-lane waste.
-       * - N > 32 with N % 64 == 0 or N % 32 != 0: cmat64 (32x64, K_step=32)
-       *   doubles M-parallelism and halves K-loop barriers. When N % 32 != 0
-       *   (e.g. N=48 or N=144), both cmat64 and cmat32 incur N-tail waste (for
-       *   N=48 both pad to 64 with 25% waste), so cmat64 wins via fewer N WGs
-       *   and K_step=32. When N % 32 == 0 && N % 64 != 0 (e.g. N=96), cmat32
-       *   (64x32, K_step=16) has 0% N-tail waste vs cmat64's 50% last-tile
-       *   waste and is selected instead.
-       * - 16 < N <= 32: cmat32 (64x32, K_step=16) fits in one N tile. */
-      if ((uint32_t)n_i <= 16 && api->gemm_cmat16) {
-         alt = api->gemm_cmat16;
-         tile_n = 16;
-      } else if ((uint32_t)n_i > 32 &&
-                 (((uint32_t)n_i % 64) == 0 || ((uint32_t)n_i % 32) != 0) &&
-                 api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat32) {
-         alt = api->gemm_cmat32;
-         tile_n = 32;
-      } else if (api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat16) {
-         alt = api->gemm_cmat16;
-         tile_n = 16;
-      }
-   }
+   /* Tile-width selection (all 128t, 4 KiB shared A): see
+    * hk_gemm_cmat_select_tile_n(). Exact N multiples pick the widest exact
+    * tile so guarded dispatches can specialize to unguarded variants when
+    * M%tile_m==0 and K%8==0; small-grid high-K shapes favor cmat16. */
+   uint32_t tile_n = hk_gemm_cmat_select_tile_n(
+      m_u, (uint32_t)n_i, (uint32_t)k_i,
+      api->gemm_cmat16 != NULL, api->gemm_cmat32 != NULL,
+      api->gemm_cmat64 != NULL);
+   struct hk_shader *alt =
+      tile_n == 16 ? api->gemm_cmat16 :
+      tile_n == 32 ? api->gemm_cmat32 :
+      tile_n == 64 ? api->gemm_cmat64 : NULL;
    if (!alt ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16))
       return normal;
@@ -4257,14 +4768,107 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                                &c_b, gemm->output.offset_B, c_bytes)))
       return normal;
 
-   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+   enum hk_compute_pair_alt_kind chosen_kind =
+      tile_n == 16 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 :
+      tile_n == 32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 :
+                     HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
+
+   /* When an unguarded or exact-multiple guarded GEMM dispatch has sufficient
+    * grid parallelism, specialize to wider/taller unguarded cmat tiles:
+    * - 64x64 (K_step=16, 4x4 accs/SG, staggered pipe_b) when M%64==0, N%64==0,
+    *   K%16==0, and (M/64)*(N/64) >= 25: halves B traffic, WGs, and barriers.
+    * - 64x48 (K_step=16, 4x3 accs/SG, staggered pipe_b) when M%64==0, N%48==0,
+    *   N%64!=0, K%8==0, and (M/64)*(N/48) >= 25: cuts A traffic 33-50% on N=96/144.
+    * - 64x24 (K_step=16, 2x3 accs/SG, pipe_b) for remaining N%24==0.
+    * - Otherwise specialize exact-multiple guarded dispatches to *_UNGUARDED. */
+   if (api->compute_pair_producer) {
+      const bool a_align16 = (gemm->reads[0].offset_B % 16u) == 0 &&
+                             ((a_b.address | a_b.offset) % 16ull) == 0;
+      const bool can_64x64 =
+         (m_u % 64u) == 0 && (n_u % 64u) == 0 && (k_u % 8u) == 0 &&
+         k_u >= 64u && (m_u / 64u) * (n_u / 64u) >= 25u && a_align16;
+      const bool can_64x48 =
+         !can_64x64 && (m_u % 64u) == 0 && (n_u % 48u) == 0 &&
+         n_u >= 96u && (n_u % 64u) != 0 && (k_u % 8u) == 0 &&
+         (m_u / 64u) * (n_u / 48u) >= 25u && a_align16;
+      if (can_64x64) {
+         const enum hk_compute_pair_alt_kind k64 =
+            gemm->is_guarded ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED
+                             : HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64;
+         struct hk_shader *s64 = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL, k64,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (s64 &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, s64,
+                                              s64->only_linked, 1u << 16)) {
+            alt = s64;
+            tile_n = 64u;
+            chosen_kind = k64;
+         }
+      } else if (can_64x48) {
+         struct hk_shader *s48 = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL,
+            HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (s48 &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, s48,
+                                              s48->only_linked, 1u << 16)) {
+            alt = s48;
+            tile_n = 48u;
+            chosen_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED;
+         }
+      } else if ((n_u % 24u) == 0 && (n_u % 32u) != 0 && (n_u % 64u) != 0 &&
+                 hk_gemm_cmat_can_specialize_unguarded(gemm->is_guarded, m_u, n_u, k_u,
+                                                       24u, gemm->reads[0].offset_B,
+                                                       a_b.address, a_b.offset)) {
+         struct hk_shader *ug24 = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL,
+            HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (ug24 &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, ug24,
+                                              ug24->only_linked, 1u << 16)) {
+            alt = ug24;
+            tile_n = 24u;
+            chosen_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED;
+         }
+      } else if (hk_gemm_cmat_can_specialize_unguarded(
+                    gemm->is_guarded, m_u, n_u, k_u, tile_n,
+                    gemm->reads[0].offset_B, a_b.address, a_b.offset)) {
+         enum hk_compute_pair_alt_kind ug_kind =
+            tile_n == 16 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED :
+            tile_n == 32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED :
+                           HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+         struct hk_shader *ug = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL, ug_kind,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (ug) {
+            alt = ug;
+            chosen_kind = ug_kind;
+         }
+      }
+   }
+
+   const uint32_t tile_m = hk_compute_pair_alt_gemm_tile_m(chosen_kind);
    const uint64_t gx = DIV_ROUND_UP(n_u, tile_n);
    const uint64_t gy = DIV_ROUND_UP(m_u, tile_m);
    if (gx > 65535 || gy > 65535)
       return normal;
+
    grid->count[0] = (uint32_t)gx;
    grid->count[1] = (uint32_t)gy;
    grid->count[2] = 1;
+   if (alt_kind_out)
+      *alt_kind_out = chosen_kind;
+   if (pack_loop_params) {
+      const uint32_t k_step = hk_compute_pair_alt_gemm_k_step(chosen_kind);
+      pack_loop_params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] =
+         DIV_ROUND_UP(k_u, k_step);
+   }
+   if (loop_bound_out && pack_loop_params)
+      hk_pack_eval_effective_instrs(&alt->pack_loop_bound,
+                                    alt->b.info.stats.instrs, pack_loop_params,
+                                    loop_bound_out);
    return alt;
 }
 
@@ -4326,8 +4930,15 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    struct hk_shader *selected = s;
    struct hk_copy4_dispatch_cert copy4_cert = {.role = HK_COMPUTE_PAIR_NONE};
+   enum hk_compute_pair_alt_kind selected_alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+   uint64_t loop_bound = 0;
+   bool has_im2col_push = false;
+   uint32_t im2col_push_off = 0;
+   struct hk_im2col_push im2col_push = {0};
    if (api && api->identity_copy4 && !api->compute_pair && !in_threads && !invocation_stat) {
-      selected = hk_select_identity_copy4(cmd, api, s, &grid, &copy4_cert);
+      selected = hk_select_identity_copy4(cmd, api, s, &grid, &copy4_cert, &loop_bound,
+                                          &has_im2col_push, &im2col_push_off, &im2col_push);
       /* Record-time no-op self-copy elision: runs after
        * hk_cs_invalidate_compute_pair() and is skipped whenever pipeline stats
        * (invocation_stat), conditional rendering (indirect grid), base_group,
@@ -4339,10 +4950,18 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
+   } else if (api && api->tensor_op_primary && !api->identity_copy4 &&
+              !api->compute_pair && !in_threads && !invocation_stat) {
+      selected = hk_select_tensor_op(cmd, api, s, &grid);
+      local_size = agx_workgroup(selected->b.info.workgroup_size[0],
+                                 selected->b.info.workgroup_size[1],
+                                 selected->b.info.workgroup_size[2]);
    } else if (api && api->depthwise_vec4 && api->compute_pair &&
               api->compute_pair->role == HK_COMPUTE_PAIR_DEPTHWISE &&
               !in_threads && !invocation_stat) {
-      selected = hk_select_depthwise_vec4(cmd, api, s, &grid);
+      selected = hk_select_depthwise_vec4(cmd, api, s, &grid, pack_loop_params, &loop_bound);
+      if (selected == api->depthwise_vec4)
+         selected_alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
@@ -4350,7 +4969,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
               api->compute_pair &&
               api->compute_pair->role == HK_COMPUTE_PAIR_GEMM &&
               !in_threads && !invocation_stat) {
-      selected = hk_select_gemm_cmat(cmd, api, s, &grid);
+      selected = hk_select_gemm_cmat(cmd, api, s, &grid, &selected_alt_kind,
+                                     pack_loop_params, &loop_bound);
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
@@ -4419,19 +5039,28 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       if (!cs)
          return;
    }
+   uint8_t saved_im2col_push[sizeof(struct hk_im2col_push)];
+   if (has_im2col_push) {
+      memcpy(saved_im2col_push, desc->root.push + im2col_push_off, sizeof(saved_im2col_push));
+      memcpy(desc->root.push + im2col_push_off, &im2col_push, sizeof(im2col_push));
+      hk_root_mark_dirty(desc);
+   }
    hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
+   if (has_im2col_push) {
+      memcpy(desc->root.push + im2col_push_off, saved_im2col_push, sizeof(saved_im2col_push));
+      hk_root_mark_dirty(desc);
+   }
    if (!in_threads && !invocation_stat && api && api->compute_pair &&
-       (selected == s || selected == api->depthwise_vec4 ||
-        selected == api->gemm_cmat16 || selected == api->gemm_cmat32 ||
-        selected == api->gemm_cmat64))
-      hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
+       (selected == s || selected_alt_kind != HK_COMPUTE_PAIR_ALT_NONE))
+      hk_record_compute_pair(cmd, cs, api, selected, selected_alt_kind,
+                             pack_loop_params, orig_groups, grid);
    else if (!in_threads && !invocation_stat &&
             copy4_cert.role != HK_COMPUTE_PAIR_NONE)
       hk_record_copy4_pair(cmd, cs, api, selected, &copy4_cert, orig_groups,
                            grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
-   cs->pack_loops |= selected->b.info.has_loops;
    if (agx_is_indirect(grid)) {
+      cs->pack_loops |= selected->b.info.has_loops;
       cs->sib_indirect = true;
    } else {
       const uint64_t threads =
@@ -4439,13 +5068,10 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
 
-      /* What submit packing bounds a packet with (hk_pack_plan()). Static
-       * instruction counts bound a program without loops; pack_loops marks
-       * the others, at most one of which a packet holds. */
-      uint64_t work;
-      if (__builtin_mul_overflow(threads, (uint64_t)selected->b.info.stats.instrs,
-                                 &work))
-         work = UINT64_MAX;
+      uint64_t work = 0;
+      cs->pack_loops |= hk_pack_account_dispatch_work_eff(
+         threads, selected->b.info.stats.instrs,
+         selected->b.info.has_loops, loop_bound, &work);
       cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
                             ? UINT64_MAX : cs->pack_threads + threads;
       cs->pack_static_work = work > UINT64_MAX - cs->pack_static_work
@@ -4531,7 +5157,8 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 
    if (!cmd->in_meta && cmd->state.cs.shader &&
        (cmd->state.cs.shader->byte_stencil ||
-        cmd->state.cs.shader->stencil_2d) &&
+        cmd->state.cs.shader->stencil_2d ||
+        cmd->state.cs.shader->compute_opt) &&
        !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
                                         cmd->conditional_meta) &&
        !hk_stat_enabled(hk_pipeline_stat_addr(
@@ -4551,6 +5178,12 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                     baseGroupX, baseGroupY, baseGroupZ, groupCountX,
                     groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
          tiled_shader = &cmd->state.cs.shader->stencil_2d->shader;
+      } else if (cmd->state.cs.shader->compute_opt &&
+                 hk_compute_opt_validate_dispatch(
+                    dev, desc, &cmd->state.cs.shader->compute_opt->plan,
+                    baseGroupX, baseGroupY, baseGroupZ, groupCountX,
+                    groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
+         tiled_shader = &cmd->state.cs.shader->compute_opt->shader;
       }
       if (tiled_shader) {
          desc->root.cs.base_group[0] = 0;
@@ -4721,6 +5354,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
 
    desc->root.cs.group_count_addr = dispatch_addr;
    desc->root.cs.grid_helper_sparse_map_addr =
-      (use_primary && buffer->sparse_map) ? buffer->sparse_map->va->addr : 0;
+      (use_primary && buffer->sparse_map) ? hk_buffer_sparse_map_addr(buffer)
+                                          : 0;
    dispatch(cmd, agx_grid_indirect(dispatch_addr));
 }

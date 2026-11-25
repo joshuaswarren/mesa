@@ -475,3 +475,98 @@ TEST(SpillLoopHeader, AGX3BRepeatsReorderableDeviceLoadInsteadOfSpilling)
    EXPECT_EQ(exit_loads, 1u);
    ralloc_free(mem);
 }
+
+/* A shader without scratch (such as an internal shader or unspillable
+ * preamble) must fail closed in register allocation rather than asserting in
+ * debug builds or silently emitting memory operands in release builds. */
+TEST(SpillFallback, NoScratchSpillFailsClosed)
+{
+   /* Case 1: remat-only fallback spill when has_scratch == false. */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.has_scratch = false;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->any_cf = true;
+      b->shader->is_preamble = true;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *left = agx_test_block(b->shader);
+      agx_block *right = agx_test_block(b->shader);
+      agx_block *join = agx_test_block(b->shader);
+      agx_block_add_successor(entry, left);
+      agx_block_add_successor(entry, right);
+      agx_block_add_successor(left, join);
+      agx_block_add_successor(right, join);
+
+      b->cursor = agx_after_block(left);
+      agx_index in_l = agx_mov(b, agx_uniform(0, AGX_SIZE_32));
+      b->cursor = agx_after_block(right);
+      agx_index in_r = agx_mov(b, agx_uniform(2, AGX_SIZE_32));
+
+      b->cursor = agx_after_block(join);
+      agx_index values[16];
+      for (agx_index &value : values) {
+         value = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *phi = agx_phi_to(b, value, 2);
+         phi->src[0] = in_l;
+         phi->src[1] = in_r;
+      }
+      for (agx_index value : values)
+         agx_unit_test(b, value);
+
+      agx_compute_liveness(b->shader);
+      agx_spill(b->shader, 24, true);
+      EXPECT_TRUE(b->shader->remat_fallback_spilled);
+      EXPECT_TRUE(b->shader->ra_failed);
+      ralloc_free(mem);
+   }
+
+   /* Case 2: direct over-budget RA with has_scratch == false (helper 32-half
+    * register file) fails closed without emitting any spill memory ops. */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17C;
+      key.has_scratch = false;
+      key.is_helper = true;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_index values[20];
+      for (unsigned i = 0; i < ARRAY_SIZE(values); ++i)
+         values[i] = agx_rcp(b, agx_uniform(2 * i, AGX_SIZE_32));
+      for (agx_index value : values)
+         agx_unit_test(b, value);
+
+      agx_ra_without_remat(b->shader);
+      EXPECT_TRUE(b->shader->ra_failed);
+
+      unsigned mem_ops = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         agx_foreach_ssa_dest(I, d)
+            mem_ops += I->dest[d].memory;
+         agx_foreach_ssa_src(I, s)
+            mem_ops += I->src[s].memory;
+      }
+      EXPECT_EQ(mem_ops, 0u);
+      ralloc_free(mem);
+   }
+}
+
+TEST(SpillFallback, CompactKernelInfoPreservesMaxUint16Scratch)
+{
+   struct agx_shader_info info = {};
+   info.scratch_size = UINT16_MAX;
+   info.agx3_spectpr_scratch_size = UINT16_MAX;
+   struct agx_precompiled_kernel_info compact = agx_compact_kernel_info(&info);
+   EXPECT_EQ(compact.scratch_size, UINT16_MAX);
+   EXPECT_EQ(compact.agx3_spectpr_scratch_size, UINT16_MAX);
+   EXPECT_EQ(compact.agx3_tps_size, (uint32_t)UINT16_MAX);
+}

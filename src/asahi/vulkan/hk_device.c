@@ -101,6 +101,8 @@ static const struct debug_named_value hk_perf_options[] = {
     "Unconditional per-launch CDM barrier (disable dependency tracking)"},
    {"trackcdmbarrier", HK_PERF_TRACKCDMBARRIER,
     "Opt into dependency-tracked per-launch CDM barriers"},
+   {"fullcdmbarrier", HK_PERF_FULLCDMBARRIER,
+    "Force the full CDM barrier word on every chip"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -1124,12 +1126,20 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->perftest |= HK_PERF_ALWAYSCDMBARRIER;
 
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
-
    /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
     * Off by default; pays CPU to skip wake-up latency on short submit->signal
     * round trips. */
    dev->vk.sync_wait_poll_us =
       CLAMP(debug_get_num_option("HK_SUBMIT_POLL_US", 0), 0, 1000000);
+
+   /* The default AGX2 CDM barrier word on this chip: the reduced 0x1ff on
+    * the dies it was measured on (agx2_cdm_barrier_default_word()), the
+    * full word elsewhere. fullcdmbarrier and a device that created a sparse
+    * resource upgrade to the full word in hk_cdm_flush().
+    */
+   dev->cdm_barrier_default_mask =
+      agx2_cdm_barrier_default_word(pdev->dev.chip,
+                                    pdev->dev.params.gpu_generation);
 
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps

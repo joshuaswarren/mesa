@@ -212,3 +212,117 @@ TEST(M5PackedLOD, LastUseSplitMovesHighHalfIntoSamplerBank)
    EXPECT_LT(pack->src[0].value, 128u);
    ralloc_free(mem);
 }
+
+TEST(M5PackedLOD, LoopInvariantSingleUseScalarLodPacks)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   body->loop_header = true;
+   agx_block_add_successor(entry, body);
+   agx_block_add_successor(body, body);
+   agx_block_add_successor(body, exit);
+
+   b->cursor = agx_after_block(entry);
+   agx_index lod = agx_temp(b->shader, AGX_SIZE_16);
+   agx_preload_to(b, lod, agx_register(6, AGX_SIZE_16));
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_preload_to(b, coords, agx_register(8, AGX_SIZE_32));
+
+   b->cursor = agx_after_block(body);
+   agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *sample = agx_texture_sample_to(
+      b, result, coords, lod, agx_zero(), agx_immediate(0), agx_zero(),
+      agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false, false, false,
+      AGX_GATHER_NONE, false);
+   sample->mask = 15;
+   agx_unit_test(b, result);
+
+   /* Single static use in a uniform loop is still live across the back-edge. */
+   agx_lower_uniform_sources(b->shader);
+
+   unsigned packs = 0;
+   agx_foreach_instr_global(b->shader, I)
+      packs += I->op == AGX_OPCODE_PACK_SAMPLER_LOD_AGX3;
+   EXPECT_EQ(packs, 1u);
+   EXPECT_TRUE(sample->memory_is_packed);
+   EXPECT_EQ(sample->src[1].size, AGX_SIZE_32);
+   ralloc_free(mem);
+
+   /* A straight-line killed single-use scalar LOD stays on the direct path. */
+   mem = ralloc_context(NULL);
+   b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   lod = agx_temp(b->shader, AGX_SIZE_16);
+   agx_preload_to(b, lod, agx_register(6, AGX_SIZE_16));
+   coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_preload_to(b, coords, agx_register(8, AGX_SIZE_32));
+   result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   sample = agx_texture_sample_to(
+      b, result, coords, lod, agx_zero(), agx_immediate(0), agx_zero(),
+      agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false, false, false,
+      AGX_GATHER_NONE, false);
+   sample->mask = 15;
+   agx_unit_test(b, result);
+
+   agx_lower_uniform_sources(b->shader);
+
+   packs = 0;
+   agx_foreach_instr_global(b->shader, I)
+      packs += I->op == AGX_OPCODE_PACK_SAMPLER_LOD_AGX3;
+   EXPECT_EQ(packs, 0u);
+   EXPECT_FALSE(sample->memory_is_packed);
+   EXPECT_EQ(sample->src[1].size, AGX_SIZE_16);
+   ralloc_free(mem);
+}
+
+TEST(M5PackedLOD, PostCseMergedScalarLodPacks)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_preload_to(b, coords, agx_register(8, AGX_SIZE_32));
+
+   agx_instr *samples[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_index lod = agx_mov(b, agx_uniform(14, AGX_SIZE_16));
+      agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      samples[i] = agx_texture_sample_to(
+         b, result, coords, lod, agx_zero(), agx_immediate(i), agx_zero(),
+         agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false, false, false,
+         AGX_GATHER_NONE, false);
+      samples[i]->mask = 15;
+      agx_unit_test(b, result);
+   }
+
+   /* CSE merges the two single-use copies into one live SSA; the follow-up
+    * lowering must pack both samples and share one producer in the block. */
+   agx_opt_cse(b->shader);
+   agx3_lower_m5_live_scalar_lods(b->shader);
+
+   unsigned packs = 0;
+   agx_foreach_instr_global(b->shader, I)
+      packs += I->op == AGX_OPCODE_PACK_SAMPLER_LOD_AGX3;
+   EXPECT_EQ(packs, 1u);
+   EXPECT_TRUE(samples[0]->memory_is_packed);
+   EXPECT_TRUE(samples[1]->memory_is_packed);
+   EXPECT_TRUE(agx_is_equiv(samples[0]->src[1], samples[1]->src[1]));
+   EXPECT_EQ(samples[0]->src[1].size, AGX_SIZE_32);
+   ralloc_free(mem);
+}

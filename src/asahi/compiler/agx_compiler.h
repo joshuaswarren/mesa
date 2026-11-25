@@ -1312,6 +1312,8 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+void agx_opt_sink_cold_cmp(agx_context *ctx);
+void agx_opt_pack_bool_or_branch(agx_context *ctx);
 bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
                               agx_index x, agx_index y, bool *result);
 void agx_optimizer_backward(agx_context *ctx);
@@ -1326,13 +1328,17 @@ bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 bool agx3_split_texture_coordinates(agx_context *ctx);
 bool agx3_reserve_cube_scratch(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
+void agx3_lower_m5_live_scalar_lods(agx_context *ctx);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_immediates(agx_context *ctx);
-void agx_materialize_agx3_cf_constants(agx_context *ctx);
+bool agx_lower_agx3_cf_constants(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
 void agx_opt_cse_pressure(agx_context *ctx);
 bool agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs);
+unsigned agx_licm_demand_bound(agx_context *ctx, unsigned demand,
+                               unsigned max_possible_regs);
+bool agx_opt_sink_immediates(agx_context *ctx);
 void agx_opt_cse_bounded(agx_context *ctx);
 bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
 bool agx_has_uniform_store(const agx_context *ctx);
@@ -1644,6 +1650,7 @@ bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
                           bool agx3c,
                           const nir_opt_peephole_select_options *flatten);
 bool agx_nir_export_select_flags_as_halves(nir_shader *s, bool branches);
+bool agx_nir_cancel_preamble_fneg(nir_shader *s, unsigned reserved);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);
