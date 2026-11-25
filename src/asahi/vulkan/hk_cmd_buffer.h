@@ -367,6 +367,7 @@ struct hk_upload_stats {
    uint64_t draw_param_uploads, draw_param_bytes, draw_param_reuses;
    uint64_t draw_id_uploads, draw_id_bytes, draw_id_reuses;
    uint64_t constant_uploads, constant_bytes, constant_reuses;
+   uint64_t xfer_desc_walks;
 };
 
 #define hk_upload_stat(cmd, field, value)                                      \
@@ -577,9 +578,10 @@ struct hk_descriptor_state {
       bool push_launched;
    } root_change;
    uint64_t generation;
-   /* Advances on every descriptor state change except hk_push_constants(), so
-    * push-only vertex launches whose fragment shader does not read push
-    * constants can still prove descriptor state unchanged in O(1). */
+   /* Advances on every descriptor state change except hk_push_constants()
+    * (set binds, dynamic offsets, push descriptors, descriptor buffers, meta
+    * restores), so push-only launches and xfer_clean can track descriptor
+    * resource mutations in O(1). */
    uint64_t non_push_generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
@@ -596,6 +598,7 @@ struct hk_descriptor_state {
 
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
+   uint32_t set_update_seq[HK_MAX_SETS];
    uint32_t sets_dirty;
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
@@ -1107,6 +1110,8 @@ struct hk_graphics_state {
 
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
+   /* Bitmask of vb[] slots with a non-zero range currently bound. */
+   uint32_t bound_vb_mask;
 
    /* Transform feedback buffers */
    struct hk_addr_range xfb[4];
@@ -3471,6 +3476,9 @@ void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
 
 void hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd);
 void hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd);
+/* Non-static for unit tests (hk_cpu_upload_bench). */
+void hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
+                             uint64_t extra_hi);
 
 void hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
                          const mesa_shader_stage *stages,
@@ -3681,6 +3689,7 @@ struct hk_meta_save {
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
    struct hk_addr_range vb0;
    struct hk_descriptor_set *desc0;
+   uint32_t desc0_update_seq;
    /* Nested meta must retain the outer query/conditional-rendering scope. */
    bool in_meta;
    bool has_push_desc0;
