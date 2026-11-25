@@ -2509,8 +2509,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                          cs->render_resources.data,
                                          cs->render_resources.size);
             }
-            struct drm_asahi_cmd_render_with_prior cmd = {0};
+            struct drm_asahi_cmd_render_with_prior cmd;
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+            cmd.prior_vdm = 0;
+            cmd.prior_cdm = 0;
             if (ts_carrier && cs == uts_cs) {
                cmd.legacy.ts_vtx.start.handle = 0;
                cmd.legacy.ts_vtx.start.offset = 0;

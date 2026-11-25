@@ -986,9 +986,10 @@ hk_g17p_bg_eot_dev_find(struct hk_g17p_bg_eot_dev_cache *dc,
                    1)) == 0,
                  "power-of-two index");
    for (unsigned i = hash & mask;; i = (i + 1) & mask) {
-      if (!dc->index[i])
+      const uint16_t slot = __atomic_load_n(&dc->index[i], __ATOMIC_ACQUIRE);
+      if (!slot)
          return NULL;
-      struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[dc->index[i] - 1];
+      struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[slot - 1];
       if (e->hash == hash && !memcmp(&e->key, dk, sizeof(*dk)))
          return e;
    }
@@ -1011,7 +1012,7 @@ hk_g17p_bg_eot_dev_insert(struct hk_g17p_bg_eot_dev_cache *dc,
    e->hash = hash;
    e->valid_variants = 0;
    memset(e->program, 0, sizeof(e->program));
-   dc->index[i] = (uint16_t)(++dc->count);
+   __atomic_store_n(&dc->index[i], (uint16_t)(++dc->count), __ATOMIC_RELEASE);
    return e;
 }
 
@@ -1768,24 +1769,41 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
    cmd->g17p_bg_eot_cache_used = true;
 
    /* frg-codegen v4 BG/EOT device cache: one value lookup per new
-    * pass. A hit fills every variant this recording will ask for; a miss
-    * attaches a fresh device entry that hk_build_bg_eot() fills. */
+    * pass. Entries are append-only and published with release ordering, so
+    * steady-state hits read without locking dc->lock; misses fall back to the
+    * lock to insert a fresh device entry that hk_build_bg_eot() fills. */
    struct hk_g17p_bg_eot_dev_cache *dc = dev->g17p_bg_eot_dev_cache;
    struct hk_g17p_bg_eot_dev_key dkey;
    if (dc && hk_g17p_bg_eot_dev_key_init(cmd, info, incomplete_render_area,
                                          &dkey)) {
       const uint64_t dhash = hk_g17p_bg_eot_dev_hash(&dkey);
-      simple_mtx_lock(&dc->lock);
       struct hk_g17p_bg_eot_dev_entry *de =
          hk_g17p_bg_eot_dev_find(dc, &dkey, dhash);
-      if (!de && !dc->full)
-         de = hk_g17p_bg_eot_dev_insert(dc, &dkey, dhash);
-      if (de) {
-         memcpy(cached->program, de->program, sizeof(cached->program));
-         cached->valid_variants = de->valid_variants;
+      if (likely(de != NULL)) {
+         const uint8_t valid =
+            __atomic_load_n(&de->valid_variants, __ATOMIC_ACQUIRE);
+         for (unsigned v = 0; v < ARRAY_SIZE(de->program); ++v) {
+            if (valid & BITFIELD_BIT(v))
+               cached->program[v] = de->program[v];
+         }
+         cached->valid_variants = valid;
+         cached->dev_entry = de;
+      } else {
+         simple_mtx_lock(&dc->lock);
+         de = hk_g17p_bg_eot_dev_find(dc, &dkey, dhash);
+         if (!de && !dc->full)
+            de = hk_g17p_bg_eot_dev_insert(dc, &dkey, dhash);
+         if (de) {
+            const uint8_t valid = de->valid_variants;
+            for (unsigned v = 0; v < ARRAY_SIZE(de->program); ++v) {
+               if (valid & BITFIELD_BIT(v))
+                  cached->program[v] = de->program[v];
+            }
+            cached->valid_variants = valid;
+         }
+         cached->dev_entry = de;
+         simple_mtx_unlock(&dc->lock);
       }
-      cached->dev_entry = de;
-      simple_mtx_unlock(&dc->lock);
    }
    return cached;
 }
@@ -2820,7 +2838,10 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
             if (program.usc && in_device &&
                 !vk_command_buffer_has_error(&cmd->vk)) {
                de->program[variant] = program;
-               de->valid_variants |= BITFIELD_BIT(variant);
+               __atomic_store_n(
+                  &de->valid_variants,
+                  (uint8_t)(de->valid_variants | BITFIELD_BIT(variant)),
+                  __ATOMIC_RELEASE);
             }
          } else {
             dc->full = true;
@@ -7142,6 +7163,17 @@ hk_get_prolog_epilog(struct hk_device *dev, void *data, size_t data_size,
    return part;
 }
 
+static void
+hk_linked_cache_insert(struct hk_shader *shader, const void *key_clone,
+                       struct hk_linked_shader *linked)
+{
+   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   if (!shader->linked.first) {
+      shader->linked.first_key = key_clone;
+      __atomic_store_n(&shader->linked.first, linked, __ATOMIC_RELEASE);
+   }
+}
+
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
                              struct hk_fast_link_key_vs *key)
@@ -7171,7 +7203,7 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
    linked->sw_indexing_hw_vs = key->prolog.hw && key->prolog.adjacency;
    linked->b.uses_base_param |= linked->sw_indexing;
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_linked_cache_insert(shader, key_clone, linked);
    return linked;
 }
 
@@ -8229,8 +8261,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                key->epilog.blend_constant_base;
             mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
             mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
-            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
-                                    mono_linked);
+            hk_linked_cache_insert(shader, mono_key_clone, mono_linked);
             return mono_linked;
          }
          if (layout) {
@@ -8292,8 +8323,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
             mono_linked->partial_mrt_opaque_eligible =
                hk_fs_partial_mrt_opaque_eligible(
                   mono_linked, &mono_linked->partial_mrt_written_mask);
-            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
-                                    mono_linked);
+            hk_linked_cache_insert(shader, mono_key_clone, mono_linked);
             return mono_linked;
          }
          ralloc_free(mono_key_clone);
@@ -8360,7 +8390,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       hk_fs_partial_mrt_opaque_eligible(linked,
                                         &linked->partial_mrt_written_mask);
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_linked_cache_insert(shader, key_clone, linked);
    return linked;
 }
 
@@ -8371,6 +8401,16 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 static struct hk_linked_shader *
 hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
 {
+   struct hk_linked_shader *first =
+      __atomic_load_n(&shader->linked.first, __ATOMIC_ACQUIRE);
+   if (likely(first != NULL)) {
+      const size_t key_size = shader->info.stage == MESA_SHADER_VERTEX
+         ? sizeof(struct hk_fast_link_key_vs)
+         : sizeof(struct hk_fast_link_key_fs);
+      if (likely(memcmp(shader->linked.first_key, key, key_size) == 0))
+         return first;
+   }
+
    struct hk_linked_shader *linked;
    simple_mtx_lock(&shader->linked.lock);
 
