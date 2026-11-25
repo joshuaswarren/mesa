@@ -889,6 +889,8 @@ merge_stream_stats(const struct asahi_g17p_stream_stats *stats)
    stream_totals.state_updates += stats->state_updates;
    stream_totals.elided_bind_tails += stats->elided_bind_tails;
    stream_totals.incremental_fs_ppp_updates += stats->incremental_fs_ppp_updates;
+   stream_totals.incremental_cull_ppp_updates +=
+      stats->incremental_cull_ppp_updates;
    stream_totals.no_varying_fs |= stats->no_varying_fs;
 }
 
@@ -899,8 +901,10 @@ check_bind_tail_counts(void)
    if (!spec || !spec[0])
       return;
 
-   unsigned exp_full = 0, exp_elided = 0, exp_fs_ppp = 0;
-   if (sscanf(spec, "%u,%u,%u", &exp_full, &exp_elided, &exp_fs_ppp) != 3) {
+   unsigned exp_full = 0, exp_elided = 0, exp_fs_ppp = 0, exp_cull_ppp = 0;
+   const int parsed = sscanf(spec, "%u,%u,%u,%u", &exp_full, &exp_elided,
+                             &exp_fs_ppp, &exp_cull_ppp);
+   if (parsed != 3 && parsed != 4) {
       fprintf(stderr, "shim: invalid ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=%s\n",
               spec);
       _Exit(EXIT_FAILURE);
@@ -909,20 +913,34 @@ check_bind_tail_counts(void)
    const unsigned full =
       stream_totals.state_updates - stream_totals.elided_bind_tails;
    if (full != exp_full || stream_totals.elided_bind_tails != exp_elided ||
-       stream_totals.incremental_fs_ppp_updates != exp_fs_ppp) {
-      fprintf(stderr,
-              "shim: G17P bind-tail counts mismatch: got full=%u elided=%u "
-              "fs_ppp=%u, expected %u,%u,%u\n",
-              full, stream_totals.elided_bind_tails,
-              stream_totals.incremental_fs_ppp_updates, exp_full, exp_elided,
-              exp_fs_ppp);
+       stream_totals.incremental_fs_ppp_updates != exp_fs_ppp ||
+       (parsed == 4 &&
+        stream_totals.incremental_cull_ppp_updates != exp_cull_ppp)) {
+      if (parsed == 4) {
+         fprintf(stderr,
+                 "shim: G17P bind-tail counts mismatch: got full=%u elided=%u "
+                 "fs_ppp=%u cull_ppp=%u, expected %u,%u,%u,%u\n",
+                 full, stream_totals.elided_bind_tails,
+                 stream_totals.incremental_fs_ppp_updates,
+                 stream_totals.incremental_cull_ppp_updates, exp_full,
+                 exp_elided, exp_fs_ppp, exp_cull_ppp);
+      } else {
+         fprintf(stderr,
+                 "shim: G17P bind-tail counts mismatch: got full=%u elided=%u "
+                 "fs_ppp=%u, expected %u,%u,%u\n",
+                 full, stream_totals.elided_bind_tails,
+                 stream_totals.incremental_fs_ppp_updates, exp_full,
+                 exp_elided, exp_fs_ppp);
+      }
       _Exit(EXIT_FAILURE);
    }
 
    fprintf(stderr,
-           "shim: G17P bind-tail counts matched: full=%u elided=%u fs_ppp=%u\n",
+           "shim: G17P bind-tail counts matched: full=%u elided=%u fs_ppp=%u "
+           "cull_ppp=%u\n",
            full, stream_totals.elided_bind_tails,
-           stream_totals.incremental_fs_ppp_updates);
+           stream_totals.incremental_fs_ppp_updates,
+           stream_totals.incremental_cull_ppp_updates);
 }
 
 static void __attribute__((destructor))
@@ -2217,10 +2235,11 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
          g17p_streams_validated++;
          fprintf(stderr,
                  "shim: G17P VDM validated: %u draws, %u indexed, %u state "
-                 "updates (%u elided, %u fs_ppp), %u links, %u barriers (%u "
-                 "inter-draw, %u unbarriered republications)\n",
+                 "updates (%u elided, %u fs_ppp, %u cull_ppp), %u links, %u "
+                 "barriers (%u inter-draw, %u unbarriered republications)\n",
                  stats.draws, stats.indexed_draws, stats.state_updates,
                  stats.elided_bind_tails, stats.incremental_fs_ppp_updates,
+                 stats.incremental_cull_ppp_updates,
                  stats.links, stats.barriers, stats.inter_draw_barriers,
                  stats.unbarriered_state_republications);
       } else if (header->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
