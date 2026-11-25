@@ -19250,14 +19250,14 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       }
    }
 
-   /* A workgroup of one subgroup needs only SIMD-group fences. (Runs after
-    * any pass that delimits shared-memory phases by workgroup barriers.) */
-   if (agx3_native_compute)
+   /* Run after all passes that delimit shared-memory phases by workgroup
+    * barriers. Preserve existing coverage for internal AGX3 shaders. */
+   if (agx3_native_compute ||
+       (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+        !key->secondary)) {
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
-   /* Larger workgroups: the barriers whose shared traffic stays in
-    * subgroup 0, such as a tree reduction's last five steps. */
-   if (agx3_native_compute)
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
