@@ -15,10 +15,12 @@
  * of the selected word per iteration.
  *
  * After the pass the byte must be one bitfield extract (no shift and mask,
- * no modulo-32 count), and the centre-minus-byte subtract must stay one
- * isub: the pass's cleanup must not re-run the main nir_opt_algebraic, which
- * would split every isub of the shader back into an ineg plus an iadd after
- * nir_opt_algebraic_late had recombined them.
+ * no modulo-32 count), and centre minus byte must be one isub, both when the
+ * shader subtracts the selected byte (the pass's cleanup must not re-run the
+ * main nir_opt_algebraic, which would split every isub of the shader back
+ * into an ineg plus an iadd) and when it adds the selected negated byte
+ * (agx_nir_fuse_selects hoists that negation out of the tree after
+ * nir_opt_algebraic_late has run, so a later fold must absorb it).
  */
 
 #include <cstdio>
@@ -58,21 +60,28 @@ load_byte(nir_builder *b, nir_def *base, nir_def *offset)
    return v;
 }
 
-/* Balanced select tree over ring[lo..hi] indexed by idx. */
+/* Balanced select tree over ring[lo..hi] indexed by idx; with `negate`, over
+ * the negated bytes (as a shader that selects -ring[k] reads). */
 nir_def *
 ring_tree(nir_builder *b, nir_def *idx, nir_def *const ring[16], unsigned lo,
-          unsigned hi)
+          unsigned hi, bool negate = false)
 {
-   if (lo == hi)
-      return nir_u2u32(b, ring[lo]);
+   if (lo == hi) {
+      nir_def *v = nir_u2u32(b, ring[lo]);
+      return negate ? nir_ineg(b, v) : v;
+   }
    const unsigned mid = (lo + hi + 1) / 2;
    return nir_bcsel(b, nir_ult_imm(b, idx, mid),
-                    ring_tree(b, idx, ring, lo, mid - 1),
-                    ring_tree(b, idx, ring, mid, hi));
+                    ring_tree(b, idx, ring, lo, mid - 1, negate),
+                    ring_tree(b, idx, ring, mid, hi, negate));
 }
 
+/* centre - ring[i & 15], as an isub of the selected byte, or (negated) as
+ * centre plus the selected negated byte: agx_nir_fuse_selects hoists the
+ * negation out of that tree, so the add only becomes a subtract if a fold
+ * runs after it. */
 nir_shader *
-build_arc_loop(void)
+build_arc_loop(bool negated)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                   &agx_nir_options, "arc");
@@ -101,8 +110,8 @@ build_arc_loop(void)
    {
       nir_def *i = nir_load_var(&b, iv);
       nir_break_if(&b, nir_uge_imm(&b, i, 24));
-      nir_def *v = ring_tree(&b, nir_iand_imm(&b, i, 15), ring, 0, 15);
-      nir_def *d = nir_isub(&b, centre, v);
+      nir_def *v = ring_tree(&b, nir_iand_imm(&b, i, 15), ring, 0, 15, negated);
+      nir_def *d = negated ? nir_iadd(&b, centre, v) : nir_isub(&b, centre, v);
       nir_store_var(&b, best, nir_imax(&b, nir_load_var(&b, best), d), 1);
 
       nir_def *hit = nir_ilt(&b, thr, d);
@@ -160,9 +169,9 @@ struct result {
 };
 
 result
-compile_arc_loop(const target &t)
+compile_arc_loop(const target &t, bool negated)
 {
-   nir_shader *nir = build_arc_loop();
+   nir_shader *nir = build_arc_loop(negated);
    agx_preprocess_nir(nir);
 
    agx_shader_key key = {};
@@ -282,19 +291,22 @@ TEST(AGX3ByteLutExtract, ClampedIndexReadsEveryByte)
 
 TEST(AGX3ByteLutExtract, OneExtractAndOneSubtractPerByte)
 {
-   for (const target &t : targets) {
-      const result r = compile_arc_loop(t);
-      printf("%s: %u instrs; in loop: %u ubitfield_extract, %u ushr, "
-             "%u ineg, %u isub\n",
-             t.name, r.instrs, r.ubfe, r.ushr, r.ineg, r.isub);
-      ASSERT_TRUE(r.ok) << t.name;
+   for (bool negated : {false, true}) {
+      for (const target &t : targets) {
+         const result r = compile_arc_loop(t, negated);
+         printf("%s%s: %u instrs; in loop: %u ubitfield_extract, %u ushr, "
+                "%u ineg, %u isub\n",
+                t.name, negated ? " (negated ring)" : "", r.instrs, r.ubfe,
+                r.ushr, r.ineg, r.isub);
+         ASSERT_TRUE(r.ok) << t.name;
 
-      /* One packed LUT read per iteration, as one bitfield extract. */
-      EXPECT_EQ(r.ubfe, 1u) << t.name;
-      EXPECT_EQ(r.ushr, 0u) << t.name;
+         /* One packed LUT read per iteration, as one bitfield extract. */
+         EXPECT_EQ(r.ubfe, 1u) << t.name << " negated " << negated;
+         EXPECT_EQ(r.ushr, 0u) << t.name << " negated " << negated;
 
-      /* centre - byte stays a subtract. */
-      EXPECT_EQ(r.ineg, 0u) << t.name;
-      EXPECT_GE(r.isub, 1u) << t.name;
+         /* centre - byte is one subtract. */
+         EXPECT_EQ(r.ineg, 0u) << t.name << " negated " << negated;
+         EXPECT_GE(r.isub, 1u) << t.name << " negated " << negated;
+      }
    }
 }

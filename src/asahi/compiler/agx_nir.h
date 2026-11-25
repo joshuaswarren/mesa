@@ -67,6 +67,7 @@ bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
 bool agx_nir_fuse_selects(struct nir_shader *shader);
+bool agx_nir_fold_ineg_add(struct nir_shader *shader);
 bool agx_nir_m5_split_or_selects(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
 bool agx_nir_opt_narrow_subword_loads(struct nir_shader *shader);

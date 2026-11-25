@@ -12370,6 +12370,10 @@ pre_preamble:
          NIR_PASS(_, nir, nir_opt_copy_prop);
          NIR_PASS(_, nir, nir_opt_dce);
       }
+      /* agx_nir_fuse_selects hoists negations out of select trees for a
+       * downstream add to absorb; nir_opt_algebraic_late, which forms isub,
+       * has already run, so make those adds subtracts here. */
+      NIR_PASS(late_progress, nir, agx_nir_fold_ineg_add);
    } else {
       NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
    }
