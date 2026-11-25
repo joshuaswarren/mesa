@@ -6398,7 +6398,12 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       grid_vs = agx_1d(gfx->tess.tes_direct_threads);
 
    /* Launch the vertex shader first */
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
+      if (cs->g18_dispatch_sealed) {
+         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+         if (!cs)
+            return (struct agx_draw){0};
+      }
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
    } else {
       hk_reserve_scratch(cmd, cs, vs);
@@ -6429,6 +6434,11 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* If we need counts, launch the count shader and prefix sum the results. */
       if (count_words) {
          perf_debug(dev, "Geometry shader count");
+         if (cs->g18_dispatch_sealed) {
+            cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+            if (!cs)
+               return (struct agx_draw){0};
+         }
          hk_dispatch_with_local_size(cmd, cs, count, grid_gs, wg);
       }
 
@@ -6440,11 +6450,21 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       /* Transform feedback / query program */
       perf_debug(dev, "Transform feedback / geometry query");
+      if (cs->g18_dispatch_sealed) {
+         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+         if (!cs)
+            return (struct agx_draw){0};
+      }
       hk_dispatch_with_local_size(cmd, cs, pre_gs, agx_1d(1),
                                   agx_workgroup(1, 1, 1));
    }
 
    /* Pre-rast geometry shader */
+   if (cs->g18_dispatch_sealed) {
+      cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+      if (!cs)
+         return (struct agx_draw){0};
+   }
    hk_dispatch_with_local_size(cmd, cs, main, grid_gs, wg);
 
    if (poly_gs_indexed(count->info.gs.shape)) {
@@ -6573,9 +6593,19 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (batch) {
       hk_launch_tess_batched(cmd, vs, tcs, grid_vs, grid_tcs, grid_tess, info,
                              state);
-   } else if (agx_chip_native_or_m5(dev->dev.chip)) {
+   } else if (agx_chip_agx3_path(dev->dev.chip)) {
+      if (cs->g18_dispatch_sealed) {
+         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+         if (!cs)
+            return (struct agx_draw){0};
+      }
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs,
                                   agx_workgroup(64, 1, 1));
+      if (cs->g18_dispatch_sealed) {
+         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+         if (!cs)
+            return (struct agx_draw){0};
+      }
       hk_dispatch_with_local_size(
          cmd, cs, tcs, grid_tcs,
          agx_workgroup(tcs->info.tess.tcs_output_patch_size, 1, 1));

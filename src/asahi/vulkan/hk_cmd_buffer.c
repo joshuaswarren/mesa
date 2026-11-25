@@ -4730,12 +4730,16 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       /* M5 compute launch (the grounded Gallium agx_launch_precomp_m5
        * shape): a per-dispatch Ioto program re-encoded as agx3d, the
        * native direct CDM record, and one terminated dispatch per
-       * command stream. Scratch and threadgroup-memory kernels need the
-       * G18 scratch admission this kernel build does not enable. */
+       * command stream. Separate from any prior non-empty user stream
+       * so precomp's version=1 shared-memory metadata never mixes with or
+       * overwrites an earlier version=2 launch. */
       struct hk_cs **target =
          (barrier & AGX_POSTGFX)  ? &cmd->current_cs.post_gfx
          : (barrier & AGX_PREGFX) ? &cmd->current_cs.pre_gfx
                                   : &cmd->current_cs.cs;
+      if (*target && (*target)->stats.cmds > 0 &&
+          !(*target)->g18_dispatch_sealed && (*target)->imm_writes.size == 0)
+         *target = NULL;
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
       if (!cs)
          return;
@@ -4743,9 +4747,14 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       const uint32_t scratch_bytes =
          MAX3(prog->info.scratch_size, prog->info.agx3_spectpr_scratch_size,
               prog->info.agx3_tps_size);
+      const uint32_t max_spill = 1u << 16;
+      const uint32_t shared_bytes =
+         prog->info.local_size
+            ? MAX2(256u, ALIGN_POT(prog->info.local_size * 4u, 64u))
+            : 0;
       if (!prog->bo || !prog->info.main_size || !prog->info.nr_gprs ||
-          prog->info.nr_preamble_gprs || scratch_bytes ||
-          prog->info.local_size ||
+          prog->info.nr_preamble_gprs || scratch_bytes > max_spill ||
+          shared_bytes > 32768u ||
           (prog->info.rodata.size_16 && !prog->rodata_offset) ||
           (prog->info.printf_uniform &&
            prog->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
@@ -4754,15 +4763,14 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
           prog->entry_offset > UINT64_MAX - prog->ptr ||
           !prog->b.workgroup.x || !prog->b.workgroup.y ||
           !prog->b.workgroup.z ||
-          agx_is_indirect(grid) || !grid.count[0] || !grid.count[1] ||
-          !grid.count[2]) {
+          agx_is_indirect(grid) ||
+          !grid.count[0] || !grid.count[1] || !grid.count[2]) {
          mesa_loge("hk: refusing precompiled G18G program %u shape "
                    "(preamble_gprs=%u scratch=%u tps=%u local=%u "
                    "staging_known=%u indirect=%u)",
                    idx, prog->info.nr_preamble_gprs, scratch_bytes,
                    prog->info.agx3_tps_size, prog->info.local_size,
-                   prog->info.agx3_staging_known,
-                   agx_is_indirect(grid));
+                   prog->info.agx3_staging_known, agx_is_indirect(grid));
          vk_command_buffer_set_error(&cmd->vk,
                                      VK_ERROR_FEATURE_NOT_PRESENT);
          return;
@@ -4835,11 +4843,11 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
          .uniform_ranges = ranges,
          .uniform_range_count = range_count,
          .shader_binary_size = prog->info.main_size,
-         .scratch_size = 0,
+         .scratch_size = scratch_bytes,
          .nr_gprs = prog->info.nr_gprs,
          .compiler_d_valid = prog->info.agx3_staging_known,
          .compiler_d = (uint32_t)prog->info.agx3_staging_halfs * 2,
-         .threadgroup_memory_size_B = 0,
+         .threadgroup_memory_size_B = shared_bytes,
       };
       struct agx3_g17p_graphics_program generated;
       if (!agx3_g18g_compute_program_generate(&desc, &generated) ||
@@ -4918,6 +4926,11 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
        * batches of 16 pass when the helper is sealed away (rel28b), so the
        * weak barrier mid-batch at position >=10 is the suspect, not the
        * launch count. */
+      if (prog->info.local_size) {
+         if (direct.size[1] < 2 && direct.size[2] < 2)
+            launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
+         launch.launch_template.word0 |= UINT32_C(1) << 23;
+      }
       const bool launched = agx3_g17g_native_compute_dispatch_append(
          &launch, &direct, 5, &sink);
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
@@ -4933,24 +4946,54 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       memcpy(sink.data + sink.length, terminate, sizeof(terminate));
       sink.length += sizeof(terminate);
       cs->current = sink.data + sink.length;
+      const bool had_cmds = cs->stats.cmds > 0;
       cs->stats.cmds++;
       cs->g18_dispatch_sealed = true;
-      /* Overwrite (last-wins) as in the admitted shape: this branch seals
-       * the stream, so it ends a batch rather than joining one; the
-       * validator-safe cross-launch merge is the rel28 work (per-bit flag
-       * OR, largest-product local dims). */
-      cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
-         .version = 1,
-         .flags = 1,
-         .registers_16 = prog->info.nr_gprs,
-         .scratch_bytes = prog->info.scratch_size,
-         .spectpr_scratch_bytes = prog->info.agx3_spectpr_scratch_size,
-         .staging_16 = prog->info.agx3_staging_halfs,
-         .local_bytes = prog->info.local_size,
-         .imageblock_stride = prog->info.imageblock_stride,
-         .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
-                        prog->b.workgroup.z},
-      };
+      const uint32_t main_scratch =
+         MAX2(prog->info.scratch_size, prog->info.agx3_tps_size);
+      if (!had_cmds) {
+         cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
+            .version = 1,
+            .flags = 1u,
+            .registers_16 = prog->info.nr_gprs,
+            .scratch_bytes = main_scratch,
+            .spectpr_scratch_bytes = prog->info.agx3_spectpr_scratch_size,
+            .staging_16 = prog->info.agx3_staging_halfs,
+            .local_bytes = prog->info.local_size,
+            .imageblock_stride = prog->info.imageblock_stride,
+            .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
+                           prog->b.workgroup.z},
+         };
+      } else {
+         const uint32_t prod = prog->b.workgroup.x * prog->b.workgroup.y *
+                               prog->b.workgroup.z;
+         const uint32_t prev_prod = cs->g18_compute_resources.local_size[0] *
+                                    cs->g18_compute_resources.local_size[1] *
+                                    cs->g18_compute_resources.local_size[2];
+         cs->g18_compute_resources.registers_16 =
+            MAX2(cs->g18_compute_resources.registers_16, prog->info.nr_gprs);
+         cs->g18_compute_resources.scratch_bytes =
+            MAX2(cs->g18_compute_resources.scratch_bytes, main_scratch);
+         cs->g18_compute_resources.spectpr_scratch_bytes =
+            MAX2(cs->g18_compute_resources.spectpr_scratch_bytes,
+                 prog->info.agx3_spectpr_scratch_size);
+         cs->g18_compute_resources.staging_16 =
+            MAX2(cs->g18_compute_resources.staging_16,
+                 prog->info.agx3_staging_halfs);
+         const uint32_t helper_local =
+            cs->g18_compute_resources.version == 2 ? shared_bytes
+                                                   : prog->info.local_size;
+         cs->g18_compute_resources.local_bytes =
+            MAX2(cs->g18_compute_resources.local_bytes, helper_local);
+         cs->g18_compute_resources.imageblock_stride =
+            MAX2(cs->g18_compute_resources.imageblock_stride,
+                 prog->info.imageblock_stride);
+         if (prod >= prev_prod) {
+            cs->g18_compute_resources.local_size[0] = prog->b.workgroup.x;
+            cs->g18_compute_resources.local_size[1] = prog->b.workgroup.y;
+            cs->g18_compute_resources.local_size[2] = prog->b.workgroup.z;
+         }
+      }
       hk_cmd_buffer_retain_bo(cmd, prog->bo);
       return;
    }
