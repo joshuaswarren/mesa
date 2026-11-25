@@ -3797,6 +3797,26 @@ agx_ra_mem_bound(agx_context *ctx)
                (unsigned)AGX_NUM_MODELED_REGS);
 }
 
+/* The register demand loop-invariant motion may raise a fitting program to
+ * (agx_opt_licm()). With a static register split that is the demand itself,
+ * so the occupancy step holds. Without one (AGX3B/AGX3C) there is no step to
+ * protect, but assignment still sizes its file from the demand rounded up to
+ * the file alignment, and that must fit max_possible_regs. A hoist may use
+ * only the halves below the next alignment boundary, which the file reserves
+ * anyway, so the aligned demand that assignment and the checks after it were
+ * sized for stays the same. A flat headroom past the boundary changed it and
+ * miscompiled programs near the top of the AGX3C file.
+ */
+unsigned
+agx_licm_demand_bound(agx_context *ctx, unsigned demand,
+                      unsigned max_possible_regs)
+{
+   if (agx_has_static_register_split(ctx))
+      return demand;
+
+   return MIN2(max_possible_regs, ALIGN_POT(demand, ra_file_alignment(ctx)));
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -3963,10 +3983,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* A program that fits can keep loop-invariant operands out of its loops,
     * as long as its demand, and so every decision below, stays the same and
-    * the registers assignment will use keep room for each loop's values. */
+    * the registers assignment will use keep room for each loop's values
+    * (agx_licm_demand_bound()). */
+   const unsigned licm_demand =
+      agx_licm_demand_bound(ctx, effective_demand, max_possible_regs);
    if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
-       agx_opt_licm(ctx, effective_demand,
-                    assignment_file(ctx, effective_demand,
+       agx_opt_licm(ctx, licm_demand,
+                    assignment_file(ctx, licm_demand,
                                     ra_file_alignment(ctx), max_possible_regs,
                                     force_spilling)))
       effective_demand = agx_calc_register_demand(ctx, false);
@@ -4014,10 +4037,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    const bool ssa_renumbered = spilling || remat;
    if (spilling || remat) {
-      assert((remat || ctx->key->has_scratch) &&
-             "internal shaders are unspillable");
+      if (!remat && !ctx->key->has_scratch) {
+         ctx->ra_failed = true;
+         return;
+      }
 
       agx_spill(ctx, max_possible_regs, remat);
+      if (ctx->ra_failed)
+         return;
 
       if (agx_is_g18g(&ctx->key->dev)) {
          /* Rematerialization changes instruction lifetimes. Measure the
@@ -4040,7 +4067,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             spilling = ctx->remat_fallback_spilled ||
                        effective_demand > max_possible_regs;
             if (effective_demand > max_possible_regs) {
+               if (!ctx->key->has_scratch) {
+                  ctx->ra_failed = true;
+                  return;
+               }
                agx_spill(ctx, max_possible_regs, false);
+               if (ctx->ra_failed)
+                  return;
                agx_compute_liveness(ctx);
                effective_demand = agx_calc_register_demand(ctx, false);
             }
@@ -4053,8 +4086,15 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             remat = false;
             spilling = true;
             agx_compute_liveness(ctx);
-            if (agx_calc_register_demand(ctx, false) > max_possible_regs)
+            if (agx_calc_register_demand(ctx, false) > max_possible_regs) {
+               if (!ctx->key->has_scratch) {
+                  ctx->ra_failed = true;
+                  return;
+               }
                agx_spill(ctx, max_possible_regs, false);
+               if (ctx->ra_failed)
+                  return;
+            }
          }
 
          /* After spilling, recalculate liveness and demand */

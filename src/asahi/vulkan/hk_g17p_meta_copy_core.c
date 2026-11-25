@@ -706,6 +706,33 @@ hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
 }
 
 bool
+hk_g17p_image_resolve_slice(enum agx_chip chip, VkImageType src_type,
+                            VkImageType dst_type, uint32_t src_layers,
+                            uint32_t dst_layers,
+                            const VkImageResolve2 *region, uint32_t slice,
+                            VkImageResolve2 *out)
+{
+   if (out)
+      *out = (VkImageResolve2){0};
+
+   if (!agx_chip_native_agx3(chip) || !region || !out ||
+       src_type != VK_IMAGE_TYPE_2D || dst_type != VK_IMAGE_TYPE_2D ||
+       src_layers == 0 || src_layers != dst_layers || slice >= src_layers ||
+       region->srcOffset.z != 0 || region->dstOffset.z != 0 ||
+       region->extent.depth != 1 ||
+       slice > UINT32_MAX - region->srcSubresource.baseArrayLayer ||
+       slice > UINT32_MAX - region->dstSubresource.baseArrayLayer)
+      return false;
+
+   *out = *region;
+   out->srcSubresource.baseArrayLayer += slice;
+   out->srcSubresource.layerCount = 1;
+   out->dstSubresource.baseArrayLayer += slice;
+   out->dstSubresource.layerCount = 1;
+   return true;
+}
+
+bool
 hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
                            struct hk_g17p_metadata_grid *grid)
 {
@@ -791,4 +818,83 @@ hk_agx3_compressed_buf2img_grid_init(
       .groups_y = (uint32_t)groups_y,
    };
    return true;
+}
+
+uint64_t
+hk_g17p_linear_tiled_slice_bytes(
+   const struct hk_g17p_linear_tiled_slice_copy *desc)
+{
+   if (!desc || !desc->src_tiled || !desc->dst_tiled || desc->src_compressed ||
+       desc->dst_compressed || desc->src_sparse || desc->dst_sparse)
+      return 0;
+
+   if (desc->src_type == VK_IMAGE_TYPE_3D || desc->dst_type == VK_IMAGE_TYPE_3D)
+      return 0;
+
+   if (desc->src_samples != desc->dst_samples || !desc->raw_block_size_B)
+      return 0;
+
+   if (!desc->src_tile_w_el || !desc->src_tile_h_el ||
+       desc->src_tile_w_el != desc->dst_tile_w_el ||
+       desc->src_tile_h_el != desc->dst_tile_h_el ||
+       !desc->src_tiles_per_row ||
+       desc->src_tiles_per_row != desc->dst_tiles_per_row)
+      return 0;
+
+   if (desc->plan.src_x_el || desc->plan.src_y_el || desc->plan.dst_x_el ||
+       desc->plan.dst_y_el || !desc->plan.width_el || !desc->plan.height_el ||
+       desc->plan.width_el != desc->src_w_el ||
+       desc->plan.width_el != desc->dst_w_el ||
+       desc->plan.height_el != desc->src_h_el ||
+       desc->plan.height_el != desc->dst_h_el)
+      return 0;
+
+   if (desc->src_level >= desc->src_levels ||
+       desc->dst_level >= desc->dst_levels)
+      return 0;
+
+   const uint64_t tile_bytes =
+      (uint64_t)desc->src_tile_w_el * desc->src_tile_h_el *
+      desc->raw_block_size_B;
+   const uint64_t tiles_y = DIV_ROUND_UP(desc->plan.height_el, desc->src_tile_h_el);
+   const uint64_t tiles = tiles_y * desc->src_tiles_per_row;
+   if (!tile_bytes || !tiles || tiles > UINT64_MAX / tile_bytes)
+      return 0;
+
+   const uint64_t slice_B = tiles * tile_bytes;
+   if ((slice_B & 15) != 0)
+      return 0;
+
+   const uint64_t uint4s = slice_B >> 4;
+   if (uint4s == 0 || uint4s > UINT32_MAX)
+      return 0;
+
+   const uint64_t groups_x = DIV_ROUND_UP(uint4s, 32);
+   if (desc->max_groups_x && groups_x > desc->max_groups_x)
+      return 0;
+
+   if (slice_B > desc->src_level_size_B || slice_B > desc->dst_level_size_B)
+      return 0;
+
+   return slice_B;
+}
+
+bool
+hk_g17p_linear_tiled_slice_addrs_valid(uint64_t dst_addr, uint64_t dst_off,
+                                       uint64_t dst_layout_size_B,
+                                       uint64_t src_addr, uint64_t src_off,
+                                       uint64_t src_layout_size_B,
+                                       uint64_t slice_B)
+{
+   if (!slice_B || (dst_addr & 15) != 0 || (src_addr & 15) != 0)
+      return false;
+
+   if (dst_off > dst_layout_size_B || slice_B > dst_layout_size_B - dst_off ||
+       src_off > src_layout_size_B || slice_B > src_layout_size_B - src_off)
+      return false;
+
+   if (dst_addr > UINT64_MAX - slice_B || src_addr > UINT64_MAX - slice_B)
+      return false;
+
+   return dst_addr + slice_B <= src_addr || src_addr + slice_B <= dst_addr;
 }

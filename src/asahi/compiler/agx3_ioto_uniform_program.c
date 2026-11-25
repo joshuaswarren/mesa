@@ -266,7 +266,6 @@ agx3_ioto_uniform_program_body_generate(
       if (!agx3_ioto_load_packer_init(&packer, chip))
          return false;
       packer.cprog_inputs = desc->preshader_inputs;
-      packer.gpu0_copy_wait = false;
       agx3_ioto_load_packer_ops(&packer, &ops);
    }
    uint32_t cprog_dest_half = 0;

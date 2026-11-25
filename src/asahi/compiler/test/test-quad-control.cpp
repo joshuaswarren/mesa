@@ -255,3 +255,96 @@ TEST(QuadControl, BallotFusionStaysWithinEncodingDomain)
       }
    }
 }
+
+TEST(QuadControl, CapabilityUnificationAcrossAGX3BAndAGX3C)
+{
+   EXPECT_TRUE(agx_chip_has_shader_quad_control(AGX_CHIP_G13G));
+   EXPECT_FALSE(agx_chip_agx3_shader_quad_control(AGX_CHIP_G13G));
+
+   const struct {
+      enum agx_chip chip;
+      enum agx_isa_encoding enc;
+      bool m5;
+   } agx3_chips[] = {
+      {AGX_CHIP_G15G, AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_CHIP_G16G, AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_CHIP_G17P, AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_CHIP_G17G, AGX_ISA_ENCODING_AGX3C, true},
+      {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C, true},
+      {AGX_CHIP_G17C, AGX_ISA_ENCODING_AGX3C, true},
+   };
+   for (const auto &c : agx3_chips) {
+      EXPECT_TRUE(agx_chip_agx3_shader_quad_control(c.chip));
+      EXPECT_TRUE(agx_chip_has_shader_quad_control(c.chip));
+   }
+   EXPECT_FALSE(agx_chip_agx3_shader_quad_control(AGX_CHIP_G18G));
+   EXPECT_FALSE(agx_chip_has_shader_quad_control(AGX_CHIP_G18G));
+
+   /* Explicit quad-control operations (including general icmp/fcmp quad votes
+    * that require the half-width ballot fusion guard) must compile and pack on
+    * both AGX3B (G15G/G16G/G17P) and AGX3C (M5). */
+   const struct {
+      enum agx_chip chip;
+      enum agx_isa_encoding enc;
+      bool m5;
+   } compile_targets[] = {
+      {AGX_CHIP_G15G, AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_CHIP_G16G, AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C, true},
+   };
+   for (const auto &t : compile_targets) {
+      for (unsigned op = 0; op < 6; ++op) {
+         SCOPED_TRACE(::testing::Message() << agx_chip_name(t.chip) << ":" << op);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "agx3 quad control");
+         b.shader->info.fs.require_full_quads = true;
+         b.shader->info.fs.quad_derivatives = true;
+         nir_def *lane = nir_load_subgroup_invocation(&b);
+         nir_def *value;
+         switch (op) {
+         case 0:
+            value = nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_ilt_imm(&b, lane, 5)));
+            break;
+         case 1:
+            value = nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 7)));
+            break;
+         case 2:
+            value = nir_b2i32(
+               &b, nir_quad_vote_any(
+                      &b, 1, nir_flt(&b, nir_u2f32(&b, lane), nir_imm_float(&b, 8.0f))));
+            break;
+         case 3:
+            value = nir_b2i32(
+               &b, nir_quad_vote_all(
+                      &b, 1, nir_ilt(&b, lane, agx_test_load_preamble(&b, 1, 32, 4))));
+            break;
+         case 4:
+            value = nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_imm_true(&b)));
+            break;
+         default:
+            value = nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_imm_false(&b)));
+            break;
+         }
+         store_result(&b, value);
+         if (t.m5)
+            agx_preprocess_nir_m5(b.shader);
+         else
+            agx_preprocess_nir_native(b.shader, t.chip);
+         nir_shader_gather_info(b.shader, b.impl);
+         agx_shader_key key = {};
+         key.dev.chip = t.chip;
+         key.dev.encoding = t.enc;
+         key.dev.shader_quad_control = agx_chip_agx3_shader_quad_control(t.chip);
+         key.no_preamble = true;
+         key.reserved_preamble = 8;
+         key.fs.nr_samples = 1;
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+         EXPECT_GT(part.info.main_size, 0u);
+         EXPECT_TRUE(part.info.needs_quad_derivatives);
+         EXPECT_TRUE(part.info.disable_tri_merging);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}

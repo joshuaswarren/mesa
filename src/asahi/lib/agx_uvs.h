@@ -30,6 +30,10 @@ enum uvs_group {
  * indeterminate order since we don't yet know the fragment shader interpolation
  * qualifiers.
  */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct agx_unlinked_uvs_layout {
    /* Bit i set <===> components[i] != 0 && i != POS && i != PSIZ. For fast
     * iteration of user varyings.
@@ -119,9 +123,13 @@ void agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
                              uint8_t sprite_coord_enable,
                              bool *generate_primitive_id);
 
-/* For a GPU whose varying table selects perspective-correct coefficients with
- * shade model 5, rewrite the smooth perspective bindings of a table that
- * agx_link_varyings_vs_fs() linked into out.
+/* For a GPU where agx_chip_uses_shade_model_5() holds (HAL300 M5/M6 family),
+ * rewrite the smooth perspective bindings of a table that
+ * agx_link_varyings_vs_fs() linked into out from shade model 7 to 5.
  */
 void agx_cf_bindings_select_perspective(void *out,
                                         const struct agx_varyings_fs *fs);
+
+#ifdef __cplusplus
+}
+#endif

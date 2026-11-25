@@ -872,6 +872,34 @@ TEST(M5NarrowBarriers, SingleSubgroupWorkgroup)
    }
 }
 
+/* SPIR-V often emits OpMemoryBarrier(Device, WorkgroupMemory) beside a
+ * workgroup control barrier. Shared memory is private to one workgroup, so
+ * a single-subgroup workgroup still narrows SCOPE_DEVICE to SCOPE_SUBGROUP
+ * when only nir_var_mem_shared is ordered, while keeping SCOPE_DEVICE when
+ * global memory is also ordered. */
+TEST(M5NarrowBarriers, SingleSubgroupDeviceScopeSharedOnly)
+{
+   for (unsigned width : {32u, 16u, 64u}) {
+      nir_builder b = compute_shader("narrow-device-shared");
+      b.shader->info.workgroup_size[0] = width;
+      nir_intrinsic_instr *shared_dev =
+         barrier_in(&b, nir_var_mem_shared, SCOPE_DEVICE);
+      nir_intrinsic_instr *global_dev =
+         barrier_in(&b, (nir_variable_mode)(nir_var_mem_shared | nir_var_mem_global),
+                    SCOPE_DEVICE);
+      const bool narrows = width <= 32;
+      EXPECT_EQ(agx_nir_narrow_single_subgroup_barriers(b.shader), narrows);
+      nir_validate_shader(b.shader, "narrow device shared barriers");
+      EXPECT_EQ(nir_intrinsic_execution_scope(shared_dev),
+                narrows ? SCOPE_SUBGROUP : SCOPE_WORKGROUP);
+      EXPECT_EQ(nir_intrinsic_memory_scope(shared_dev),
+                narrows ? SCOPE_SUBGROUP : SCOPE_DEVICE);
+      EXPECT_EQ(nir_intrinsic_execution_scope(global_dev), SCOPE_WORKGROUP);
+      EXPECT_EQ(nir_intrinsic_memory_scope(global_dev), SCOPE_DEVICE);
+      ralloc_free(b.shader);
+   }
+}
+
 /* Rotated loops for the exact-tail path; shape selects the live-outs. */
 enum tail_shape {
    TAIL_INVARIANT_FROM_OUTER_PHI, /* t = w * 3 in the loop, w an if/else phi */

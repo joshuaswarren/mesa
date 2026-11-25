@@ -4,6 +4,8 @@
  */
 
 #include "agx_pack.h"
+#include "agx_uvs.h"
+#include "asahi/compiler/agx_compile.h"
 #include "agx_vdm_mesh_core.h"
 #include <cstring>
 #include <array>
@@ -200,4 +202,30 @@ TEST(M5MeshTaskPayload, RejectsInvalidPayloadWithoutMutation)
       EXPECT_FALSE(agx_vdm_m5_mesh_set_task_payload(&info, bad));
       EXPECT_EQ(memcmp(&info, &before, sizeof(info)), 0);
    }
+}
+
+TEST(Packing, CfBindingsSelectPerspective)
+{
+   struct agx_varyings_fs fs = {};
+   fs.nr_bindings = 3;
+   fs.bindings[0] = { .cf_base = 0, .count = 4, .smooth = true, .perspective = true };
+   fs.bindings[1] = { .cf_base = 4, .count = 4, .smooth = true, .perspective = false };
+   fs.bindings[2] = { .cf_base = 8, .count = 4, .smooth = false, .perspective = false };
+
+   uint8_t buf[AGX_CF_BINDING_HEADER_LENGTH + 3 * AGX_CF_BINDING_LENGTH] = {};
+   struct agx_cf_binding_packed *packed =
+      (struct agx_cf_binding_packed *)(buf + AGX_CF_BINDING_HEADER_LENGTH);
+
+   packed[0].opaque[0] = (AGX_SHADE_MODEL_PERSPECTIVE << 2) | (0x123u << 5);
+   packed[1].opaque[0] = (AGX_SHADE_MODEL_LINEAR << 2) | (0x456u << 5);
+   packed[2].opaque[0] = (AGX_SHADE_MODEL_FLAT_VERTEX_0 << 2) | (0x789u << 5);
+
+   agx_cf_bindings_select_perspective(buf, &fs);
+
+   EXPECT_EQ((packed[0].opaque[0] >> 2) & 0x7u, 5u);
+   EXPECT_EQ(packed[0].opaque[0] & ~BITFIELD_RANGE(2, 3), 0x123u << 5);
+   EXPECT_EQ((packed[1].opaque[0] >> 2) & 0x7u, (unsigned)AGX_SHADE_MODEL_LINEAR);
+   EXPECT_EQ(packed[1].opaque[0] & ~BITFIELD_RANGE(2, 3), 0x456u << 5);
+   EXPECT_EQ((packed[2].opaque[0] >> 2) & 0x7u, (unsigned)AGX_SHADE_MODEL_FLAT_VERTEX_0);
+   EXPECT_EQ(packed[2].opaque[0] & ~BITFIELD_RANGE(2, 3), 0x789u << 5);
 }

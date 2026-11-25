@@ -425,6 +425,11 @@ agx_build_tilebuffer_layout_g18_mixed(const enum pipe_format *formats,
 /* The attachment mask of a layout built that way (zero otherwise). */
 unsigned
 agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib);
+/* The attachment mask of any G18 single-sample layout whose offsets, sample
+ * size and formats match the native-1130 layout, including uniform layouts
+ * owned by the word/raw32 paths. */
+unsigned
+agx_g18g_native_mixed_epilog_mask(const struct agx_tilebuffer_layout *tib);
 
 /* The IMGWBLK f29 tile class Apple's end of tile uses for a witnessed format:
  * 0 8-bit integer lanes, 1 16-bit lanes, 2 32-bit lanes, 3 tile bytes in the

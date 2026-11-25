@@ -207,6 +207,18 @@ bool hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
                               const VkImageBlit2 *region, uint32_t slice,
                               VkImageBlit2 *out);
 
+/* Convert one 2D array slice of a valid resolve region into a single-layer
+ * region. HAL200 writes compressed arrays one layer at a time (the BG/EOT
+ * contract is single-layer), and the generic vk_meta_resolve_image path
+ * otherwise reaches a compressed array through a layered render pass. The
+ * resolved source/destination layer counts must match, and the layer count
+ * must be at least one. */
+bool hk_g17p_image_resolve_slice(enum agx_chip chip, VkImageType src_type,
+                                 VkImageType dst_type, uint32_t src_layers,
+                                 uint32_t dst_layers,
+                                 const VkImageResolve2 *region, uint32_t slice,
+                                 VkImageResolve2 *out);
+
 /* One destination coordinate's exact G17P linear-filter footprint.  The low
  * half is the lower source coordinate and bits 16..23 are the Q8 upper-texel
  * weight.  A carried weight of 256 is normalized to the following source
@@ -292,3 +304,49 @@ bool hk_agx3_compressed_buf2img_grid_init(
    uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
    uint32_t max_groups_x, uint32_t max_groups_y,
    struct hk_agx3_compressed_buf2img_grid *grid);
+
+struct hk_g17p_linear_tiled_slice_copy {
+   bool src_tiled;
+   bool dst_tiled;
+   bool src_compressed;
+   bool dst_compressed;
+   bool src_sparse;
+   bool dst_sparse;
+   VkImageType src_type;
+   VkImageType dst_type;
+   VkSampleCountFlagBits src_samples;
+   VkSampleCountFlagBits dst_samples;
+   uint32_t src_w_el;
+   uint32_t src_h_el;
+   uint32_t dst_w_el;
+   uint32_t dst_h_el;
+   uint32_t src_tile_w_el;
+   uint32_t src_tile_h_el;
+   uint32_t dst_tile_w_el;
+   uint32_t dst_tile_h_el;
+   uint32_t src_tiles_per_row;
+   uint32_t dst_tiles_per_row;
+   uint32_t raw_block_size_B;
+   uint32_t src_level;
+   uint32_t src_levels;
+   uint32_t dst_level;
+   uint32_t dst_levels;
+   uint64_t src_level_size_B;
+   uint64_t dst_level_size_B;
+   uint32_t max_groups_x;
+   struct hk_g17p_image_copy_element_plan plan;
+};
+
+/* Return the 16-byte-aligned byte span for a full-slice GPU-tiled copy whose
+ * source and destination share identical tile geometry, or 0 when the copy
+ * must use element-wise Morton addressing. */
+uint64_t hk_g17p_linear_tiled_slice_bytes(
+   const struct hk_g17p_linear_tiled_slice_copy *desc);
+
+/* Whether one slice's GPU virtual address ranges are 16-byte aligned, within
+ * their owning layouts, and non-overlapping for a linear uint4 copy. */
+bool hk_g17p_linear_tiled_slice_addrs_valid(uint64_t dst_addr, uint64_t dst_off,
+                                            uint64_t dst_layout_size_B,
+                                            uint64_t src_addr, uint64_t src_off,
+                                            uint64_t src_layout_size_B,
+                                            uint64_t slice_B);

@@ -59,7 +59,7 @@ hk_compute_pair_fadd_copy4_match(const struct hk_compute_pair_dispatch *producer
        copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
        cp->src_start > UINT64_MAX - cp->bytes ||
        cp->dst_start > UINT64_MAX - cp->bytes ||
-       hk_dual_write_push_offset(producer->info.fadd_push_bytes) +
+       hk_dual_write_push_offset(producer->info.fadd.push_bytes) +
           sizeof(struct hk_dual_copy_push) > HK_MAX_PUSH_SIZE ||
        ((copy4->bindings[1].address + cp->dst_start) % 16) != 0 ||
        fp->src_start > UINT64_MAX - fp->bytes ||

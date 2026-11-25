@@ -39,6 +39,7 @@
 #include "hk_native_vertex_template.h"
 #include "hk_frame_anatomy.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -115,7 +116,6 @@
    (cmd->state.gfx.linked_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
 
 static void hk_flush_shaders(struct hk_cmd_buffer *cmd);
-static struct hk_shader *hk_bound_fs(struct hk_cmd_buffer *cmd);
 static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
@@ -332,8 +332,13 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
    const uint32_t occlusion_pending_query = gfx->occlusion.pending_query;
 
    memset(gfx, 0, sizeof(*gfx));
+   memset(&cmd->sync.xfer_clean, 0, sizeof(cmd->sync.xfer_clean));
    gfx->render = render_save;
    memcpy(gfx->descriptors.push, push, sizeof(push));
+   for (unsigned i = 0; i < HK_MAX_SETS; i++) {
+      if (gfx->descriptors.push[i])
+         hk_push_descriptor_set_reset_upload(gfx->descriptors.push[i]);
+   }
    gfx->descriptors.root.draw.pipeline_stats = pipeline_stats;
    gfx->descriptors.root.draw.pipeline_stats_flags = pipeline_stats_flags;
    gfx->descriptors.root.mesh_prims_query = mesh_prims_query;
@@ -425,21 +430,21 @@ hk_g17p_bg_eot_shader_supported(const struct agx_bg_eot_shader *shader)
 static struct hk_bg_eot
 hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
                            const struct agx_bg_eot_key *framebuffer_key,
-                           const VkRenderingInfo *info, bool store)
+                           const VkRenderingInfo *info, bool store,
+                           bool partial_render, bool incomplete_render_area)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
    struct agx_bg_eot_key key = *framebuffer_key;
    memset(key.tib.logical_format, 0, sizeof(key.tib.logical_format));
    memset(key.tib.spilled, 0, sizeof(key.tib.spilled));
    memset(key.tib._offset_B, 0, sizeof(key.tib._offset_B));
    memset(key.op, 0, sizeof(key.op));
    key.mixed_mrt = true;
-   /* Multisample targets are stored unresolved: a multi-target pass
-    * resolves afterwards, from the multisample images. */
-   key.multisample_store = store && key.tib.nr_samples > 1;
 
    const VkRenderingAttachmentInfo *atts[HK_MAX_RTS];
    struct hk_image_view *views[HK_MAX_RTS];
+   unsigned logical_rts[HK_MAX_RTS];
    static const enum agx_bg_eot_op order[] = {AGX_BG_LOAD, AGX_BG_CLEAR,
                                               AGX_EOT_STORE};
    unsigned count = 0, reloads = 0;
@@ -448,7 +453,7 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
          if (framebuffer_key->op[rt] != order[i])
             continue;
 
-         struct hk_image_view *view = cmd->state.gfx.render.color_att[rt].iview;
+         struct hk_image_view *view = render->color_att[rt].iview;
          if (count == ARRAY_SIZE(views) || rt >= info->colorAttachmentCount ||
              !view ||
              view->vk.image->samples != MAX2(key.tib.nr_samples, 1) ||
@@ -462,10 +467,71 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
          key.tib._offset_B[count] = framebuffer_key->tib._offset_B[rt];
          key.op[count] = order[i];
          atts[count] = &info->pColorAttachments[rt];
+         logical_rts[count] = rt;
          views[count++] = view;
          reloads += order[i] == AGX_BG_LOAD;
       }
    }
+
+   /* Resolve-only final EOTs on mixed/subset MRT passes (such as a 5-RT
+    * deferred local-read pass with 4 DONT_CARE G-buffers and 1 resolved color
+    * target) can resolve directly through single-sample PBE descriptors in EOT
+    * instead of storing unresolved MSAA samples and running a post-pass meta
+    * resolve. Partial renders and non-eligible passes keep unresolved MSAA
+    * stores. */
+   bool direct_resolve = false;
+   if (store && count > 0) {
+      struct hk_agx3_g17p_mixed_resolve_target resolve_targets[HK_MAX_RTS] = {0};
+      for (unsigned i = 0; i < count; ++i) {
+         const struct hk_image_view *resolve_view =
+            render->color_att[logical_rts[i]].resolve_iview;
+         const bool resolve_pbe_valid =
+            resolve_view && (key.tib.layered
+                                ? resolve_view->planes[0].layered_eot_pbe_valid
+                                : resolve_view->planes[0].eot_pbe_valid);
+         resolve_targets[i] = (struct hk_agx3_g17p_mixed_resolve_target){
+            .format = key.tib.logical_format[i],
+            .view_format = hk_format_to_pipe_format(views[i]->vk.format),
+            .has_resolve_target =
+               atts[i]->resolveImageView != VK_NULL_HANDLE &&
+               atts[i]->resolveMode != VK_RESOLVE_MODE_NONE &&
+               resolve_view != NULL,
+            .average_resolve =
+               atts[i]->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
+            .store_source = atts[i]->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            .resolve_pbe_valid = resolve_pbe_valid,
+            .resolve_format_matches =
+               resolve_view && resolve_view->vk.format == views[i]->vk.format,
+            .resolve_samples =
+               resolve_view ? resolve_view->vk.image->samples : 0,
+         };
+      }
+
+      const bool suspend_resume =
+         (render->flags &
+          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+      bool any_unstored_resolve = false;
+      unsigned color_and_resolve_views = 0;
+      for (unsigned rt = 0; rt < info->colorAttachmentCount; ++rt) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[rt];
+         if (att->imageView == VK_NULL_HANDLE)
+            continue;
+         if (rt < render->color_att_count) {
+            color_and_resolve_views += render->color_att[rt].iview != NULL;
+            color_and_resolve_views +=
+               render->color_att[rt].resolve_iview != NULL;
+         }
+         if (att->resolveMode != VK_RESOLVE_MODE_NONE &&
+             (rt >= HK_MAX_RTS || framebuffer_key->op[rt] != AGX_EOT_STORE))
+            any_unstored_resolve = true;
+      }
+
+      direct_resolve = hk_agx3_g17p_mixed_direct_color_resolve_supported(
+         &framebuffer_key->tib, resolve_targets, count, partial_render,
+         incomplete_render_area, suspend_resume, any_unstored_resolve,
+         color_and_resolve_views);
+   }
+   key.multisample_store = store && !direct_resolve && key.tib.nr_samples > 1;
 
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
@@ -564,14 +630,18 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
        */
       struct hk_native_pbe_descriptor pbe_arguments[HK_MAX_RTS] = {0};
       for (unsigned rt = 0; rt < count; ++rt) {
-         if (!(key.tib.layered ? views[rt]->planes[0].layered_eot_pbe_valid
-                               : views[rt]->planes[0].eot_pbe_valid)) {
+         struct hk_image_view *target =
+            direct_resolve ? render->color_att[logical_rts[rt]].resolve_iview
+                           : views[rt];
+         if (!target ||
+             !(key.tib.layered ? target->planes[0].layered_eot_pbe_valid
+                               : target->planes[0].eot_pbe_valid)) {
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FORMAT_NOT_SUPPORTED);
             return (struct hk_bg_eot){0};
          }
-         pbe_arguments[rt] = key.tib.layered ? views[rt]->planes[0].layered_eot
-                                             : views[rt]->planes[0].eot;
+         pbe_arguments[rt] = key.tib.layered ? target->planes[0].layered_eot
+                                             : target->planes[0].eot;
       }
 
       const uint64_t pbe_argument_va = hk_pool_upload(
@@ -678,6 +748,9 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
       hk_cmd_publish_ioto_program(cmd, &reservation, program_length);
    if (!published)
       return (struct hk_bg_eot){0};
+
+   if (direct_resolve)
+      render->g17p_direct_color_resolve = true;
 
    return (struct hk_bg_eot){
       .usc = published,
@@ -987,9 +1060,10 @@ hk_g17p_bg_eot_dev_find(struct hk_g17p_bg_eot_dev_cache *dc,
                    1)) == 0,
                  "power-of-two index");
    for (unsigned i = hash & mask;; i = (i + 1) & mask) {
-      if (!dc->index[i])
+      const uint16_t slot = __atomic_load_n(&dc->index[i], __ATOMIC_ACQUIRE);
+      if (!slot)
          return NULL;
-      struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[dc->index[i] - 1];
+      struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[slot - 1];
       if (e->hash == hash && !memcmp(&e->key, dk, sizeof(*dk)))
          return e;
    }
@@ -1012,7 +1086,7 @@ hk_g17p_bg_eot_dev_insert(struct hk_g17p_bg_eot_dev_cache *dc,
    e->hash = hash;
    e->valid_variants = 0;
    memset(e->program, 0, sizeof(e->program));
-   dc->index[i] = (uint16_t)(++dc->count);
+   __atomic_store_n(&dc->index[i], (uint16_t)(++dc->count), __ATOMIC_RELEASE);
    return e;
 }
 
@@ -1020,7 +1094,7 @@ static struct hk_bg_eot
 hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                      struct agx_bg_eot_key *key,
                      const VkRenderingInfo *info, bool store,
-                     bool partial_render,
+                     bool partial_render, bool incomplete_render_area,
                      struct hk_g17p_bg_eot_dev_cache *dc, bool *in_device)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1037,7 +1111,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       assert(!dc);
       if (dc)
          return (struct hk_bg_eot){0};
-      return hk_build_g17p_mixed_bg_eot(cmd, key, info, store);
+      return hk_build_g17p_mixed_bg_eot(cmd, key, info, store, partial_render,
+                                        incomplete_render_area);
    }
 
    /* Vulkan keeps unused colour attachments as holes in the logical array.
@@ -1064,20 +1139,35 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    compact_info.pColorAttachments = attachments;
    key = &compact_key;
    info = &compact_info;
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const bool r11g11b10_own_class = hk_eot_r11g11b10_own_class(&dev->dev);
+   const bool suspend_resume =
+      (render->flags &
+       (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+   /* Single-target direct resolve supports partial renderArea via
+    * preserve_resolve_outside, while refusing sparse multiview viewMask.
+    * Both are false whenever incomplete_render_area is false. */
+   const bool sparse_view_mask =
+      incomplete_render_area && render->view_mask &&
+      render->view_mask != BITFIELD64_MASK(render->cr.layers);
    if (!store && !partial_render && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
-      const struct hk_rendering_state *render = &cmd->state.gfx.render;
-      const bool partial_area = render->area.offset.x || render->area.offset.y ||
-         render->area.extent.width < render->cr.width ||
-         render->area.extent.height < render->cr.height;
+      const bool partial_area = incomplete_render_area &&
+         (render->area.offset.x || render->area.offset.y ||
+          render->area.extent.width < render->cr.width ||
+          render->area.extent.height < render->cr.height);
       /* The EOT resolve writes full tiles. Merge the destination outside the
-       * API rectangle before that store, retaining native MSAA resolution. */
-      key->preserve_resolve_outside = partial_area &&
+       * API rectangle before that store, retaining native MSAA resolution.
+       * Suspended/resumed passes and sparse multiview masks must not
+       * direct-resolve. */
+      key->preserve_resolve_outside = partial_area && !suspend_resume &&
+         !sparse_view_mask &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, active_count,
             att->resolveImageView != VK_NULL_HANDLE,
             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
-            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            r11g11b10_own_class);
    }
    if (!hk_agx3_g17p_rt0_tile_layout_supported(&key->tib)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1095,8 +1185,9 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
     * leave holes before the sole live color attachment; selecting from
     * logical slot0 and colorAttachmentCount before compaction loses its
     * STORE requirement and selects a single-sample EOT for an MS surface.
-    * Keep samples for partial renders, explicit STORE, and resolves that
-    * execute after the pass. Final direct resolves remain single-sampled. */
+    * Keep samples for partial renders, suspended/resumed passes, sparse
+    * multiview masks, explicit STORE, and resolves that execute after the
+    * pass. Final direct resolves remain single-sampled. */
    if (store && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
       const struct hk_image_view *iview = color_att[0].iview;
@@ -1104,9 +1195,11 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       const bool has_resolve = att->resolveImageView != VK_NULL_HANDLE &&
                                att->resolveMode != VK_RESOLVE_MODE_NONE;
       const bool resolved_after_pass = has_resolve &&
-         !hk_agx3_g17p_direct_color_resolve_supported(
-            &key->tib, active_count, has_resolve,
-            att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT, store_source);
+         (suspend_resume || sparse_view_mask ||
+          !hk_agx3_g17p_direct_color_resolve_supported(
+             &key->tib, active_count, has_resolve,
+             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT, store_source,
+             r11g11b10_own_class));
       key->multisample_store = hk_agx3_g17p_multisample_store_supported(
          &key->tib, active_count,
          partial_render || store_source || resolved_after_pass,
@@ -1131,7 +1224,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          .source_pbe_valid = iview && iview->planes[0].eot_pbe_valid,
          .resolve_pbe_valid = resolve && resolve->planes[0].eot_pbe_valid,
       };
-      key->store_and_resolve = key->multisample_store &&
+      key->store_and_resolve = key->multisample_store && !suspend_resume &&
+         !sparse_view_mask &&
          hk_agx3_g17p_store_and_resolve_supported(&key->tib, &fused);
    }
 
@@ -1311,12 +1405,13 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
        * which is what key->multisample_store selects below.
        */
       const bool direct_resolve =
-         !partial_render &&
+         !partial_render && !suspend_resume && !sparse_view_mask &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, info->colorAttachmentCount,
             att->resolveImageView != VK_NULL_HANDLE,
             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
-            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            r11g11b10_own_class);
       struct hk_image_view *target = direct_resolve
          ? color_att[0].resolve_iview : iview;
       struct hk_image_view *iview1 = dual_mrt_active
@@ -1393,8 +1488,10 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       struct hk_native_pbe_descriptor pbe_arguments[4] = {target_pbe};
       /* The native resolve averages in linear space when its PBE requests
        * the sRGB transfer. Ordinary stores already have encoded tile bytes
-       * and retain the unmodified end-of-tile descriptor. */
-      if (direct_resolve && util_format_is_srgb(key->tib.logical_format[0]) &&
+       * and retain the unmodified end-of-tile descriptor. Check the unmapped
+       * view format so this never depends on hk_eot_key_format(). */
+      if (direct_resolve &&
+          util_format_is_srgb(hk_format_to_pipe_format(iview->vk.format)) &&
           !(color_att[0].flags &
             VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
          ((uint8_t *)&pbe_arguments[0])[15] |= 0x20;
@@ -1683,6 +1780,7 @@ struct hk_g17p_bg_eot_cache_key {
    uint32_t layers;
    uint8_t color_attachment_count;
    bool incomplete_render_area;
+   bool suspend_resume;
 };
 
 static uint64_t
@@ -1720,6 +1818,9 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
       .layers = cmd->state.gfx.render.cr.layers,
       .color_attachment_count = info->colorAttachmentCount,
       .incomplete_render_area = incomplete_render_area,
+      .suspend_resume =
+         (cmd->state.gfx.render.flags &
+          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0,
    };
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
@@ -1770,24 +1871,41 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
    cmd->g17p_bg_eot_cache_used = true;
 
    /* frg-codegen v4 BG/EOT device cache: one value lookup per new
-    * pass. A hit fills every variant this recording will ask for; a miss
-    * attaches a fresh device entry that hk_build_bg_eot() fills. */
+    * pass. Entries are append-only and published with release ordering, so
+    * steady-state hits read without locking dc->lock; misses fall back to the
+    * lock to insert a fresh device entry that hk_build_bg_eot() fills. */
    struct hk_g17p_bg_eot_dev_cache *dc = dev->g17p_bg_eot_dev_cache;
    struct hk_g17p_bg_eot_dev_key dkey;
    if (dc && hk_g17p_bg_eot_dev_key_init(cmd, info, incomplete_render_area,
                                          &dkey)) {
       const uint64_t dhash = hk_g17p_bg_eot_dev_hash(&dkey);
-      simple_mtx_lock(&dc->lock);
       struct hk_g17p_bg_eot_dev_entry *de =
          hk_g17p_bg_eot_dev_find(dc, &dkey, dhash);
-      if (!de && !dc->full)
-         de = hk_g17p_bg_eot_dev_insert(dc, &dkey, dhash);
-      if (de) {
-         memcpy(cached->program, de->program, sizeof(cached->program));
-         cached->valid_variants = de->valid_variants;
+      if (likely(de != NULL)) {
+         const uint8_t valid =
+            __atomic_load_n(&de->valid_variants, __ATOMIC_ACQUIRE);
+         for (unsigned v = 0; v < ARRAY_SIZE(de->program); ++v) {
+            if (valid & BITFIELD_BIT(v))
+               cached->program[v] = de->program[v];
+         }
+         cached->valid_variants = valid;
+         cached->dev_entry = de;
+      } else {
+         simple_mtx_lock(&dc->lock);
+         de = hk_g17p_bg_eot_dev_find(dc, &dkey, dhash);
+         if (!de && !dc->full)
+            de = hk_g17p_bg_eot_dev_insert(dc, &dkey, dhash);
+         if (de) {
+            const uint8_t valid = de->valid_variants;
+            for (unsigned v = 0; v < ARRAY_SIZE(de->program); ++v) {
+               if (valid & BITFIELD_BIT(v))
+                  cached->program[v] = de->program[v];
+            }
+            cached->valid_variants = valid;
+         }
+         cached->dev_entry = de;
+         simple_mtx_unlock(&dc->lock);
       }
-      cached->dev_entry = de;
-      simple_mtx_unlock(&dc->lock);
    }
    return cached;
 }
@@ -2820,12 +2938,17 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                        HK_G17P_BG_EOT_DEV_DATA_MAX, 32)) {
             bool in_device = false;
             program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                           partial_render, dc, &in_device);
+                                           partial_render,
+                                           incomplete_render_area, dc,
+                                           &in_device);
             built = true;
             if (program.usc && in_device &&
                 !vk_command_buffer_has_error(&cmd->vk)) {
                de->program[variant] = program;
-               de->valid_variants |= BITFIELD_BIT(variant);
+               __atomic_store_n(
+                  &de->valid_variants,
+                  (uint8_t)(de->valid_variants | BITFIELD_BIT(variant)),
+                  __ATOMIC_RELEASE);
             }
          } else {
             dc->full = true;
@@ -2834,7 +2957,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       }
       if (!built)
          program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                        partial_render, NULL, NULL);
+                                        partial_render,
+                                        incomplete_render_area, NULL, NULL);
       if (cache && program.usc && !vk_command_buffer_has_error(&cmd->vk)) {
          cache->program[variant] = program;
          cache->valid_variants |= BITFIELD_BIT(variant);
@@ -3536,6 +3660,30 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
    const bool imageblock = agx_chip_native_imageblock(dev->dev.chip);
    const bool hal300 = agx_chip_hal300_path(dev->dev.chip);
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   if (dev->dev.chip == AGX_CHIP_G18G && samples == 1 && !layered) {
+      bool raw32 = true;
+      unsigned active = 0;
+      for (unsigned rt = 0; rt < count; ++rt) {
+         const enum pipe_format f = formats[rt];
+         if (f == PIPE_FORMAT_NONE)
+            continue;
+         raw32 &= f == PIPE_FORMAT_R32G32B32A32_FLOAT ||
+                  f == PIPE_FORMAT_R32G32B32A32_SINT ||
+                  f == PIPE_FORMAT_R32G32B32A32_UINT;
+         active++;
+      }
+      raw32 &= active >= 2 && active <= 8;
+      if (raw32) {
+         return agx_build_tilebuffer_layout_resident(
+            formats, count, samples, layered, 128, 131072, 1024, resident_mask);
+      }
+      const bool kernel_native_samples =
+         !!(dev->dev.params.features & DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES);
+      if (agx_g18g_native_mixed_tile_bytes(formats, count, samples, layered,
+                                           kernel_native_samples)) {
+         return agx_build_tilebuffer_layout_g18_mixed(formats, count);
+      }
+   }
    const uint8_t max_sample_size_B =
       m5 ? AGX_MAX_RENDER_TARGETS * 16 :
       hal300 ? (layered ? 32 : 64) :
@@ -3808,14 +3956,16 @@ hk_xfer_match_descriptors(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
  * noted transfer write, through the bound descriptors, vertex and index
  * buffers, [extra_lo, extra_hi) (indirect parameters) or the conditional
  * rendering predicate. Shader stores to transform feedback buffers are
- * matched against everything. */
-static void
+ * matched against everything. Non-static for unit tests (hk_cpu_upload_bench). */
+void
 hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
                         uint64_t extra_hi)
 {
    struct hk_sync_state *st = &cmd->sync;
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
-   struct hk_cs *best = NULL;
+   /* Transfers reachable via device addresses (including through push
+    * constants) must always be ordered before graphics. */
+   struct hk_cs *best = st->xfer_any;
 
    if (extra_lo < extra_hi)
       best = hk_sync_xfer_match(cmd, extra_lo, extra_hi, best);
@@ -3824,31 +3974,56 @@ hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
    if (gfx->xfb_enabled)
       best = hk_sync_xfer_match_all(cmd, best);
 
-   const bool clean =
-      st->xfer_clean.valid && st->xfer_clean.version == st->xfer_version &&
-      st->xfer_clean.descriptors == gfx->descriptors.generation &&
-      st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation &&
-      st->xfer_clean.index == gfx->index.buffer.addr;
+   const bool desc_clean =
+      st->xfer_clean.desc_valid &&
+      st->xfer_clean.desc_version == st->xfer_version &&
+      !gfx->descriptors.push_dirty &&
+      st->xfer_clean.descriptors == gfx->descriptors.non_push_generation;
+   if (!desc_clean) {
+      hk_upload_stat(cmd, xfer_desc_walks, 1);
+      struct hk_cs *desc_match = hk_xfer_match_descriptors(cmd, NULL);
+      st->xfer_clean.desc_valid =
+         desc_match == NULL && !gfx->descriptors.push_dirty;
+      st->xfer_clean.desc_version = st->xfer_version;
+      st->xfer_clean.descriptors = gfx->descriptors.non_push_generation;
+      best = hk_sync_later(best, desc_match);
+   }
 
-   if (!clean) {
-      struct hk_cs *state = hk_xfer_match_descriptors(cmd, NULL);
-      for (unsigned i = 0; i < ARRAY_SIZE(gfx->vb); ++i) {
-         if (gfx->vb[i].range)
-            state = hk_sync_xfer_match(cmd, gfx->vb[i].addr,
+   const bool vb_clean =
+      st->xfer_clean.vb_valid &&
+      st->xfer_clean.vb_version == st->xfer_version &&
+      st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation;
+   if (!vb_clean) {
+      struct hk_cs *vb_match = NULL;
+      u_foreach_bit(i, gfx->bound_vb_mask) {
+         assert(gfx->vb[i].range > 0);
+         vb_match = hk_sync_xfer_match(cmd, gfx->vb[i].addr,
                                        gfx->vb[i].addr + gfx->vb[i].range,
-                                       state);
+                                       vb_match);
       }
-      if (gfx->index.buffer.range)
-         state = hk_sync_xfer_match(
-            cmd, gfx->index.buffer.addr,
-            gfx->index.buffer.addr + gfx->index.buffer.range, state);
-
-      st->xfer_clean.valid = state == NULL;
-      st->xfer_clean.version = st->xfer_version;
-      st->xfer_clean.descriptors = gfx->descriptors.generation;
+      st->xfer_clean.vb_valid = vb_match == NULL;
+      st->xfer_clean.vb_version = st->xfer_version;
       st->xfer_clean.vertex_buffers = gfx->vertex_buffer_generation;
-      st->xfer_clean.index = gfx->index.buffer.addr;
-      best = hk_sync_later(best, state);
+      best = hk_sync_later(best, vb_match);
+   }
+
+   const bool index_clean =
+      st->xfer_clean.index_valid &&
+      st->xfer_clean.index_version == st->xfer_version &&
+      st->xfer_clean.index_addr == gfx->index.buffer.addr &&
+      st->xfer_clean.index_range == gfx->index.buffer.range;
+   if (!index_clean) {
+      struct hk_cs *index_match = NULL;
+      if (gfx->index.buffer.range) {
+         index_match = hk_sync_xfer_match(
+            cmd, gfx->index.buffer.addr,
+            gfx->index.buffer.addr + gfx->index.buffer.range, NULL);
+      }
+      st->xfer_clean.index_valid = index_match == NULL;
+      st->xfer_clean.index_version = st->xfer_version;
+      st->xfer_clean.index_addr = gfx->index.buffer.addr;
+      st->xfer_clean.index_range = gfx->index.buffer.range;
+      best = hk_sync_later(best, index_match);
    }
 
    if (best)
@@ -4528,16 +4703,16 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 }
 
 static bool
-hk_hal200_decompress_attachment(struct hk_cmd_buffer *cmd,
-                                struct hk_device *dev,
-                                const struct hk_rendering_state *render,
-                                const struct hk_image *image,
-                                struct ail_layout *layout,
-                                unsigned level, unsigned layer,
-                                uint32_t layer_count, uint64_t base,
-                                VkAttachmentLoadOp load_op,
-                                VkRenderingFlags rendering_flags,
-                                bool incomplete_render_area)
+hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
+                              struct hk_device *dev,
+                              const struct hk_rendering_state *render,
+                              const struct hk_image *image,
+                              struct ail_layout *layout,
+                              unsigned level, unsigned layer,
+                              uint32_t layer_count, uint64_t base,
+                              VkAttachmentLoadOp load_op,
+                              VkRenderingFlags rendering_flags,
+                              bool incomplete_render_area)
 {
    if (!hk_g17p_decompress_image_type_supported(image->vk.image_type))
       return false;
@@ -4799,7 +4974,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->tilebuffer = hk_tilebuffer_layout(
       dev, &render->color_att[0].vk_format, sizeof(render->color_att[0]),
       render->color_att_count, render->tilebuffer.nr_samples,
-      !agx_chip_native_or_m5(dev->dev.chip) ||
+      !agx_chip_agx3_path(dev->dev.chip) ||
          !hk_agx3_g17p_single_layer_rendering(render->view_mask, layer_count),
       g17p_wide_ms_to_memory, hk_resident_attachments(dev, render));
 
@@ -5253,13 +5428,24 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
 
-               if (agx_chip_native_hal200(dev->dev.chip)) {
-                  if (!hk_hal200_decompress_attachment(
+               /* Native HAL200 decompresses every spilled compressed colour
+                * attachment with libagx_agx3_decompress. Gen10 private
+                * compression (AGX_CAP_GEN10_2D_COMPRESSION) takes the same
+                * program, at its 16x8 metadata tile (ail_metadata_tile()), for
+                * the single-sample 16-byte targets an eight-target pass
+                * spills; 2x/4x RGBA16F takes libagx_m5_decompress_rgba16f
+                * below. */
+               if (agx_chip_native_hal200(dev->dev.chip) ||
+                   (agx_chip_has_cap(dev->dev.chip,
+                                     AGX_CAP_GEN10_2D_COMPRESSION) &&
+                    layout->sample_count_sa == 1 &&
+                    ail_get_blocksize_B(layout) == 16)) {
+                  if (!hk_agx3_decompress_attachment(
                          cmd, dev, render, image, layout, level, layer,
                          layer_count, base,
                          pRenderingInfo->pColorAttachments[i].loadOp,
                          pRenderingInfo->flags, incomplete_render_area)) {
-                     mesa_loge_once("HAL200: spilled render pass with a "
+                     mesa_loge_once("AGX3: spilled render pass with a "
                                     "compressed attachment (%s, %ux) is "
                                     "unsupported",
                                     util_format_short_name(layout->format),
@@ -5472,9 +5658,19 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       clear_draw_skips_zs = true;
    }
    /* Resolves of loaded samples write the destination even without geometry. */
-   const bool loaded_resolve =
-      render->g17p_direct_color_resolve &&
-      pRenderingInfo->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+   bool loaded_resolve = false;
+   if (render->g17p_direct_color_resolve) {
+      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att =
+            &pRenderingInfo->pColorAttachments[i];
+         if (att->imageView != VK_NULL_HANDLE &&
+             att->resolveMode != VK_RESOLVE_MODE_NONE &&
+             att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            loaded_resolve = true;
+            break;
+         }
+      }
+   }
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
    render->process_empty_tiles_without_z =
@@ -5498,7 +5694,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
        * RGBA8 3024x1964 target, for a clear of a small HUD rectangle. Only
        * a resolve of loaded samples (or Z/S clears left to ZLS when the clear
        * draw is colour-only) still writes its destination from empty tiles. */
-      if (agx_chip_native_or_m5(dev->dev.chip)) {
+      if (agx_chip_agx3_path(dev->dev.chip)) {
          render->process_empty_tiles_without_z =
             loaded_resolve || (clear_draw_skips_zs && resolved_clear_s);
          cs->cr.process_empty_tiles =
@@ -5982,21 +6178,6 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
    }
 }
 
-static struct hk_api_shader *
-hk_bound_fs_obj(struct hk_graphics_state *gfx)
-{
-   if (gfx->mesh_fs)
-      return gfx->mesh_fs;
-   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
-}
-
-static struct hk_shader *
-hk_bound_fs(struct hk_cmd_buffer *cmd)
-{
-   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
-                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
-}
-
 static uint64_t
 hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 {
@@ -6328,6 +6509,14 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                                     false /* restart */);
 }
 
+static struct hk_cs *
+hk_refresh_pre_gfx_cs(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G18G)
+      return cs;
+   return hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+}
+
 static __attribute__((hot)) struct agx_draw
 hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      struct agx_draw draw)
@@ -6403,7 +6592,10 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       grid_vs = agx_1d(gfx->tess.tes_direct_threads);
 
    /* Launch the vertex shader first */
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
    } else {
       hk_reserve_scratch(cmd, cs, vs);
@@ -6434,6 +6626,9 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* If we need counts, launch the count shader and prefix sum the results. */
       if (count_words) {
          perf_debug(dev, "Geometry shader count");
+         cs = hk_refresh_pre_gfx_cs(cmd, cs);
+         if (!cs)
+            return (struct agx_draw){0};
          hk_dispatch_with_local_size(cmd, cs, count, grid_gs, wg);
       }
 
@@ -6445,11 +6640,17 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       /* Transform feedback / query program */
       perf_debug(dev, "Transform feedback / geometry query");
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, pre_gs, agx_1d(1),
                                   agx_workgroup(1, 1, 1));
    }
 
    /* Pre-rast geometry shader */
+   cs = hk_refresh_pre_gfx_cs(cmd, cs);
+   if (!cs)
+      return (struct agx_draw){0};
    hk_dispatch_with_local_size(cmd, cs, main, grid_gs, wg);
 
    if (poly_gs_indexed(count->info.gs.shape)) {
@@ -6578,9 +6779,15 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (batch) {
       hk_launch_tess_batched(cmd, vs, tcs, grid_vs, grid_tcs, grid_tess, info,
                              state);
-   } else if (agx_chip_native_or_m5(dev->dev.chip)) {
+   } else if (agx_chip_agx3_path(dev->dev.chip)) {
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs,
                                   agx_workgroup(64, 1, 1));
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(
          cmd, cs, tcs, grid_tcs,
          agx_workgroup(tcs->info.tess.tcs_output_patch_size, 1, 1));
@@ -6827,6 +7034,10 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
 }
 
 static void build_g17p_fs_epilog(nir_builder *b, const void *key_);
+static void build_g18_msaa4_fs_epilog(nir_builder *b, const void *key_);
+static void build_g18_msaa4_fs_epilog_ex(nir_builder *b,
+                                         const struct agx_fs_epilog_key *key,
+                                         struct agx_fs_epilog_result *res);
 static void build_fs_prolog(nir_builder *b, const void *key);
 
 /* Prolog/epilog parts persist in the device's disk cache. The in-memory
@@ -6850,6 +7061,8 @@ hk_prolog_epilog_builder_id(hk_internal_builder_t builder)
       return 4;
    if (builder == agx_nir_fs_epilog)
       return 5;
+   if (builder == build_g18_msaa4_fs_epilog)
+      return 6;
    return 0;
 }
 
@@ -7007,6 +7220,9 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       agx_nir_fs_epilog_g17p_ex(
          &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
+   else if (builder == build_g18_msaa4_fs_epilog)
+      build_g18_msaa4_fs_epilog_ex(
+         &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
    else if (builder == agx_nir_fs_epilog)
       agx_nir_fs_epilog_ex(
          &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
@@ -7044,9 +7260,16 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       backend_key.g17p_emrt =
          ((const struct agx_fs_epilog_key *)key->key)->native_spills;
-   if (builder == build_g17p_fs_epilog ||
-       (agx_chip_g17_m5(dev->dev.chip) &&
-        builder == agx_nir_fs_epilog && nr_samples > 1)) {
+   if (agx_chip_has_cap(dev->dev.chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
+       (builder == agx_nir_fs_epilog || builder == build_g17p_fs_epilog ||
+        builder == build_g18_msaa4_fs_epilog))
+      backend_key.g18_native_mixed =
+         ((const struct agx_fs_epilog_key *)key->key)->g18_native_mixed;
+   if (builder == build_g18_msaa4_fs_epilog) {
+      NIR_PASS(_, b.shader, agx_nir_lower_g18_tile_samples, nr_samples);
+   } else if (builder == build_g17p_fs_epilog ||
+              (agx_chip_g17_m5(dev->dev.chip) &&
+               builder == agx_nir_fs_epilog && nr_samples > 1)) {
       /* Preprocessing can unroll any multisample epilog, not only eMRT.
        * Its induction masks then become literals. Materialize the native
        * coverage operands after that transformation, before binary packing. */
@@ -7149,6 +7372,17 @@ hk_get_prolog_epilog(struct hk_device *dev, void *data, size_t data_size,
    return part;
 }
 
+static void
+hk_linked_cache_insert(struct hk_shader *shader, const void *key_clone,
+                       struct hk_linked_shader *linked)
+{
+   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   if (!shader->linked.first) {
+      shader->linked.first_key = key_clone;
+      __atomic_store_n(&shader->linked.first, linked, __ATOMIC_RELEASE);
+   }
+}
+
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
                              struct hk_fast_link_key_vs *key)
@@ -7178,7 +7412,7 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
    linked->sw_indexing_hw_vs = key->prolog.hw && key->prolog.adjacency;
    linked->b.uses_base_param |= linked->sw_indexing;
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_linked_cache_insert(shader, key_clone, linked);
    return linked;
 }
 
@@ -7209,6 +7443,59 @@ static void
 build_g17p_fs_epilog(nir_builder *b, const void *key)
 {
    agx_nir_fs_epilog_g17p(b, key);
+}
+
+static void
+build_g18_msaa4_fs_epilog_ex(nir_builder *b,
+                             const struct agx_fs_epilog_key *key,
+                             struct agx_fs_epilog_result *res)
+{
+   if (key->link.sample_shading) {
+      struct agx_fs_epilog_key pixel = *key;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog_ex(b, &pixel, res);
+
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, key->link.loc_written,
+                                  key->link.size_32, key->link.colour_comps,
+                                  key->link.packed_colour);
+      NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
+      NIR_PASS(_, b->shader, agx_nir_unroll_g17p_samples_layout,
+               key->nr_samples, &layout);
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b->shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b->shader, nir_opt_algebraic);
+      } while (progress);
+      NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
+   } else {
+      agx_nir_fs_epilog_ex(b, key, res);
+      nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
+      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+         if (node->type == nir_cf_node_loop)
+            nir_cf_node_as_loop(node)->control = nir_loop_control_unroll;
+      }
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b->shader, nir_lower_vars_to_ssa);
+         NIR_PASS(progress, b->shader, nir_opt_copy_prop);
+         NIR_PASS(progress, b->shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b->shader, nir_opt_loop_unroll);
+         NIR_PASS(progress, b->shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b->shader, nir_opt_dce);
+      } while (progress);
+   }
+
+   NIR_PASS(_, b->shader, agx_nir_lower_g18_tile_samples, key->nr_samples);
+}
+
+static void
+build_g18_msaa4_fs_epilog(nir_builder *b, const void *key)
+{
+   build_g18_msaa4_fs_epilog_ex(b, key, NULL);
 }
 
 /*
@@ -8198,7 +8485,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    /* A G17P epilog selects each written target's pixel classes from its
     * position among all of the framebuffer's colour targets. */
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       struct agx_tilebuffer_layout tib =
          agx_fs_epilog_tilebuffer_layout(&key->epilog);
       for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
@@ -8236,8 +8523,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                key->epilog.blend_constant_base;
             mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
             mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
-            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
-                                    mono_linked);
+            hk_linked_cache_insert(shader, mono_key_clone, mono_linked);
             return mono_linked;
          }
          if (layout) {
@@ -8299,8 +8585,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
             mono_linked->partial_mrt_opaque_eligible =
                hk_fs_partial_mrt_opaque_eligible(
                   mono_linked, &mono_linked->partial_mrt_written_mask);
-            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
-                                    mono_linked);
+            hk_linked_cache_insert(shader, mono_key_clone, mono_linked);
             return mono_linked;
          }
          ralloc_free(mono_key_clone);
@@ -8312,16 +8597,21 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       return NULL;
    }
 
+   hk_internal_builder_t epilog_builder =
+      (agx_chip_native_agx3(dev->dev.chip) ||
+       (agx_chip_g17_m5(dev->dev.chip) &&
+        (key->epilog.link.sample_shading ||
+         key->epilog.native_spills)))
+         ? build_g17p_fs_epilog
+      : dev->dev.chip == AGX_CHIP_G18G &&
+            (key->epilog.nr_samples == 2 || key->epilog.nr_samples == 4)
+         ? build_g18_msaa4_fs_epilog
+         : agx_nir_fs_epilog;
    struct agx_shader_part *epilog =
       hk_get_prolog_epilog(dev, &key->epilog, sizeof(key->epilog),
-                           (agx_chip_native_agx3(dev->dev.chip) ||
-                            (agx_chip_g17_m5(dev->dev.chip) &&
-                             (key->epilog.link.sample_shading ||
-                              key->epilog.native_spills)))
-                              ? build_g17p_fs_epilog
-                              : agx_nir_fs_epilog,
+                           epilog_builder,
                            true, epilog_stop, 0, g17p_tile_partitions,
-                           agx_chip_native_or_m5(dev->dev.chip)
+                           agx_chip_agx3_path(dev->dev.chip)
                               ? key->epilog.nr_samples
                               : 0);
    if (!epilog) {
@@ -8367,7 +8657,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       hk_fs_partial_mrt_opaque_eligible(linked,
                                         &linked->partial_mrt_written_mask);
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_linked_cache_insert(shader, key_clone, linked);
    return linked;
 }
 
@@ -8378,6 +8668,16 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 static struct hk_linked_shader *
 hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
 {
+   struct hk_linked_shader *first =
+      __atomic_load_n(&shader->linked.first, __ATOMIC_ACQUIRE);
+   if (likely(first != NULL)) {
+      const size_t key_size = shader->info.stage == MESA_SHADER_VERTEX
+         ? sizeof(struct hk_fast_link_key_vs)
+         : sizeof(struct hk_fast_link_key_fs);
+      if (likely(memcmp(shader->linked.first_key, key, key_size) == 0))
+         return first;
+   }
+
    struct hk_linked_shader *linked;
    simple_mtx_lock(&shader->linked.lock);
 
@@ -9053,9 +9353,195 @@ hk_g17p_bind_tail_refused(unsigned line)
 }
 
 static bool
-hk_g17p_bind_tail_state_matches(
+hk_g17p_bind_tail_state_matches_impl(
    const struct hk_cmd_buffer *cmd,
-   const struct hk_g17p_prepared_bind_tail *prepared);
+   const struct hk_g17p_prepared_bind_tail *prepared, bool ignore_cull);
+
+static inline bool
+hk_g17p_front_face_ccw(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   bool front_face_ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
+       !gfx->shaders[MESA_SHADER_GEOMETRY]) {
+      front_face_ccw ^= gfx->tess.info.ccw;
+      front_face_ccw ^= dyn->ts.domain_origin ==
+                        VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+   }
+   return front_face_ccw;
+}
+
+static void
+hk_g17p_bind_tail_dyn_capture(const struct vk_dynamic_graphics_state *dyn,
+                              struct hk_g17p_bind_tail_dyn_state *out)
+{
+   const unsigned vp_count = MAX2(dyn->vp.viewport_count, 1);
+   assert(vp_count <= AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS);
+   assert(dyn->vp.scissor_count <= AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS);
+
+   if (likely(vp_count == 1)) {
+      out->viewports[0] = dyn->vp.viewports[0];
+   } else {
+      memcpy(out->viewports, dyn->vp.viewports, vp_count * sizeof(VkViewport));
+   }
+   if (likely(dyn->vp.scissor_count == 1)) {
+      out->scissors[0] = dyn->vp.scissors[0];
+   } else if (dyn->vp.scissor_count) {
+      memcpy(out->scissors, dyn->vp.scissors,
+             dyn->vp.scissor_count * sizeof(VkRect2D));
+   }
+   out->stencil_front = dyn->ds.stencil.front;
+   out->stencil_back = dyn->ds.stencil.back;
+   out->rasterization_stream = dyn->rs.rasterization_stream;
+   out->line_width_raw = fui(dyn->rs.line.width);
+   out->depth_bias_constant_raw = fui(dyn->rs.depth_bias.constant_factor);
+   out->depth_bias_clamp_raw = fui(dyn->rs.depth_bias.clamp);
+   out->depth_bias_slope_raw = fui(dyn->rs.depth_bias.slope_factor);
+   out->depth_bias_representation = dyn->rs.depth_bias.representation;
+   out->viewport_count = dyn->vp.viewport_count;
+   out->scissor_count = dyn->vp.scissor_count;
+   out->depth_clip_enable = dyn->rs.depth_clip_enable;
+   out->polygon_mode = dyn->rs.polygon_mode;
+   out->cull_mode = dyn->rs.cull_mode;
+   out->front_face = dyn->rs.front_face;
+   out->line_mode = dyn->rs.line.mode;
+   out->depth_compare_op = dyn->ds.depth.compare_op;
+   out->domain_origin = dyn->ts.domain_origin;
+   out->rasterization_samples = dyn->ms.rasterization_samples;
+   out->depth_clip_negative_one_to_one =
+      dyn->vp.depth_clip_negative_one_to_one;
+   out->rasterizer_discard_enable = dyn->rs.rasterizer_discard_enable;
+   out->depth_clamp_enable = dyn->rs.depth_clamp_enable;
+   out->depth_bias_enable = dyn->rs.depth_bias.enable;
+   out->depth_bias_exact = dyn->rs.depth_bias.exact;
+   out->depth_test_enable = dyn->ds.depth.test_enable;
+   out->depth_write_enable = dyn->ds.depth.write_enable;
+   out->depth_bounds_test_enable = dyn->ds.depth.bounds_test.enable;
+   out->stencil_test_enable = dyn->ds.stencil.test_enable;
+}
+
+static bool
+hk_g17p_bind_tail_viewport_dyn_matches(
+   const struct vk_dynamic_graphics_state *dyn,
+   const struct hk_g17p_bind_tail_dyn_state *snap)
+{
+   if (snap->viewport_count != dyn->vp.viewport_count ||
+       snap->scissor_count != dyn->vp.scissor_count ||
+       snap->depth_clip_negative_one_to_one !=
+          dyn->vp.depth_clip_negative_one_to_one ||
+       snap->depth_clamp_enable != dyn->rs.depth_clamp_enable ||
+       snap->depth_clip_enable != dyn->rs.depth_clip_enable ||
+       snap->depth_bias_enable != dyn->rs.depth_bias.enable)
+      return false;
+
+   if (dyn->rs.depth_bias.enable &&
+       (snap->depth_bias_exact != dyn->rs.depth_bias.exact ||
+        snap->depth_bias_representation != dyn->rs.depth_bias.representation ||
+        snap->depth_bias_constant_raw != fui(dyn->rs.depth_bias.constant_factor) ||
+        snap->depth_bias_clamp_raw != fui(dyn->rs.depth_bias.clamp) ||
+        snap->depth_bias_slope_raw != fui(dyn->rs.depth_bias.slope_factor)))
+      return false;
+
+   const unsigned vp_count = MAX2(dyn->vp.viewport_count, 1);
+   if (likely(vp_count == 1)) {
+      if (memcmp(&snap->viewports[0], &dyn->vp.viewports[0],
+                 sizeof(VkViewport)) != 0)
+         return false;
+   } else if (memcmp(snap->viewports, dyn->vp.viewports,
+                     vp_count * sizeof(VkViewport)) != 0) {
+      return false;
+   }
+
+   if (likely(dyn->vp.scissor_count == 1)) {
+      if (memcmp(&snap->scissors[0], &dyn->vp.scissors[0],
+                 sizeof(VkRect2D)) != 0)
+         return false;
+   } else if (dyn->vp.scissor_count &&
+              memcmp(snap->scissors, dyn->vp.scissors,
+                     dyn->vp.scissor_count * sizeof(VkRect2D)) != 0) {
+      return false;
+   }
+
+   return true;
+}
+
+static ATTRIBUTE_NOINLINE bool
+hk_g17p_bind_tail_dyn_matches_slow(
+   const struct vk_dynamic_graphics_state *dyn,
+   const struct hk_g17p_bind_tail_dyn_state *snap, bool ignore_cull)
+{
+   static_assert(sizeof(struct vk_stencil_test_face_state) == 7,
+                 "no padding in vk_stencil_test_face_state");
+
+   if (snap->rasterizer_discard_enable != dyn->rs.rasterizer_discard_enable ||
+       snap->rasterization_stream != dyn->rs.rasterization_stream ||
+       snap->polygon_mode != dyn->rs.polygon_mode ||
+       snap->line_mode != dyn->rs.line.mode ||
+       snap->line_width_raw != fui(dyn->rs.line.width) ||
+       snap->depth_test_enable != dyn->ds.depth.test_enable ||
+       snap->depth_write_enable != dyn->ds.depth.write_enable ||
+       snap->depth_compare_op != dyn->ds.depth.compare_op ||
+       snap->depth_bounds_test_enable != dyn->ds.depth.bounds_test.enable ||
+       snap->stencil_test_enable != dyn->ds.stencil.test_enable ||
+       snap->domain_origin != dyn->ts.domain_origin ||
+       snap->rasterization_samples != dyn->ms.rasterization_samples ||
+       memcmp(&snap->stencil_front, &dyn->ds.stencil.front,
+              sizeof(snap->stencil_front)) != 0 ||
+       memcmp(&snap->stencil_back, &dyn->ds.stencil.back,
+              sizeof(snap->stencil_back)) != 0)
+      return false;
+
+   if (!ignore_cull && (snap->cull_mode != dyn->rs.cull_mode ||
+                        snap->front_face != dyn->rs.front_face))
+      return false;
+
+   return hk_g17p_bind_tail_viewport_dyn_matches(dyn, snap);
+}
+
+static inline bool
+hk_g17p_bind_tail_dyn_matches_impl(
+   const struct vk_dynamic_graphics_state *dyn,
+   uint64_t prepared_dynamic_generation,
+   const struct hk_g17p_bind_tail_dyn_state *snap, bool ignore_cull)
+{
+   if (likely(prepared_dynamic_generation == dyn->generation))
+      return true;
+   return hk_g17p_bind_tail_dyn_matches_slow(dyn, snap, ignore_cull);
+}
+
+static bool
+hk_g17p_bind_tail_viewport_matches(
+   struct hk_cmd_buffer *cmd,
+   const struct hk_g17p_prepared_bind_tail *prepared)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   const struct hk_rendering_state *render = &gfx->render;
+
+   return prepared->render_color0 ==
+             (render->color_att_count == 1
+                 ? render->color_att[0].iview : NULL) &&
+          prepared->render_depth == render->depth_att.iview &&
+          prepared->render_stencil == render->stencil_att.iview &&
+          memcmp(&prepared->render_area, &render->area,
+                 sizeof(prepared->render_area)) == 0 &&
+          prepared->render_depth_format == render->depth_att.vk_format &&
+          prepared->render_width == render->cr.width &&
+          prepared->render_height == render->cr.height &&
+          prepared->render_layer_count == render->layer_count &&
+          prepared->render_view_mask == render->view_mask &&
+          prepared->render_color_count == render->color_att_count &&
+          prepared->render_samples == render->tilebuffer.nr_samples &&
+          prepared->rasterizer_discard == hk_rast_discard(cmd) &&
+          (prepared->object_type == AGX_OBJECT_TYPE_TRIANGLE) ==
+             (gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE) &&
+          (prepared->dynamic_generation == dyn->generation ||
+           hk_g17p_bind_tail_viewport_dyn_matches(dyn,
+                                                  &gfx->g17p_bind_tail_dyn));
+}
 
 static bool
 hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
@@ -9071,8 +9557,10 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
     * snapshot is overwritten below.  Invalidating it is sufficient on entry;
     * clearing the complete viewport arrays here made every rebuild pay for
     * unused viewport slots as well. */
-   if (prepared)
+   if (prepared) {
       prepared->valid = false;
+      prepared->fs_record_in_tail_valid = false;
+   }
 
    if (!agx_chip_native_agx3(dev->dev.chip) || !prepared)
       return hk_g17p_bind_tail_refused(__LINE__);
@@ -9097,15 +9585,14 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
        fragment_program >= (UINT64_C(1) << 48))
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   /* Every input below except the fragment stage program is identical to the
-    * last successful build: only the root, descriptor or vertex-buffer
-    * identity moved (a descriptor push or vertex-buffer bind), and those reach
-    * the tail only through fragment_program above.  Repack the fragment
-    * record into a copy of the last state block. */
+   /* Every input below except the fragment stage program (and optionally
+    * cull/front-face mode) is identical to the last successful build: copy the
+    * last state block and repack only the fragment record (and CULL record if
+    * cull/winding changed). */
    if (gfx->g17p_bind_tail_memo.valid &&
        gfx->g17p_bind_tail_memo.fs == fs &&
        gfx->g17p_bind_tail_memo.hw_vs == hk_bound_hw_vs(gfx) &&
-       hk_g17p_bind_tail_state_matches(cmd, prepared)) {
+       hk_g17p_bind_tail_state_matches_impl(cmd, prepared, true)) {
       struct agx_ppp_hal200_fragment_fields memo_fs_fields =
          gfx->g17p_bind_tail_memo.fs_fields;
       memo_fs_fields.stage_program = fragment_program;
@@ -9113,6 +9600,25 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       if (!agx_ppp_hal200_fragment_core_pack(dev->dev.chip, &memo_fs_fields,
                                              &memo_fs_record))
          return hk_g17p_bind_tail_refused(__LINE__);
+
+      uint32_t memo_cull_word = gfx->g17p_bind_tail_memo.cull_word;
+      if (!agx_ppp_hal200_cull_mode_pack(
+             dev->dev.chip, dyn->rs.cull_mode, hk_g17p_front_face_ccw(cmd),
+             memo_cull_word, &memo_cull_word))
+         return hk_g17p_bind_tail_refused(__LINE__);
+
+      struct agx_ppp_hal200_graphics_core memo_cull_record;
+      const bool cull_differs =
+         memo_cull_word != gfx->g17p_bind_tail_memo.cull_word;
+      if (cull_differs) {
+         const struct agx_ppp_hal200_graphics_fields memo_cull_fields = {
+            .words = {memo_cull_word},
+         };
+         if (!agx_ppp_hal200_graphics_core_pack(
+                dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_CULL, &memo_cull_fields,
+                &memo_cull_record))
+            return hk_g17p_bind_tail_refused(__LINE__);
+      }
 
       /* The tail's record pointers all name that block: move them to the
        * copy. */
@@ -9126,6 +9632,9 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       memcpy(memo_state.cpu, gfx->g17p_bind_tail_memo.state_cpu,
              memo_state_size);
       memcpy(memo_state.cpu, memo_fs_record.bytes, memo_fs_record.length);
+      if (cull_differs)
+         memcpy((uint8_t *)memo_state.cpu + 0x6c, memo_cull_record.bytes,
+                memo_cull_record.length);
 
       const uint32_t delta =
          (uint32_t)memo_state.gpu - gfx->g17p_bind_tail_memo.state_compact;
@@ -9137,17 +9646,29 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
          memcpy(offset, &value, sizeof(value));
       }
       gfx->g17p_bind_tail_memo.fs_fields.stage_program = fragment_program;
+      gfx->g17p_bind_tail_memo.cull_word = memo_cull_word;
       gfx->g17p_bind_tail_memo.state_cpu = memo_state.cpu;
       gfx->g17p_bind_tail_memo.state_compact = (uint32_t)memo_state.gpu;
 
       prepared->dynamic_generation = dyn->generation;
-      prepared->descriptor_generation = gfx->descriptors.generation;
+      gfx->g17p_bind_tail_dyn.cull_mode = dyn->rs.cull_mode;
+      gfx->g17p_bind_tail_dyn.front_face = dyn->rs.front_face;
+      prepared->cull_word = memo_cull_word;
+      prepared->descriptor_generation =
+         hk_root_push_only_dirty(&gfx->descriptors)
+            ? gfx->descriptors.uploaded_root_generation
+            : gfx->descriptors.generation;
+      prepared->non_push_descriptor_generation =
+         gfx->descriptors.non_push_generation;
       prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
       prepared->root = gfx->root;
       prepared->fragment_shader = fs;
       prepared->fragment_program = fragment_program;
-      prepared->fragment_dma_set_base = hk_g17p_dma_set_base(cmd, fs);
+      prepared->fragment_dma_set_index = hk_g17p_dma_set_index(fs);
+      prepared->fragment_dma_set_base =
+         hk_g17p_dma_set_base_from_index(cmd, prepared->fragment_dma_set_index);
       prepared->valid = true;
+      prepared->fs_record_in_tail_valid = true;
       return true;
    }
    /* The memo describes prepared, which the build below overwrites. */
@@ -9307,13 +9828,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    /* Software tessellation emits its own winding; fold the domain's
     * orientation into the front face as the common CULL packet does
     * (shader_object.misc.state.*.vert_tess_frag.cull.*). */
-   bool front_face_ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
-   if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
-       !gfx->shaders[MESA_SHADER_GEOMETRY]) {
-      front_face_ccw ^= gfx->tess.info.ccw;
-      front_face_ccw ^= dyn->ts.domain_origin ==
-                        VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
-   }
+   const bool front_face_ccw = hk_g17p_front_face_ccw(cmd);
    if (!agx_ppp_hal200_cull_mode_pack(
           dev->dev.chip, dyn->rs.cull_mode, front_face_ccw,
           cull_fields.words[0], &cull_fields.words[0]))
@@ -9327,8 +9842,9 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
           vk_rasterization_state_depth_clip_enable(&dyn->rs),
           cull_fields.words[0], &cull_fields.words[0]))
       return hk_g17p_bind_tail_refused(__LINE__);
+   const bool rasterizer_discard = hk_rast_discard(cmd);
    if (!agx_ppp_hal200_rasterizer_discard_pack(
-          dev->dev.chip, hk_rast_discard(cmd), secondary_fields.words[0],
+          dev->dev.chip, rasterizer_discard, secondary_fields.words[0],
           cull_fields.words[0], &secondary_fields.words[0],
           &cull_fields.words[0]))
       return hk_g17p_bind_tail_refused(__LINE__);
@@ -9354,114 +9870,139 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
                    (native_mesh_primitive_address_enabled ? UINT32_C(0x2000) : 0),
    };
 
-   /* Only the first viewport_count entries are written and read. */
+   /* When only material state (shaders, depth/stencil, blend, occlusion,
+    * cull) changed and every viewport/scissor/depth-bias/render-area input
+    * still matches the previous build, reuse its packed viewport payload,
+    * raster fragment-control base, and inline scissor/depth-bias records. */
+   const bool reuse_viewport =
+      gfx->g17p_bind_tail_memo.viewport_valid &&
+      gfx->g17p_bind_tail_memo.state_cpu &&
+      gfx->g17p_bind_tail_memo.viewport_length &&
+      hk_g17p_bind_tail_viewport_matches(cmd, prepared);
+   const uint8_t *cached_viewport_bytes =
+      reuse_viewport
+         ? gfx->g17p_bind_tail_memo.state_cpu + AGX_G17P_BIND_GROUP_BYTES
+         : NULL;
+   const size_t cached_viewport_length =
+      reuse_viewport ? gfx->g17p_bind_tail_memo.viewport_length : 0;
+
+   /* Only the first viewport_count entries are written and read when
+    * !reuse_viewport. */
    struct agx_ppp_viewport_payload_fields viewport_fields;
-   viewport_fields.viewport_count = viewport_count;
-   viewport_fields.viewport_control_raw = 0;
    unsigned minx[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
    unsigned miny[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
    unsigned maxx[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
    unsigned maxy[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      const VkViewport *vp = &dyn->vp.viewports[i];
-      minx[i] = MIN2(vp->x, vp->x + vp->width);
-      miny[i] = MIN2(vp->y, vp->y + vp->height);
-      maxx[i] = MAX2(vp->x, vp->x + vp->width);
-      maxy[i] = MAX2(vp->y, vp->y + vp->height);
-      minx[i] = MIN2(minx[i], render->cr.width);
-      miny[i] = MIN2(miny[i], render->cr.height);
-      maxx[i] = MIN2(maxx[i], render->cr.width);
-      maxy[i] = MIN2(maxy[i], render->cr.height);
-      if (i < dyn->vp.scissor_count) {
-         const VkRect2D *s = &dyn->vp.scissors[i];
-         minx[i] = MAX2(minx[i], s->offset.x);
-         miny[i] = MAX2(miny[i], s->offset.y);
-         maxx[i] = MIN2(maxx[i], s->offset.x + s->extent.width);
-         maxy[i] = MIN2(maxy[i], s->offset.y + s->extent.height);
-      }
-   }
-
-   const VkViewport *vp = &dyn->vp.viewports[0];
-   const struct hk_image_view *color = render->color_att_count == 1
-                                         ? render->color_att[0].iview : NULL;
-   const VkRect2D api_scissor = dyn->vp.scissor_count
-                                  ? dyn->vp.scissors[0] : (VkRect2D){0};
-   const struct hk_g17p_full_frame_scissor full_frame = {
-      .width = render->cr.width,
-      .height = render->cr.height,
-      .area_x = render->area.offset.x,
-      .area_y = render->area.offset.y,
-      .area_width = render->area.extent.width,
-      .area_height = render->area.extent.height,
-      .scissor_x = api_scissor.offset.x,
-      .scissor_y = api_scissor.offset.y,
-      .scissor_width = api_scissor.extent.width,
-      .scissor_height = api_scissor.extent.height,
-      .viewport_x = vp->x,
-      .viewport_y = vp->y,
-      .viewport_width = vp->width,
-      .viewport_height = vp->height,
-      .min_depth = vp->minDepth,
-      .max_depth = vp->maxDepth,
-      .viewport_count = dyn->vp.viewport_count,
-      .scissor_count = dyn->vp.scissor_count,
-      .single_color_layer_sample =
-         color && !render->depth_att.iview && !render->stencil_att.iview &&
-         render->layer_count == 1 && !render->view_mask &&
-         render->tilebuffer.nr_samples == 1 &&
-         u_minify(color->vk.image->extent.width, color->vk.base_mip_level) ==
-            render->cr.width &&
-         u_minify(color->vk.image->extent.height, color->vk.base_mip_level) ==
-            render->cr.height,
-      .default_depth =
-         vk_rasterization_state_depth_clip_enable(&dyn->rs) &&
-         !dyn->rs.depth_clamp_enable && !dyn->vp.depth_clip_negative_one_to_one &&
-         !dyn->rs.depth_bias.enable && !hk_rast_discard(cmd),
-   };
-   const bool scissor_enable = dyn->vp.viewport_count > 0 &&
-                              !hk_g17p_full_frame_scissor_can_elide(&full_frame);
-   const bool depth_bias_enable =
-      dyn->rs.depth_bias.enable &&
-      gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE;
-   const bool exact = dyn->rs.depth_bias.exact;
-   const bool force_unorm =
-      dyn->rs.depth_bias.representation ==
-      VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
-   const float depth_bias =
-      depth_bias_enable
-         ? dyn->rs.depth_bias.constant_factor /
-              hk_depth_bias_factor(render->depth_att.vk_format, exact,
-                                   force_unorm)
-         : 0.0f;
    struct agx_ppp_hal200_raster_state
       raster_states[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      const VkViewport *current_vp = &dyn->vp.viewports[i];
-      const float min_z = dyn->rs.depth_clamp_enable
-                             ? MIN2(current_vp->minDepth, current_vp->maxDepth)
-                             : 0.0f;
-      const float max_z = dyn->rs.depth_clamp_enable
-                             ? MAX2(current_vp->minDepth, current_vp->maxDepth)
-                             : 1.0f;
-      const struct agx_ppp_hal200_raster_fields raster_fields = {
-         .scissor_enable = scissor_enable,
-         .depth_bias_enable = depth_bias_enable,
-         .max_x = MIN2(maxx[i], UINT16_MAX),
-         .min_x = MIN2(minx[i], UINT16_MAX),
-         .max_y = MIN2(maxy[i], UINT16_MAX),
-         .min_y = MIN2(miny[i], UINT16_MAX),
-         .min_z_raw = fui(min_z),
-         .max_z_raw = fui(max_z),
-         .depth_bias_raw = fui(depth_bias),
-         .slope_scale_raw =
-            depth_bias_enable ? fui(dyn->rs.depth_bias.slope_factor) : 0,
-         .clamp_raw = depth_bias_enable ? fui(dyn->rs.depth_bias.clamp) : 0,
+   uint32_t raster_fragment_control;
+
+   if (reuse_viewport) {
+      raster_fragment_control =
+         gfx->g17p_bind_tail_memo.raster_fragment_control;
+   } else {
+      viewport_fields.viewport_count = viewport_count;
+      viewport_fields.viewport_control_raw = 0;
+      for (unsigned i = 0; i < viewport_count; ++i) {
+         const VkViewport *vp = &dyn->vp.viewports[i];
+         minx[i] = MIN2(vp->x, vp->x + vp->width);
+         miny[i] = MIN2(vp->y, vp->y + vp->height);
+         maxx[i] = MAX2(vp->x, vp->x + vp->width);
+         maxy[i] = MAX2(vp->y, vp->y + vp->height);
+         minx[i] = MIN2(minx[i], render->cr.width);
+         miny[i] = MIN2(miny[i], render->cr.height);
+         maxx[i] = MIN2(maxx[i], render->cr.width);
+         maxy[i] = MIN2(maxy[i], render->cr.height);
+         if (i < dyn->vp.scissor_count) {
+            const VkRect2D *s = &dyn->vp.scissors[i];
+            minx[i] = MAX2(minx[i], s->offset.x);
+            miny[i] = MAX2(miny[i], s->offset.y);
+            maxx[i] = MIN2(maxx[i], s->offset.x + s->extent.width);
+            maxy[i] = MIN2(maxy[i], s->offset.y + s->extent.height);
+         }
+      }
+
+      const VkViewport *vp = &dyn->vp.viewports[0];
+      const struct hk_image_view *color = render->color_att_count == 1
+                                            ? render->color_att[0].iview : NULL;
+      const VkRect2D api_scissor = dyn->vp.scissor_count
+                                     ? dyn->vp.scissors[0] : (VkRect2D){0};
+      const struct hk_g17p_full_frame_scissor full_frame = {
+         .width = render->cr.width,
+         .height = render->cr.height,
+         .area_x = render->area.offset.x,
+         .area_y = render->area.offset.y,
+         .area_width = render->area.extent.width,
+         .area_height = render->area.extent.height,
+         .scissor_x = api_scissor.offset.x,
+         .scissor_y = api_scissor.offset.y,
+         .scissor_width = api_scissor.extent.width,
+         .scissor_height = api_scissor.extent.height,
+         .viewport_x = vp->x,
+         .viewport_y = vp->y,
+         .viewport_width = vp->width,
+         .viewport_height = vp->height,
+         .min_depth = vp->minDepth,
+         .max_depth = vp->maxDepth,
+         .viewport_count = dyn->vp.viewport_count,
+         .scissor_count = dyn->vp.scissor_count,
+         .single_color_layer_sample =
+            color && !render->depth_att.iview && !render->stencil_att.iview &&
+            render->layer_count == 1 && !render->view_mask &&
+            render->tilebuffer.nr_samples == 1 &&
+            u_minify(color->vk.image->extent.width, color->vk.base_mip_level) ==
+               render->cr.width &&
+            u_minify(color->vk.image->extent.height, color->vk.base_mip_level) ==
+               render->cr.height,
+         .default_depth =
+            vk_rasterization_state_depth_clip_enable(&dyn->rs) &&
+            !dyn->rs.depth_clamp_enable &&
+            !dyn->vp.depth_clip_negative_one_to_one &&
+            !dyn->rs.depth_bias.enable && !rasterizer_discard,
       };
-      if (!agx_ppp_hal200_raster_state_build(
-             dev->dev.chip, &raster_fields, &raster_states[i]))
-         return hk_g17p_bind_tail_refused(__LINE__);
+      const bool scissor_enable = dyn->vp.viewport_count > 0 &&
+                                 !hk_g17p_full_frame_scissor_can_elide(&full_frame);
+      const bool depth_bias_enable =
+         dyn->rs.depth_bias.enable &&
+         gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE;
+      const bool exact = dyn->rs.depth_bias.exact;
+      const bool force_unorm =
+         dyn->rs.depth_bias.representation ==
+         VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+      const float depth_bias =
+         depth_bias_enable
+            ? dyn->rs.depth_bias.constant_factor /
+                 hk_depth_bias_factor(render->depth_att.vk_format, exact,
+                                      force_unorm)
+            : 0.0f;
+      for (unsigned i = 0; i < viewport_count; ++i) {
+         const VkViewport *current_vp = &dyn->vp.viewports[i];
+         const float min_z = dyn->rs.depth_clamp_enable
+                                ? MIN2(current_vp->minDepth, current_vp->maxDepth)
+                                : 0.0f;
+         const float max_z = dyn->rs.depth_clamp_enable
+                                ? MAX2(current_vp->minDepth, current_vp->maxDepth)
+                                : 1.0f;
+         const struct agx_ppp_hal200_raster_fields raster_fields = {
+            .scissor_enable = scissor_enable,
+            .depth_bias_enable = depth_bias_enable,
+            .max_x = MIN2(maxx[i], UINT16_MAX),
+            .min_x = MIN2(minx[i], UINT16_MAX),
+            .max_y = MIN2(maxy[i], UINT16_MAX),
+            .min_y = MIN2(miny[i], UINT16_MAX),
+            .min_z_raw = fui(min_z),
+            .max_z_raw = fui(max_z),
+            .depth_bias_raw = fui(depth_bias),
+            .slope_scale_raw =
+               depth_bias_enable ? fui(dyn->rs.depth_bias.slope_factor) : 0,
+            .clamp_raw = depth_bias_enable ? fui(dyn->rs.depth_bias.clamp) : 0,
+         };
+         if (!agx_ppp_hal200_raster_state_build(
+                dev->dev.chip, &raster_fields, &raster_states[i]))
+            return hk_g17p_bind_tail_refused(__LINE__);
+      }
+      raster_fragment_control = raster_states[0].fragment_control;
    }
-   const struct agx_ppp_hal200_raster_state *raster_state = &raster_states[0];
 
    /* The pass type goes in SECONDARY header 0x02000048's first payload word,
     * within the 0xe6600000 field mask and ORed with 0x200. It is not the
@@ -9496,7 +10037,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    const uint32_t linked_fragment_control = fc_packed.opaque[0];
    /* Native458934..45896c retains both stencil-control bits in the
     * same per-draw record as depth. No extra state allocation or launch. */
-   uint32_t fragment_control = raster_state->fragment_control |
+   uint32_t fragment_control = raster_fragment_control |
       (stencil_test ? UINT32_C(0x000c0000) : 0);
    const struct agx_ppp_hal200_fragment_control_fields control_fields = {
       .linked_control = linked_fragment_control,
@@ -9591,15 +10132,18 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
                                          &w_cull2_record))
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      static_assert(sizeof(prepared->scissors[i]) ==
-                    sizeof(raster_states[i].scissor));
-      static_assert(sizeof(prepared->depth_bias[i]) ==
-                    sizeof(raster_states[i].depth_bias));
-      memcpy(prepared->scissors[i], raster_states[i].scissor,
-             sizeof(prepared->scissors[i]));
-      memcpy(prepared->depth_bias[i], raster_states[i].depth_bias,
-             sizeof(prepared->depth_bias[i]));
+   if (!reuse_viewport) {
+      gfx->g17p_bind_tail_memo.viewport_valid = false;
+      for (unsigned i = 0; i < viewport_count; ++i) {
+         static_assert(sizeof(prepared->scissors[i]) ==
+                       sizeof(raster_states[i].scissor));
+         static_assert(sizeof(prepared->depth_bias[i]) ==
+                       sizeof(raster_states[i].depth_bias));
+         memcpy(prepared->scissors[i], raster_states[i].scissor,
+                sizeof(prepared->scissors[i]));
+         memcpy(prepared->depth_bias[i], raster_states[i].depth_bias,
+                sizeof(prepared->depth_bias[i]));
+      }
    }
 
    /* Preserve the physical +0x00..+0x73 layout from Metal.  The complete
@@ -9618,44 +10162,53 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    memcpy(&bind_group[0x60], w_cull2_record.bytes, w_cull2_record.length);
    memcpy(&bind_group[0x6c], cull_record.bytes, cull_record.length);
 
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      uint8_t region_clip[AGX_REGION_CLIP_LENGTH];
-      agx_pack(region_clip, REGION_CLIP, cfg) {
-         cfg.enable = true;
-         cfg.min_x = minx[i] / 32;
-         cfg.min_y = miny[i] / 32;
-         cfg.max_x = DIV_ROUND_UP(MAX2(maxx[i], 1), 32);
-         cfg.max_y = DIV_ROUND_UP(MAX2(maxy[i], 1), 32);
-      }
-      memcpy(&viewport_fields.region_clip_raw[i], region_clip,
-             sizeof(region_clip));
-      const VkViewport *current_vp = &dyn->vp.viewports[i];
-      viewport_fields.viewports[i] =
-         (struct agx_ppp_viewport_transform_raw){
-            .translate_x = fui(current_vp->x + 0.5f * current_vp->width),
-            .scale_x = fui(current_vp->width * 0.5f),
-            .translate_y = fui(current_vp->y + 0.5f * current_vp->height),
-            .scale_y = fui(current_vp->height * 0.5f),
-            .translate_z = fui(current_vp->minDepth),
-            .scale_z = fui(current_vp->maxDepth - current_vp->minDepth),
-         };
-   }
-
    struct agx_ppp_viewport_payload_core viewport_record;
-   if (!agx_ppp_viewport_payload_core_pack(dev->dev.chip, &viewport_fields,
-                                            &viewport_record))
-      return hk_g17p_bind_tail_refused(__LINE__);
+   const uint8_t *viewport_bytes;
+   size_t viewport_length;
+   if (reuse_viewport) {
+      viewport_bytes = cached_viewport_bytes;
+      viewport_length = cached_viewport_length;
+   } else {
+      for (unsigned i = 0; i < viewport_count; ++i) {
+         uint8_t region_clip[AGX_REGION_CLIP_LENGTH];
+         agx_pack(region_clip, REGION_CLIP, cfg) {
+            cfg.enable = true;
+            cfg.min_x = minx[i] / 32;
+            cfg.min_y = miny[i] / 32;
+            cfg.max_x = DIV_ROUND_UP(MAX2(maxx[i], 1), 32);
+            cfg.max_y = DIV_ROUND_UP(MAX2(maxy[i], 1), 32);
+         }
+         memcpy(&viewport_fields.region_clip_raw[i], region_clip,
+                sizeof(region_clip));
+         const VkViewport *current_vp = &dyn->vp.viewports[i];
+         viewport_fields.viewports[i] =
+            (struct agx_ppp_viewport_transform_raw){
+               .translate_x = fui(current_vp->x + 0.5f * current_vp->width),
+               .scale_x = fui(current_vp->width * 0.5f),
+               .translate_y = fui(current_vp->y + 0.5f * current_vp->height),
+               .scale_y = fui(current_vp->height * 0.5f),
+               .translate_z = fui(current_vp->minDepth),
+               .scale_z = fui(current_vp->maxDepth - current_vp->minDepth),
+            };
+      }
+
+      if (!agx_ppp_viewport_payload_core_pack(dev->dev.chip, &viewport_fields,
+                                              &viewport_record))
+         return hk_g17p_bind_tail_refused(__LINE__);
+      viewport_bytes = viewport_record.bytes;
+      viewport_length = viewport_record.length;
+   }
 
    /* A VDM fetch happens after recording. Never point earlier draws at a
     * device-global record that another draw/CB can overwrite. This upload
     * and its architectural low alias live until command-buffer reset. */
-   const size_t state_size = agx_g17p_bind_state_size(viewport_record.length);
+   const size_t state_size = agx_g17p_bind_state_size(viewport_length);
    struct agx_ptr state = hk_pool_vdm_alloc(cmd, state_size, 64);
    struct hk_g17p_bind_state_upload uploaded;
    if (!state_size || !state.cpu ||
        !hk_g17p_upload_bind_state(state.cpu, state_size, state.gpu,
-                                  bind_group, viewport_record.bytes,
-                                  viewport_record.length,
+                                  bind_group, viewport_bytes,
+                                  viewport_length,
                                   gfx->linked_varyings.counts_32.opaque[0],
                                   gfx->linked_varyings.counts_16.opaque[0],
                                   &uploaded))
@@ -9665,19 +10218,30 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    gfx->g17p_bind_tail_memo.state_cpu = state.cpu;
    gfx->g17p_bind_tail_memo.state_compact = (uint32_t)state.gpu;
    gfx->g17p_bind_tail_memo.state_size = state_size;
+   hk_g17p_bind_tail_dyn_capture(dyn, &gfx->g17p_bind_tail_dyn);
+   cmd->g17p_gfx_caches_used = true;
    prepared->dynamic_generation = dyn->generation;
-   prepared->descriptor_generation = gfx->descriptors.generation;
+   prepared->descriptor_generation =
+      hk_root_push_only_dirty(&gfx->descriptors)
+         ? gfx->descriptors.uploaded_root_generation
+         : gfx->descriptors.generation;
+   prepared->non_push_descriptor_generation =
+      gfx->descriptors.non_push_generation;
    prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
    prepared->root = gfx->root;
    prepared->fragment_shader = fs;
    prepared->fragment_program = fragment_program;
-   prepared->fragment_dma_set_base = hk_g17p_dma_set_base(cmd, fs);
+   prepared->fragment_dma_set_index = hk_g17p_dma_set_index(fs);
+   prepared->fragment_dma_set_base =
+      hk_g17p_dma_set_base_from_index(cmd, prepared->fragment_dma_set_index);
+   prepared->cull_word = cull_fields.words[0];
    prepared->render_color0 = render->color_att_count == 1
       ? render->color_att[0].iview : NULL;
    prepared->render_depth = render->depth_att.iview;
    prepared->render_stencil = render->stencil_att.iview;
    prepared->render_area = render->area;
    prepared->render_depth_format = render->depth_att.vk_format;
+   prepared->render_stencil_format = render->stencil_att.vk_format;
    prepared->render_width = render->cr.width;
    prepared->render_height = render->cr.height;
    prepared->render_layer_count = render->layer_count;
@@ -9700,30 +10264,39 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    prepared->generate_primitive_id = gfx->generate_primitive_id;
    prepared->force_never_in_shader =
       gfx->descriptors.root.draw.force_never_in_shader;
+   prepared->rasterizer_discard = rasterizer_discard;
    prepared->in_meta = cmd->in_meta;
    prepared->valid = true;
+   prepared->fs_record_in_tail_valid = true;
 
    gfx->g17p_bind_tail_memo.fs_fields = fs_fields;
+   gfx->g17p_bind_tail_memo.cull_word = cull_fields.words[0];
+   gfx->g17p_bind_tail_memo.raster_fragment_control = raster_fragment_control;
+   gfx->g17p_bind_tail_memo.viewport_length = viewport_length;
    gfx->g17p_bind_tail_memo.fs = fs;
    gfx->g17p_bind_tail_memo.hw_vs = vs;
    gfx->g17p_bind_tail_memo.valid = true;
+   gfx->g17p_bind_tail_memo.viewport_valid = true;
 
    return true;
 }
 
-/* Every builder input except the root / descriptor / vertex-buffer
- * identity, which reach the tail only through the fragment stage program. */
+/* Every builder input except the root / descriptor / vertex-buffer identity
+ * (which reach the tail only through the fragment stage program), and
+ * optionally cull_mode / front_face when ignore_cull is true. */
 static bool
-hk_g17p_bind_tail_state_matches(
+hk_g17p_bind_tail_state_matches_impl(
    const struct hk_cmd_buffer *cmd,
-   const struct hk_g17p_prepared_bind_tail *prepared)
+   const struct hk_g17p_prepared_bind_tail *prepared, bool ignore_cull)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
    const struct hk_rendering_state *render = &gfx->render;
 
-   return prepared->dynamic_generation == dyn->generation &&
+   return hk_g17p_bind_tail_dyn_matches_impl(dyn, prepared->dynamic_generation,
+                                             &gfx->g17p_bind_tail_dyn,
+                                             ignore_cull) &&
           prepared->render_color0 ==
              (render->color_att_count == 1
                  ? render->color_att[0].iview : NULL) &&
@@ -9732,6 +10305,7 @@ hk_g17p_bind_tail_state_matches(
           memcmp(&prepared->render_area, &render->area,
                  sizeof(prepared->render_area)) == 0 &&
           prepared->render_depth_format == render->depth_att.vk_format &&
+          prepared->render_stencil_format == render->stencil_att.vk_format &&
           prepared->render_width == render->cr.width &&
           prepared->render_height == render->cr.height &&
           prepared->render_layer_count == render->layer_count &&
@@ -9762,25 +10336,47 @@ hk_g17p_bind_tail_state_matches(
 }
 
 static bool
-hk_g17p_prepared_bind_tail_matches(
+hk_g17p_prepared_bind_tail_matches_impl(
    const struct hk_cmd_buffer *cmd,
-   const struct hk_g17p_prepared_bind_tail *prepared)
+   const struct hk_g17p_prepared_bind_tail *prepared, bool check_push)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
 
+   if (!prepared->valid)
+      return false;
+
+#if defined(MESA_DEBUG) && MESA_DEBUG
+   assert(prepared->fragment_dma_set_index ==
+          hk_g17p_dma_set_index(prepared->fragment_shader));
+#endif
+
    /* The tail launches a fragment program whose UNIFORM_DMA span, when it is
     * set-sourced, names the set address the root held when the program was
-    * built (hk_g17p_dma_set_base()). A push descriptor set gets its address
-    * when it is flushed, which moves that address without a new descriptor
-    * generation or root identity. */
-   return prepared->valid &&
-          prepared->descriptor_generation == gfx->descriptors.generation &&
+    * built (hk_g17p_dma_set_base()). Flushing a changed push descriptor set
+    * updates that address and advances descriptor generation; checking
+    * fragment_dma_set_base directly also guards against any cached-root or
+    * descriptor-buffer set-base mismatch. */
+   const bool desc_gen_match =
+      check_push
+         ? prepared->descriptor_generation == gfx->descriptors.generation
+         : prepared->non_push_descriptor_generation ==
+              gfx->descriptors.non_push_generation;
+   return desc_gen_match &&
           prepared->vertex_buffer_generation ==
              gfx->vertex_buffer_generation &&
           prepared->root == gfx->root &&
           prepared->fragment_dma_set_base ==
-             hk_g17p_dma_set_base(cmd, prepared->fragment_shader) &&
-          hk_g17p_bind_tail_state_matches(cmd, prepared);
+             hk_g17p_dma_set_base_from_index(cmd,
+                                             prepared->fragment_dma_set_index) &&
+          hk_g17p_bind_tail_state_matches_impl(cmd, prepared, false);
+}
+
+static bool
+hk_g17p_prepared_bind_tail_matches(
+   const struct hk_cmd_buffer *cmd,
+   const struct hk_g17p_prepared_bind_tail *prepared)
+{
+   return hk_g17p_prepared_bind_tail_matches_impl(cmd, prepared, true);
 }
 
 static bool
@@ -9788,7 +10384,7 @@ hk_g17p_publish_native_bind_tail(
    struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out,
    const struct hk_g17p_prepared_bind_tail *prepared)
 {
-   if (!prepared->valid || !out || !*out)
+   if (!prepared->valid || !prepared->fs_record_in_tail_valid || !out || !*out)
       return false;
 
    const unsigned scissor_bytes =
@@ -9838,6 +10434,7 @@ hk_g17p_publish_native_bind_tail(
        gfx->g17p_bind_tail_memo.valid) {
       cs->g17p_bind_tail.fs_program = prepared->fragment_program;
       cs->g17p_bind_tail.state_compact = gfx->g17p_bind_tail_memo.state_compact;
+      cs->g17p_bind_tail.cull_word = prepared->cull_word;
       cs->g17p_bind_tail.scissor_size = cs->scissor.size;
       cs->g17p_bind_tail.depth_bias_size = cs->depth_bias.size;
       cs->g17p_bind_tail.viewport_count = prepared->viewport_count;
@@ -9885,12 +10482,49 @@ hk_g17p_emit_fs_ppp_update(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    return true;
 }
 
+static __attribute__((hot)) bool
+hk_g17p_emit_cull_ppp_update(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                             uint8_t **out, uint32_t cull_word)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct agx_ppp_hal200_graphics_fields cull_fields = {
+      .words = {cull_word},
+   };
+   struct agx_ppp_hal200_graphics_core cull_record;
+   if (!agx_ppp_hal200_graphics_core_pack(
+          dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_CULL, &cull_fields,
+          &cull_record))
+      return false;
+
+   /* Match the 64-byte alignment of the bind tail's state block. */
+   struct agx_ptr state = hk_pool_vdm_alloc(cmd, cull_record.length, 64);
+   if (!state.cpu ||
+       !agx_g17p_draw_state_range_valid(state.gpu, cull_record.length))
+      return false;
+
+   memcpy(state.cpu, cull_record.bytes, cull_record.length);
+
+   struct agx_vdm_ppp_state_core ppp;
+   if (!agx_vdm_ppp_state_core_pack(dev->dev.chip, (uint32_t)state.gpu,
+                                    cull_record.length / 4, &ppp))
+      return false;
+
+   memcpy(*out, ppp.bytes, ppp.length);
+   *out += ppp.length;
+
+   cs->g17p_bind_tail.cull_word = cull_word;
+   if (unlikely(dev->frame_anatomy))
+      cs->anatomy_ppp++;
+   return true;
+}
+
 /* known_match: the caller evaluated hk_g17p_prepared_bind_tail_matches()
  * for this draw and nothing it reads has changed since.
  * allow_incremental: when the stream already latched an identical bind tail
- * for every non-FS PPP record, elide the tail (0 bytes) if the fragment
- * program is unchanged, or emit a single 8-byte PPP_STATE_UPDATE for the
- * 28-byte fragment record if only the fragment program moved. */
+ * for every non-FS/non-CULL PPP record, elide the tail (0 bytes) if both the
+ * fragment program and CULL word are unchanged, or emit standalone 8-byte
+ * PPP_STATE_UPDATE records for the 28-byte fragment record and/or 8-byte
+ * CULL record. */
 static __attribute__((hot)) bool
 hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                               uint8_t **out, bool known_match,
@@ -9909,13 +10543,19 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        cs->depth_bias.size == cs->g17p_bind_tail.depth_bias_size &&
        cs->g17p_bind_tail.viewport_count ==
           MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1)) {
-      /* Fast path: when prepared still matches every root, descriptor, VB and
-       * render-state input, the fragment program is unchanged and equals
-       * prepared->fragment_program without re-uploading the FS USC program. */
-      if (((known_match && prepared->valid) ||
-           hk_g17p_prepared_bind_tail_matches(cmd, prepared)) &&
-          prepared->fragment_program == cs->g17p_bind_tail.fs_program)
+      /* Fast path: when prepared still matches every root, descriptor, VB,
+       * dynamic, and render-state input, the fragment program and CULL state
+       * are unchanged without re-uploading the FS USC program. */
+      if (likely(((known_match && prepared->valid) ||
+                  hk_g17p_prepared_bind_tail_matches(cmd, prepared)) &&
+                 prepared->fragment_program == cs->g17p_bind_tail.fs_program &&
+                 prepared->cull_word == cs->g17p_bind_tail.cull_word)) {
+         if (unlikely(prepared->dynamic_generation !=
+                      cmd->vk.dynamic_graphics_state.generation))
+            prepared->dynamic_generation =
+               cmd->vk.dynamic_graphics_state.generation;
          return true;
+      }
 
       struct hk_shader *fs = hk_bound_fs(cmd);
       struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
@@ -9926,34 +10566,159 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
          if (gfx->g17p_bind_tail_memo.fs == fs &&
              gfx->g17p_bind_tail_memo.hw_vs == hk_bound_hw_vs(gfx) &&
-             hk_g17p_bind_tail_state_matches(cmd, prepared)) {
+             hk_g17p_bind_tail_state_matches_impl(cmd, prepared, true)) {
+            const struct vk_dynamic_graphics_state *dyn =
+               &cmd->vk.dynamic_graphics_state;
+            const bool dyn_gen_match =
+               prepared->dynamic_generation == dyn->generation;
+            uint32_t new_cull_word = cs->g17p_bind_tail.cull_word;
+            bool cull_dyn_changed = false;
+            if (unlikely(!dyn_gen_match)) {
+               cull_dyn_changed =
+                  gfx->g17p_bind_tail_dyn.cull_mode != dyn->rs.cull_mode ||
+                  gfx->g17p_bind_tail_dyn.front_face != dyn->rs.front_face;
+            }
+            const bool cull_changed =
+               cull_dyn_changed ||
+               prepared->cull_word != cs->g17p_bind_tail.cull_word;
+            if (unlikely(cull_changed)) {
+               if (!agx_ppp_hal200_cull_mode_pack(
+                      hk_cmd_buffer_device(cmd)->dev.chip, dyn->rs.cull_mode,
+                      hk_g17p_front_face_ccw(cmd),
+                      gfx->g17p_bind_tail_memo.cull_word, &new_cull_word))
+                  return hk_g17p_bind_tail_refused(__LINE__);
+            }
+
             /* Unlike hk_g17p_prepared_bind_tail_matches() (which checks
-             * fragment_dma_set_base directly), this branch relies on
-             * hk_upload_usc_words() returning a fresh program address whenever
-             * the fragment's uniform-DMA / push-descriptor set base moves, so
-             * the compare below emits an updated FS PPP record. */
-            const uint64_t fragment_program =
-               hk_upload_usc_words(cmd, fs, linked_fs);
-            if (!fragment_program ||
-                (fragment_program & UINT64_C(0x3f)) != 0 ||
-                fragment_program >= (UINT64_C(1) << 48))
-               return hk_g17p_bind_tail_refused(__LINE__);
+             * fragment_dma_set_base directly), when root/descriptor/VB state
+             * moved we rely on hk_upload_usc_words() returning a fresh program
+             * address whenever the fragment's uniform-DMA / push-descriptor
+             * set base moved. When root/descriptor/VB/dma_set_base all still
+             * match prepared (or only push constants changed for a fragment
+             * shader that does not read push constants), reuse
+             * prepared->fragment_program directly. */
+            const int8_t dma_set_index =
+               (prepared->valid && prepared->fragment_shader == fs)
+                  ? prepared->fragment_dma_set_index
+                  : hk_g17p_dma_set_index(fs);
+            const uint64_t dma_set_base =
+               hk_g17p_dma_set_base_from_index(cmd, dma_set_index);
+            const bool push_only_dirty =
+               hk_root_push_only_dirty(&gfx->descriptors);
+            const bool desc_gen_ok =
+               prepared->descriptor_generation ==
+                  gfx->descriptors.generation ||
+               (push_only_dirty &&
+                !(fs->info.agx3_root_reads &
+                  (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
+                prepared->non_push_descriptor_generation ==
+                   gfx->descriptors.non_push_generation);
+            uint64_t fragment_program;
+            if (prepared->valid && desc_gen_ok &&
+                prepared->vertex_buffer_generation ==
+                   gfx->vertex_buffer_generation &&
+                prepared->root == gfx->root &&
+                prepared->fragment_shader == fs &&
+                prepared->fragment_dma_set_base == dma_set_base) {
+               fragment_program = prepared->fragment_program;
+            } else {
+               fragment_program = hk_upload_usc_words(cmd, fs, linked_fs);
+               if (!fragment_program ||
+                   (fragment_program & UINT64_C(0x3f)) != 0 ||
+                   fragment_program >= (UINT64_C(1) << 48))
+                  return hk_g17p_bind_tail_refused(__LINE__);
+            }
 
-            if (fragment_program == cs->g17p_bind_tail.fs_program)
-               return true;
+            const bool fs_changed =
+               fragment_program != cs->g17p_bind_tail.fs_program;
+            const bool cull_emit =
+               new_cull_word != cs->g17p_bind_tail.cull_word;
+            const uint64_t new_desc_gen =
+               push_only_dirty ? gfx->descriptors.uploaded_root_generation
+                               : gfx->descriptors.generation;
 
-            if (hk_g17p_emit_fs_ppp_update(cmd, cs, out, fragment_program)) {
-               /* prepared->tail still points to the earlier bind block's FS
-                * record; force a rebuild if a later stream needs a full tail. */
-               prepared->valid = false;
+            if (likely(!fs_changed && !cull_emit &&
+                       prepared->fragment_program == fragment_program &&
+                       prepared->cull_word == new_cull_word)) {
+               /* No-op incremental path: neither FS nor CULL changed and
+                * prepared already records (fragment_program, new_cull_word),
+                * so prepared->fs_record_in_tail_valid is already exact. Keep
+                * this path on hot prepared fields without touching cold
+                * g17p_bind_tail_dyn or g17p_bind_tail_memo fields. */
+               if (unlikely(!dyn_gen_match)) {
+                  if (cull_dyn_changed) {
+                     gfx->g17p_bind_tail_dyn.cull_mode = dyn->rs.cull_mode;
+                     gfx->g17p_bind_tail_dyn.front_face = dyn->rs.front_face;
+                  }
+                  prepared->dynamic_generation = dyn->generation;
+               }
+               prepared->descriptor_generation = new_desc_gen;
+               prepared->non_push_descriptor_generation =
+                  gfx->descriptors.non_push_generation;
+               prepared->vertex_buffer_generation =
+                  gfx->root_vertex_buffer_generation;
+               prepared->root = gfx->root;
+               prepared->fragment_shader = fs;
+               prepared->fragment_dma_set_index = dma_set_index;
+               prepared->fragment_dma_set_base = dma_set_base;
+               prepared->valid = true;
                return true;
             }
+
+            uint8_t *orig_out = *out;
+            const uint64_t orig_fs = cs->g17p_bind_tail.fs_program;
+            const uint32_t orig_cull = cs->g17p_bind_tail.cull_word;
+            const uint32_t orig_ppp = cs->anatomy_ppp;
+            bool ok = true;
+
+            if (fs_changed)
+               ok = hk_g17p_emit_fs_ppp_update(cmd, cs, out, fragment_program);
+            if (ok && cull_emit)
+               ok = hk_g17p_emit_cull_ppp_update(cmd, cs, out, new_cull_word);
+
+            if (ok) {
+               /* Keep prepared->valid true so subsequent draws with the same
+                * state match without re-running hk_upload_usc_words(). Track
+                * separately whether prepared->tail's embedded FS and CULL
+                * records still match, so a later full-tail publish rebuilds
+                * when they diverge. */
+               if (unlikely(!dyn_gen_match)) {
+                  if (cull_dyn_changed) {
+                     gfx->g17p_bind_tail_dyn.cull_mode = dyn->rs.cull_mode;
+                     gfx->g17p_bind_tail_dyn.front_face = dyn->rs.front_face;
+                  }
+                  prepared->dynamic_generation = dyn->generation;
+               }
+               prepared->cull_word = new_cull_word;
+               prepared->descriptor_generation = new_desc_gen;
+               prepared->non_push_descriptor_generation =
+                  gfx->descriptors.non_push_generation;
+               prepared->vertex_buffer_generation =
+                  gfx->root_vertex_buffer_generation;
+               prepared->root = gfx->root;
+               prepared->fragment_shader = fs;
+               prepared->fragment_program = fragment_program;
+               prepared->fragment_dma_set_index = dma_set_index;
+               prepared->fragment_dma_set_base = dma_set_base;
+               prepared->valid = true;
+               prepared->fs_record_in_tail_valid =
+                  fragment_program ==
+                     gfx->g17p_bind_tail_memo.fs_fields.stage_program &&
+                  new_cull_word == gfx->g17p_bind_tail_memo.cull_word;
+               return true;
+            }
+
+            *out = orig_out;
+            cs->g17p_bind_tail.fs_program = orig_fs;
+            cs->g17p_bind_tail.cull_word = orig_cull;
+            cs->anatomy_ppp = orig_ppp;
          }
       }
    }
 
-   if ((known_match && prepared->valid) ||
-       hk_g17p_prepared_bind_tail_matches(cmd, prepared)) {
+   if (prepared->fs_record_in_tail_valid &&
+       ((known_match && prepared->valid) ||
+        hk_g17p_prepared_bind_tail_matches(cmd, prepared))) {
       if (!hk_g17p_publish_native_bind_tail(cmd, cs, out, prepared))
          return false;
       *tail_emitted = true;
@@ -10468,8 +11233,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                 render->tilebuffer.max_bytes_per_tile &&
              (!has_zs_attachment || plain_ms_zs))) ||
           fragment_pass > AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH ||
-          (!discard && (dyn->vp.depth_clip_negative_one_to_one ||
-          dyn->ds.depth.bounds_test.enable ||
+          (!discard && (dyn->ds.depth.bounds_test.enable ||
           !bounded_viewport || !bounded_depth_range))) {
          {
             fprintf(stderr, "M5 PPP profile: uvs=%u osel=%#x provoking=%u object=%u "
@@ -11164,9 +11928,10 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
       if (restart)
          prim = u_decomposed_prim(prim);
 
-      /* G17P materialises adjacency into an index buffer before the hardware
-       * vertex program. Applying the remap again in the prolog is wrong. */
-      if (!agx_chip_native_or_m5(dev->dev.chip))
+      /* AGX3 paths materialise adjacency into an index buffer before the
+       * hardware vertex program. Applying the remap again in the prolog is
+       * wrong. */
+      if (!agx_chip_agx3_path(dev->dev.chip))
          key->prolog.adjacency = prim;
    }
 
@@ -11351,7 +12116,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    bool defer_api_sample_mask = agx_chip_native_agx3(dev->dev.chip) &&
                                 has_sample_mask && !nontrivial_force_early;
 
-   const bool native_samples = agx_chip_native_or_m5(dev->dev.chip);
+   const bool native_samples = agx_chip_agx3_path(dev->dev.chip);
    if (native_samples && fs->info.fs.uses_sample_shading &&
        dyn->ms.rasterization_samples > 1) {
       if (report_errors)
@@ -11394,7 +12159,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        * (agx_nir_apply_api_mask_to_force_early()). */
       .prolog.api_sample_mask =
          has_sample_mask && !defer_api_sample_mask &&
-               (!agx_chip_native_or_m5(dev->dev.chip) ||
+               (!agx_chip_agx3_path(dev->dev.chip) ||
                 !nontrivial_force_early)
             ? api_sample_mask
             : 0xff,
@@ -11476,7 +12241,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.first_mask = in->tib->first_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
-
+   bool has_masked_rt = false;
    for (uint32_t i = 0; i < in->color_att_count; i++) {
       const VkFormat format = *(const VkFormat *)(
          (const uint8_t *)in->color_formats + i * in->color_formats_stride);
@@ -11498,6 +12263,8 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          &dyn->cb.attachments[i];
       bool write_enable = dyn->cb.color_write_enables & BITFIELD_BIT(i);
       unsigned write_mask = write_enable ? cb->write_mask : 0;
+      if (format != VK_FORMAT_UNDEFINED && write_mask != BITFIELD_MASK(4))
+         has_masked_rt = true;
 
       if (agx_chip_native_agx3(dev->dev.chip) && !write_enable) {
          key->epilog.preserve_rt |= BITFIELD_BIT(i);
@@ -11538,6 +12305,19 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          };
       }
    }
+
+   /* Single-sample G18 word-MRT layouts whose formats all belong to the
+    * native1130 set share the exact same tile layout (offsets and sample size)
+    * as native1130. When a draw carries a partial or empty write mask (for
+    * example dynamic colorWriteEnable=false alongside a partial channel mask),
+    * use the native1130 epilog path so empty-mask targets are skipped instead
+    * of emitting preserve_zero_mask reloads that mix loads with partial
+    * stores on 3+ targets. */
+   key->epilog.g18_native_mixed =
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
+      (agx_g18g_native_mixed_mask(in->tib) != 0 ||
+       (has_masked_rt && agx_g18g_word_mrt_mask(in->tib) != 0 &&
+        agx_g18g_native_mixed_epilog_mask(in->tib) != 0));
 
    if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
        !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
@@ -11903,7 +12683,8 @@ hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
  * G17P, the native HAL200 bind tail: the vertex-program publication of every
  * draw that republishes render state.  Shared by hk_flush_dynamic_state_slow()
  * and hk_g17p_emit_indirect_record(), so both emit exactly the same records.
- * tail_known_match: see hk_g17p_emit_native_bind_tail().  Returns false, with
+ * tail_match: see enum hk_g17p_bind_tail_match and
+ * hk_g17p_emit_native_bind_tail().  Returns false, with
  * the command buffer error set and cs->current at the failed record, when
  * publication is refused. */
 /* Minimum indirect multi-draw count required to hoist a pure root-only AGX3
@@ -11973,11 +12754,21 @@ hk_maybe_hoist_vertex_preamble(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    gfx->g17p_hoisted_preamble_va = out.gpu;
 }
 
+enum hk_g17p_bind_tail_match {
+   HK_G17P_BIND_TAIL_UNKNOWN = 0,
+   HK_G17P_BIND_TAIL_KNOWN_MATCH,
+   /* Caller already proved prepared matches every input AND the current
+    * HAL200 stream already latched the identical bind tail, fragment program,
+    * and CULL word, so incremental emission elides the tail to 0 bytes. */
+   HK_G17P_BIND_TAIL_ELIDED,
+};
+
 static bool
 hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              uint8_t **out_p, struct hk_shader *hw_vs,
                              uint64_t pipeline_program, struct agx_draw draw,
-                             bool ordinary_draw_path, bool tail_known_match,
+                             bool ordinary_draw_path,
+                             enum hk_g17p_bind_tail_match tail_match,
                              bool *tail_emitted)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -12130,9 +12921,10 @@ tail:
          cs->anatomy_vdm_new++;
       cs->anatomy_last_program = pipeline_program;
    }
-   if (hk_vertex_state_has_bind_tail(dev->dev.chip)) {
+   if (tail_match != HK_G17P_BIND_TAIL_ELIDED &&
+       hk_vertex_state_has_bind_tail(dev->dev.chip)) {
       if (!hk_g17p_emit_native_bind_tail(
-             cmd, cs, &out, tail_known_match,
+             cmd, cs, &out, tail_match == HK_G17P_BIND_TAIL_KNOWN_MATCH,
              agx_chip_native_hal200(dev->dev.chip), tail_emitted)) {
          mesa_loge("failed to emit native HAL200 bind tail for %s",
                    agx_chip_name(dev->dev.chip));
@@ -12279,6 +13071,61 @@ hk_update_effective_fragment_pass_type(struct hk_cmd_buffer *cmd,
    if (!hk_rast_discard(cmd) && !tag_write_disable &&
        !cmd->in_begin_rendering_clear)
       cs->user_color_written_mask |= gfx->fast_link_fs.app_color_written;
+}
+
+struct hk_agx2_vertex_state {
+   struct agx_vdm_state_packed header;
+   struct agx_counts_packed counts;
+   struct agx_vdm_state_vertex_shader_word_1_packed shader;
+   struct agx_vdm_state_vertex_outputs_packed outputs;
+   struct agx_vdm_state_vertex_unknown_packed control;
+   uint32_t padding;
+};
+
+static struct hk_agx2_vertex_state
+hk_agx2_pack_vertex_state(struct hk_cmd_buffer *cmd, const struct hk_shader *vs)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_agx2_vertex_state state = {
+      .counts = vs->counts,
+      .outputs = vs->info.uvs.vdm,
+   };
+   static_assert(sizeof(state) ==
+                 ALIGN_POT(AGX_VDM_STATE_LENGTH +
+                           AGX_VDM_STATE_VERTEX_SHADER_WORD_0_LENGTH +
+                           AGX_VDM_STATE_VERTEX_SHADER_WORD_1_LENGTH +
+                           AGX_VDM_STATE_VERTEX_OUTPUTS_LENGTH +
+                           AGX_VDM_STATE_VERTEX_UNKNOWN_LENGTH, 8));
+
+   agx_pack(&state.header, VDM_STATE, cfg) {
+      cfg.vertex_shader_word_0_present = true;
+      cfg.vertex_shader_word_1_present = true;
+      cfg.vertex_outputs_present = true;
+      cfg.vertex_unknown_present = true;
+   }
+   agx_pack(&state.control, VDM_STATE_VERTEX_UNKNOWN, cfg) {
+      cfg.flat_shading_control = translate_vdm_vertex(gfx->provoking);
+      cfg.unknown_4 = cfg.unknown_5 = hk_rast_discard(cmd);
+      cfg.generate_primitive_id = gfx->generate_primitive_id;
+   }
+   return state;
+}
+
+static bool
+hk_agx2_publish_vertex_state(struct hk_cmd_buffer *cmd, uint8_t **out,
+                             struct hk_agx2_vertex_state *state,
+                             uint64_t program)
+{
+   if (unlikely(program > UINT32_MAX)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   agx_pack(&state->shader, VDM_STATE_VERTEX_SHADER_WORD_1, cfg)
+      cfg.pipeline = program;
+
+   memcpy(*out, state, sizeof(*state));
+   *out += sizeof(*state);
+   return true;
 }
 
 static __attribute__((noinline)) void
@@ -12656,7 +13503,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             t.cpu, &gfx->linked_varyings, hw_vs->info.uvs.user_size,
             &linked_fs->b.cf, gfx->provoking, 0, &gfx->generate_primitive_id);
 
-         if (dev->dev.chip == AGX_CHIP_G17G)
+         if (agx_chip_uses_shade_model_5(dev->dev.chip))
             agx_cf_bindings_select_perspective(t.cpu, &linked_fs->b.cf);
 
          gfx->varyings = native_vit ? t.gpu : agx_usc_addr(&dev->dev, t.gpu);
@@ -12702,7 +13549,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    {
       const struct hk_shader *fs = hk_bound_fs(cmd);
       const bool fs_reads_hw_layer =
-         !agx_chip_native_or_m5(dev->dev.chip) && fs && fs->info.fs.reads_layer;
+         !agx_chip_agx3_path(dev->dev.chip) && fs && fs->info.fs.reads_layer;
       const uint16_t no_attachments =
          gfx->render.no_attachments && !fs_reads_hw_layer;
       if (gfx->descriptors.root.draw.no_attachments != no_attachments) {
@@ -12866,39 +13713,14 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out = mesh_tail_emitted;
          }
       } else switch (agx_chip_command_stream_generation(dev->dev.chip)) {
-      case AGX_CS_GENERATION_AGX2:
-         if (pipeline_program > UINT32_MAX) {
-            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      case AGX_CS_GENERATION_AGX2: {
+         struct hk_agx2_vertex_state state = hk_agx2_pack_vertex_state(cmd, hw_vs);
+         if (!hk_agx2_publish_vertex_state(cmd, &out, &state, pipeline_program)) {
             cs->current = out;
             return;
          }
-
-         agx_push(out, VDM_STATE, cfg) {
-            cfg.vertex_shader_word_0_present = true;
-            cfg.vertex_shader_word_1_present = true;
-            cfg.vertex_outputs_present = true;
-            cfg.vertex_unknown_present = true;
-         }
-
-         agx_push_packed(out, hw_vs->counts, VDM_STATE_VERTEX_SHADER_WORD_0);
-
-         agx_push(out, VDM_STATE_VERTEX_SHADER_WORD_1, cfg) {
-            cfg.pipeline = pipeline_program;
-         }
-
-         agx_push_packed(out, hw_vs->info.uvs.vdm,
-                         VDM_STATE_VERTEX_OUTPUTS);
-
-         agx_push(out, VDM_STATE_VERTEX_UNKNOWN, cfg) {
-            cfg.flat_shading_control = translate_vdm_vertex(gfx->provoking);
-            cfg.unknown_4 = cfg.unknown_5 = hk_rast_discard(cmd);
-            cfg.generate_primitive_id = gfx->generate_primitive_id;
-         }
-
-         /* Pad up to a multiple of 8 bytes */
-         memset(out, 0, 4);
-         out += 4;
          break;
+      }
 
       case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL200:
@@ -12907,7 +13729,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          if (!hk_agx3_publish_vertex_state(
                 cmd, cs, &out, hw_vs, pipeline_program, draw,
                 ordinary_draw_path,
-                prepared_varyings && gfx->root == prepared_varyings_root,
+                (prepared_varyings && gfx->root == prepared_varyings_root)
+                   ? HK_G17P_BIND_TAIL_KNOWN_MATCH
+                   : HK_G17P_BIND_TAIL_UNKNOWN,
                 &tail_emitted))
             return;
          *g17p_native_bind_tail_emitted_out =
@@ -13019,10 +13843,25 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 }
 
+static inline bool
+hk_dyn_only_cull_dirty(const struct vk_dynamic_graphics_state *dyn)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(dyn->dirty); ++i) {
+      BITSET_WORD w = dyn->dirty[i];
+      if (i == BITSET_BITWORD(MESA_VK_DYNAMIC_RS_CULL_MODE))
+         w &= ~BITSET_BIT(MESA_VK_DYNAMIC_RS_CULL_MODE);
+      if (i == BITSET_BITWORD(MESA_VK_DYNAMIC_RS_FRONT_FACE))
+         w &= ~BITSET_BIT(MESA_VK_DYNAMIC_RS_FRONT_FACE);
+      if (w)
+         return false;
+   }
+   return true;
+}
+
 /* Guarded fast draw flush for native HAL200 (G17P / G16G) streams when only
- * descriptors, push constants, vertex buffers, draw parameters or draw IDs
- * moved since the last draw in this render stream.  Everything else falls
- * back to hk_flush_dynamic_state_slow(). */
+ * descriptors, push constants, vertex buffers, draw parameters, draw IDs, or
+ * cull/front-face state moved since the last draw in this render stream.
+ * Everything else falls back to hk_flush_dynamic_state_slow(). */
 static __attribute__((hot)) bool
 hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                  uint32_t draw_id, struct agx_draw draw,
@@ -13037,8 +13876,9 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (gfx->g17p_hoist_preamble_requested && !gfx->g17p_hoisted_preamble_va))
       return false;
 
-   if (vk_dynamic_graphics_state_any_dirty(dyn) || gfx->shaders_dirty ||
-       gfx->linked_dirty || (gfx->dirty & ~HK_DIRTY_VB))
+   const bool any_dyn_dirty = vk_dynamic_graphics_state_any_dirty(dyn);
+   if ((unlikely(any_dyn_dirty) && !hk_dyn_only_cull_dirty(dyn)) ||
+       gfx->shaders_dirty || gfx->linked_dirty || (gfx->dirty & ~HK_DIRTY_VB))
       return false;
 
    if (!gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
@@ -13069,7 +13909,9 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        gfx->fast_link_fs.key.prolog.statistics)
       return false;
 
+   struct hk_g17p_prepared_bind_tail *prepared = &gfx->g17p_bind_tail;
    const uint8_t viewport_count = MAX2(dyn->vp.viewport_count, 1);
+   const bool dyn_gen_match = prepared->dynamic_generation == dyn->generation;
    if (!cs->g17p_bind_tail.valid || !gfx->g17p_bind_tail_memo.valid ||
        cs->g17p_bind_tail.state_compact !=
           gfx->g17p_bind_tail_memo.state_compact ||
@@ -13078,15 +13920,42 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        cs->g17p_bind_tail.viewport_count != viewport_count ||
        gfx->g17p_bind_tail_memo.hw_vs != hw_vs ||
        gfx->g17p_bind_tail_memo.fs != fs ||
-       gfx->g17p_bind_tail.dynamic_generation != dyn->generation ||
-       gfx->g17p_bind_tail.in_meta != cmd->in_meta ||
-       gfx->g17p_bind_tail.linked_vs != linked_vs ||
-       gfx->g17p_bind_tail.linked_fs != linked_fs ||
-       gfx->g17p_bind_tail.render_samples !=
-          gfx->render.tilebuffer.nr_samples ||
-       gfx->g17p_bind_tail.render_color_count != gfx->render.color_att_count ||
-       gfx->g17p_bind_tail.render_view_mask != gfx->render.view_mask)
+       (unlikely(!dyn_gen_match) &&
+        !hk_g17p_bind_tail_dyn_matches_slow(dyn, &gfx->g17p_bind_tail_dyn,
+                                            true)) ||
+       prepared->in_meta != cmd->in_meta ||
+       prepared->linked_vs != linked_vs ||
+       prepared->linked_fs != linked_fs ||
+       prepared->render_samples != gfx->render.tilebuffer.nr_samples ||
+       prepared->render_color_count != gfx->render.color_att_count ||
+       prepared->render_view_mask != gfx->render.view_mask)
       return false;
+
+   uint32_t new_cull_word = cs->g17p_bind_tail.cull_word;
+   bool cull_changed = false;
+   bool cull_matches_prepared = true;
+   if (unlikely(any_dyn_dirty || !dyn_gen_match ||
+                prepared->cull_word != cs->g17p_bind_tail.cull_word)) {
+      if (any_dyn_dirty ||
+          gfx->g17p_bind_tail_dyn.cull_mode != dyn->rs.cull_mode ||
+          gfx->g17p_bind_tail_dyn.front_face != dyn->rs.front_face ||
+          prepared->cull_word != cs->g17p_bind_tail.cull_word) {
+         if (!agx_ppp_hal200_cull_mode_pack(
+                dev->dev.chip, dyn->rs.cull_mode, hk_g17p_front_face_ccw(cmd),
+                gfx->g17p_bind_tail_memo.cull_word, &new_cull_word))
+            return false;
+         cull_changed = new_cull_word != cs->g17p_bind_tail.cull_word;
+         cull_matches_prepared =
+            !cull_changed &&
+            gfx->g17p_bind_tail_dyn.cull_mode == dyn->rs.cull_mode &&
+            gfx->g17p_bind_tail_dyn.front_face == dyn->rs.front_face &&
+            prepared->cull_word == cs->g17p_bind_tail.cull_word;
+         if (cull_matches_prepared)
+            prepared->dynamic_generation = dyn->generation;
+      } else {
+         prepared->dynamic_generation = dyn->generation;
+      }
+   }
 
    if (!hk_root_dirty(desc) && agx_chip_native_hal200(dev->dev.chip) &&
        hk_root_upload_needs_growth(desc->uploaded_root_size,
@@ -13117,8 +13986,29 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       sw_vs->b.info.uses_base_param || linked_vs->b.uses_base_param;
    const bool uses_draw_id = sw_vs->b.info.uses_draw_id;
    if (!gfx->dirty && hk_root_launch_current(desc, push_launch_fits) &&
-       !republishes_base_param && !uses_draw_id)
+       !republishes_base_param && !uses_draw_id) {
+      if (unlikely(cull_changed)) {
+         assert(cs->current + 0x1000 < cs->end && "already ensured space");
+         uint8_t *out = cs->current;
+         if (!hk_g17p_emit_cull_ppp_update(cmd, cs, &out, new_cull_word))
+            return false;
+         cs->current = out;
+      }
+      if (unlikely(any_dyn_dirty || cull_changed)) {
+         gfx->g17p_bind_tail_dyn.cull_mode = dyn->rs.cull_mode;
+         gfx->g17p_bind_tail_dyn.front_face = dyn->rs.front_face;
+         prepared->cull_word = new_cull_word;
+         prepared->dynamic_generation = dyn->generation;
+         prepared->fs_record_in_tail_valid =
+            prepared->valid &&
+            prepared->fragment_program ==
+               gfx->g17p_bind_tail_memo.fs_fields.stage_program &&
+            new_cull_word == gfx->g17p_bind_tail_memo.cull_word;
+         if (any_dyn_dirty)
+            vk_dynamic_graphics_state_clear_dirty(dyn);
+      }
       return true;
+   }
 
    if (unlikely(dev->frame_anatomy))
       cs->anatomy_republish++;
@@ -13152,9 +14042,33 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_reserve_scratch(cmd, cs, hw_vs);
    if (!push_only)
       pipeline_program = hk_upload_usc_words(cmd, hw_vs, linked_vs);
+
+   const bool desc_gen_match =
+      push_only
+         ? prepared->non_push_descriptor_generation ==
+              desc->non_push_generation
+         : prepared->descriptor_generation == desc->generation;
+   const bool tail_known_match =
+      cull_matches_prepared && prepared->valid && desc_gen_match &&
+      prepared->vertex_buffer_generation == gfx->vertex_buffer_generation &&
+      prepared->root == gfx->root &&
+      prepared->fragment_dma_set_base ==
+         hk_g17p_dma_set_base_from_index(cmd, prepared->fragment_dma_set_index);
+#if defined(MESA_DEBUG) && MESA_DEBUG
+   assert(!tail_known_match ||
+          hk_g17p_prepared_bind_tail_matches_impl(cmd, prepared, !push_only));
+#endif
+   const enum hk_g17p_bind_tail_match tail_match =
+      (tail_known_match &&
+       prepared->fragment_program == cs->g17p_bind_tail.fs_program &&
+       prepared->cull_word == cs->g17p_bind_tail.cull_word)
+         ? HK_G17P_BIND_TAIL_ELIDED
+         : (tail_known_match ? HK_G17P_BIND_TAIL_KNOWN_MATCH
+                             : HK_G17P_BIND_TAIL_UNKNOWN);
+
    bool tail_emitted = false;
    if (!hk_agx3_publish_vertex_state(cmd, cs, &out, hw_vs, pipeline_program,
-                                     draw, true, false, &tail_emitted))
+                                     draw, true, tail_match, &tail_emitted))
       return true;
    *g17p_native_bind_tail_emitted_out =
       hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
@@ -13163,6 +14077,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (vk_command_buffer_has_error(&cmd->vk))
       return true;
 
+   if (unlikely(any_dyn_dirty))
+      vk_dynamic_graphics_state_clear_dirty(dyn);
    gfx->dirty = 0;
    if (push_only)
       hk_root_mark_push_launched(desc);
@@ -13243,8 +14159,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
             bool tail_emitted = false;
             if (unlikely(!hk_agx3_publish_vertex_state(
-                   cmd, cs, &out, hw_vs, pipeline_program, draw, true, false,
-                   &tail_emitted)))
+                   cmd, cs, &out, hw_vs, pipeline_program, draw, true,
+                   HK_G17P_BIND_TAIL_UNKNOWN, &tail_emitted)))
                return;
             *g17p_native_bind_tail_emitted_out =
                hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
@@ -13857,6 +14773,9 @@ void
 hk_cmd_bind_vertex_buffer(struct hk_cmd_buffer *cmd, uint32_t vb_idx,
                           struct hk_addr_range addr_range)
 {
+   static_assert(AGX_MAX_VBUFS <= 32, "bound_vb_mask is a 32-bit mask");
+   assert(vb_idx < ARRAY_SIZE(cmd->state.gfx.vb));
+
    /* An identical rebind leaves every consumer's input unchanged. Dirtiness
     * already pending (e.g. after state invalidation) is kept as it is. */
    if (cmd->state.gfx.vb[vb_idx].addr == addr_range.addr &&
@@ -13864,6 +14783,10 @@ hk_cmd_bind_vertex_buffer(struct hk_cmd_buffer *cmd, uint32_t vb_idx,
       return;
 
    cmd->state.gfx.vb[vb_idx] = addr_range;
+   if (addr_range.range)
+      cmd->state.gfx.bound_vb_mask |= BITFIELD_BIT(vb_idx);
+   else
+      cmd->state.gfx.bound_vb_mask &= ~BITFIELD_BIT(vb_idx);
    cmd->state.gfx.dirty |= HK_DIRTY_VB;
    cmd->state.gfx.vertex_buffer_generation++;
 }
@@ -14873,6 +15796,9 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
                         pool_entries ? 0 : hk_heap(cmd), draw_id,
                         conditional && cmd->state.conditional.inverted);
    }
+   ccs = hk_refresh_pre_gfx_cs(cmd, ccs);
+   if (!ccs)
+      return;
    const uint16_t *wg = task->b.info.workgroup_size;
    struct agx_grid task_grid = gpu_setup
       ? agx_grid_indirect(record + offsetof(struct libagx_task_record, dispatch))
@@ -14886,7 +15812,8 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
     * (hk_cdm_alias_scope_unpatched()). */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
-   if (hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
+   if (!ccs->g18_dispatch_sealed &&
+       hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, ccs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, ccs, alias_scope);
    }
@@ -15381,6 +16308,9 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  * the one the stream already latched (hk_cs.m5_ppp_emitted), so it emits
  * nothing there either.
  *
+ * On AGX2, the indirect-count path checks this after its first ordinary draw.
+ * Vertex and fragment state are then stable apart from per-draw uniforms.
+ *
  * The check reads no per-record value except the indirect address, and
  * emitting a record changes none of what it reads, so a multi-draw checks it
  * once (draw is already normalised).  It has no side effects.
@@ -15533,7 +16463,9 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 
       if (!hk_agx3_publish_vertex_state(
              cmd, cs, &out, hw_vs, pipeline_program, draw, true,
-             prepared_varyings && gfx->root == prepared_varyings_root,
+             (prepared_varyings && gfx->root == prepared_varyings_root)
+                ? HK_G17P_BIND_TAIL_KNOWN_MATCH
+                : HK_G17P_BIND_TAIL_UNKNOWN,
              &tail_emitted))
          return;
 
@@ -15822,7 +16754,8 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
                     cs->g17p_bind_tail.viewport_count !=
                        prepared->viewport_count ||
                     prepared->fragment_program !=
-                       cs->g17p_bind_tail.fs_program))
+                       cs->g17p_bind_tail.fs_program ||
+                    prepared->cull_word != cs->g17p_bind_tail.cull_word))
                   return start;
                need_bind_tail_every_draw = false;
             } else {
@@ -15831,6 +16764,9 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
          } else {
             need_bind_tail_every_draw = true;
          }
+         if ((need_bind_tail_every_draw || !cs->g17p_bind_tail.valid) &&
+             !prepared->fs_record_in_tail_valid)
+            return start;
       }
 
       if (!hk_agx3_multi_draw_ioto_prepare(cmd, hw_vs, linked_hw_vs,
@@ -15974,6 +16910,11 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
       bool tail_emitted = false;
 
       if (republishes) {
+         if (native_agx3 &&
+             (need_bind_tail_every_draw || !cs->g17p_bind_tail.valid) &&
+             !prepared->fs_record_in_tail_valid)
+            break;
+
          const uint64_t draw_params =
             uses_base_param ? addr + param_offset : 0;
          const uint64_t draw_id_ptr =
@@ -16027,6 +16968,7 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
                cs->g17p_bind_tail.fs_program = prepared->fragment_program;
                cs->g17p_bind_tail.state_compact =
                   gfx->g17p_bind_tail_memo.state_compact;
+               cs->g17p_bind_tail.cull_word = prepared->cull_word;
                cs->g17p_bind_tail.scissor_size = cs->scissor.size;
                cs->g17p_bind_tail.depth_bias_size = cs->depth_bias.size;
                cs->g17p_bind_tail.viewport_count = prepared->viewport_count;
@@ -16897,6 +17839,45 @@ hk_vdm_spans_append_range(struct hk_cmd_buffer *cmd,
    return true;
 }
 
+/* Emit consecutive AGX2 records in the current stream chunk. Draw 0 has
+ * already published all graphics state. Only the vertex uniforms for draw
+ * parameters or DrawID can move. Keep the complete VDM vertex update when
+ * they do, including the vertex counts and output state.
+ */
+static bool
+hk_agx2_emit_indirect_count_chunk(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                  struct agx_draw draw, uint32_t first,
+                                  uint32_t count, uint32_t stride,
+                                  struct hk_agx2_vertex_state *vertex)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   struct hk_linked_shader *linked = gfx->linked[MESA_SHADER_VERTEX];
+   const enum agx_chip records =
+      agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip);
+   const uint32_t restart = hk_draw_restart_index(cmd, draw);
+   uint8_t *out = cs->current;
+
+   for (uint32_t i = 0; i < count; ++i, draw.b.ptr += stride) {
+      if (vertex) {
+         hk_flush_draw_params_and_id(cmd, vs, linked, first + i, draw);
+         const uint64_t program = hk_upload_usc_words(cmd, vs, linked);
+         if (vk_command_buffer_has_error(&cmd->vk) ||
+             !hk_agx2_publish_vertex_state(cmd, &out, vertex, program))
+            return false;
+      }
+
+      out = (uint8_t *)agx_vdm_draw((uint32_t *)out, records, draw,
+                                    gfx->topology, restart);
+   }
+
+   cs->current = out;
+   cs->stats.calls += count;
+   cs->stats.cmds += count;
+   hk_upload_stat(cmd, draws, count);
+   return true;
+}
+
 /*
  * Fast path for vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount:
  *
@@ -17165,6 +18146,55 @@ hk_draw_indirect_count_vdm_truncate(struct hk_cmd_buffer *cmd,
             }
 #endif
             draw_id += batch_n;
+         }
+         emitted_fast = true;
+      }
+   }
+
+   if (agx_chip_command_stream_generation(dev->dev.chip) ==
+          AGX_CS_GENERATION_AGX2 &&
+       !dev->frame_anatomy && !hk_attachmentless_render(cs)) {
+      struct agx_draw draw =
+         indexed ? agx_draw_indexed_indirect(in + stride, ib.addr, ib.range,
+                                             gfx->index.size,
+                                             dyn->ia.primitive_restart_enable)
+                 : agx_draw_indirect(in + stride);
+
+      if (hk_g17p_indirect_records_eligible(cmd, &draw, false)) {
+         const enum agx_chip records =
+            agx_vdm_index_list_record_chip(dev->dev.chip);
+         uint32_t record_size = agx_vdm_draw_size(records, draw);
+         struct hk_agx2_vertex_state state, *vertex = NULL;
+         if (hk_gfx_republishes_render_state(cmd)) {
+            state = hk_agx2_pack_vertex_state(cmd, hk_bound_hw_vs(gfx));
+            vertex = &state;
+            record_size += sizeof(state);
+         }
+
+         assert(record_size >= AGX_VDM_STREAM_LINK_LENGTH);
+         for (uint32_t first = 1; first < maxDrawCount;) {
+            hk_ensure_cs_has_space(cmd, cs, record_size);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               goto out;
+
+            const size_t available = cs->end - cs->current -
+               AGX_VDM_STREAM_LINK_LENGTH - HK_CS_SPACE_PADDING;
+            const uint32_t count =
+               MIN2(maxDrawCount - first, available / record_size);
+            const uint64_t base = hk_cs_current_addr(cs);
+            assert(count > 0);
+            if (!hk_vdm_spans_append_range(cmd, &spans, stack_spans, &span_cap,
+                                           &num_spans, first, count, base,
+                                           record_size))
+               goto out;
+
+            draw.b.ptr = in + (uint64_t)first * stride;
+            if (!hk_agx2_emit_indirect_count_chunk(cmd, cs, draw, first, count,
+                                                  stride, vertex))
+               goto out;
+            assert(hk_cs_current_addr(cs) - base ==
+                   (uint64_t)count * record_size);
+            first += count;
          }
          emitted_fast = true;
       }

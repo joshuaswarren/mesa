@@ -517,13 +517,15 @@ test_agx3_pbe(void)
    bad[6].dimension = AGX_TEXTURE_DIMENSION_1D;
    bad[7].mode = AGX_IMAGE_MODE_SPARSE;
 
-   /* sRGB on store is Gen9-only, as in hk_pack_native_pbe(). */
+   /* sRGB on store is supported on both Gen9 and Gen10 (M5), staying off on
+    * G18G's native PBE path. */
    struct AGX_PBE srgb = rt;
    srgb.srgb = true;
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                      &srgb));
-   CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
-                                      &srgb));
+   CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                     &srgb));
+   CHECK(!agx_gallium_pack_g18_native_pbe(&native, &srgb));
 
    for (unsigned i = 0; i < ARRAY_SIZE(bad); ++i) {
       memset(&native, 0xff, sizeof(native));
@@ -720,6 +722,36 @@ test_g17p_compressed_render_target(void)
                       sizeof(expected_layered)) == 0);
       }
 
+      /* Gen10 (M5) packs the same compressed single-sample and 2x/4x
+       * multisample RGBA8 render targets: compression at word0[61] instead of
+       * word0[59], word1[63] and the metadata address >> 4 in word2, and the
+       * 2x/4x selector at word0[59:58]. The allocator's page_aligned_layers
+       * flag of the single layer is dropped, since the Gen10 codec refuses
+       * it on a compressed packet. G18G stays off. */
+      for (unsigned s = 0; s <= ARRAY_SIZE(ms_counts); ++s) {
+         rt = original;
+         rt.page_aligned_layers = true;
+         if (s) {
+            rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+            rt.samples = ms_counts[s - 1];
+         }
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                           &rt));
+         uint64_t words[4];
+         memcpy(words, native.opaque, sizeof(words));
+         CHECK((words[0] & 0xf) == (s ? 4u : 2u));
+         CHECK(words[0] & (UINT64_C(1) << 61));
+         CHECK(!(words[0] & (UINT64_C(1) << 59)));
+         CHECK(!!(words[0] & (UINT64_C(1) << 58)) == (s == 2));
+         CHECK(words[1] & (UINT64_C(1) << 63));
+         CHECK(!(words[1] & (UINT64_C(1) << 60)));
+         CHECK(words[2] == targets[i].metadata >> 4);
+         CHECK(words[3] == 0);
+      }
+      rt = original;
+      CHECK(!agx_gallium_pack_g18_native_pbe(&native, &rt));
+
       /* Outside the proven compressed 2D (with mips), single-level 2D array /
        * 3D, and 2x/4x 2D multisample packets nothing is encoded. */
       rt = original;
@@ -760,9 +792,8 @@ test_g17p_compressed_render_target(void)
       rt.layout = AGX_LAYOUT_TWIDDLED;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
-      rt = original;
-      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
-                                         &native, &rt));
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                         &rt));
    }
 }
 

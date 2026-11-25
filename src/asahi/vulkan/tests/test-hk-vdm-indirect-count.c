@@ -161,6 +161,7 @@ test_cross_chip_link_roundtrip(void)
       AGX_CHIP_G16G,
       AGX_CHIP_G17P,
       AGX_CHIP_G17G,
+      AGX_CHIP_G18G,
    };
    const uint64_t target = UINT64_C(0x3a4b5c6d8);
 
@@ -196,7 +197,6 @@ test_cross_chip_link_roundtrip(void)
       AGX_CHIP_G15P,
       AGX_CHIP_G16P,
       AGX_CHIP_G17A,
-      AGX_CHIP_G18G,
       AGX_CHIP_UNKNOWN,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(closed_chips); ++i) {

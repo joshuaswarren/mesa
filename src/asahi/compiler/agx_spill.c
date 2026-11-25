@@ -576,10 +576,10 @@ reload_by_repeat(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 static void
 record_spill(struct spill_ctx *ctx)
 {
-   if (ctx->remat_only) {
-      assert(ctx->shader->key->has_scratch && "remat fallback needs scratch");
+   if (!ctx->shader->key->has_scratch)
+      ctx->shader->ra_failed = true;
+   if (ctx->remat_only)
       ctx->shader->remat_fallback_spilled = true;
-   }
    ctx->shader->has_spill_pcopy_reserved = true;
 }
 
@@ -2101,7 +2101,8 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    }
 
    if (memory) {
-      assert(ctx->key->has_scratch && "memory values need scratch");
+      if (!ctx->key->has_scratch)
+         ctx->ra_failed = true;
       ctx->has_spill_pcopy_reserved = true;
       ctx->remat_fallback_spilled |= remat_only;
    }

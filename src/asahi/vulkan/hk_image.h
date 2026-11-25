@@ -266,19 +266,19 @@ hk_agx2_packed_float_copy(enum agx_chip chip, VkFormat format)
 /* Whether end-of-tile programs store R11G11B10F through its own class, under
  * the lane class of packed 32-bit formats (see hk_eot_key_format()), rather
  * than as the raw tile word through an R32_UINT PBE. The stored bytes are the
- * same. The reason is the end-of-tile PBE of the G17P profile: when an
+ * same. The reason is the end-of-tile PBE of the HAL200 profile: when an
  * end-of-tile program resolves a multisampled tile into its single-sample
  * target, only this class averages the packed fields. Through the raw 32-bit
  * class no resolved pixel is its samples' mean, and the wrong value changes
  * from run to run (aurora-r11g11b10f 2, res-eot). It is also the only class
- * that could write the format compressed. The PBE is the same on every G17P
- * SoC, so all of them take it: measured on the M4 Pro (since c724930c) and
- * the M4 Max; the A18 Pro has the same PBE classes and has not been measured.
+ * that could write the format compressed. The PBE is shared across native
+ * HAL200 SoCs (G17P and G16G), so all of them take it: measured on M4 (G16G),
+ * M4 Pro (since c724930c), and M4 Max, and shared by A18 Pro.
  * M5 already stores the format in its own class (agx_rt0_pbe_format()). */
 static inline bool
 hk_eot_r11g11b10_own_class(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P;
+   return agx_chip_native_hal200(dev->chip);
 }
 
 /* The format an end-of-tile PBE stores a target through. */
