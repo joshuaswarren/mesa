@@ -44,7 +44,11 @@ agx_ppp_hal300_graphics_core_pack_g18g(
           fields->varying_table >= (UINT64_C(1) << 48))
          return false;
    } else {
-      if (fields->vertex_varying_components > 8 ||
+      if (fields->vertex_varying_components >
+             ((fields->rasterizer_discard ||
+               !fields->fragment_varying_components) ? 124 : 8) ||
+          4 + fields->point_size_output + fields->layer_output +
+             fields->clip_distance_words + fields->vertex_varying_components > 128 ||
           fields->fragment_varying_components >
              fields->vertex_varying_components ||
           fields->needs_primitive_id)
@@ -75,13 +79,13 @@ agx_ppp_hal300_graphics_core_pack_g18g(
                         ? (fields->output_select & 0x40000) != 0
                         : fields->point_size_output;
 
-   /* Only the witnessed point shape: Apple's point draw exports a point
-    * size, and a point without one has no capture behind it. Lines are
-    * captured on G18G only, without a point size. */
+   /* Points require a point-size output unless rasterizer discard is active.
+    * Lines may still carry a point-size UVS word (for example, tessellation
+    * evaluation shaders lowered with a default point size for isolines). */
    if (fields->object_type > AGX_PPP_HAL300_LINES ||
-       (fields->object_type == AGX_PPP_HAL300_POINTS && !psiz) ||
-       (fields->object_type == AGX_PPP_HAL300_LINES &&
-        (chip != AGX_CHIP_G18G || psiz)))
+       (fields->object_type == AGX_PPP_HAL300_POINTS && !psiz &&
+        !fields->rasterizer_discard) ||
+       (fields->object_type == AGX_PPP_HAL300_LINES && chip != AGX_CHIP_G18G))
       return false;
 
    if (fields->line_width_valid &&
