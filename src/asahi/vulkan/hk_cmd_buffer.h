@@ -1381,6 +1381,9 @@ struct hk_cs {
     * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
 
+   /* The vertex stages read the hoisted preamble after this stream. */
+   bool pre_gfx_writes_preamble;
+
    /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
     * which a merge moves with its bytes. */
    uint32_t alias_sites;

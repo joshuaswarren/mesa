@@ -782,16 +782,15 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (cs->stats.cmds == 0)
       return;
 
-   if (!hk_cmd_alias_scope(cmd)) {
-      hk_cdm_note_alias_site(cmd, cs);
-      return;
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
+   if ((alias_scope || cs->pre_gfx_writes_preamble) &&
+       hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_visibility_flush(dev, cs, alias_scope);
    }
 
-   if (!hk_cdm_visibility_flush_needed(dev, cs, true))
-      return;
-
-   hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-   hk_cdm_visibility_flush(dev, cs, true);
+   if (!alias_scope)
+      hk_cdm_note_alias_site(cmd, cs);
 }
 
 void
@@ -1968,12 +1967,15 @@ hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
          .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
       };
       if (!hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
-             &program.launch, &direct, 0x5, &sink))
+             &program.launch, &direct, 0, &sink))
          return false;
 
       cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
-      cs->strong_flush_end = cs->current;
-      cs->weak_barrier_end = NULL;
+      /* Later CDM helpers can copy the address of the output into vertex
+       * programs, but only VDM reads the values. Share their final flush,
+       * or upgrade the stream's tail when no helper has flushed it. */
+      cs->weak_barrier_end = cs->current;
+      cs->pre_gfx_writes_preamble = true;
       cs->stats.cmds++;
       return true;
    }
