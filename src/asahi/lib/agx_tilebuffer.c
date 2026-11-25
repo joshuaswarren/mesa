@@ -799,8 +799,8 @@ agx_g18g_native_mixed_tile_bytes(const enum pipe_format *formats,
    return sample_B * 32 * 32;
 }
 
-unsigned
-agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
+static unsigned
+agx_g18g_native_mixed_layout_mask(const struct agx_tilebuffer_layout *tib)
 {
    if (!tib || tib->nr_samples != 1 || tib->tile_size != 32 * 32 ||
        tib->layered || agx_tilebuffer_spills(tib))
@@ -820,9 +820,7 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
    unsigned active;
    const unsigned end = agx_g18g_index_order_offsets(
       tib->logical_format, AGX_MAX_RENDER_TARGETS, offset_B, &active);
-   if (active < 2 || tib->sample_size_B != ALIGN_POT(end, 8) ||
-       agx_g18g_owned_by_existing_path(tib->logical_format,
-                                       AGX_MAX_RENDER_TARGETS))
+   if (active < 2 || tib->sample_size_B != ALIGN_POT(end, 8))
       return 0;
 
    u_foreach_bit(rt, mask) {
@@ -830,6 +828,22 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
          return 0;
    }
    return mask;
+}
+
+unsigned
+agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
+{
+   const unsigned mask = agx_g18g_native_mixed_layout_mask(tib);
+   if (!mask || agx_g18g_owned_by_existing_path(tib->logical_format,
+                                                AGX_MAX_RENDER_TARGETS))
+      return 0;
+   return mask;
+}
+
+unsigned
+agx_g18g_native_mixed_epilog_mask(const struct agx_tilebuffer_layout *tib)
+{
+   return agx_g18g_native_mixed_layout_mask(tib);
 }
 
 unsigned

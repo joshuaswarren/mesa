@@ -47,7 +47,7 @@ static const unsigned all_caps =
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |
    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |
    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
-   AGX_CAP_ZLS_FULL_RENDER_BOUNDS;
+   AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -189,6 +189,19 @@ test_zls_full_render_bounds(void)
    }
 }
 
+/* AGX_CAP_NATIVE_MIXED_EPILOG is set where the native1130 single-sample
+ * fragment epilog encoding has been verified (G18G). */
+static void
+test_native_mixed_epilog(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_NATIVE_MIXED_EPILOG) ==
+                    (c == AGX_CHIP_G18G),
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -201,6 +214,7 @@ main(void)
    test_gen10_2d_compression();
    test_sparse_binding();
    test_zls_full_render_bounds();
+   test_native_mixed_epilog();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,
