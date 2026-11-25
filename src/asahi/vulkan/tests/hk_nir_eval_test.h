@@ -326,6 +326,12 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
             r = hk_eval_f2u(fmaxf(a, b));
             break;
          }
+         case nir_op_ffloor:
+            r = hk_eval_f2u(floorf(hk_eval_u2f((uint32_t)s0)));
+            break;
+         case nir_op_fceil:
+            r = hk_eval_f2u(ceilf(hk_eval_u2f((uint32_t)s0)));
+            break;
          case nir_op_feq:
             r = hk_eval_u2f((uint32_t)s0) == hk_eval_u2f((uint32_t)s1);
             break;
