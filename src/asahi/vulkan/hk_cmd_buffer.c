@@ -205,6 +205,23 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
 }
 
 void
+hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd, const void *from,
+                                const void *from_end, uint8_t *to, size_t skip)
+{
+   util_dynarray_foreach(&cmd->sparse_sites, struct hk_sparse_site, site) {
+      const uint8_t *word = (const uint8_t *)site->word;
+      if (word < (const uint8_t *)from || word >= (const uint8_t *)from_end)
+         continue;
+
+      /* As the alias sites: a site in the folded leading record moves to
+       * the trailing record that absorbed it. */
+      const size_t offset = word - (const uint8_t *)from;
+      site->word = (uint32_t *)(offset < skip ? to - AGX3_CDM_BARRIER_SIZE
+                                             : to + offset - skip);
+   }
+}
+
+void
 hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
                                const void *from_end, uint8_t *to, size_t skip)
 {
@@ -330,12 +347,61 @@ hk_submit_patch_alias_sites(struct hk_device *dev,
    u_rwlock_wrunlock(&dev->host_alias.patch_lock);
 }
 
+void
+hk_cdm_note_sparse_site(struct hk_cs *cs, uint32_t *word)
+{
+   struct hk_sparse_site *site =
+      util_dynarray_grow(&cs->cmd->sparse_sites, struct hk_sparse_site, 1);
+   if (site) {
+      *site = (struct hk_sparse_site){
+         .word = word,
+         .value = AGX_CDM_BARRIER_FULL_WORD |
+                  (AGX_CDM_BLOCK_TYPE_BARRIER << 29),
+      };
+      cs->sparse_sites++;
+   }
+}
+
+/* Writes the stream words of the sparse patch sites. Same store discipline
+ * as the alias sites: the words are stored whole, then made visible before
+ * the submission that lets the GPU run them. */
+static void
+hk_cmd_buffer_patch_sparse_sites(struct hk_cmd_buffer *cmd)
+{
+   util_dynarray_foreach(&cmd->sparse_sites, struct hk_sparse_site, site)
+      __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+
+   __sync_synchronize();
+   if (util_has_cache_ops())
+      util_post_flush_fence();
+}
+
+void
+hk_submit_patch_sparse_sites(struct hk_device *dev,
+                             struct vk_command_buffer *const *cmds,
+                             unsigned count)
+{
+   bool unpatched = false;
+   for (unsigned i = 0; i < count && !unpatched; ++i) {
+      const struct hk_cmd_buffer *cmd = (const void *)cmds[i];
+      unpatched = cmd->sparse_sites.size != 0;
+   }
+   if (!unpatched)
+      return;
+
+   u_rwlock_wrlock(&dev->host_alias.patch_lock);
+   for (unsigned i = 0; i < count; ++i)
+      hk_cmd_buffer_patch_sparse_sites((struct hk_cmd_buffer *)cmds[i]);
+   u_rwlock_wrunlock(&dev->host_alias.patch_lock);
+}
+
 static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
    hk_cmd_buffer_reset_alias_sites(cmd);
+   util_dynarray_clear(&cmd->sparse_sites);
    hk_cmd_pending_reap(dev);
    hk_cmd_pending_retain_lost(dev, cmd);
 
@@ -377,6 +443,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    hk_device_quiesce_lost_submissions(hk_cmd_pool_device(pool));
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->alias_sites);
+   util_dynarray_fini(&cmd->sparse_sites);
    util_dynarray_fini(&cmd->large_bos);
    util_dynarray_fini(&cmd->meta_push_saves);
    free(cmd->retained_set);
@@ -417,6 +484,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
    cmd->alias_sites = UTIL_DYNARRAY_INIT;
+   cmd->sparse_sites = UTIL_DYNARRAY_INIT;
    cmd->meta_push_saves = UTIL_DYNARRAY_INIT;
    list_inithead(&cmd->alias_link);
 

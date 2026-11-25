@@ -1471,6 +1471,10 @@ struct hk_cs {
     * which a merge moves with its bytes. */
    uint32_t alias_sites;
 
+   /* AGX2: sparse patch sites recorded in this stream
+    * (hk_cmd_buffer::sparse_sites), which a merge moves with its bytes. */
+   uint32_t sparse_sites;
+
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
     * barrier (the strong flush that makes a preceding render visible), so a
@@ -1918,6 +1922,11 @@ void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
                                     const void *from, const void *from_end,
                                     uint8_t *to, size_t skip);
 
+/* As hk_cmd_buffer_move_alias_sites(), for the AGX2 sparse patch sites. */
+void hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd,
+                                     const void *from, const void *from_end,
+                                     uint8_t *to, size_t skip);
+
 /*
  * Helper to merge two compute control streams, concatenating the second control
  * stream, up to b_current, to the first one. Must sync with hk_cs.
@@ -1989,6 +1998,9 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       if (b->alias_sites && a->cmd == b->cmd)
          hk_cmd_buffer_move_alias_sites(a->cmd, b->start, b_current, dst,
                                         b_skip);
+      if (b->sparse_sites && a->cmd == b->cmd)
+         hk_cmd_buffer_move_sparse_sites(a->cmd, b->start, b_current, dst,
+                                         b_skip);
 
       /* These markers point just past an emitted barrier. Preserve them in
        * the destination root so another adjacent merge still has an exact
@@ -2026,6 +2038,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    }
 
    a->alias_sites += b->alias_sites;
+   a->sparse_sites += b->sparse_sites;
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
@@ -2445,6 +2458,11 @@ struct hk_cmd_buffer {
    uint32_t alias_patched;
    uint32_t alias_registered;
    struct list_head alias_link;
+
+   /* AGX2 reduced-word CDM barrier records emitted while no sparse resource
+    * existed (struct hk_sparse_site), upgraded to the full word at submit
+    * when dev->sparse_used is set (hk_submit_patch_sparse_sites()). */
+   struct util_dynarray sparse_sites;
 };
 
 /* A patch site: the stream word of a barrier record an application
@@ -2457,6 +2475,15 @@ struct hk_cmd_buffer {
  * dispatch after it no longer drops it, and a merge that folds a leading
  * barrier over it writes a barrier. */
 struct hk_alias_site {
+   uint32_t *word;
+   uint32_t value;
+};
+
+/* A patch site: the stream word of an AGX2 barrier record emitted with the
+ * reduced flag word while the device held no sparse resource. `value` is
+ * the full-word record, written at submit when a sparse resource exists by
+ * then (hk_submit_patch_sparse_sites()). */
+struct hk_sparse_site {
    uint32_t *word;
    uint32_t value;
 };
@@ -2475,6 +2502,16 @@ void hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* Writes the command buffer's patch sites, once. Callers ensure no reset
  * runs concurrently; two writers write the same words. */
 void hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd);
+
+/* Records the just-emitted reduced-word AGX2 barrier record at `word` as a
+ * sparse patch site in cs's stream (hk_cdm_flush()). */
+void hk_cdm_note_sparse_site(struct hk_cs *cs, uint32_t *word);
+
+/* Writes each submitted command buffer's sparse patch sites, once
+ * dev->sparse_used is set: an upgrade only strengthens the record. */
+void hk_submit_patch_sparse_sites(struct hk_device *dev,
+                                  struct vk_command_buffer *const *cmds,
+                                  unsigned count);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT and

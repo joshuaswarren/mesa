@@ -614,8 +614,29 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    case AGX_CS_GENERATION_AGX2:
       if (cs->current == cs->strong_flush_end)
          return;
-      cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
-      cs->strong_flush_end = cs->current;
+
+      {
+         /* The only Borealis AGX2 barrier-word path: the reduced word on
+          * the dies it was measured on (hk_device::cdm_barrier_default_mask,
+          * agx2_cdm_barrier_default_word()), the full word on every other
+          * chip, under fullcdmbarrier, and once the device holds a sparse
+          * resource -- the reduced set leaves page remappings behind the
+          * launches unordered. Gallium keeps agx_cdm_barrier()'s full
+          * record. */
+         const uint32_t mask = agx2_cdm_barrier_emit_word(
+            dev->cdm_barrier_default_mask, p_atomic_read(&dev->sparse_used),
+            HK_PERF(dev, FULLCDMBARRIER));
+
+         uint32_t *word = cs->current;
+         *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+         cs->strong_flush_end = cs->current;
+
+         /* A sparse resource created between recording and submission
+          * still upgrades this record at submit. */
+         if (mask != AGX_CDM_BARRIER_FULL_WORD)
+            hk_cdm_note_sparse_site(cs, word);
+      }
       break;
 
    case AGX_CS_GENERATION_G15:

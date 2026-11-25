@@ -753,6 +753,41 @@ agx_chip_command_stream_generation(enum agx_chip chip)
    return agx_chip_info(chip)->cs_generation;
 }
 
+/* The flag word the AGX2 CDM barrier record carries when every bit is set:
+ * unk_0..19 plus the USC cache invalidate, the record the shared
+ * agx_cdm_barrier() emitter produces. */
+#define AGX_CDM_BARRIER_FULL_WORD 0xfffffu
+
+/* The default flag word of the AGX2 CDM barrier record Borealis emits at a
+ * tracked compute dependency (hk_cdm_flush()). The reduced word 0x1ff
+ * (unk_0..8, PBE/texture-cache maintenance included) is the set measured on
+ * the two AGX2 X dies; every other chip keeps the full word. The gate is a
+ * chip property rather than a measured property because the reduced set is a
+ * die-level drain characteristic: the two chips it was proven on are the
+ * only AGX2 parts the lab holds. The word alone does not decide when a
+ * barrier is emitted, and a device that created a sparse resource upgrades
+ * to the full word at emit or submit (hk_cdm_flush(),
+ * hk_submit_patch_sparse_sites()). */
+static inline uint32_t
+agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
+{
+   if (chip == AGX_CHIP_G13X ||
+       (chip == AGX_CHIP_G14X && gpu_generation == 14))
+      return 0x1ffu;
+   return AGX_CDM_BARRIER_FULL_WORD;
+}
+
+/* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
+ * full word once the device holds a sparse resource or under
+ * fullcdmbarrier, the chip's default word otherwise. */
+static inline uint32_t
+agx2_cdm_barrier_emit_word(uint32_t default_word, bool sparse_used,
+                           bool force_full)
+{
+   return (sparse_used || force_full) ? AGX_CDM_BARRIER_FULL_WORD
+                                      : default_word;
+}
+
 static inline enum agx_descriptor_generation
 agx_chip_descriptor_generation(enum agx_chip chip)
 {

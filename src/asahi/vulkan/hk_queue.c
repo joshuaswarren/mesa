@@ -6768,6 +6768,14 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       hk_submit_patch_alias_sites(dev, submit->command_buffers,
                                   submit->command_buffer_count);
 
+   /* Command buffers recorded before the device held a sparse resource
+    * carry the reduced AGX2 barrier word at their patch sites; write the
+    * full word before the streams are packed (host_alias.patch_lock, same
+    * lifetime rule as the alias sites above). */
+   if (unlikely(p_atomic_read(&dev->sparse_used)))
+      hk_submit_patch_sparse_sites(dev, submit->command_buffers,
+                                   submit->command_buffer_count);
+
    /* Look at the command buffers before they are submitted: once the work is
     * with the kernel it can complete, and the application may then free or
     * reset them while this callback is still running on a submit thread. */
