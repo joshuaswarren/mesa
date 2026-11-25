@@ -22,6 +22,7 @@
 #include "hk_device_memory.h"
 #include "hk_identity_copy4.h"
 #include "hk_nir_tensor_ops.h"
+#include "hk_pack_loop_bound.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -307,6 +308,8 @@ struct hk_shader {
     * stripped, used when the vertex preamble is hoisted into a PREGFX compute
     * dispatch for multi-draw batches. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
+
+   struct hk_pack_loop_bound pack_loop_bound;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -1126,3 +1129,12 @@ bool hk_nir_merge_buffer_words(nir_shader *nir);
  * or compilation fails. */
 struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
                                             struct hk_shader *vs);
+
+struct blob;
+struct blob_reader;
+
+void hk_shader_serialize(struct vk_device *vk_dev,
+                         const struct hk_shader *shader, struct blob *blob);
+VkResult hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
+                               struct hk_shader *shader, bool absent,
+                               bool cache_candidate);

@@ -58,6 +58,12 @@
 
 #include <stdio.h>
 
+/* Largest per-thread scratch frame of a kernel that may overlap the
+ * application dispatches around it. 64 unordered dispatches of 4096 threads
+ * take as long as ordered ones with 512 bytes per thread and five times as
+ * long with 1 KB. */
+#define HK_M5_OVERLAP_MAX_SCRATCH_B 512
+
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
