@@ -1414,7 +1414,10 @@ agx_nir_coalesce_sample_mask_updates(nir_shader *shader, unsigned nr_samples)
    for (unsigned i = 0; i < count; ++i)
       nir_instr_remove(&updates[i]->instr);
 
-   return nir_progress(true, impl, nir_metadata_control_flow);
+   nir_foreach_function_impl(other, shader) {
+      nir_progress(other == impl, other, nir_metadata_control_flow);
+   }
+   return true;
 }
 
 /*

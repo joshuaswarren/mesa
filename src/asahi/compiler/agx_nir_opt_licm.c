@@ -1046,8 +1046,10 @@ agx_nir_reassociate_loop_invariant_eq(nir_shader *shader)
    bool progress = false;
 
    nir_foreach_function_impl(impl, shader) {
-      if (impl->function->is_preamble || !cf_list_has_loop(&impl->body))
+      if (impl->function->is_preamble || !cf_list_has_loop(&impl->body)) {
+         nir_no_progress(impl);
          continue;
+      }
 
       nir_builder b = nir_builder_create(impl);
       unsigned top_hoists = 0;
