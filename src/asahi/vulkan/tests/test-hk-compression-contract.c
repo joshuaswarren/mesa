@@ -356,6 +356,36 @@ check_image_creation(struct hk_physical_device *pdev)
    assert(!hk_image_from_handle(image)->planes[1].layout.compressed);
    hk_DestroyImage(device, image, NULL);
 
+   const bool expect_msaa_color =
+      agx_chip_has_cap(pdev->dev.chip, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION);
+   VkImageCreateInfo msaa_color = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = {64, 64, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_2_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   assert(hk_CreateImage(device, &msaa_color, NULL, &image) == VK_SUCCESS);
+   assert(hk_image_from_handle(image)->planes[0].layout.compressed ==
+          expect_msaa_color);
+   hk_DestroyImage(device, image, NULL);
+   msaa_color.samples = VK_SAMPLE_COUNT_4_BIT;
+   msaa_color.arrayLayers = 4;
+   assert(hk_CreateImage(device, &msaa_color, NULL, &image) == VK_SUCCESS);
+   assert(hk_image_from_handle(image)->planes[0].layout.compressed ==
+          expect_msaa_color);
+   hk_DestroyImage(device, image, NULL);
+   msaa_color.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+   assert(hk_CreateImage(device, &msaa_color, NULL, &image) == VK_SUCCESS);
+   assert(!hk_image_from_handle(image)->planes[0].layout.compressed);
+   hk_DestroyImage(device, image, NULL);
+
    const uint64_t modifier = DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
    VkImageDrmFormatModifierListCreateInfoEXT list = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,

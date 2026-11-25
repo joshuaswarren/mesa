@@ -221,16 +221,19 @@ test_hal200_lossless_compression(void)
    }
 }
 
-/* AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION is enabled only on G17P: G16G shares
- * the HAL200 PBE/texture/ZLS contract but its 1-8B 2x/4x MSAA colour variants
- * are not qualified yet. */
+/* AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION is enabled across native HAL200 AGX3B
+ * parts (G16G and G17P) and off on every chip without the base HAL200 cap. */
 static void
 test_hal200_msaa_color_compression(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G16G || c == AGX_CHIP_G17P;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
-                    (c == AGX_CHIP_G17P),
+                    expected,
+                 c);
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
+                    agx_chip_native_hal200(c),
                  c);
       /* MSAA colour never enables without the base HAL200 cap. */
       if (agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION))

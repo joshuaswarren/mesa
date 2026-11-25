@@ -218,9 +218,11 @@ main(void)
 
    /* Verify Gen9 compressed AIL layout + PBE descriptor emission for the key
     * HAL200 targets (rgba8, rgba16f, rgba32f 1x 2D/array, d32f via R32_UINT
-    * copy alias). 2x/4x MSAA colour compression on native HAL200 is gated by
-    * AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G17P only); a plain MSAA layout
-    * on G16G is covered by the chip-caps row test. */
+    * copy alias). 2x/4x MSAA colour compression on native HAL200 is enabled
+    * across G16G and G17P via AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION; the
+    * chip-caps row test owns the admission matrix, and the 2x/4x compressed
+    * layout + PBE path is further exercised through
+    * hk_hal200_compression_eligible() in test-hk-g17p-compression.c. */
    static const struct {
       enum pipe_format format;
       unsigned layers;
