@@ -24,6 +24,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
@@ -3101,31 +3102,6 @@ hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
    list->size = kept;
 }
 
-struct hk_compute_pair_interval {
-   uint64_t start, end;
-   uint32_t handle;
-};
-
-static bool
-compute_pair_interval(const struct hk_storage_backing *backing,
-                      uint64_t start, uint64_t end, struct hk_compute_pair_interval *out)
-{
-   if (!backing->handle || start >= end || end > backing->size ||
-       backing->offset > UINT64_MAX - end)
-      return false;
-   *out = (struct hk_compute_pair_interval){
-      backing->offset + start, backing->offset + end, backing->handle,
-   };
-   return true;
-}
-
-static bool
-compute_pair_same_interval(const struct hk_compute_pair_interval *a,
-                           const struct hk_compute_pair_interval *b)
-{
-   return a->handle == b->handle && a->start == b->start && a->end == b->end;
-}
-
 static bool
 compute_pair_buffers_match(const struct hk_compute_pair_dispatch *producer,
                            const struct hk_compute_pair_dispatch *clamp)
@@ -3215,13 +3191,6 @@ compute_pair_can_replace(const struct hk_cs *producer, const struct hk_cs *consu
 }
 
 static bool
-compute_pair_intervals_disjoint(const struct hk_compute_pair_interval *a,
-                                const struct hk_compute_pair_interval *b)
-{
-   return a->handle != b->handle || a->end <= b->start || b->end <= a->start;
-}
-
-static bool
 compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
                          const struct hk_compute_pair_dispatch *copy4)
 {
@@ -3229,6 +3198,16 @@ compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
        producer->alt_kind == HK_COMPUTE_PAIR_ALT_NONE ||
        copy4->info.role != HK_COMPUTE_PAIR_COPY4)
       return false;
+
+   const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
+   if (!copy4->bindings[1].address ||
+       copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
+       cp->src_start > UINT64_MAX - cp->bytes ||
+       cp->dst_start > UINT64_MAX - cp->bytes)
+      return false;
+
+   if (producer->info.role == HK_COMPUTE_PAIR_FADD)
+      return hk_compute_pair_fadd_copy4_match(producer, copy4);
 
    struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
    memcpy(ps.groups, producer->groups, sizeof(ps.groups));
@@ -3262,15 +3241,8 @@ compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
    }
 
    if (hk_dual_write_push_offset(push_bytes) + sizeof(struct hk_dual_copy_push) >
-       HK_MAX_PUSH_SIZE)
-      return false;
-
-   const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
-   if (!copy4->bindings[1].address ||
-       copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
-       ((copy4->bindings[1].address + cp->dst_start) % dst_align) != 0 ||
-       cp->src_start > UINT64_MAX - cp->bytes ||
-       cp->dst_start > UINT64_MAX - cp->bytes)
+       HK_MAX_PUSH_SIZE ||
+       ((copy4->bindings[1].address + cp->dst_start) % dst_align) != 0)
       return false;
 
    struct hk_compute_pair_interval output, src, dst;
@@ -3412,7 +3384,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (members[i].cs && hk_compute_pair_stream_eligible(members[i].cs)) {
             const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
             if ((p->info.role == HK_COMPUTE_PAIR_DEPTHWISE ||
-                 p->info.role == HK_COMPUTE_PAIR_GEMM) &&
+                 p->info.role == HK_COMPUTE_PAIR_GEMM ||
+                 p->info.role == HK_COMPUTE_PAIR_FADD) &&
                 AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes) {
                members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
             }
@@ -3449,7 +3422,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                continue;
             }
             if ((p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
-                 p->info.role != HK_COMPUTE_PAIR_GEMM) ||
+                 p->info.role != HK_COMPUTE_PAIR_GEMM &&
+                 p->info.role != HK_COMPUTE_PAIR_FADD) ||
                 !p->producer || !p->root_va)
                continue;
 
@@ -3666,7 +3640,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   const uint32_t prod_pb =
                      p_disp->info.role == HK_COMPUTE_PAIR_DEPTHWISE
                         ? p_disp->info.depthwise.push_bytes
-                        : p_disp->info.gemm.push_bytes;
+                        : p_disp->info.role == HK_COMPUTE_PAIR_FADD
+                             ? p_disp->info.fadd_push_bytes
+                             : p_disp->info.gemm.push_bytes;
                   const uint32_t dual_off = hk_dual_write_push_offset(prod_pb);
                   if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_COPY) {
                      const uint64_t dst2_va =
