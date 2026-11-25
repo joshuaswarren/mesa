@@ -2802,7 +2802,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
     * clear included, was lost.
     */
    key.single_sample_reload = false;
-
+   if (store && !partial_render)
+      key.resolve_mask = render->agx2_resolve_mask;
 
    bool needs_textures_for_spilled_rts =
       agx_tilebuffer_spills(&render->tilebuffer) && !partial_render && !store;
@@ -3023,6 +3024,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          agx_usc_uniform(&b, 4 + (8 * rt), 8, colour);
          uniforms = MAX2(uniforms, 4 + (8 * rt) + 8);
       } else if (key.op[rt] == AGX_EOT_STORE) {
+         if (key.resolve_mask & BITFIELD_BIT(rt))
+            iview = render->color_att[rt].resolve_iview;
          const bool valid = key.tib.layered
                                ? iview->planes[0].layered_eot_pbe_valid
                                : iview->planes[0].eot_pbe_valid;
@@ -4810,6 +4813,38 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
    return true;
 }
 
+/* A 2D block store resolves four RGBA8 tile samples through the destination
+ * PBE. A partial render still needs a multisample store to the source for
+ * reload, and a subrect resolve must preserve destination pixels outside it.
+ */
+static uint8_t
+hk_agx2_color_resolve_mask(const struct hk_device *dev,
+                           const struct hk_rendering_state *render)
+{
+   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX2 ||
+       agx_chip_command_stream_generation(dev->dev.chip) != AGX_CS_GENERATION_AGX2 ||
+       !render->cr.whole_attachments || render->cr.layers != 1 ||
+       render->view_mask || render->tilebuffer.nr_samples != 4 ||
+       (render->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)))
+      return 0;
+
+   uint8_t mask = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      const struct hk_image_view *dst = att->resolve_iview;
+      if (att->iview && dst && !render->tilebuffer.spilled[i] &&
+          att->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE &&
+          att->resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT &&
+          att->iview->vk.image->samples == VK_SAMPLE_COUNT_4_BIT &&
+          render->tilebuffer.logical_format[i] == PIPE_FORMAT_R8G8B8A8_UNORM &&
+          dst->vk.view_type == VK_IMAGE_VIEW_TYPE_2D &&
+          dst->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
+          dst->planes[0].eot_pbe_valid)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
+}
+
 static void
 hk_begin_rendering(VkCommandBuffer commandBuffer,
                    const VkRenderingInfo *pRenderingInfo)
@@ -5054,6 +5089,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             render->cr.whole_attachments = false;
       }
    }
+
+   render->agx2_resolve_mask = hk_agx2_color_resolve_mask(dev, render);
 
    perf_debug(cmd, "Rendering %ux%ux%u@%u %s%s", render->cr.width,
               render->cr.height, render->cr.layers,
@@ -5666,6 +5703,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
          }
       }
    }
+   u_foreach_bit(i, render->agx2_resolve_mask)
+      loaded_resolve |= render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_LOAD;
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
    render->process_empty_tiles_without_z =
@@ -5826,8 +5865,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    VkRenderingAttachmentInfo vk_color_att[HK_MAX_RTS];
    VkRenderingAttachmentFlagsInfoKHR vk_color_att_flags[HK_MAX_RTS];
    for (uint32_t i = 0; i < render->color_att_count; i++) {
-      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE &&
-          !render->g17p_direct_color_resolve)
+      const bool resolved = render->g17p_direct_color_resolve ||
+                            (render->agx2_resolve_mask & BITFIELD_BIT(i));
+      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE && !resolved)
          need_resolve = true;
 
       vk_color_att_flags[i] = (VkRenderingAttachmentFlagsInfoKHR) {
@@ -5839,7 +5879,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          .pNext = &vk_color_att_flags[i],
          .imageView = hk_image_view_to_handle(render->color_att[i].iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .resolveMode = render->g17p_direct_color_resolve
+         .resolveMode = resolved
                            ? VK_RESOLVE_MODE_NONE
                            : render->color_att[i].resolve_mode,
          .resolveImageView =

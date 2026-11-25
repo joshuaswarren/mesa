@@ -97,6 +97,9 @@ hk_device_init_meta(struct hk_device *dev)
       agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
       agx_chip_agx3_path(dev->dev.chip);
+   dev->meta.resolve_rgba8_4x_half_up =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2 &&
+      agx_chip_command_stream_generation(dev->dev.chip) == AGX_CS_GENERATION_AGX2;
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
