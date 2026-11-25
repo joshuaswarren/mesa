@@ -68,6 +68,14 @@ main(void)
    assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G14X));
    assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G18G));
 
+   /* NIR-lowered VK_EXT_depth_clip_control stays on across AGX2, native AGX3,
+    * and AGX3C/HAL300 (M5), and fails closed on AGX3D (G18G). */
+   assert(agx_chip_has_depth_clip_control(AGX_CHIP_G13G));
+   assert(agx_chip_has_depth_clip_control(AGX_CHIP_G14X));
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_depth_clip_control(elide_chips[i]));
+   assert(!agx_chip_has_depth_clip_control(AGX_CHIP_G18G));
+
    /* Hardware ASTC HDR decode stays on across AGX2, native AGX3, and
     * AGX3C/HAL300 (M5), and fails closed on AGX3D (G18G). */
    assert(agx_chip_has_astc_hdr(AGX_CHIP_G13G));

@@ -11228,8 +11228,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                 render->tilebuffer.max_bytes_per_tile &&
              (!has_zs_attachment || plain_ms_zs))) ||
           fragment_pass > AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH ||
-          (!discard && (dyn->vp.depth_clip_negative_one_to_one ||
-          dyn->ds.depth.bounds_test.enable ||
+          (!discard && (dyn->ds.depth.bounds_test.enable ||
           !bounded_viewport || !bounded_depth_range))) {
          {
             fprintf(stderr, "M5 PPP profile: uvs=%u osel=%#x provoking=%u object=%u "
@@ -13069,6 +13068,61 @@ hk_update_effective_fragment_pass_type(struct hk_cmd_buffer *cmd,
       cs->user_color_written_mask |= gfx->fast_link_fs.app_color_written;
 }
 
+struct hk_agx2_vertex_state {
+   struct agx_vdm_state_packed header;
+   struct agx_counts_packed counts;
+   struct agx_vdm_state_vertex_shader_word_1_packed shader;
+   struct agx_vdm_state_vertex_outputs_packed outputs;
+   struct agx_vdm_state_vertex_unknown_packed control;
+   uint32_t padding;
+};
+
+static struct hk_agx2_vertex_state
+hk_agx2_pack_vertex_state(struct hk_cmd_buffer *cmd, const struct hk_shader *vs)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_agx2_vertex_state state = {
+      .counts = vs->counts,
+      .outputs = vs->info.uvs.vdm,
+   };
+   static_assert(sizeof(state) ==
+                 ALIGN_POT(AGX_VDM_STATE_LENGTH +
+                           AGX_VDM_STATE_VERTEX_SHADER_WORD_0_LENGTH +
+                           AGX_VDM_STATE_VERTEX_SHADER_WORD_1_LENGTH +
+                           AGX_VDM_STATE_VERTEX_OUTPUTS_LENGTH +
+                           AGX_VDM_STATE_VERTEX_UNKNOWN_LENGTH, 8));
+
+   agx_pack(&state.header, VDM_STATE, cfg) {
+      cfg.vertex_shader_word_0_present = true;
+      cfg.vertex_shader_word_1_present = true;
+      cfg.vertex_outputs_present = true;
+      cfg.vertex_unknown_present = true;
+   }
+   agx_pack(&state.control, VDM_STATE_VERTEX_UNKNOWN, cfg) {
+      cfg.flat_shading_control = translate_vdm_vertex(gfx->provoking);
+      cfg.unknown_4 = cfg.unknown_5 = hk_rast_discard(cmd);
+      cfg.generate_primitive_id = gfx->generate_primitive_id;
+   }
+   return state;
+}
+
+static bool
+hk_agx2_publish_vertex_state(struct hk_cmd_buffer *cmd, uint8_t **out,
+                             struct hk_agx2_vertex_state *state,
+                             uint64_t program)
+{
+   if (unlikely(program > UINT32_MAX)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   agx_pack(&state->shader, VDM_STATE_VERTEX_SHADER_WORD_1, cfg)
+      cfg.pipeline = program;
+
+   memcpy(*out, state, sizeof(*state));
+   *out += sizeof(*state);
+   return true;
+}
+
 static __attribute__((noinline)) void
 hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             uint32_t draw_id, struct agx_draw draw,
@@ -13654,39 +13708,14 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out = mesh_tail_emitted;
          }
       } else switch (agx_chip_command_stream_generation(dev->dev.chip)) {
-      case AGX_CS_GENERATION_AGX2:
-         if (pipeline_program > UINT32_MAX) {
-            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      case AGX_CS_GENERATION_AGX2: {
+         struct hk_agx2_vertex_state state = hk_agx2_pack_vertex_state(cmd, hw_vs);
+         if (!hk_agx2_publish_vertex_state(cmd, &out, &state, pipeline_program)) {
             cs->current = out;
             return;
          }
-
-         agx_push(out, VDM_STATE, cfg) {
-            cfg.vertex_shader_word_0_present = true;
-            cfg.vertex_shader_word_1_present = true;
-            cfg.vertex_outputs_present = true;
-            cfg.vertex_unknown_present = true;
-         }
-
-         agx_push_packed(out, hw_vs->counts, VDM_STATE_VERTEX_SHADER_WORD_0);
-
-         agx_push(out, VDM_STATE_VERTEX_SHADER_WORD_1, cfg) {
-            cfg.pipeline = pipeline_program;
-         }
-
-         agx_push_packed(out, hw_vs->info.uvs.vdm,
-                         VDM_STATE_VERTEX_OUTPUTS);
-
-         agx_push(out, VDM_STATE_VERTEX_UNKNOWN, cfg) {
-            cfg.flat_shading_control = translate_vdm_vertex(gfx->provoking);
-            cfg.unknown_4 = cfg.unknown_5 = hk_rast_discard(cmd);
-            cfg.generate_primitive_id = gfx->generate_primitive_id;
-         }
-
-         /* Pad up to a multiple of 8 bytes */
-         memset(out, 0, 4);
-         out += 4;
          break;
+      }
 
       case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL200:
@@ -16274,6 +16303,9 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  * the one the stream already latched (hk_cs.m5_ppp_emitted), so it emits
  * nothing there either.
  *
+ * On AGX2, the indirect-count path checks this after its first ordinary draw.
+ * Vertex and fragment state are then stable apart from per-draw uniforms.
+ *
  * The check reads no per-record value except the indirect address, and
  * emitting a record changes none of what it reads, so a multi-draw checks it
  * once (draw is already normalised).  It has no side effects.
@@ -17802,6 +17834,45 @@ hk_vdm_spans_append_range(struct hk_cmd_buffer *cmd,
    return true;
 }
 
+/* Emit consecutive AGX2 records in the current stream chunk. Draw 0 has
+ * already published all graphics state. Only the vertex uniforms for draw
+ * parameters or DrawID can move. Keep the complete VDM vertex update when
+ * they do, including the vertex counts and output state.
+ */
+static bool
+hk_agx2_emit_indirect_count_chunk(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                  struct agx_draw draw, uint32_t first,
+                                  uint32_t count, uint32_t stride,
+                                  struct hk_agx2_vertex_state *vertex)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   struct hk_linked_shader *linked = gfx->linked[MESA_SHADER_VERTEX];
+   const enum agx_chip records =
+      agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip);
+   const uint32_t restart = hk_draw_restart_index(cmd, draw);
+   uint8_t *out = cs->current;
+
+   for (uint32_t i = 0; i < count; ++i, draw.b.ptr += stride) {
+      if (vertex) {
+         hk_flush_draw_params_and_id(cmd, vs, linked, first + i, draw);
+         const uint64_t program = hk_upload_usc_words(cmd, vs, linked);
+         if (vk_command_buffer_has_error(&cmd->vk) ||
+             !hk_agx2_publish_vertex_state(cmd, &out, vertex, program))
+            return false;
+      }
+
+      out = (uint8_t *)agx_vdm_draw((uint32_t *)out, records, draw,
+                                    gfx->topology, restart);
+   }
+
+   cs->current = out;
+   cs->stats.calls += count;
+   cs->stats.cmds += count;
+   hk_upload_stat(cmd, draws, count);
+   return true;
+}
+
 /*
  * Fast path for vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount:
  *
@@ -18070,6 +18141,55 @@ hk_draw_indirect_count_vdm_truncate(struct hk_cmd_buffer *cmd,
             }
 #endif
             draw_id += batch_n;
+         }
+         emitted_fast = true;
+      }
+   }
+
+   if (agx_chip_command_stream_generation(dev->dev.chip) ==
+          AGX_CS_GENERATION_AGX2 &&
+       !dev->frame_anatomy && !hk_attachmentless_render(cs)) {
+      struct agx_draw draw =
+         indexed ? agx_draw_indexed_indirect(in + stride, ib.addr, ib.range,
+                                             gfx->index.size,
+                                             dyn->ia.primitive_restart_enable)
+                 : agx_draw_indirect(in + stride);
+
+      if (hk_g17p_indirect_records_eligible(cmd, &draw, false)) {
+         const enum agx_chip records =
+            agx_vdm_index_list_record_chip(dev->dev.chip);
+         uint32_t record_size = agx_vdm_draw_size(records, draw);
+         struct hk_agx2_vertex_state state, *vertex = NULL;
+         if (hk_gfx_republishes_render_state(cmd)) {
+            state = hk_agx2_pack_vertex_state(cmd, hk_bound_hw_vs(gfx));
+            vertex = &state;
+            record_size += sizeof(state);
+         }
+
+         assert(record_size >= AGX_VDM_STREAM_LINK_LENGTH);
+         for (uint32_t first = 1; first < maxDrawCount;) {
+            hk_ensure_cs_has_space(cmd, cs, record_size);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               goto out;
+
+            const size_t available = cs->end - cs->current -
+               AGX_VDM_STREAM_LINK_LENGTH - HK_CS_SPACE_PADDING;
+            const uint32_t count =
+               MIN2(maxDrawCount - first, available / record_size);
+            const uint64_t base = hk_cs_current_addr(cs);
+            assert(count > 0);
+            if (!hk_vdm_spans_append_range(cmd, &spans, stack_spans, &span_cap,
+                                           &num_spans, first, count, base,
+                                           record_size))
+               goto out;
+
+            draw.b.ptr = in + (uint64_t)first * stride;
+            if (!hk_agx2_emit_indirect_count_chunk(cmd, cs, draw, first, count,
+                                                  stride, vertex))
+               goto out;
+            assert(hk_cs_current_addr(cs) - base ==
+                   (uint64_t)count * record_size);
+            first += count;
          }
          emitted_fast = true;
       }

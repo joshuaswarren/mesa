@@ -286,9 +286,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
       /* Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table on
-       * AGX2 and native AGX3; HAL300 PPP admission still rejects negative-one
-       * depth clip. */
-      .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
+       * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C); other HAL300
+       * encodings such as AGX3D (G18G) stay off until qualified. */
+      .EXT_depth_clip_control = agx_chip_has_depth_clip_control(dev->chip),
       .EXT_depth_clip_enable = true,
       /* Descriptor buffers use AGX_CAP_DESCRIPTOR_BUFFER (agx_chip_caps.h):
        * AGX2, native AGX3, and M5 are qualified; G18G still uses AGX2-biased
@@ -305,7 +305,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_host_import(dev),
-      .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
+      .EXT_fragment_shader_interlock = agx_chip_native_or_m5(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
