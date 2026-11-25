@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include "agx_test.h"
 extern "C" {
+#include "agx_compile.h"
 #include "agx_nir.h"
 }
 
@@ -195,6 +196,99 @@ TEST(PreambleModifiers, ReassociatesLoopInvariantEquality)
    }
    EXPECT_EQ(pre_iadds, 1u);
    EXPECT_EQ(loop_iadds, 1u);
+
+   ralloc_free(b.shader);
+}
+
+static void
+add_empty_preamble(nir_shader *shader)
+{
+   nir_function *pre = nir_function_create(shader, "preamble");
+   pre->is_preamble = true;
+   nir_function_impl_create(pre);
+}
+
+TEST(PreambleModifiers, ReassociatesLoopInvariantEqualityPreservesPreambleMetadata)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "reassociate loop eq preamble");
+   add_empty_preamble(b.shader);
+
+   nir_def *inv = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+   nir_def *init = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+
+   nir_block *pre = nir_cursor_current_block(b.cursor);
+   nir_loop *loop = nir_push_loop(&b);
+
+   nir_phi_instr *j_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&j_phi->instr, &j_phi->def, 1, 32);
+   nir_phi_instr_add_src(j_phi, pre, init);
+
+   nir_def *j = &j_phi->def;
+   nir_push_if(&b, nir_uge_imm(&b, j, 4096));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, NULL);
+
+   nir_def *j32 = nir_iadd_imm(&b, j, 32);
+   nir_def *ne = nir_ine(&b, j32, inv);
+   nir_intrinsic_instr *gst =
+      nir_store_global(&b, nir_b2i32(&b, ne), nir_imm_int64(&b, 0x1000));
+   nir_intrinsic_set_align(gst, 4, 0);
+   nir_intrinsic_set_write_mask(gst, 1);
+
+   nir_def *j_next = nir_iadd_imm(&b, j, 128);
+   nir_phi_instr_add_src(j_phi, nir_loop_last_block(loop), j_next);
+   nir_instr_insert(nir_before_block(nir_loop_first_block(loop)),
+                    &j_phi->instr);
+   nir_pop_loop(&b, loop);
+
+   bool progress = false;
+   NIR_PASS(progress, b.shader, agx_nir_reassociate_loop_invariant_eq);
+   EXPECT_TRUE(progress);
+
+   ralloc_free(b.shader);
+}
+
+TEST(PreambleModifiers, CoalesceSampleMaskPreservesPreambleMetadata)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "coalesce sample mask preamble");
+   add_empty_preamble(b.shader);
+
+   nir_def *cov = nir_load_sample_mask_in(&b);
+   cov = nir_u2u16(&b, cov);
+   nir_def *live = nir_imm_intN_t(&b, 0xf, 16);
+   nir_intrinsic_instr *m0 =
+      nir_sample_mask_agx(&b, nir_iand_imm(&b, cov, 0x3), live);
+   nir_intrinsic_set_flags(m0, AGX_SAMPLE_MASK_SUBSET_FULL_OR_KILL);
+   nir_intrinsic_instr *m1 =
+      nir_sample_mask_agx(&b, nir_iand_imm(&b, cov, 0xc), live);
+   nir_intrinsic_set_flags(m1, AGX_SAMPLE_MASK_SUBSET_FULL_OR_KILL);
+
+   bool progress = false;
+   NIR_PASS(progress, b.shader, agx_nir_coalesce_sample_mask_updates, 4);
+   EXPECT_TRUE(progress);
+
+   ralloc_free(b.shader);
+}
+
+TEST(PreambleModifiers, NarrowU8FaddTreePreservesEmptyPreambleMetadata)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "narrow u8 fadd empty preamble");
+   add_empty_preamble(b.shader);
+
+   nir_def *addr = nir_imm_int64(&b, 0x1000);
+   nir_def *a = nir_u2f32(&b, nir_load_global(&b, 1, 8, addr));
+   nir_def *c = nir_u2f32(&b, nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 1)));
+   nir_def *sum = nir_fadd(&b, a, c);
+   nir_intrinsic_instr *gst = nir_store_global(&b, sum, addr);
+   nir_intrinsic_set_align(gst, 4, 0);
+   nir_intrinsic_set_write_mask(gst, 1);
+
+   bool progress = false;
+   NIR_PASS(progress, b.shader, agx_nir_opt_narrow_u8_fadd_tree);
+   EXPECT_TRUE(progress);
 
    ralloc_free(b.shader);
 }
