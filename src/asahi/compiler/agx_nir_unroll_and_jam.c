@@ -1026,8 +1026,8 @@ emit_jammed_loop(nir_builder *b, nir_loop *orig_loop, unsigned J,
       new_loop->partially_unrolled = true;
    nir_block *new_hdr = nir_loop_first_block(new_loop);
 
-   struct jammed_phi_rec phis[32];
-   unsigned n_phis = 0;
+   struct util_dynarray phis;
+   util_dynarray_init(&phis, NULL);
 
    /* Create header phis (1 for non-variant, J for variant). Defer insertion
     * until after nir_phi_instr_add_src so all phi srcs are registered on their
@@ -1039,16 +1039,14 @@ emit_jammed_loop(nir_builder *b, nir_loop *orig_loop, unsigned J,
                       phi->def.bit_size);
          for (unsigned j = 0; j < J; ++j)
             _mesa_hash_table_insert(remaps[j], &phi->def, &np->def);
-         assert(n_phis < ARRAY_SIZE(phis));
-         phis[n_phis++] = (struct jammed_phi_rec){phi, np, -1};
+         util_dynarray_append(&phis, ((struct jammed_phi_rec){phi, np, -1}));
       } else {
          for (unsigned j = 0; j < J; ++j) {
             nir_phi_instr *np = nir_phi_instr_create(b->shader);
             nir_def_init(&np->instr, &np->def, phi->def.num_components,
                          phi->def.bit_size);
             _mesa_hash_table_insert(remaps[j], &phi->def, &np->def);
-            assert(n_phis < ARRAY_SIZE(phis));
-            phis[n_phis++] = (struct jammed_phi_rec){phi, np, (int)j};
+            util_dynarray_append(&phis, ((struct jammed_phi_rec){phi, np, (int)j}));
          }
       }
    }
@@ -1061,17 +1059,18 @@ emit_jammed_loop(nir_builder *b, nir_loop *orig_loop, unsigned J,
    nir_block *new_pre = nir_cf_node_as_block(nir_cf_node_prev(&new_loop->cf_node));
    nir_block *new_latch = nir_loop_last_block(new_loop);
 
-   for (unsigned i = 0; i < n_phis; ++i) {
-      unsigned lane = phis[i].lane >= 0 ? (unsigned)phis[i].lane : 0;
-      nir_phi_src *esrc = nir_phi_get_src_from_block(phis[i].orig, orig_pre);
-      nir_phi_src *lsrc = nir_phi_get_src_from_block(phis[i].orig, orig_latch);
+   util_dynarray_foreach(&phis, struct jammed_phi_rec, rec) {
+      unsigned lane = rec->lane >= 0 ? (unsigned)rec->lane : 0;
+      nir_phi_src *esrc = nir_phi_get_src_from_block(rec->orig, orig_pre);
+      nir_phi_src *lsrc = nir_phi_get_src_from_block(rec->orig, orig_latch);
       assert(esrc && lsrc);
-      nir_phi_instr_add_src(phis[i].clone, new_pre,
+      nir_phi_instr_add_src(rec->clone, new_pre,
                             remap_lookup(remaps[lane], esrc->src.ssa));
-      nir_phi_instr_add_src(phis[i].clone, new_latch,
+      nir_phi_instr_add_src(rec->clone, new_latch,
                             remap_lookup(remaps[lane], lsrc->src.ssa));
-      nir_instr_insert(nir_after_phis(new_hdr), &phis[i].clone->instr);
+      nir_instr_insert(nir_after_phis(new_hdr), &rec->clone->instr);
    }
+   util_dynarray_fini(&phis);
 }
 
 static void
