@@ -1801,7 +1801,9 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
 
    memcpy(desc->root.push + info->offset, info->pValues, info->size);
    hk_root_mark_push_dirty(desc);
-   /* non_push_generation intentionally does not advance on push constants. */
+   /* non_push_generation intentionally does not advance on push constants
+    * (push constants carry no tracked resource addresses; BDA transfers
+    * already set sync.xfer_any). */
    desc->generation++;
 }
 

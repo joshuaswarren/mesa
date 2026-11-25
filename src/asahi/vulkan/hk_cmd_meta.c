@@ -253,6 +253,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    } else {
       desc->push_active &= ~BITFIELD_BIT(0);
    }
+   desc->non_push_generation++;
 
    /* Nested meta operations end in the reverse order they begin, so this
     * save is the last one stacked. */

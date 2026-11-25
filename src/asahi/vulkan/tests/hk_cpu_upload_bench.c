@@ -589,6 +589,211 @@ vertex_input_elision_correctness(struct fixture *f)
    reset(f);
 }
 
+static void
+xfer_clean_isolation_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   VkCommandBuffer vk_cb = hk_cmd_buffer_to_handle(cmd);
+
+   reset(f);
+   memset(&cmd->sync, 0, sizeof(cmd->sync));
+
+   /* Build a Gen9 UBO descriptor set at a non-overlapping GPU VA. */
+   union {
+      struct hk_descriptor_set_layout layout;
+      uint8_t storage[sizeof(struct hk_descriptor_set_layout) +
+                      sizeof(struct hk_descriptor_set_binding_layout)];
+   } ubo_layout_mem;
+   memset(&ubo_layout_mem, 0, sizeof(ubo_layout_mem));
+   struct hk_descriptor_set_layout *ubo_layout = &ubo_layout_mem.layout;
+   ubo_layout->vk.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT;
+   ubo_layout->descriptor_generation = 9;
+   ubo_layout->binding_count = 1;
+   ubo_layout->binding[0] = (struct hk_descriptor_set_binding_layout){
+      .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .array_size = 1,
+      .offset = 0,
+      .stride = sizeof(struct hk_buffer_address),
+   };
+
+   struct hk_buffer_address ubo_desc = {
+      .base_addr = 0x500000,
+      .size = 4096,
+   };
+   struct hk_descriptor_set ubo_set = {
+      .base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET,
+      .layout = ubo_layout,
+      .mapped_ptr = &ubo_desc,
+      .addr = 0x380000,
+      .size = sizeof(ubo_desc),
+   };
+   struct vk_pipeline_layout pipe_layout = {
+      .base.type = VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+      .set_layouts = { &ubo_layout->vk },
+   };
+   VkDescriptorSet vk_set = hk_descriptor_set_to_handle(&ubo_set);
+   VkBindDescriptorSetsInfoKHR bind_info = {
+      .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR,
+      .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+      .layout = vk_pipeline_layout_to_handle(&pipe_layout),
+      .descriptorSetCount = 1,
+      .pDescriptorSets = &vk_set,
+   };
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_info);
+
+   /* Bind non-overlapping VB 0 and index buffer. */
+   hk_cmd_bind_vertex_buffer(cmd, 0, (struct hk_addr_range){
+      .addr = 0x600000, .range = 4096,
+   });
+   CHECK(cmd->state.gfx.bound_vb_mask == BITFIELD_BIT(0));
+   cmd->state.gfx.index.buffer = (struct hk_addr_range){
+      .addr = 0x700000, .range = 1024,
+   };
+
+   /* Note a pending staging transfer to a disjoint range [0x900000, 0x901000). */
+   struct hk_cs xfer_cs = {
+      .type = HK_CS_CDM,
+      .sync.seq = 1,
+   };
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = 0x900000,
+      .hi = 0x901000,
+      .valid = true,
+      .device_address = false,
+   };
+   hk_sync_note_xfer_write(cmd, &xfer_cs);
+   CHECK(cmd->sync.xfer_write_count == 1);
+
+   /* First draw populates all three xfer_clean slices with one descriptor walk. */
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 1);
+   CHECK(cmd->sync.xfer_write_count == 1);
+   CHECK(cmd->sync.xfer_clean.desc_valid);
+   CHECK(cmd->sync.xfer_clean.vb_valid);
+   CHECK(cmd->sync.xfer_clean.index_valid);
+
+   /* Push-constant loop: generation advances, non_push_generation does not,
+    * and hk_xfer_match_descriptors() must NOT be re-walked. */
+   const uint64_t rg_before = cmd->state.gfx.descriptors.non_push_generation;
+   const uint64_t gen_before = cmd->state.gfx.descriptors.generation;
+   for (uint32_t i = 1; i <= 8; ++i) {
+      VkPushConstantsInfoKHR pc = {
+         .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+         .layout = vk_pipeline_layout_to_handle(&pipe_layout),
+         .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+         .offset = 0,
+         .size = sizeof(i),
+         .pValues = &i,
+      };
+      hk_CmdPushConstants2KHR(vk_cb, &pc);
+      hk_xfer_check_draw_slow(cmd, 0, 0);
+   }
+   CHECK(cmd->state.gfx.descriptors.generation == gen_before + 8);
+   CHECK(cmd->state.gfx.descriptors.non_push_generation == rg_before);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 1);
+   CHECK(cmd->sync.xfer_write_count == 1);
+
+   /* Sparse VB changes must re-check only bound VBs and NEVER re-walk
+    * descriptor sets. Verify bound_vb_mask sets and clears properly. */
+   for (uint32_t i = 0; i < 4; ++i) {
+      hk_cmd_bind_vertex_buffer(cmd, 17, (struct hk_addr_range){
+         .addr = 0x620000 + i * 4096, .range = 4096,
+      });
+      CHECK(cmd->state.gfx.bound_vb_mask ==
+            (BITFIELD_BIT(0) | BITFIELD_BIT(17)));
+      hk_xfer_check_draw_slow(cmd, 0, 0);
+   }
+   hk_cmd_bind_vertex_buffer(cmd, 17, (struct hk_addr_range){
+      .addr = 0, .range = 0,
+   });
+   CHECK(cmd->state.gfx.bound_vb_mask == BITFIELD_BIT(0));
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 1);
+   CHECK(cmd->sync.xfer_write_count == 1);
+
+   /* Index buffer change to a non-overlapping range does not re-walk descriptors,
+    * while expanding range at the same base to overlap the transfer MUST order. */
+   cmd->state.gfx.index.buffer = (struct hk_addr_range){
+      .addr = 0x8ff000, .range = 0x1000,
+   };
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 1);
+   CHECK(cmd->sync.xfer_write_count == 1);
+
+   cmd->state.gfx.index.buffer.range = 0x2000;
+   const uint32_t ver_before_order = cmd->sync.xfer_version;
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 1);
+   CHECK(cmd->sync.xfer_write_count == 0);
+   CHECK(cmd->sync.xfer_version > ver_before_order);
+
+   /* A pending transfer overlapping a high sparse VB slot must order properly. */
+   struct hk_cs xfer_cs2 = {
+      .type = HK_CS_CDM,
+      .sync.seq = 2,
+   };
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = 0xa00000,
+      .hi = 0xa01000,
+      .valid = true,
+      .device_address = false,
+   };
+   hk_sync_note_xfer_write(cmd, &xfer_cs2);
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 2);
+   CHECK(cmd->sync.xfer_write_count == 1);
+
+   hk_cmd_bind_vertex_buffer(cmd, 19, (struct hk_addr_range){
+      .addr = 0xa00800, .range = 256,
+   });
+   CHECK(cmd->state.gfx.bound_vb_mask ==
+         (BITFIELD_BIT(0) | BITFIELD_BIT(19)));
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->state.upload_stats.xfer_desc_walks == 2);
+   CHECK(cmd->sync.xfer_write_count == 0);
+
+   /* BDA transfers set sync.xfer_any and must order even after push-constant
+    * updates with unchanged descriptor/VB/index slices. */
+   struct hk_cs xfer_cs3 = {
+      .type = HK_CS_CDM,
+      .sync.seq = 3,
+   };
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = 0xb00000,
+      .hi = 0xb01000,
+      .valid = true,
+      .device_address = true,
+   };
+   hk_sync_note_xfer_write(cmd, &xfer_cs3);
+   CHECK(cmd->sync.xfer_any == &xfer_cs3);
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->sync.xfer_any == NULL);
+
+   /* Secondary-CB graphics state invalidation clears bound_vb_mask and
+    * invalidates xfer_clean so generation resets cannot falsely match. */
+   struct hk_cs xfer_cs4 = {
+      .type = HK_CS_CDM,
+      .sync.seq = 4,
+   };
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = 0xc00000,
+      .hi = 0xc01000,
+      .valid = true,
+      .device_address = false,
+   };
+   hk_sync_note_xfer_write(cmd, &xfer_cs4);
+   hk_xfer_check_draw_slow(cmd, 0, 0);
+   CHECK(cmd->sync.xfer_clean.desc_valid && cmd->sync.xfer_clean.vb_valid);
+   hk_cmd_invalidate_graphics_state(cmd);
+   CHECK(cmd->state.gfx.bound_vb_mask == 0);
+   CHECK(!cmd->sync.xfer_clean.desc_valid);
+   CHECK(!cmd->sync.xfer_clean.vb_valid);
+   CHECK(!cmd->sync.xfer_clean.index_valid);
+
+   memset(&cmd->sync, 0, sizeof(cmd->sync));
+   reset(f);
+}
+
 static uint64_t
 now_ns(void)
 {
@@ -659,6 +864,7 @@ main(int argc, char **argv)
    correctness(f);
    reuse_correctness(f);
    vertex_input_elision_correctness(f);
+   xfer_clean_isolation_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);
