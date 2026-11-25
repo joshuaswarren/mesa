@@ -18,6 +18,50 @@
 #include "util/list.h"
 #include "util/u_dynarray.h"
 
+void
+hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = cmd->state.oq_pending_render;
+   if (!render)
+      return;
+
+   /* Any later stream or sync record flushed oq_pending_render into post_gfx,
+    * so nothing depends on this render. Verify no tail requirement names it,
+    * then stamp its free retirement slots directly (same slot order as
+    * hk_stamp_oq_available()). */
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
+      if (cut && cut->sync.seq >= render->sync.seq) {
+         hk_flush_oq_pending(cmd);
+         return;
+      }
+   }
+
+   const unsigned order[] = {1, 2, 0};
+   unsigned free_slots[ARRAY_SIZE(order)], nfree = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+      const unsigned slot = order[i];
+      if ((slot == 0 && render->timestamp.start.handle) ||
+          render->oq_stamp[slot].handle)
+         continue;
+      free_slots[nfree++] = slot;
+   }
+
+   if (nfree < render->oq_pending_count) {
+      hk_flush_oq_pending(cmd);
+      return;
+   }
+
+   for (unsigned i = 0; i < render->oq_pending_count; ++i) {
+      render->oq_stamp[free_slots[i]] = (struct agx_timestamp_req){
+         .handle = render->oq_pending[i].handle,
+         .offset_B = render->oq_pending[i].offset_B,
+      };
+   }
+   render->oq_pending_count = 0;
+   cmd->state.oq_pending_render = NULL;
+}
+
 bool
 hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -282,20 +326,19 @@ hk_resolve_oq_reverse(struct hk_cmd_buffer *cmd)
 bool
 hk_oq_render_stamps_supported(enum agx_chip chip)
 {
-   /* G17P and M5 (G17G/G17S) both run the shared G17 kernel runtime: a render
-    * completes only once its completion stamps cover it, after the
-    * end-of-render maintenance, and the host then writes its four stage
-    * timestamps into the requested slots before signalling the fence
-    * (g17/queue/render/retirement.rs, g17/completion.rs). */
-   return agx_chip_g17p_or_m5(chip);
+   /* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) kernel runtimes publish
+    * a render's four stage timestamps only after full retirement (including
+    * end-of-render maintenance) before signalling the fence
+    * (g16/poll.rs, g17/queue/render/retirement.rs, g17/completion.rs). */
+   return agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip);
 }
 
 void
 hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd)
 {
-   /* The reverse order is qualified on G17P; the other native AGX3 chips keep
-    * recording order until it is measured there. */
-   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+   /* Reverse order applies across native HAL200 chips; G15 keeps recording
+    * order until measured there. */
+   if (agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_resolve_oq_reverse(cmd);
    else
       hk_resolve_oq_forward(cmd);

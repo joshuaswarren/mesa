@@ -9,6 +9,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_pack.h"
 #include "hk_queue.h"
 
@@ -521,14 +522,49 @@ test_boundary(void)
    dev->dev.chip = AGX_CHIP_G17P;
    T("G17P: HAL200 strong flush boundary (alias-scoped at pack time)",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
+   dev->dev.chip = AGX_CHIP_G15G;
+   T("G15G: strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G15S;
-   T("G15S: not qualified, no boundary",
-     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   T("G15S: strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G17A;
    T("G17A: HAL200, caches pending, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   dev->dev.chip = AGX_CHIP_G13X;
+   T("G13X: AGX2 strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G14G;
-   T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   T("G14G: AGX2 strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
+
+   uint8_t agx2_term[HK_PACK_CDM_TERMINATE_MAX] = {0};
+   const size_t agx2_term_size =
+      hk_pack_cdm_terminate(AGX_CHIP_G14G, agx2_term);
+   T("AGX2 terminate packs 8 bytes",
+     agx2_term_size == AGX_CDM_STREAM_TERMINATE_LENGTH);
+   struct hk_cmd_buffer *agx2_cmd = new_cmd();
+   struct hk_cs *agx2_cs = add(agx2_cmd, true);
+   uint8_t *agx2_bytes =
+      test_alloc(64 + agx2_term_size + HK_CS_SPACE_PADDING);
+   memcpy(agx2_bytes + 64, agx2_term, agx2_term_size);
+   agx2_cs->start = agx2_bytes;
+   agx2_cs->current = agx2_bytes + 64 + agx2_term_size;
+   agx2_cs->end = (uint8_t *)agx2_cs->current + HK_CS_SPACE_PADDING;
+   agx2_cs->strong_flush_end = agx2_bytes + 64;
+   agx2_cs->stats.cmds = agx2_cs->stats.calls = 1;
+   agx2_cs->pack_dispatches = 1;
+   agx2_cs->pack_threads = 64;
+   agx2_cs->pack_static_work = 64 * 16;
+   util_dynarray_init(&agx2_cs->imm_writes, NULL);
+   util_dynarray_init(&agx2_cs->compute_resources, NULL);
+   T("AGX2 G14G accepts strong-flush stream with 8-byte terminate",
+     hk_pack_run_member(dev_with(AGX_CHIP_G14G, 0), agx2_cmd, agx2_term,
+                        false) == agx2_cs);
+   agx2_cs->strong_flush_end = NULL;
+   T("AGX2 G14G rejects stream without strong-flush tail",
+     !hk_pack_run_member(dev_with(AGX_CHIP_G14G, 0), agx2_cmd, agx2_term,
+                         false));
 
    chip = AGX_CHIP_G17S;
    struct hk_cmd_buffer *c = plain(1);
@@ -1193,6 +1229,35 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
+   abort();
+}
+
 bool
 hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -1241,8 +1306,136 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {
-   (void)set;
-   abort();
+   memset(set, 0, sizeof(*set));
+   set->complete = true;
+}
+
+/* Reusing one packet across submissions must clear every CDM and sync field
+ * while preserving dynarray backing allocations and leaving unused graphics
+ * state untouched. */
+static void
+test_packet_reuse(bool negctl)
+{
+   struct hk_device *dev = dev_with(AGX_CHIP_G17P, 0);
+   struct hk_cmd_buffer *cmd = test_alloc(sizeof(*cmd));
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   uint8_t buf1[256] = {0}, buf2[256] = {0};
+
+   /* Fill unused graphics tails with a sentinel to verify hk_pack_init_packet
+    * does not touch them. */
+   memset(&cmd->state.gfx, 0x5a, sizeof(cmd->state.gfx));
+   memset(&cs->tib, 0x5a, sizeof(*cs) - offsetof(struct hk_cs, tib));
+
+   /* First submission populates CDM state, sync state, and both dynarrays. */
+   hk_pack_init_packet(cmd, cs, dev, buf1, 0x10000, sizeof(buf1), false);
+   const uint32_t dummy_res = 0x12345678u;
+   const uint64_t dummy_q[2] = {0x2000, 0x40};
+   util_dynarray_append(&cs->compute_resources, dummy_res);
+   util_dynarray_append(&cs->query_access_ranges, dummy_q[0]);
+   util_dynarray_append(&cs->query_access_ranges, dummy_q[1]);
+   void *res_data = cs->compute_resources.data;
+   size_t res_cap = cs->compute_resources.capacity;
+   void *q_data = cs->query_access_ranges.data;
+   size_t q_cap = cs->query_access_ranges.capacity;
+
+   cs->stats.cmds = 42;
+   cs->pack_threads = 9999;
+   cs->uses_sampler_heap = true;
+   cs->strong_flush_end = buf1 + 64;
+   cs->compute_attachments.count = 3;
+   cs->compute_attachments.complete = false;
+   cs->sync.kind = HK_SYNC_COMPUTE;
+   cs->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+   cmd->sync.req[0][HK_SYNC_CDM].prior = HK_SYNC_COMPUTE;
+   cmd->sync.req[0][HK_SYNC_CDM].cut = cs;
+   cmd->sync.last_any[HK_SYNC_CDM] = cs;
+
+   /* Reinitialize the same packet for a second submission (skipped in negctl
+    * mode to prove the checks below catch stale packet state). */
+   if (!negctl)
+      hk_pack_init_packet(cmd, cs, dev, buf2, 0x20000, 128, true);
+
+   T("packet reuse preserves compute_resources backing",
+     cs->compute_resources.data == res_data &&
+        cs->compute_resources.capacity == res_cap &&
+        cs->compute_resources.size == 0);
+   T("packet reuse preserves query_access_ranges backing",
+     cs->query_access_ranges.data == q_data &&
+        cs->query_access_ranges.capacity == q_cap &&
+        cs->query_access_ranges.size == 0);
+   T("packet reuse clears CDM fields",
+     cs->stats.cmds == 0 && cs->pack_threads == 0 && !cs->uses_sampler_heap &&
+        cs->strong_flush_end == NULL && cs->compute_attachments.count == 0 &&
+        cs->compute_attachments.complete && cs->sync.kind == 0 &&
+        cs->sync.dep[HK_SYNC_VDM].prior == 0);
+   T("packet reuse initializes stream pointers and flags",
+     cs->cmd == cmd && cs->type == HK_CS_CDM && cs->start == buf2 &&
+        cs->current == buf2 && cs->end == buf2 + 128 && cs->addr == 0x20000 &&
+        cs->root_size == 128 && cs->sync.seq == 1 && cs->visible_completion &&
+        list_is_singular(&cmd->control_streams) &&
+        first_cs(cmd) == cs && cmd->vk.base.device == &dev->vk);
+   T("packet reuse clears command sync state",
+     cmd->sync.req[0][HK_SYNC_CDM].prior == 0 &&
+        cmd->sync.req[0][HK_SYNC_CDM].cut == NULL &&
+        cmd->sync.last_any[HK_SYNC_CDM] == NULL);
+
+   bool gfx_untouched = true;
+   const uint8_t *gfx_bytes = (const uint8_t *)&cmd->state.gfx;
+   for (size_t i = 0; i < sizeof(cmd->state.gfx); ++i) {
+      if (gfx_bytes[i] != 0x5a) {
+         gfx_untouched = false;
+         break;
+      }
+   }
+   bool cs_tail_untouched = true;
+   const uint8_t *tail_bytes = (const uint8_t *)&cs->tib;
+   for (size_t i = 0; i < sizeof(*cs) - offsetof(struct hk_cs, tib); ++i) {
+      if (tail_bytes[i] != 0x5a) {
+         cs_tail_untouched = false;
+         break;
+      }
+   }
+   T("packet reuse leaves unused graphics state untouched",
+     gfx_untouched && cs_tail_untouched);
+
+   util_dynarray_fini(&cs->compute_resources);
+   util_dynarray_fini(&cs->query_access_ranges);
+}
+
+static void
+test_span_pool_policy(void)
+{
+   T("16 KiB and 64 KiB spans map to distinct O(1) buckets",
+     hk_cmd_span_bucket_for_size(HK_CMD_SPAN_SIZE) !=
+        hk_cmd_span_bucket_for_size(HK_CMD_STREAM_SPAN_SIZE));
+
+   struct agx_device g17p = {.chip = AGX_CHIP_G17P, .is_virtio = false};
+   struct agx_device g17p_virtio = {.chip = AGX_CHIP_G17P, .is_virtio = true};
+   struct agx_device g17s = {.chip = AGX_CHIP_G17S, .is_virtio = false};
+   struct agx_device g13g = {.chip = AGX_CHIP_G13G, .is_virtio = false};
+
+   T("native AGX3 caches up to 256 main/root/ioto spans",
+     hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_MAIN) ==
+        HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_ROOT) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_USC) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17p) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17s, HK_CMD_BO_MAIN) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17s) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX);
+   T("virtio and AGX2 keep default span cache cap",
+     hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_MAIN) ==
+        HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_ROOT) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g13g, HK_CMD_BO_MAIN) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
 }
 
 void
@@ -1375,12 +1568,182 @@ test_compute_pair_stream_safety(void)
      !hk_copy4_classify_intervals(true, 2, b_fadd, 0, 64, 256, &same));
 }
 
-int
-main(void)
+static struct hk_storage_backing
+fadd_backing(uint32_t handle, uint64_t offset, uint32_t size)
 {
+   return (struct hk_storage_backing){
+      .address = ((uint64_t)handle << 24) + offset,
+      .offset = offset,
+      .size = size,
+      .handle = handle,
+   };
+}
+
+/* Submit-time FADD + copy4 dual-write fusion gate: the fused shader writes the
+ * copy4 destination (dst2) while it still reads both FADD sources, so any
+ * overlap between dst2 and the FADD output or reads must keep the two
+ * dispatches separate. Overlap is decided on BO intervals, so a second
+ * descriptor with a different buffer offset that reaches the same bytes
+ * counts as an overlap. */
+static void
+test_fadd_copy4_fusion_gate(void)
+{
+   enum { SRC0 = 1, SRC1 = 2, OUT = 3, OTHER = 4 };
+   const uint32_t bytes = 1024, size = 4096;
+
+   struct hk_compute_pair_dispatch fadd = {0};
+   fadd.info.role = HK_COMPUTE_PAIR_FADD;
+   fadd.info.fadd_push_bytes = 4;
+   fadd.alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD;
+   fadd.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   fadd.bindings[0] = fadd_backing(SRC0, 0, size);
+   fadd.bindings[1] = fadd_backing(SRC1, 0, size);
+   fadd.bindings[2] = fadd_backing(OUT, 0, size);
+
+   struct hk_compute_pair_dispatch copy = {0};
+   copy.info.role = HK_COMPUTE_PAIR_COPY4;
+   copy.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   copy.bindings[0] = fadd.bindings[2];
+   copy.bindings[1] = fadd_backing(OTHER, 0, size);
+
+   struct hk_compute_pair_dispatch f, c;
+   T("fadd+copy4 fuses with dst2 in another BO",
+     hk_compute_pair_fadd_copy4_match(&fadd, &copy));
+
+   /* dst2 in the output's BO, through the output's own descriptor. */
+   c = copy; c.bindings[1] = fadd.bindings[2]; c.extra.copy4.dst_start = bytes;
+   T("fadd+copy4 fuses with dst2 right after the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes / 2;
+   T("fadd+copy4 rejects dst2 half over the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes - 16;
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* dst2 through a second descriptor on the output's BO: offsets differ but
+    * the GPU ranges intersect. */
+   c = copy; c.bindings[1] = fadd_backing(OUT, 768, bytes);
+   T("fadd+copy4 rejects another descriptor overlapping the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   c.extra.copy4.dst_start = 0;
+   T("fadd+copy4 rejects dst2 equal to the output via a second descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   c.extra.copy4.dst_start = 1024;
+   T("fadd+copy4 fuses with a second descriptor past the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = 256;
+   T("fadd+copy4 rejects a second descriptor ending inside the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   f = fadd; f.extra.copy4.dst_start = 2048;
+   f.extra.copy4.src_start = 2048;
+   c.extra.copy4.src_start = 2048;
+   c.extra.copy4.dst_start = 1536;
+   T("fadd+copy4 rejects dst2 covering the start of an offset output",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* dst2 over either FADD source, which the fused shader still reads. */
+   c = copy; c.bindings[1] = fadd_backing(SRC1, 512, size - 512);
+   T("fadd+copy4 rejects dst2 overlapping src1 via another descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes - 16, size - bytes);
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of src0",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes, size - bytes);
+   T("fadd+copy4 fuses with dst2 right after src0",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* In-place FADD (src0 == output). */
+   f = fadd; f.bindings[0] = fadd.bindings[2];
+   T("in-place fadd+copy4 fuses with disjoint dst2",
+     hk_compute_pair_fadd_copy4_match(&f, &copy));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   T("in-place fadd+copy4 rejects dst2 over the in-place range",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* The copy must read exactly what the FADD wrote. */
+   c = copy; c.extra.copy4.src_start = 16;
+   T("fadd+copy4 rejects a shifted copy source",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.extra.copy4.bytes = bytes / 2;
+   T("fadd+copy4 rejects a partial copy of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[0] = fadd_backing(OUT, 16, size - 16);
+   T("fadd+copy4 rejects a copy source through a shifted descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OTHER, 4, size - 4);
+   T("fadd+copy4 rejects an unaligned dst2",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   f = fadd; f.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   T("fadd+copy4 requires the linear FADD alternate",
+     !hk_compute_pair_fadd_copy4_match(&f, &copy));
+}
+
+/* A packet that carried a fused compute-pair dispatch is reused like any
+ * other: the state the fused emitter sets (matrix ops, M5 resource
+ * profiles) starts the next submission clear, and a packet never holds a
+ * compute-pair record of its own. */
+static void
+test_fused_packet_reuse(bool negctl)
+{
+   struct hk_device *dev = dev_with(AGX_CHIP_G17P, 0);
+   struct hk_cmd_buffer *cmd = test_alloc(sizeof(*cmd));
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   uint8_t buf[256] = {0};
+   struct hk_compute_pair_dispatch stale = {0};
+
+   hk_pack_init_packet(cmd, cs, dev, buf, 0x10000, sizeof(buf), true);
+   const uint32_t profile = 0xfeedu;
+   util_dynarray_append(&cs->compute_resources, profile);
+   cs->m5_matrix_ops = true;
+   cs->compute_pair = &stale;
+
+   if (!negctl)
+      hk_pack_init_packet(cmd, cs, dev, buf, 0x10000, sizeof(buf), true);
+
+   T("fused packet reuse clears matrix ops", !cs->m5_matrix_ops);
+   T("fused packet reuse clears resource profiles",
+     cs->compute_resources.size == 0);
+   T("reused packet holds no compute-pair record", cs->compute_pair == NULL);
+}
+
+/* The buffers a packed submission pins: each once, none for NULL. */
+static void
+test_pack_add_bo(void)
+{
+   struct util_dynarray bos;
+   util_dynarray_init(&bos, NULL);
+   struct agx_bo *a = (struct agx_bo *)(uintptr_t)0x1000;
+   struct agx_bo *b = (struct agx_bo *)(uintptr_t)0x2000;
+
+   T("add_bo accepts NULL", hk_pack_add_bo(&bos, NULL));
+   T("add_bo adds nothing for NULL",
+     util_dynarray_num_elements(&bos, struct agx_bo *) == 0);
+   T("add_bo appends", hk_pack_add_bo(&bos, a) && hk_pack_add_bo(&bos, b));
+   T("add_bo keeps a duplicate once", hk_pack_add_bo(&bos, a) &&
+     util_dynarray_num_elements(&bos, struct agx_bo *) == 2 &&
+     *util_dynarray_element(&bos, struct agx_bo *, 0) == a &&
+     *util_dynarray_element(&bos, struct agx_bo *, 1) == b);
+   util_dynarray_fini(&bos);
+}
+
+int
+main(int argc, char **argv)
+{
+   const bool negctl = argc > 1 && !strcmp(argv[1], "--negctl");
    test_context = ralloc_context(NULL);
    if (!test_context)
       return EXIT_FAILURE;
+   if (negctl) {
+      test_packet_reuse(true);
+      test_fused_packet_reuse(true);
+      printf("%u tests, %u failures\n", tests, failures);
+      ralloc_free(test_context);
+      return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+   }
    test_boundary();
    test_atomics_choice();
    test_rejections();
@@ -1396,7 +1759,12 @@ main(void)
    test_full_classes();
    test_random();
    test_history();
+   test_packet_reuse(false);
+   test_span_pool_policy();
    test_compute_pair_stream_safety();
+   test_fadd_copy4_fusion_gate();
+   test_fused_packet_reuse(false);
+   test_pack_add_bo();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

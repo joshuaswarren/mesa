@@ -35,6 +35,12 @@ store64(uint64_t address, uint64_t value)
    store32(address + 4ul, uint(value >> 32));
 }
 
+void
+store128(uint64_t address, uvec4 value)
+{
+   DEREF(REF(uvec4)(address)) = value;
+}
+
 /* Use the reciprocal estimate only to locate an integer quotient. Its exact
  * 48-bit product/remainder gives round-to-nearest-even without shader f64 or
  * a general 64-bit division. A float/FMA refinement alone was insufficient
@@ -136,10 +142,9 @@ clear_instance_pointers(uint job_index, uint first, uint stride)
    uint64_t size = pointers + uint64_t(job.leaf_bound) * 16ul + 184ul;
    if (job.output_bvh >= (1ul << 48) || size > (1ul << 48) - job.output_bvh)
       return;
-   for (uint i = first; i < job.leaf_bound; i += stride) {
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul, 0ul);
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul + 8ul, 0ul);
-   }
+   for (uint i = first; i < job.leaf_bound; i += stride)
+      DEREF(REF(uvec4)(job.output_bvh + pointers + uint64_t(i) * 16ul)) =
+         uvec4(0u);
 }
 
 void
@@ -213,8 +218,8 @@ main()
       return;
    }
    uint64_t h = job.output_bvh + 64ul;
-   for (uint i = 0; i < 32; ++i)
-      store32(h + uint64_t(i) * 4ul, 0);
+   for (uint i = 0; i < 8; ++i)
+      store128(h + uint64_t(i) * 16ul, uvec4(0u));
    store64(h, (instances ? 0x080000008000f032ul : 0x080000002000f032ul) |
                (uint64_t(args.reserved == 2 ? 2 : 3) << 24));
    store64(h + 8ul, size);
@@ -259,8 +264,12 @@ main()
       descriptor[27] = inverse_bits;
    }
    [[unroll]]
-   for (uint i = 0; i < 46; ++i)
-      store32(job.output_bvh + descriptor_offset + uint64_t(i) * 4ul, descriptor[i]);
+   for (uint i = 0; i < 44; i += 4)
+      store128(job.output_bvh + descriptor_offset + uint64_t(i) * 4ul,
+               uvec4(descriptor[i], descriptor[i + 1], descriptor[i + 2],
+                     descriptor[i + 3]));
+   store32(job.output_bvh + descriptor_offset + 44ul * 4ul, descriptor[44]);
+   store32(job.output_bvh + descriptor_offset + 45ul * 4ul, descriptor[45]);
    publish_metadata(job, size);
    DEREF(INDEX(uint32_t, args.status, id)) = 0;
 }

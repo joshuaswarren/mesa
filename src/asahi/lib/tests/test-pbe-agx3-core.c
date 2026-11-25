@@ -662,7 +662,26 @@ check_gen9_compressed_atlas_vector(void)
    bad = fields;
    bad.layout = 1;
    CHECK(!agx_pbe_agx3_2d_pack(9, &bad, &packed));
-   CHECK(!agx_pbe_agx3_2d_array_mip_pack(9, &fields, 2, 0, 5, &packed));
+   /* Gen9 compressed 2D array mip chains preserve the base metadata pointer
+    * in word2[43:0] alongside level/levels in word2[51:44], array dimension in
+    * word0[3:0], layers-1 in word1[59:44], and page_aligned_layers in bit60. */
+   struct agx_pbe_agx3_2d_fields array_fields = fields;
+   array_fields.page_aligned_layers = true;
+   for (unsigned level = 0; level < 5; ++level) {
+      uint8_t array_expected[32];
+      memcpy(array_expected, expected, sizeof(array_expected));
+      array_expected[0] = (array_expected[0] & 0xf0) | 3;
+      /* layers = 4 -> (4 - 1) << 44 in word1 (bits 44..59 -> byte 13 bits 4..7),
+       * plus page_aligned_layers at bit 60 (byte 15 bit 4). */
+      array_expected[13] |= 3u << 4;
+      array_expected[15] |= 1u << 4;
+      array_expected[21] = level << 4;
+      CHECK(agx_pbe_agx3_2d_array_mip_pack(9, &array_fields, 4, level, 5,
+                                           &packed));
+      CHECK(memcmp(packed.bytes, array_expected, sizeof(array_expected)) == 0);
+   }
+   /* Compressed 3D mip chains remain rejected. */
+   CHECK(!agx_pbe_agx3_3d_mip_pack(9, &array_fields, 4, 0, 5, &packed));
    return 0;
 }
 
@@ -793,12 +812,56 @@ check_gen9_interchange_compressed(void)
    return 0;
 }
 
+/* Verify the Gen10 linear R32G32B32A32_UINT storage texel-buffer PBE shape
+ * used by large aligned buffer fills (width = 16384, height = 256, 64 MiB). */
+static int
+check_gen10_linear_buffer_fill(void)
+{
+   const uint64_t size = UINT64_C(64) << 20;
+   const uint64_t base = UINT64_C(0x1000000000);
+   struct agx_pbe_agx3_2d_fields fields = {
+      .layout = 0,
+      .channels = 0x38, /* R32G32B32A32 */
+      .type = 2,        /* UINT */
+      .swizzle_r = 0,
+      .swizzle_g = 1,
+      .swizzle_b = 2,
+      .swizzle_a = 3,
+      .width = 16384,
+      .height = (uint32_t)((size / 16) / 16384),
+      .buffer = base,
+      .stride_B = 16384 * 16,
+   };
+   struct agx_pbe_agx3_descriptor packed;
+   struct agx_pbe_agx3_2d_fields decoded;
+
+   CHECK(agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                  &packed));
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_10, packed.bytes,
+                                packed.length, &decoded));
+   CHECK(same_fields(AGX_PBE_AGX3_GENERATION_10, &decoded, &fields));
+
+   fields.buffer = base + size - 16;
+   CHECK(agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                  &packed));
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_10, packed.bytes,
+                                packed.length, &decoded));
+   CHECK(same_fields(AGX_PBE_AGX3_GENERATION_10, &decoded, &fields));
+
+   /* Fail closed past the Gen10 linear 44-bit address domain. */
+   fields.buffer = UINT64_C(1) << 44;
+   CHECK(!agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                   &packed));
+   return 0;
+}
+
 int
 main(void)
 {
    if (check_exact_generation_vectors() || check_exact_gen9_array_vector() ||
        check_exact_gen9_linear_vector() ||
        check_gen10_linear() ||
+       check_gen10_linear_buffer_fill() ||
        check_exhaustive_format_axes() ||
        check_dimension_and_address_bits() || check_fail_closed_axes() ||
        check_gen9_srgb_vector() ||

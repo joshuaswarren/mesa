@@ -151,6 +151,25 @@ check_other_mnemonic(void)
        (bound && (len != t->forms[form].size || memcmp(out, ref, len))))
       fail("binder differs from the table walk for another mnemonic",
            "other mnemonic", 0, other);
+
+   /* Verify that an override setting a nonzero baseline field back to zero
+    * clears its nonzero bit and composes identically to omitting that field. */
+   for (unsigned extra = 0; extra < AGX3_MAX_FIELDS; ++extra) {
+      if (sample_fields[extra])
+         continue;
+      kv[nkv] = (struct agx3_field_kv){.field = extra, .value = 1};
+      const struct agx3_field_kv zero_override = {.field = extra, .value = 0};
+      form = agx3_compose_apple_order(t, sample_mnemonic, sample_fields, ref);
+      uint8_t ov_out[2 * AGX3_MAX_WORDS];
+      uint8_t ov_len = 0;
+      checks++;
+      if (!agx3_bind_compose(enc, sample_mnemonic, AGX3_BIND_APPLE_ORDER, kv,
+                             nkv + 1, &zero_override, 1, ov_out, &ov_len) ||
+          ov_len != t->forms[form].size || memcmp(ov_out, ref, ov_len))
+         fail("zero override did not clear baseline nonzero bit",
+              "zero override", 0, sample_mnemonic);
+      break;
+   }
    return true;
 }
 

@@ -17,12 +17,6 @@
 #define NELEM(a) (sizeof(a) / sizeof((a)[0]))
 
 static bool
-enc_ok(enum agx_isa_encoding e)
-{
-   return e == AGX_ISA_ENCODING_AGX3B || e == AGX_ISA_ENCODING_AGX3C;
-}
-
-static bool
 args_ok(const uint8_t *out, const uint8_t *len)
 {
    return out != NULL && len != NULL;
@@ -43,7 +37,7 @@ rt_compose(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
    memset(out, 0, AGX3_RT_CORE_MAX_LENGTH);
    *len = 0;
 
-   if (!enc_ok(enc))
+   if (!agx_isa_is_agx3(enc))
       return false;
 
    if (!agx3_bind_compose(enc, mnemonic, 0, baseline, nbaseline, overrides,

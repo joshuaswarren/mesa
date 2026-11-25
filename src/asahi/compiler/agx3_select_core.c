@@ -78,8 +78,7 @@ agx3_select_encode(enum agx_isa_encoding encoding,
    }
 
    /* Only the two AGX3 encodings; agx2 has its own packer. */
-   if (encoding != AGX_ISA_ENCODING_AGX3B &&
-       encoding != AGX_ISA_ENCODING_AGX3C)
+   if (!agx_isa_is_agx3(encoding))
       return false;
 
    memset(out, 0, AGX3_SEL_MAX_LENGTH);

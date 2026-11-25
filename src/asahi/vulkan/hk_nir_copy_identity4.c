@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 #include "hk_identity_copy4.h"
 #include "hk_nir_fast_udiv.h"
+#include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_wgid.h"
 #include "compiler/nir/nir_builder.h"
 
 static nir_scalar
@@ -281,23 +283,39 @@ bind_im2col_mul(struct im2col_params *p, enum im2col_param_id id,
    return false;
 }
 
+/* Accept load_workgroup_id[axis] as GlobalInvocationID[axis] when
+ * local_size[axis] == 1 (so LocalInvocationID[axis] == 0).
+ *
+ * NOTE: The bare load_workgroup_id[axis] form (without + load_base_workgroup_id)
+ * equals GlobalInvocationID[axis] ONLY when base_group[axis] == 0. This matcher
+ * is sound only together with the dispatch-time nonzero-base refusal gate
+ * (hk_nir_dispatch_zero_base() in hk_cmd_dispatch.c:hk_select_identity_copy4()),
+ * which falls back to the original shader whenever any vkCmdDispatchBase offset
+ * is nonzero. */
+static bool
+is_coord_id(nir_scalar s, unsigned axis, unsigned local_size)
+{
+   s = nir_scalar_chase_movs(s);
+   return s.def && s.def->bit_size == 32 && s.comp == axis &&
+          (intr(s.def, nir_intrinsic_load_global_invocation_id) ||
+           (local_size == 1 && intr(s.def, nir_intrinsic_load_workgroup_id)));
+}
+
 static bool
 coord(nir_scalar s, unsigned axis, unsigned local_size)
 {
    s = strip_zero_add(s);
-   if (s.comp == axis && intr(s.def, nir_intrinsic_load_global_invocation_id))
+   if (is_coord_id(s, axis, local_size))
       return true;
    if (!alu(s, nir_op_iadd))
       return false;
 
    nir_scalar g = arg(s, 0), base = arg(s, 1);
-   if (g.comp == axis && intr(g.def, nir_intrinsic_load_global_invocation_id) &&
-       const_arg(base, nir_op_imul, 1, local_size) && arg(base, 0).comp == axis &&
-       intr(arg(base, 0).def, nir_intrinsic_load_base_workgroup_id))
+   if (is_coord_id(g, axis, local_size) &&
+       hk_nir_match_base_wg_scaled(base, axis, local_size))
       return true;
-   if (base.comp == axis && intr(base.def, nir_intrinsic_load_global_invocation_id) &&
-       const_arg(g, nir_op_imul, 1, local_size) && arg(g, 0).comp == axis &&
-       intr(arg(g, 0).def, nir_intrinsic_load_base_workgroup_id))
+   if (is_coord_id(base, axis, local_size) &&
+       hk_nir_match_base_wg_scaled(g, axis, local_size))
       return true;
    return false;
 }
@@ -934,6 +952,7 @@ collect_accesses(nir_function_impl *impl, struct access_set *accesses)
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:
@@ -1237,6 +1256,7 @@ match_linear_1d(nir_shader *nir, enum hk_identity_copy4_kind *kind_out,
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:
@@ -1628,6 +1648,7 @@ match_pad4d(nir_shader *nir, struct pad4d_match *out)
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:
@@ -2164,8 +2185,9 @@ hk_nir_im2col_vec4(const nir_shader *orig)
    return nir;
 }
 
-nir_shader *
-hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
+static nir_shader *
+hk_nir_copy_identity4_build(const nir_shader *orig,
+                            struct hk_identity_copy4 *info, bool dual_copy)
 {
    nir_shader *nir = nir_shader_clone(NULL, orig);
    nir_opt_constant_folding(nir);
@@ -2189,13 +2211,26 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
       push_bytes = im2col_p.push_bytes;
    } else {
       struct pad4d_match pad4 = {0};
-      if (match_pad4d(nir, &pad4))
+      if (match_pad4d(nir, &pad4)) {
+         if (dual_copy) {
+            ralloc_free(nir);
+            return NULL;
+         }
          return build_pad4d_vec4(nir, &pad4, orig_local, info);
+      }
       if (!match_linear_1d(nir, &kind, srcs, &dst, &count_off, &src_off,
                            &dst_off, &push_bytes, &fadd_fp_ctrl)) {
          ralloc_free(nir);
          return NULL;
       }
+   }
+
+   if (dual_copy &&
+       (kind != HK_IDENTITY_COPY4_LINEAR_FADD ||
+        hk_dual_write_push_offset(push_bytes) +
+           sizeof(struct hk_dual_copy_push) > UINT16_MAX)) {
+      ralloc_free(nir);
+      return NULL;
    }
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -2232,6 +2267,14 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
       dst_off4 = nir_ushr_imm(&b, push_at(&b, dst_off, push_bytes), 2);
    }
 
+   nir_def *dst2_base = NULL;
+   if (dual_copy) {
+      const uint32_t dual_off = hk_dual_write_push_offset(push_bytes);
+      nir_def *lo = push_at(&b, (uint16_t)dual_off, (uint16_t)(dual_off + 8));
+      nir_def *hi = push_at(&b, (uint16_t)(dual_off + 4), (uint16_t)(dual_off + 8));
+      dst2_base = nir_pack_64_2x32_split(&b, lo, hi);
+   }
+
    /* Workgroup-uniform interior check without uint32 underflow. */
    nir_def *full_wg = nir_iand(
       &b, nir_uge(&b, total4, nir_imm_int(&b, wg_chunk)),
@@ -2239,9 +2282,11 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
    nir_if *fast = nir_push_if(&b, full_wg);
    {
       nir_def *vals[4];
+      nir_def *idxs[4];
       nir_def *dst_idxs[4];
       for (unsigned k = 0; k < 4; ++k) {
          nir_def *idx = k ? nir_iadd_imm(&b, base, (int32_t)(k * wg_x)) : base;
+         idxs[k] = idx;
          nir_def *s_idx = src_off4 ? nir_iadd(&b, idx, src_off4) : idx;
          dst_idxs[k] = dst_off4 ? nir_iadd(&b, idx, dst_off4) : idx;
          nir_def *in0 = address(&b, srcs[0], s_idx, read);
@@ -2259,6 +2304,12 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
          nir_def *out = address(&b, dst, dst_idxs[k], ACCESS_NON_READABLE);
          nir_store_global(&b, vals[k], out, .align_mul = 16, .write_mask = 0xf,
                           .access = ACCESS_NON_READABLE);
+         if (dst2_base) {
+            nir_def *out2 =
+               nir_iadd(&b, dst2_base, nir_ishl_imm(&b, nir_u2u64(&b, idxs[k]), 4));
+            nir_store_global(&b, vals[k], out2, .align_mul = 16,
+                             .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+         }
       }
    }
    nir_push_else(&b, fast);
@@ -2281,6 +2332,12 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
             nir_def *out = address(&b, dst, d_idx, ACCESS_NON_READABLE);
             nir_store_global(&b, p0, out, .align_mul = 16, .write_mask = 0xf,
                              .access = ACCESS_NON_READABLE);
+            if (dst2_base) {
+               nir_def *out2 =
+                  nir_iadd(&b, dst2_base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 4));
+               nir_store_global(&b, p0, out2, .align_mul = 16,
+                                .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+            }
          }
          nir_pop_if(&b, ok);
       }
@@ -2318,4 +2375,17 @@ hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
    for (unsigned d = 0; d < 3; ++d)
       info->local[d] = orig_local[d];
    return nir;
+}
+
+nir_shader *
+hk_nir_copy_identity4(const nir_shader *orig, struct hk_identity_copy4 *info)
+{
+   return hk_nir_copy_identity4_build(orig, info, false);
+}
+
+nir_shader *
+hk_nir_copy_identity4_fadd_dual(const nir_shader *orig,
+                                struct hk_identity_copy4 *info)
+{
+   return hk_nir_copy_identity4_build(orig, info, true);
 }

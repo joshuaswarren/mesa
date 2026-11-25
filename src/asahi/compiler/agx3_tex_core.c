@@ -8,6 +8,7 @@
 
 #include "agx3_alu_core.h"
 #include "agx3_binder.h"
+#include "agx3_native_stats.h"
 
 #include <string.h>
 
@@ -48,8 +49,7 @@ one_or_zero(uint16_t value)
 static bool
 fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
 {
-   if (d == NULL || (enc != AGX_ISA_ENCODING_AGX3B &&
-                     enc != AGX_ISA_ENCODING_AGX3C))
+   if (d == NULL || !agx_isa_is_agx3(enc))
       return false;
 
    if ((d->width != AGX3_TEX_W16 && d->width != AGX3_TEX_W32) ||
@@ -283,8 +283,7 @@ mask_witnessed(uint8_t mask)
 static bool
 sample_ok(enum agx_isa_encoding enc, const struct agx3_tex_sample_desc *d)
 {
-   if (d == NULL || (enc != AGX_ISA_ENCODING_AGX3B &&
-                     enc != AGX_ISA_ENCODING_AGX3C))
+   if (d == NULL || !agx_isa_is_agx3(enc))
       return false;
 
    if (d->sample_abi > AGX3_TEX_SAMPLE_ABI_APPLE_FRAGMENT ||
@@ -1012,7 +1011,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
 }
 
 static bool
-agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+agx3_tex_stage_copy_hints_encode(enum agx_isa_encoding enc, bool wide_source,
                     uint16_t dest, uint16_t src,
                     uint8_t slot, uint16_t wait_mask,
                           bool src_cache, bool src_discard,
@@ -1026,7 +1025,7 @@ agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
        (enc == AGX_ISA_ENCODING_AGX3C && src_cache == src_discard))
       return false;
 
-   if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
+   if (!agx_isa_is_agx3(enc))
       return false;
 
    /* High source registers require the extended M5 encoding. Keep the
@@ -1075,6 +1074,21 @@ agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
    memset(out, 0, AGX3_TEX_COPY_MAX_LENGTH);
    *len = 0;
    return false;
+}
+
+static bool
+agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+                               uint16_t dest, uint16_t src, uint8_t slot,
+                               uint16_t wait_mask, bool src_cache,
+                               bool src_discard,
+                               uint8_t out[AGX3_TEX_COPY_MAX_LENGTH],
+                               uint8_t *len)
+{
+   const bool ok = agx3_tex_stage_copy_hints_encode(
+      enc, wide_source, dest, src, slot, wait_mask, src_cache, src_discard, out,
+      len);
+   agx3_native_stats.staging_copies += ok;
+   return ok;
 }
 
 bool
@@ -1422,7 +1436,7 @@ agx3_tex_decode_fetch(enum agx_isa_encoding enc, const void *instruction,
    if (out == NULL)
       return false;
    memset(out, 0, sizeof(*out));
-   if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
+   if (!agx_isa_is_agx3(enc))
       return false;
    if (enc == AGX_ISA_ENCODING_AGX3B && instruction && instruction_size == 20) {
       const uint8_t *p = instruction;
@@ -2220,6 +2234,19 @@ agx3_tex_normalize_cube_array_layer(enum agx_isa_encoding enc, uint16_t dest,
 }
 
 bool
+agx3_tex_stage_array_lod_at(enum agx_isa_encoding enc, uint16_t bank,
+                            uint16_t layer, uint16_t lod, uint8_t slot,
+                            uint16_t wait_mask, bool layer_cache,
+                            bool layer_discard, bool lod_cache,
+                            bool lod_discard, uint8_t out[AGX3_TEX_MAX_LENGTH],
+                            uint8_t *len)
+{
+   return agx3_tex_stage_array_typed_lod(
+      enc, bank, layer, lod, slot, wait_mask, layer_cache, layer_discard,
+      lod_cache, lod_discard, AGX3_TEX_LEVEL_FLOAT, out, len);
+}
+
+bool
 agx3_tex_stage_array_lod(enum agx_isa_encoding enc, uint16_t layer,
                          uint16_t lod, uint8_t slot, uint16_t wait_mask,
                          bool layer_cache, bool layer_discard,
@@ -2345,7 +2372,7 @@ cube_cem_calc_to(enum agx_isa_encoding enc, uint16_t x, uint16_t y,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        x >= 128 || y >= 128 || z >= 128 || (dest & 1) ||
        dest > 190 || axis > 2 ||
        ((discard[0] || discard[1] || discard[2]) && axis != 2) ||
@@ -2471,7 +2498,7 @@ agx3_tex_cube_cem_finalize_at(enum agx_isa_encoding enc, uint8_t component,
    *len = 0;
    /* `bank` is f5: agx3_tex_cube_cem_finalize_to() keeps component * 2 (the
     * second component's baseline), the G18G layer names its own block. */
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        component > 1 || bank > 6 || (bank & 1) ||
        (reciprocal & 1) || reciprocal > 190 ||
        (axis_value & 1) || axis_value > 190 || slot < 1 ||
@@ -2991,7 +3018,7 @@ agx3_tex_pack_ms_array_layer(enum agx_isa_encoding enc, uint16_t src,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        src >= 128 || dest > (enc == AGX_ISA_ENCODING_AGX3C ? 254 : 190) ||
        (dest & 1) || (cache && discard))
       return false;

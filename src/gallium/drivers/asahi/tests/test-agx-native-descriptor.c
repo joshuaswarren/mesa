@@ -651,8 +651,78 @@ test_g17p_compressed_render_target(void)
       CHECK(memcmp(native.opaque, targets[i].words,
                    sizeof(targets[i].words)) == 0);
 
-      /* Outside the compressed single-layer 2D packet nothing is encoded. */
+      /* Gen9 compressed 2x/4x 2D multisample keeps the single-sample compressed
+       * payload and updates only the dimension nibble (4) and sample selector
+       * at word0[57:56]. */
       const struct AGX_PBE original = rt;
+      static const enum agx_sample_count ms_counts[] = {
+         AGX_SAMPLE_COUNT_2,
+         AGX_SAMPLE_COUNT_4,
+      };
+      for (unsigned s = 0; s < ARRAY_SIZE(ms_counts); ++s) {
+         rt = original;
+         rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+         rt.samples = ms_counts[s];
+         uint64_t expected_ms[4];
+         memcpy(expected_ms, targets[i].words, sizeof(expected_ms));
+         expected_ms[0] = (expected_ms[0] & ~UINT64_C(0xf)) | 4u |
+                          ((uint64_t)s << 56);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_ms, sizeof(expected_ms)) == 0);
+      }
+
+      /* Gen9 compressed 2D mip chains preserve the compressed payload and
+       * apply the Gen9 mip extension (word0 bit58, word2[51:44]). */
+      for (unsigned level = 0; level < 5; ++level) {
+         rt = original;
+         rt.level = level;
+         rt.levels = 5;
+         rt.unk_mipmapped = true;
+         uint64_t expected_mip[4];
+         memcpy(expected_mip, targets[i].words, sizeof(expected_mip));
+         expected_mip[0] |= UINT64_C(1) << 58;
+         expected_mip[2] |= ((uint64_t)level << 44) | (UINT64_C(4) << 48);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_mip, sizeof(expected_mip)) == 0);
+      }
+
+      /* Gen9 compressed single-level 2D array and 3D packets keep the 2D
+       * compressed payload and set dimension (3 or 5), layers-1 at
+       * word1[59:44], and page_aligned_layers at word1[60]. */
+      static const struct {
+         enum agx_texture_dimension dim;
+         uint64_t dim_bits;
+         unsigned layers;
+      } layered_cases[] = {
+         {AGX_TEXTURE_DIMENSION_2D_ARRAY, 3u, 2u},
+         {AGX_TEXTURE_DIMENSION_3D, 5u, 4u},
+      };
+      for (unsigned c = 0; c < ARRAY_SIZE(layered_cases); ++c) {
+         rt = original;
+         rt.dimension = layered_cases[c].dim;
+         rt.layers = layered_cases[c].layers;
+         rt.page_aligned_layers = true;
+         uint64_t expected_layered[4];
+         memcpy(expected_layered, targets[i].words, sizeof(expected_layered));
+         expected_layered[0] =
+            (expected_layered[0] & ~UINT64_C(0xf)) | layered_cases[c].dim_bits;
+         expected_layered[1] |=
+            ((uint64_t)(layered_cases[c].layers - 1u) << 44) |
+            (UINT64_C(1) << 60);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_layered,
+                      sizeof(expected_layered)) == 0);
+      }
+
+      /* Outside the proven compressed 2D (with mips), single-level 2D array /
+       * 3D, and 2x/4x 2D multisample packets nothing is encoded. */
+      rt = original;
       rt.acceleration_buffer = 0;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
@@ -663,11 +733,27 @@ test_g17p_compressed_render_target(void)
       rt = original;
       rt.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
       rt.layers = 2;
+      rt.levels = 5;
+      rt.unk_mipmapped = true;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                         &rt));
+      rt = original;
+      rt.dimension = AGX_TEXTURE_DIMENSION_3D;
+      rt.layers = 4;
+      rt.levels = 5;
+      rt.unk_mipmapped = true;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                         &rt));
+      rt = original;
+      rt.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
+      rt.layers = 2;
+      rt.samples = AGX_SAMPLE_COUNT_4;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;
       rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
       rt.samples = AGX_SAMPLE_COUNT_4;
+      rt.layout = AGX_LAYOUT_TWIDDLED;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;
@@ -1129,19 +1215,300 @@ test_gen9_uncompressed_dimensions(void)
    }
 }
 
+static void
+test_gen9_compressed_depth_array(void)
+{
+   static const struct {
+      enum agx_channels channels;
+      enum agx_texture_type type;
+   } formats[] = {
+      {AGX_CHANNELS_R32, AGX_TEXTURE_TYPE_FLOAT},
+      {AGX_CHANNELS_R16, AGX_TEXTURE_TYPE_UNORM},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(formats); ++i) {
+      /* Compressed single-level 2D-array texture descriptor (sampled as a full
+       * array or a sub-range starting at a non-zero layer). */
+      struct AGX_TEXTURE semantic = {AGX_TEXTURE_header};
+      semantic.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      semantic.layout = AGX_LAYOUT_GPU;
+      semantic.channels = formats[i].channels;
+      semantic.type = formats[i].type;
+      semantic.swizzle_r = AGX_CHANNEL_R;
+      semantic.swizzle_g = AGX_CHANNEL_R;
+      semantic.swizzle_b = AGX_CHANNEL_R;
+      semantic.swizzle_a = AGX_CHANNEL_R;
+      semantic.width = 2048;
+      semantic.height = 2048;
+      semantic.depth = 4;
+      semantic.address = UINT64_C(0x10000100000);
+      semantic.acceleration_buffer = UINT64_C(0x10004120000);
+      semantic.compressed = true;
+      semantic.extended = true;
+      semantic.page_aligned_layers = true;
+
+      struct agx_gallium_texture_descriptor native;
+      memset(&native, 0xa5, sizeof(native));
+      CHECK(agx_gallium_pack_native_texture(
+         AGX_DESCRIPTOR_GENERATION_9, &native, &semantic));
+
+      struct AGX_TEXTURE_GEN9 decoded;
+      CHECK(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)native.opaque,
+                                    &decoded));
+      CHECK(decoded.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY);
+      CHECK(decoded.layout == AGX_LAYOUT_GPU);
+      CHECK(decoded.channels == formats[i].channels);
+      CHECK(decoded.type == formats[i].type);
+      CHECK(decoded.width == 2048 && decoded.height == 2048);
+      CHECK(decoded.compressed && decoded.extended && !decoded.has_levels);
+      CHECK(decoded.depth == 4 && decoded.page_aligned_layers);
+      CHECK(decoded.address == semantic.address);
+      CHECK(decoded.acceleration_buffer == semantic.acceleration_buffer);
+      CHECK(decoded.swizzle_r == AGX_CHANNEL_R &&
+            decoded.swizzle_g == AGX_CHANNEL_R &&
+            decoded.swizzle_b == AGX_CHANNEL_R &&
+            decoded.swizzle_a == AGX_CHANNEL_R);
+
+      /* Re-packing the unpacked Gen9 struct must reproduce identical bytes. */
+      struct agx_texture_gen9_packed repacked;
+      memset(&repacked, 0x5a, sizeof(repacked));
+      agx_pack(&repacked, TEXTURE_GEN9, cfg) {
+         cfg = decoded;
+      }
+      CHECK(memcmp(native.opaque, repacked.opaque, sizeof(repacked.opaque)) == 0);
+
+      /* Misaligned metadata VA must be rejected cleanly. */
+      struct AGX_TEXTURE bad_meta = semantic;
+      bad_meta.acceleration_buffer += 8;
+      memset(&native, 0xff, sizeof(native));
+      CHECK(!agx_gallium_pack_native_texture(
+         AGX_DESCRIPTOR_GENERATION_9, &native, &bad_meta));
+      CHECK(native.opaque[0] == 0 && native.opaque[7] == 0);
+
+      /* Staging uploads and per-layer blits write a single layer of the
+       * compressed 2D array through a Gen9 compressed 2D PBE with the array's
+       * page_aligned_layers flag set on the underlying layout. */
+      struct AGX_PBE slice_pbe = render_target_pbe();
+      slice_pbe.dimension = AGX_TEXTURE_DIMENSION_2D;
+      slice_pbe.layout = AGX_LAYOUT_GPU;
+      slice_pbe.channels = formats[i].channels;
+      slice_pbe.type = formats[i].type;
+      slice_pbe.swizzle_r = AGX_CHANNEL_R;
+      slice_pbe.swizzle_g = AGX_CHANNEL_R;
+      slice_pbe.swizzle_b = AGX_CHANNEL_R;
+      slice_pbe.swizzle_a = AGX_CHANNEL_R;
+      slice_pbe.width = 2048;
+      slice_pbe.height = 2048;
+      slice_pbe.levels = 1;
+      slice_pbe.layers = 1;
+      slice_pbe.buffer = semantic.address;
+      slice_pbe.acceleration_buffer = semantic.acceleration_buffer;
+      slice_pbe.compressed = true;
+      slice_pbe.extended = true;
+      slice_pbe.page_aligned_layers = true;
+
+      struct agx_gallium_pbe_descriptor native_pbe;
+      memset(&native_pbe, 0xa5, sizeof(native_pbe));
+      CHECK(agx_gallium_pack_native_pbe(
+         AGX_DESCRIPTOR_GENERATION_9, &native_pbe, &slice_pbe));
+
+      const struct agx_pbe_agx3_2d_fields fields = {
+         .layout = slice_pbe.layout,
+         .channels = slice_pbe.channels,
+         .type = slice_pbe.type,
+         .swizzle_r = slice_pbe.swizzle_r,
+         .swizzle_g = slice_pbe.swizzle_g,
+         .swizzle_b = slice_pbe.swizzle_b,
+         .swizzle_a = slice_pbe.swizzle_a,
+         .width = slice_pbe.width,
+         .height = slice_pbe.height,
+         .buffer = slice_pbe.buffer,
+         .compressed = true,
+         .acceleration_buffer = slice_pbe.acceleration_buffer,
+         .page_aligned_layers = true,
+      };
+      struct agx_pbe_agx3_descriptor expected_pbe;
+      CHECK(agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_9, &fields, 0, 1,
+                                     &expected_pbe));
+      CHECK(memcmp(native_pbe.opaque, expected_pbe.bytes,
+                   sizeof(expected_pbe.bytes)) == 0);
+      uint64_t word1 = 0;
+      memcpy(&word1, &native_pbe.opaque[2], sizeof(word1));
+      CHECK(((word1 >> 60) & 1) == 0);
+      CHECK(((word1 >> 63) & 1) == 1);
+   }
+}
+
+static void
+test_dmabuf_modifier_external_only(void)
+{
+   /* AGX2 has in-place decompression, so no modifier is external-only.
+    * AGX3 keeps GPU_TILED_COMPRESSED external-only (imported from Vulkan to
+    * sample), while INTERCHANGE stays renderable for compositor scanout FBOs
+    * (protected against BO reallocation by agx_decompress() / batch reject). */
+   static const enum agx_descriptor_generation gens[] = {
+      AGX_DESCRIPTOR_GENERATION_7,
+      AGX_DESCRIPTOR_GENERATION_8,
+      AGX_DESCRIPTOR_GENERATION_9,
+      AGX_DESCRIPTOR_GENERATION_10,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(gens); ++i) {
+      const bool agx3 = agx_gallium_descriptor_generation_is_agx3(gens[i]);
+      CHECK(agx_gallium_dmabuf_modifier_external_only(
+               gens[i], DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED) == agx3);
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(
+         gens[i], DRM_FORMAT_MOD_APPLE_GPU_TILED));
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(
+         gens[i], DRM_FORMAT_MOD_APPLE_INTERCHANGE));
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(gens[i],
+                                                       DRM_FORMAT_MOD_LINEAR));
+   }
+}
+
+static void
+test_gen9_interchange_descriptors(void)
+{
+   static const struct {
+      enum agx_channels channels;
+      enum agx_channel swizzle_r, swizzle_g, swizzle_b, swizzle_a;
+      uint8_t expected_pbe_byte2;
+   } cases[] = {
+      /* 8-bit BGRA / RGBA */
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0xc6},
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0xe4},
+      /* 10-bit BGR10A2/BGR10X2 (MTL94 swizzle) and RGB10A2/RGB10X2 */
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0xc6},
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0xe4},
+   };
+
+   const unsigned width = 3456, height = 2234;
+   const unsigned tiles_x = DIV_ROUND_UP(width, 16);
+   const uint64_t base_va = UINT64_C(0x1000080000);
+   const uint64_t meta_va = UINT64_C(0x1001ec0000);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      struct AGX_PBE pbe = {AGX_PBE_header};
+      pbe.dimension = AGX_TEXTURE_DIMENSION_2D;
+      pbe.layout = AGX_LAYOUT_INTERCHANGE;
+      pbe.channels = cases[i].channels;
+      pbe.type = AGX_TEXTURE_TYPE_UNORM;
+      pbe.swizzle_r = cases[i].swizzle_r;
+      pbe.swizzle_g = cases[i].swizzle_g;
+      pbe.swizzle_b = cases[i].swizzle_b;
+      pbe.swizzle_a = cases[i].swizzle_a;
+      pbe.width = width;
+      pbe.height = height;
+      pbe.layers = 1;
+      pbe.levels = 1;
+      pbe.buffer = base_va;
+      pbe.compressed = true;
+      pbe.extended = true;
+      pbe.acceleration_buffer = meta_va;
+      pbe.stride = tiles_x * 16 - 4;
+
+      struct agx_gallium_pbe_descriptor packed_pbe;
+      CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                        &packed_pbe, &pbe));
+      const uint8_t *pbe_bytes = (const uint8_t *)packed_pbe.opaque;
+      CHECK((pbe_bytes[0] & 0x3f) == 0x32); /* dim=2 (2D), layout=3 (IX) */
+      CHECK(pbe_bytes[2] == cases[i].expected_pbe_byte2);
+
+      struct agx_pbe_agx3_2d_fields decoded_pbe;
+      CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_9, packed_pbe.opaque,
+                                   sizeof(packed_pbe.opaque), &decoded_pbe));
+      CHECK(decoded_pbe.layout == AGX_LAYOUT_INTERCHANGE);
+      CHECK(decoded_pbe.channels == cases[i].channels);
+      CHECK(decoded_pbe.type == AGX_TEXTURE_TYPE_UNORM);
+      CHECK(decoded_pbe.swizzle_r == cases[i].swizzle_r &&
+            decoded_pbe.swizzle_g == cases[i].swizzle_g &&
+            decoded_pbe.swizzle_b == cases[i].swizzle_b &&
+            decoded_pbe.swizzle_a == cases[i].swizzle_a);
+      CHECK(decoded_pbe.compressed);
+      CHECK(decoded_pbe.buffer == base_va);
+      CHECK(decoded_pbe.acceleration_buffer == meta_va);
+      CHECK(decoded_pbe.stride_B == tiles_x * 16);
+
+      /* Gen10, uncompressed, layered, or mipmapped Interchange PBEs must fail. */
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
+                                         &packed_pbe, &pbe));
+      struct AGX_PBE bad_pbe = pbe;
+      bad_pbe.compressed = false;
+      bad_pbe.extended = false;
+      bad_pbe.acceleration_buffer = 0;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+      bad_pbe = pbe;
+      bad_pbe.levels = 2;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+      bad_pbe = pbe;
+      bad_pbe.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      bad_pbe.layers = 2;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+
+      struct AGX_TEXTURE tex = {AGX_TEXTURE_header};
+      tex.dimension = AGX_TEXTURE_DIMENSION_2D;
+      tex.layout = AGX_LAYOUT_INTERCHANGE;
+      tex.channels = cases[i].channels;
+      tex.type = AGX_TEXTURE_TYPE_UNORM;
+      tex.swizzle_r = cases[i].swizzle_r;
+      tex.swizzle_g = cases[i].swizzle_g;
+      tex.swizzle_b = cases[i].swizzle_b;
+      tex.swizzle_a = cases[i].swizzle_a;
+      tex.width = width;
+      tex.height = height;
+      tex.depth = 1;
+      tex.address = base_va;
+      tex.compressed = true;
+      tex.extended = true;
+      tex.acceleration_buffer = meta_va;
+      tex.stride = (tiles_x - 1) << 4;
+
+      struct agx_gallium_texture_descriptor packed_tex;
+      CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9,
+                                            &packed_tex, &tex));
+      struct AGX_TEXTURE_GEN9 decoded_tex = {0};
+      CHECK(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed_tex.opaque,
+                                    &decoded_tex));
+      CHECK(decoded_tex.layout == AGX_LAYOUT_INTERCHANGE);
+      CHECK(decoded_tex.channels == cases[i].channels);
+      CHECK(decoded_tex.type == AGX_TEXTURE_TYPE_UNORM);
+      CHECK(decoded_tex.swizzle_r == cases[i].swizzle_r &&
+            decoded_tex.swizzle_g == cases[i].swizzle_g &&
+            decoded_tex.swizzle_b == cases[i].swizzle_b &&
+            decoded_tex.swizzle_a == cases[i].swizzle_a);
+      CHECK(decoded_tex.compressed && decoded_tex.extended);
+      CHECK(decoded_tex.address == base_va);
+      CHECK(decoded_tex.acceleration_buffer == meta_va);
+      CHECK(decoded_tex.stride == ((tiles_x - 1) << 4));
+
+      /* Gen10 rejects Interchange textures as well. */
+      CHECK(!agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_10,
+                                             &packed_tex, &tex));
+   }
+}
+
 int
 main(void)
 {
    test_chip_routing();
    test_feature_gates();
+   test_dmabuf_modifier_external_only();
    test_g17p_txf_sampler();
    test_native_sampler_generations();
    test_g17p_sampler_handles();
    test_standard_border_colours();
    test_gen9_uncompressed_mip_views();
    test_gen9_uncompressed_dimensions();
+   test_gen9_compressed_depth_array();
    test_native_packers();
    test_agx3_pbe();
+   test_gen9_interchange_descriptors();
    test_g17p_compressed_render_target();
    test_g17p_image_atomic_sw();
    printf("Gallium AGX native descriptors: %u checks passed\n", checks);
