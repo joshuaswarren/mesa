@@ -559,8 +559,9 @@ agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
 }
 
 /*
- * G17G's and G18G's varying tables select perspective-correct coefficients
- * with shade model 5. AGX2's 7 sets them up linearly there, which only a
+ * HAL300 varying tables (agx_chip_uses_shade_model_5(): M5 G17G/G17S/G17C and
+ * M6 G18G) select perspective-correct coefficients with shade model 5. AGX2's
+ * 7 sets them up linearly there, which only a
  * clip-space W other than 1 exposes: a constant colour reads back as c * W,
  * the shader's 1/W divide applied to an undivided coefficient (dEQP
  * fill_rules.projected; gpu/persp1.c measures 5 exact, 7/3/1/4 not). On G18G

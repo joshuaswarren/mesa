@@ -405,6 +405,7 @@ test_chip_sets(void)
       const bool m5 = agx_chip_g17_m5(c);
 
       CHECK(agx_chip_hal300_path(c) == (m5 || c == AGX_CHIP_G18G));
+      CHECK(agx_chip_uses_shade_model_5(c) == (m5 || c == AGX_CHIP_G18G));
       CHECK(agx_chip_agx3_path(c) == (native || m5 || c == AGX_CHIP_G18G));
       CHECK(agx_chip_native_or_m5(c) == (native || m5));
       CHECK(agx_chip_native_or_g18g(c) == (native || c == AGX_CHIP_G18G));

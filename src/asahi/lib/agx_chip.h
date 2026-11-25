@@ -1383,6 +1383,20 @@ agx_chip_local_read_tilebuffer(enum agx_chip chip)
           (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
 }
 
+/*
+ * Whether the varying coefficient table selects perspective-correct
+ * interpolation with shade model 5 instead of AGX2's 7.
+ *
+ * HAL300 parts (M5 G17G/G17S/G17C and M6 G18G) treat shade model 7 as linear,
+ * so smooth perspective bindings must be rewritten to shade model 5 via
+ * agx_cf_bindings_select_perspective().
+ */
+static inline bool
+agx_chip_uses_shade_model_5(enum agx_chip chip)
+{
+   return agx_chip_hal300_path(chip);
+}
+
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)
