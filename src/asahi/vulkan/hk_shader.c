@@ -908,6 +908,10 @@ enum hk_feature_key {
    HK_FEAT_DESCRIPTOR_BUFFER = BITFIELD_BIT(8),
 
    HK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(9),
+
+   /* G18G skips record-time descriptor snapshots for compute combined tables
+    * when storage images can be updated after bind. */
+   HK_FEAT_STORAGE_IMAGE_UPDATE_AFTER_BIND = BITFIELD_BIT(10),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -978,6 +982,9 @@ hk_make_feature_key(const struct vk_features *feats)
    return (feats->customBorderColors ? HK_FEAT_CUSTOM_BORDER : 0) |
           (feats->descriptorBindingSampledImageUpdateAfterBind
               ? HK_FEAT_SAMPLED_IMAGE_UPDATE_AFTER_BIND
+              : 0) |
+          (feats->descriptorBindingStorageImageUpdateAfterBind
+              ? HK_FEAT_STORAGE_IMAGE_UPDATE_AFTER_BIND
               : 0) |
           (feats->robustBufferAccess ? HK_FEAT_ROBUST_BUFFER_ACCESS : 0) |
           (feats->robustBufferAccess2 ? HK_FEAT_ROBUST_BUFFER_ACCESS_2 : 0) |
@@ -5743,16 +5750,28 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          shader->info.agx3_storage_image_valid = true;
          shader->info.agx3_storage_image = storage;
       } else if (ops.has_tex || has_bindless_image) {
-         nir_shader *c = nir_shader_clone(NULL, nir);
-         if (hk_g18g_keep_lowered(
-                &nir, c, c && agx_nir_lower_g18g_combined_tables(c, &tables))) {
+         /* agx_nir_lower_g18g_combined_tables() snapshots bound descriptor sets
+          * at command-buffer recording time; skip it when descriptor buffers or
+          * update-after-bind are enabled so the shader uses the bindless/heap
+          * path instead of failing at dispatch time. */
+         const bool record_time_tables =
+            !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
+            !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
+            !dev->vk.enabled_features.descriptorBindingStorageImageUpdateAfterBind;
+         bool tables_ok = false;
+         if (record_time_tables) {
+            nir_shader *c = nir_shader_clone(NULL, nir);
+            tables_ok = hk_g18g_keep_lowered(
+               &nir, c, c && agx_nir_lower_g18g_combined_tables(c, &tables));
+         }
+         if (tables_ok) {
             shader->info.agx3_storage_image_valid = true;
             shader->info.agx3_storage_image =
                (struct agx_g17p_storage_image_binding){0};
             shader->info.agx3_g18_tables_valid = true;
             shader->info.agx3_g18_tables = tables;
          } else if (ops.has_tex || ops.has_bindless_image_read) {
-            c = nir_shader_clone(NULL, nir);
+            nir_shader *c = nir_shader_clone(NULL, nir);
             shader->info.agx3_indexed_sampler_valid = hk_g18g_keep_lowered(
                &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, g17p));
          }
