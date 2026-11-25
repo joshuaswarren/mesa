@@ -3553,6 +3553,30 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
    const bool imageblock = agx_chip_native_imageblock(dev->dev.chip);
    const bool hal300 = agx_chip_hal300_path(dev->dev.chip);
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   if (dev->dev.chip == AGX_CHIP_G18G && samples == 1 && !layered) {
+      bool raw32 = true;
+      unsigned active = 0;
+      for (unsigned rt = 0; rt < count; ++rt) {
+         const enum pipe_format f = formats[rt];
+         if (f == PIPE_FORMAT_NONE)
+            continue;
+         raw32 &= f == PIPE_FORMAT_R32G32B32A32_FLOAT ||
+                  f == PIPE_FORMAT_R32G32B32A32_SINT ||
+                  f == PIPE_FORMAT_R32G32B32A32_UINT;
+         active++;
+      }
+      raw32 &= active >= 2 && active <= 8;
+      if (raw32) {
+         return agx_build_tilebuffer_layout_resident(
+            formats, count, samples, layered, 128, 131072, 1024, resident_mask);
+      }
+      const bool kernel_native_samples =
+         !!(dev->dev.params.features & DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES);
+      if (agx_g18g_native_mixed_tile_bytes(formats, count, samples, layered,
+                                           kernel_native_samples)) {
+         return agx_build_tilebuffer_layout_g18_mixed(formats, count);
+      }
+   }
    const uint8_t max_sample_size_B =
       m5 ? AGX_MAX_RENDER_TARGETS * 16 :
       hal300 ? (layered ? 32 : 64) :
@@ -4816,7 +4840,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->tilebuffer = hk_tilebuffer_layout(
       dev, &render->color_att[0].vk_format, sizeof(render->color_att[0]),
       render->color_att_count, render->tilebuffer.nr_samples,
-      !agx_chip_native_or_m5(dev->dev.chip) ||
+      !agx_chip_agx3_path(dev->dev.chip) ||
          !hk_agx3_g17p_single_layer_rendering(render->view_mask, layer_count),
       g17p_wide_ms_to_memory, hk_resident_attachments(dev, render));
 
@@ -7107,6 +7131,11 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       backend_key.g17p_emrt =
          ((const struct agx_fs_epilog_key *)key->key)->native_spills;
+   if (dev->dev.chip == AGX_CHIP_G18G &&
+       (builder == agx_nir_fs_epilog || builder == build_g17p_fs_epilog ||
+        builder == build_g18_msaa4_fs_epilog))
+      backend_key.g18_native_mixed =
+         ((const struct agx_fs_epilog_key *)key->key)->g18_native_mixed;
    if (builder == build_g18_msaa4_fs_epilog) {
       NIR_PASS(_, b.shader, agx_nir_lower_g18_tile_samples, nr_samples);
    } else if (builder == build_g17p_fs_epilog ||
@@ -11618,6 +11647,9 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.first_mask = in->tib->first_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
+   key->epilog.g18_native_mixed =
+      dev->dev.chip == AGX_CHIP_G18G &&
+      agx_g18g_native_mixed_mask(in->tib) != 0;
 
    for (uint32_t i = 0; i < in->color_att_count; i++) {
       const VkFormat format = *(const VkFormat *)(
