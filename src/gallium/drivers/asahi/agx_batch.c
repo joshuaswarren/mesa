@@ -430,6 +430,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17g_prims = 0;
    batch->g17g_small_budget = false;
    batch->incoherent_writes = false;
+   batch->vtx_needs_render_barrier = false;
    agx_bo_unreference(dev, batch->sampler_heap.bo);
    batch->sampler_heap.bo = NULL;
    batch->sampler_heap.count = 0;
@@ -963,6 +964,30 @@ agx_sync_writer(struct agx_context *ctx, struct agx_resource *rsrc,
 static void agx_batch_reads_internal(struct agx_batch *batch,
                                      struct agx_resource *rsrc,
                                      uint64_t start, uint64_t end);
+
+void
+agx_batch_note_vtx_read(struct agx_batch *batch, struct agx_resource *rsrc)
+{
+   if (batch->vtx_needs_render_barrier || !rsrc || !rsrc->bo)
+      return;
+
+   struct agx_bo *bo = rsrc->bo;
+   struct agx_batch *writer = agx_writer_get(batch->ctx, bo->handle);
+   if ((writer && writer != batch) || (bo->flags & AGX_BO_SHARED) ||
+       agx_bo_writer_syncobj(p_atomic_read(&bo->writer)) != 0) {
+      batch->vtx_needs_render_barrier = true;
+      return;
+   }
+
+   if (rsrc->separate_stencil && rsrc->separate_stencil->bo) {
+      struct agx_bo *sbo = rsrc->separate_stencil->bo;
+      struct agx_batch *swriter = agx_writer_get(batch->ctx, sbo->handle);
+      if ((swriter && swriter != batch) || (sbo->flags & AGX_BO_SHARED) ||
+          agx_bo_writer_syncobj(p_atomic_read(&sbo->writer)) != 0) {
+         batch->vtx_needs_render_barrier = true;
+      }
+   }
+}
 
 void
 agx_batch_reads(struct agx_batch *batch, struct agx_resource *rsrc)
@@ -2195,6 +2220,19 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       struct drm_asahi_cmd_header header = agx_cmd_header(
          false, compute_here ? DRM_ASAHI_BARRIER_NONE : 0,
          compute_here ? compute_commands : 0);
+
+      /* Overlap the next render's tiling with the previous render's fragment
+       * stage when the kernel preserves tiling order under
+       * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS (non-classic submission models) and
+       * this batch's tiling/vertex work has no dependency on prior GPU writes.
+       */
+      if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+          agx_chip_submission_model(dev->chip) != AGX_SUBMISSION_MODEL_CLASSIC &&
+          !compute && in_sync_count == 0 &&
+          header.vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
+          !batch->vtx_needs_render_barrier) {
+         render->flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+      }
       /* G18G takes the full drm_asahi_cmd_render. */
       header.size = dev->chip == AGX_CHIP_G18G
                        ? sizeof(struct drm_asahi_cmd_render)

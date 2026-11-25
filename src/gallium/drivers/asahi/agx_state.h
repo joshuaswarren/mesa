@@ -726,6 +726,13 @@ struct agx_batch {
     */
    bool incoherent_writes;
 
+   /* If true, this render batch's tiling/vertex work reads or writes a BO with
+    * an in-flight GPU writer (or uses a pre-fragment stage that writes memory),
+    * so tiling must wait for prior renders instead of deferring the barrier to
+    * the fragment stage via DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
+    */
+   bool vtx_needs_render_barrier;
+
    struct agx_pool pool, pipeline_pool;
    struct util_dynarray g17p_vdm_aliases;
 
@@ -1934,6 +1941,8 @@ uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);
 
 void agx_batch_init_state(struct agx_batch *batch);
+void agx_batch_note_vtx_read(struct agx_batch *batch,
+                             struct agx_resource *rsrc);
 
 struct asahi_bg_eot {
    uint64_t usc;

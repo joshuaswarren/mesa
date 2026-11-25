@@ -19,6 +19,7 @@
 
 static unsigned calls, computes, renders, expected_inputs;
 static bool fail_submit;
+static bool expect_fragment_barriers;
 static uint32_t first_output;
 
 static int
@@ -56,6 +57,10 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          CHECK(h->vdm_barrier == (prefix[1] ? DRM_ASAHI_BARRIER_NONE : 0));
          CHECK(h->cdm_barrier == (prefix[1] ? 1 : 0));
          CHECK(h->size == agx_render_command_size(dev));
+         const struct drm_asahi_cmd_render *r =
+            (const void *)(data + cursor + sizeof(*h));
+         CHECK(!!(r->flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS) ==
+               expect_fragment_barriers);
          prefix[0]++;
          renders++;
       } else {
@@ -108,6 +113,7 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    calls = computes = renders = first_output = 0;
    expected_inputs = bo_count + 2;
    fail_submit = fail;
+   expect_fragment_barriers = false;
    memset(&ctx->submit_perf, 0, sizeof(ctx->submit_perf));
    struct drm_asahi_cmd_compute c = {0};
    struct drm_asahi_cmd_render r = {0};
@@ -131,6 +137,61 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
       CHECK(bos[i].refcnt == 1);
    pctx->flush(pctx, NULL, 0);
    CHECK(ctx->submit_perf.submits == 0 && ctx->submit_perf.batches == 0);
+}
+
+static void
+run_fragment_barrier_checks(struct pipe_screen *screen)
+{
+   struct agx_device *dev = agx_device(screen);
+   const uint64_t saved_features = dev->params.features;
+   const bool non_classic =
+      agx_chip_submission_model(dev->chip) != AGX_SUBMISSION_MODEL_CLASSIC;
+   struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+   CHECK(pctx);
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_screen *ascreen = agx_screen(screen);
+   p_atomic_set(&ascreen->flush_wait_seqid, 0);
+   dev->params.max_commands_per_submission = 64;
+
+   for (unsigned mode = 0; mode < 4; mode++) {
+      dev->params.features = mode == 3
+         ? (saved_features & ~DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+         : (saved_features | DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS);
+
+      struct agx_batch *batch = agx_get_batch(ctx);
+      struct agx_va va = {.addr = 0x4000};
+      struct agx_bo clean_bo = {.handle = 11, .refcnt = 1, .va = &va};
+      struct agx_resource clean_rsrc = {.bo = &clean_bo};
+      agx_batch_note_vtx_read(batch, &clean_rsrc);
+      CHECK(!batch->vtx_needs_render_barrier);
+
+      if (mode == 1) {
+         struct agx_bo shared_bo = {
+            .handle = 12,
+            .refcnt = 1,
+            .va = &va,
+            .flags = AGX_BO_SHARED,
+         };
+         struct agx_resource shared_rsrc = {.bo = &shared_bo};
+         agx_batch_note_vtx_read(batch, &shared_rsrc);
+         CHECK(batch->vtx_needs_render_barrier);
+      }
+
+      const bool compute = (mode == 2);
+      calls = computes = renders = first_output = 0;
+      expected_inputs = 0;
+      fail_submit = false;
+      expect_fragment_barriers = non_classic && mode == 0;
+
+      struct drm_asahi_cmd_compute c = {0};
+      struct drm_asahi_cmd_render r = {0};
+      agx_batch_submit(ctx, batch, compute ? &c : NULL, &r);
+      CHECK(calls == 1 && computes == compute && renders == 1);
+      agx_sync_all(ctx, "fragment barrier test retirement");
+   }
+
+   dev->params.features = saved_features;
+   pctx->destroy(pctx);
 }
 
 int
@@ -160,6 +221,7 @@ main(void)
          run_batch(pctx, true, true, false, false, 2);
       pctx->destroy(pctx);
    }
+   run_fragment_barrier_checks(screen);
    screen->destroy(screen);
    driDestroyOptionInfo(&info);
    close(fd);

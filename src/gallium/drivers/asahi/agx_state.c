@@ -6783,6 +6783,8 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct agx_resource *rsrc = tex->rsrc;
       agx_batch_reads(batch, tex->rsrc);
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE)
+         agx_batch_note_vtx_read(batch, rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
       if (dev->chip == AGX_CHIP_G18G && rsrc->base.b.nr_samples > 1 &&
@@ -6861,6 +6863,12 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       }
 
       struct pipe_image_view *view = &ctx->stage[stage].images[i];
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
+         if (view->shader_access & PIPE_IMAGE_ACCESS_WRITE)
+            batch->vtx_needs_render_barrier = true;
+         else
+            agx_batch_note_vtx_read(batch, agx_resource(view->resource));
+      }
       agx_batch_track_image(batch, view);
       if (agx_chip_native_or_g18g(dev->chip) &&
           view->resource->target == PIPE_BUFFER)
@@ -15005,6 +15013,7 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(info->index.resource);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vtx_read(batch, rsrc);
 
    *extent =
       ALIGN_POT(rsrc->layout.size_B - rsrc->layout.level_offsets_B[0], 4);
@@ -15361,6 +15370,7 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vtx_read(batch, rsrc);
    return agx_map_gpu(rsrc) + indirect->offset;
 }
 
@@ -17351,6 +17361,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       if (clean) {
          struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
          agx_batch_reads(clean, indirect_rsrc);
+         agx_batch_note_vtx_read(clean, indirect_rsrc);
          indirect_rsrc_base = agx_map_gpu(indirect_rsrc);
          if (info->index_size)
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
@@ -17872,6 +17883,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_update_descriptors(batch, ctx->fs);
    if (batch->native_rejected)
       return;
+
+   if (ctx->gs || ctx->in_tess || ctx->streamout.num_targets ||
+       ctx->cond_query ||
+       (ctx->vs && ctx->vs->so && ctx->vs->so->info.writes_memory))
+      batch->vtx_needs_render_barrier = true;
 
    if (IS_DIRTY(VS) || IS_DIRTY(FS) || ctx->gs || IS_DIRTY(VERTEX) ||
        IS_DIRTY(BLEND_COLOR) || IS_DIRTY(QUERY) || IS_DIRTY(POLY_STIPPLE) ||
