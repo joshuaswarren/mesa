@@ -5637,7 +5637,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * in a register (agx_optimizer_inline_imm), so only G17P admits one to
     * the sampler lowerings below. */
    const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
-   if (agx_chip_native_agx3(dev->dev.chip) &&
+   if (agx_chip_native_or_g18g(dev->dev.chip) &&
        nir->info.stage == MESA_SHADER_VERTEX) {
       /* Software vertex variants feed geometry/tessellation through CDM.
        * They use the same indexed texture heap and shifted vertex uniforms
@@ -5661,7 +5661,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                   AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
                   shader->info.agx3_gen1_fragment_rq);
       }
-   } else if (agx_chip_native_agx3(dev->dev.chip) &&
+   } else if (agx_chip_native_or_g18g(dev->dev.chip) &&
               (nir->info.stage == MESA_SHADER_GEOMETRY ||
                nir->info.stage == MESA_SHADER_TESS_CTRL ||
                nir->info.stage == MESA_SHADER_TESS_EVAL ||
@@ -7390,7 +7390,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    meta.reads_images = hk_shader_reads_images(nir);
    meta.may_kill = hk_fs_may_kill(nir);
 
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_native_or_g18g(dev->dev.chip)) {
       nir_shader *candidate =
          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
