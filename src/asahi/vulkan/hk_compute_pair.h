@@ -31,6 +31,9 @@ enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED = 7,
    HK_COMPUTE_PAIR_ALT_LINEAR_FADD = 8,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED = 9,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED = 10,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 = 11,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED = 12,
 };
 
 static inline bool
@@ -39,10 +42,13 @@ hk_compute_pair_alt_is_gemm_cmat(enum hk_compute_pair_alt_kind kind)
    return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
-          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED;
 }
 
 static inline uint32_t
@@ -57,12 +63,45 @@ hk_compute_pair_alt_gemm_tile_n(enum hk_compute_pair_alt_kind kind)
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32:
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED:
       return 32;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED:
+      return 48;
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64:
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED:
       return 64;
    default:
       return 0;
    }
+}
+
+static inline uint32_t
+hk_compute_pair_alt_gemm_tile_m(enum hk_compute_pair_alt_kind kind)
+{
+   switch (kind) {
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED:
+      return 32;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED:
+      return 64;
+   default:
+      return 0;
+   }
+}
+
+static inline uint32_t
+hk_compute_pair_alt_gemm_k_step(enum hk_compute_pair_alt_kind kind)
+{
+   return (kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 ||
+           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED)
+             ? 32u : 16u;
 }
 
 static inline bool
@@ -71,7 +110,10 @@ hk_compute_pair_alt_is_gemm_unguarded(enum hk_compute_pair_alt_kind kind)
    return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
-          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED;
 }
 
 static inline bool

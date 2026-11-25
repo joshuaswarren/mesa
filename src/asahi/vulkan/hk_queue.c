@@ -4045,8 +4045,7 @@ compute_pair_dw_gemm_match(const struct hk_compute_pair_dispatch *dw,
    if (p->k_offset_B + sizeof(int32_t) > sizeof(gemm->push))
       return false;
    memcpy(&k_i, gemm->push + p->k_offset_B, sizeof(k_i));
-   const uint32_t k_step =
-      hk_gemm_cmat_k_step(hk_compute_pair_alt_gemm_tile_n(gemm->alt_kind));
+   const uint32_t k_step = hk_compute_pair_alt_gemm_k_step(gemm->alt_kind);
    if (k_i <= 0 || (uint32_t)k_i != (uint32_t)ch ||
        ((uint32_t)k_i % k_step) != 0)
       return false;
@@ -4291,12 +4290,17 @@ compute_pair_gemm_pad4_dw_match(const struct hk_compute_pair_dispatch *gemm,
       return false;
 
    enum hk_compute_pair_alt_kind eff_alt = gemm->alt_kind;
-   if (hk_compute_pair_alt_gemm_tile_n(eff_alt) == 64) {
-      if ((n_u % 32u) != 0)
+   const uint32_t orig_tn = hk_compute_pair_alt_gemm_tile_n(eff_alt);
+   if (orig_tn == 64 || orig_tn == 48) {
+      if ((n_u % 32u) == 0) {
+         eff_alt = gemm->info.gemm.is_guarded
+                      ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED
+                      : HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
+      } else if ((n_u % 24u) == 0) {
+         eff_alt = HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED;
+      } else {
          return false;
-      eff_alt = gemm->info.gemm.is_guarded
-                   ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED
-                   : HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
+      }
    }
    const uint32_t eff_tile_n = hk_compute_pair_alt_gemm_tile_n(eff_alt);
    if ((eff_tile_n != 16 && eff_tile_n != 24 && eff_tile_n != 32) ||
@@ -5175,7 +5179,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                             !hk_compute_pair_alt_is_gemm_unguarded(eff_alt_kind)) {
                            const uint32_t tn =
                               hk_compute_pair_alt_gemm_tile_n(eff_alt_kind);
-                           const uint32_t tm = hk_gemm_cmat_tile_m(tn);
+                           const uint32_t tm =
+                              hk_compute_pair_alt_gemm_tile_m(eff_alt_kind);
                            struct hk_nir_direct_shape ps = {p->push, sizeof(p->push)};
                            memcpy(ps.groups, p->groups, sizeof(ps.groups));
                            uint64_t p_end[4] = {0};
@@ -5203,7 +5208,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             struct hk_dw_a_push dw_a_push = {0};
             if (dual != HK_COMPUTE_PAIR_DUAL_GEMM_DW && !has_im2col &&
                 p->info.role == HK_COMPUTE_PAIR_GEMM &&
-                hk_compute_pair_alt_is_gemm_unguarded(p->alt_kind) &&
+                hk_compute_pair_alt_is_gemm_unguarded_for(
+                   p->alt_kind, p->info.gemm.is_guarded) &&
                 p->exec_threads[0] > 0 && p->exec_local[0] > 0 &&
                 p->exec_threads[0] == p->exec_local[0]) {
                unsigned cur = i;
@@ -5312,6 +5318,19 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      has_dw_a = true;
                      dw_a_idx = found_dw;
                      dw_a_copy_idx = has_copy ? found_copy : 0;
+                     /* 64x64 + dw_a (4x4 accs) exceeds 160 GPRs; downgrade to
+                      * 32x64 (2x4 accs, K_step=32) when K is a multiple of 32. */
+                     if (eff_alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 ||
+                         eff_alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED) {
+                        int32_t k_dw = 0;
+                        memcpy(&k_dw, p->push + p->info.gemm.k_offset_B, 4);
+                        if (k_dw > 0 && ((uint32_t)k_dw % 32u) == 0 &&
+                            p->exec_threads[1] <= 32767u) {
+                           eff_alt_kind = p->info.gemm.is_guarded
+                                             ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED
+                                             : HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
+                        }
+                     }
                   }
                }
             }
@@ -5360,6 +5379,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      has_dw_a = false;
                      dw_a_idx = 0;
                      dw_a_copy_idx = 0;
+                     eff_alt_kind = p->alt_kind;
                   } else {
                      fused = NULL;
                      break;
@@ -5377,11 +5397,15 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   if (dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW) {
                      const uint32_t in_w_o = gemm_dw_push.in_wh & 0xffffu;
                      const uint32_t in_h_o = gemm_dw_push.in_wh >> 16;
+                     const uint32_t gdw_tn = hk_compute_pair_alt_gemm_tile_n(eff_alt_kind);
                      int32_t n_o = 0;
                      memcpy(&n_o, p->push + p->info.gemm.n_offset_B, 4);
-                     eff_p.exec_threads[0] = ((uint32_t)n_o / 32u) * 128u;
+                     eff_p.exec_threads[0] = ((uint32_t)n_o / gdw_tn) * 128u;
                      eff_p.exec_threads[1] = (in_h_o >> 3) * (in_w_o >> 3);
                      eff_p.exec_threads[2] = 1u;
+                  } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 32u &&
+                             hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 64u) {
+                     eff_p.exec_threads[1] = p->exec_threads[1] * 2u;
                   }
                }
                if (!cand || !hk_fused_compute_shader_eligible(dev, cand, &eff_p))
@@ -5465,6 +5489,15 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   (uint64_t)eff_p.exec_threads[2];
                uint64_t fused_params[HK_PACK_LOOP_PARAM_COUNT];
                memcpy(fused_params, p->pack_loop_params, sizeof(fused_params));
+               if (eff_alt_kind != p->alt_kind &&
+                   hk_compute_pair_alt_gemm_k_step(eff_alt_kind) !=
+                      hk_compute_pair_alt_gemm_k_step(p->alt_kind)) {
+                  int32_t k_o = 0;
+                  memcpy(&k_o, p->push + p->info.gemm.k_offset_B, 4);
+                  const uint32_t eff_ks = hk_compute_pair_alt_gemm_k_step(eff_alt_kind);
+                  fused_params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] =
+                     DIV_ROUND_UP((uint32_t)k_o, eff_ks);
+               }
                bool params_ok = true;
                if (dual == HK_COMPUTE_PAIR_DUAL_PAD4 ||
                    dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW) {
@@ -6199,10 +6232,12 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                         if (pl->alt_kind_override != HK_COMPUTE_PAIR_ALT_NONE) {
                            const uint32_t in_w_o = dp.in_wh & 0xffffu;
                            const uint32_t in_h_o = dp.in_wh >> 16;
+                           const uint32_t gdw_tn =
+                              hk_compute_pair_alt_gemm_tile_n(pl->alt_kind_override);
                            int32_t n_o = 0;
                            memcpy(&n_o, p_disp->push + p_disp->info.gemm.n_offset_B, 4);
                            tmp_disp.alt_kind = pl->alt_kind_override;
-                           tmp_disp.exec_threads[0] = ((uint32_t)n_o / 32u) * 128u;
+                           tmp_disp.exec_threads[0] = ((uint32_t)n_o / gdw_tn) * 128u;
                            tmp_disp.exec_threads[1] = (in_h_o >> 3) * (in_w_o >> 3);
                            tmp_disp.exec_threads[2] = 1u;
                         }
@@ -6248,6 +6283,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   if (pl->alt_kind_override != HK_COMPUTE_PAIR_ALT_NONE &&
                       pl->dual_write != HK_COMPUTE_PAIR_DUAL_GEMM_DW) {
                      tmp_disp.alt_kind = pl->alt_kind_override;
+                     if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 32u &&
+                         hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 64u) {
+                        tmp_disp.exec_threads[1] = p_disp->exec_threads[1] * 2u;
+                     }
                   }
                   if (root_ok && pl->im2col_idx_off) {
                      const struct hk_cmd_buffer *im_src =
@@ -6305,7 +6344,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                            .sh = 1u,
                            .pad_x = 0u,
                            .pad_y = 0u,
-                           .flags = HK_IM2COL_A_FLAG_VEC4,
+                           .flags = HK_IM2COL_A_FLAG_VEC4 | HK_IM2COL_A_FLAG_COPY1X1,
                         };
                      }
                      hk_im2col_a_push_init_udiv(&ip);

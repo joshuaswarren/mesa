@@ -263,7 +263,8 @@ struct hk_dual_gemm_dw_push {
    uint32_t _pad;
 };
 
-#define HK_IM2COL_A_FLAG_VEC4 (1u << 0)
+#define HK_IM2COL_A_FLAG_VEC4    (1u << 0)
+#define HK_IM2COL_A_FLAG_COPY1X1 (1u << 1)
 
 struct hk_im2col_a_push {
    uint32_t src_va_lo;
@@ -513,6 +514,20 @@ hk_nir_bind_depthwise_loop_bounds(struct nir_shader *nir,
  * epilogue into output writeback; when `dual_write` is non-zero, also writes
  * the fused copy4 or pad4 destination buffer directly from registers. */
 struct nir_shader *
+hk_nir_build_gemm_cmat_tiled_with_bound(
+   const struct nir_shader *producer,
+   const struct hk_nir_gemm_output *info,
+   uint32_t tile_m,
+   uint32_t tile_n,
+   const struct hk_nir_clamp_epilogue *epilogue,
+   enum hk_compute_pair_dual_write dual_write,
+   const struct hk_nir_fadd_epilogue *fadd_ep,
+   bool im2col_a,
+   const struct hk_nir_dw_a_cfg *dw_a,
+   const struct hk_nir_dw_a_cfg *gemm_dw,
+   struct hk_pack_loop_bound *loop_bound_out);
+
+struct nir_shader *
 hk_nir_build_gemm_cmat_with_bound(
    const struct nir_shader *producer,
    const struct hk_nir_gemm_output *info,
@@ -609,7 +624,8 @@ hk_gemm_cmat_can_specialize_unguarded(bool is_guarded, uint64_t m_u,
 {
    if (!is_guarded || m_u == 0 || n_u == 0 || k_u == 0)
       return false;
-   if (tile_n != 16u && tile_n != 24u && tile_n != 32u && tile_n != 64u)
+   if (tile_n != 16u && tile_n != 24u && tile_n != 32u && tile_n != 48u &&
+       tile_n != 64u)
       return false;
    const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
    return (m_u % tile_m) == 0 && (n_u % tile_n) == 0 && (k_u % 8u) == 0 &&

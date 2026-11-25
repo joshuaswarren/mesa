@@ -4718,16 +4718,54 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       tile_n == 32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 :
                      HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
 
-   /* When a guarded GEMM dispatch has exact tile-aligned M/N/K and a 16-byte
-    * aligned A buffer, specialize to the unguarded cmat kernel (no boundary
-    * predicates or scalar tail loops). For N % 24 == 0 that is not already a
-    * multiple of 32 or 64 (e.g. N = 24, 48, 72, 120, 144), specialize to the
-    * lazy 64x24 unguarded kernel (0% N-padding waste, 6 accs/SG). */
+   /* When an unguarded or exact-multiple guarded GEMM dispatch has sufficient
+    * grid parallelism, specialize to wider/taller unguarded cmat tiles:
+    * - 64x64 (K_step=16, 4x4 accs/SG, staggered pipe_b) when M%64==0, N%64==0,
+    *   K%16==0, and (M/64)*(N/64) >= 25: halves B traffic, WGs, and barriers.
+    * - 64x48 (K_step=16, 4x3 accs/SG, staggered pipe_b) when M%64==0, N%48==0,
+    *   N%64!=0, K%8==0, and (M/64)*(N/48) >= 25: cuts A traffic 33-50% on N=96/144.
+    * - 64x24 (K_step=16, 2x3 accs/SG, pipe_b) for remaining N%24==0.
+    * - Otherwise specialize exact-multiple guarded dispatches to *_UNGUARDED. */
    if (api->compute_pair_producer) {
-      if ((n_u % 24u) == 0 && (n_u % 32u) != 0 && (n_u % 64u) != 0 &&
-          hk_gemm_cmat_can_specialize_unguarded(gemm->is_guarded, m_u, n_u, k_u,
-                                                24u, gemm->reads[0].offset_B,
-                                                a_b.address, a_b.offset)) {
+      const bool a_align16 = (gemm->reads[0].offset_B % 16u) == 0 &&
+                             ((a_b.address | a_b.offset) % 16ull) == 0;
+      const bool can_64x64 =
+         (m_u % 64u) == 0 && (n_u % 64u) == 0 && (k_u % 8u) == 0 &&
+         k_u >= 64u && (m_u / 64u) * (n_u / 64u) >= 25u && a_align16;
+      const bool can_64x48 =
+         !can_64x64 && (m_u % 64u) == 0 && (n_u % 48u) == 0 &&
+         n_u >= 96u && (n_u % 64u) != 0 && (k_u % 8u) == 0 &&
+         (m_u / 64u) * (n_u / 48u) >= 25u && a_align16;
+      if (can_64x64) {
+         const enum hk_compute_pair_alt_kind k64 =
+            gemm->is_guarded ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED
+                             : HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64;
+         struct hk_shader *s64 = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL, k64,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (s64 &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, s64,
+                                              s64->only_linked, 1u << 16)) {
+            alt = s64;
+            tile_n = 64u;
+            chosen_kind = k64;
+         }
+      } else if (can_64x48) {
+         struct hk_shader *s48 = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL,
+            HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (s48 &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, s48,
+                                              s48->only_linked, 1u << 16)) {
+            alt = s48;
+            tile_n = 48u;
+            chosen_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED;
+         }
+      } else if ((n_u % 24u) == 0 && (n_u % 32u) != 0 && (n_u % 64u) != 0 &&
+                 hk_gemm_cmat_can_specialize_unguarded(gemm->is_guarded, m_u, n_u, k_u,
+                                                       24u, gemm->reads[0].offset_B,
+                                                       a_b.address, a_b.offset)) {
          struct hk_shader *ug24 = hk_compute_pair_get_or_compile_fused(
             dev, api->compute_pair_producer, NULL,
             HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED,
@@ -4756,7 +4794,7 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       }
    }
 
-   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+   const uint32_t tile_m = hk_compute_pair_alt_gemm_tile_m(chosen_kind);
    const uint64_t gx = DIV_ROUND_UP(n_u, tile_n);
    const uint64_t gy = DIV_ROUND_UP(m_u, tile_m);
    if (gx > 65535 || gy > 65535)
@@ -4768,7 +4806,7 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (alt_kind_out)
       *alt_kind_out = chosen_kind;
    if (pack_loop_params) {
-      const uint32_t k_step = hk_gemm_cmat_k_step(tile_n);
+      const uint32_t k_step = hk_compute_pair_alt_gemm_k_step(chosen_kind);
       pack_loop_params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] =
          DIV_ROUND_UP(k_u, k_step);
    }

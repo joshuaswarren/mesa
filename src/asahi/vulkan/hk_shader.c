@@ -10483,8 +10483,10 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
       struct hk_nir_gemm_output gemm_info = prod->info.gemm;
       if (hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
          gemm_info.is_guarded = false;
-      fused_nir = hk_nir_build_gemm_cmat_with_bound(
-         prod->nir, &gemm_info, hk_compute_pair_alt_gemm_tile_n(alt_kind),
+      fused_nir = hk_nir_build_gemm_cmat_tiled_with_bound(
+         prod->nir, &gemm_info,
+         hk_compute_pair_alt_gemm_tile_m(alt_kind),
+         hk_compute_pair_alt_gemm_tile_n(alt_kind),
          epilogue, base_dual, fadd_ep, im2col_a, dw_a, gemm_dw,
          &fused_loop_bound);
    } else if (has_ep) {

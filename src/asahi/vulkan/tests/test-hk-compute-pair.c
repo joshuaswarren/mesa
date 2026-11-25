@@ -3766,41 +3766,50 @@ test_g17p_compile_occupancy(void)
    const struct {
       const char *name;
       bool guarded;
+      uint32_t tile_m;
       uint32_t tile_n;
       bool clamp;
       enum hk_compute_pair_dual_write dual;
       bool im2col_a;
       bool dw_a;
    } cases[] = {
-      { "cmat16_ug",               false, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat32_ug",               false, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat32_ug_dpad4",         false, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
-      { "cmat64_ug_dpad4",         false, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
-      { "cmat16_grd",              true,  16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat32_grd",              true,  32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat32_grd_dcopy",        true,  32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      false, false },
-      { "cmat32_grd_dpad4",        true,  32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
-      { "cmat64_grd",              true,  64, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat64_grd_dpad4",        true,  64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
-      { "cmat16_ug_im2a_dpad4",    false, 16, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat24_ug",               false, 24, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
-      { "cmat24_ug_dcopy",         false, 24, true,  HK_COMPUTE_PAIR_DUAL_COPY,      false, false },
-      { "cmat24_ug_dpad4",         false, 24, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
-      { "cmat24_ug_im2a_dpad4",    false, 24, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat32_ug_im2a_dcopy",    false, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
-      { "cmat32_ug_im2a_dpad4",    false, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat64_ug_im2a_dpad4",    false, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat16_grd_im2a_dpad4",   true,  16, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat32_grd_im2a_dcopy",   true,  32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
-      { "cmat32_grd_im2a_dpad4",   true,  32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat64_grd_im2a_dpad4",   true,  64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
-      { "cmat16_ug_dwa_dcopy",     false, 16, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, true  },
-      { "cmat24_ug_dwa_dfaddcopy", false, 24, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
-      { "cmat32_ug_dwa_dfaddcopy", false, 32, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
-      { "cmat64_ug_dwa_dfaddcopy", false, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
-      { "cmat16_ug_gemm_dw",       false, 16, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
-      { "cmat24_ug_gemm_dw",       false, 24, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
-      { "cmat32_ug_gemm_dw",       false, 32, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
+      { "cmat16_ug",               false, 64, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32_ug",               false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32_ug_dpad4",         false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat48_ug",               false, 64, 48, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat48_ug_dpad4",         false, 64, 48, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat64x64_ug",            false, 64, 64, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat64x64_ug_dpad4",      false, 64, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat64_ug_dpad4",         false, 32, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat16_grd",              true,  64, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32_grd",              true,  64, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32_grd_dcopy",        true,  64, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      false, false },
+      { "cmat32_grd_dpad4",        true,  64, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat64_grd",              true,  32, 64, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat64_grd_dpad4",        true,  32, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat16_ug_im2a_dpad4",    false, 64, 16, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat24_ug",               false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat24_ug_dcopy",         false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_COPY,      false, false },
+      { "cmat24_ug_dpad4",         false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      false, false },
+      { "cmat24_ug_im2a_dpad4",    false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat32_ug_im2a_dcopy",    false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
+      { "cmat32_ug_im2a_dpad4",    false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat48_ug_im2a_dpad4",    false, 64, 48, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat64x64_ug_im2a_dpad4", false, 64, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat64_ug_im2a_dpad4",    false, 32, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat16_grd_im2a_dpad4",   true,  64, 16, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat32_grd_im2a_dcopy",   true,  64, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
+      { "cmat32_grd_im2a_dpad4",   true,  64, 32, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat64_grd_im2a_dpad4",   true,  32, 64, true,  HK_COMPUTE_PAIR_DUAL_PAD4,      true,  false },
+      { "cmat16_ug_dwa_dcopy",     false, 64, 16, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, true  },
+      { "cmat24_ug_dwa_dfaddcopy", false, 64, 24, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat32_ug_dwa_dfaddcopy", false, 64, 32, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat48_ug_dwa_dfaddcopy", false, 64, 48, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat64x64_ug_dwa_dfaddcopy", false, 64, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true },
+      { "cmat64_ug_dwa_dfaddcopy", false, 32, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat16_ug_gemm_dw",       false, 64, 16, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
+      { "cmat24_ug_gemm_dw",       false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
+      { "cmat32_ug_gemm_dw",       false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
    };
    bool all_ok = true;
    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
@@ -3818,17 +3827,22 @@ test_g17p_compile_occupancy(void)
          hk_compute_pair_dual_is_fadd_ep(cases[i].dual) ? &fadd_ok : NULL;
       const struct hk_nir_dw_a_cfg *gdw =
          cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ? &dwa_relu6 : NULL;
-      nir_shader *alt = hk_nir_build_gemm_cmat_with_bound(
-         orig, &m, cases[i].tile_n, cases[i].clamp ? &relu6 : NULL,
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         orig, &m, cases[i].tile_m, cases[i].tile_n, cases[i].clamp ? &relu6 : NULL,
          cases[i].dual, fe, cases[i].im2col_a,
          cases[i].dw_a ? &dwa_relu6 : NULL, gdw, &lb);
       HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
-      /* With Dynamic Caching ILP headroom on AGX3B, heavy producer+consumer
-       * multi-fusions (im2col_a, dw_a, gemm_dw) may use up to 128 half-GPRs
-       * (832 threads, 0 scratch), while core GEMM variants stay <= 104 GPRs. */
+      /* With Dynamic Caching ILP headroom on AGX3B, 0-scratch heavy variants
+       * trade small GPR increases for higher ILP and tile reuse:
+       *  - core small GEMM: <= 104 GPRs (1024t)
+       *  - im2col_a / dw_a / gemm_dw / cmat48: <= 128 GPRs (832t)
+       *  - 64x64 (16 accs/SG): <= 136 GPRs (768t = 6 WGs/core; 144 for dw_a) */
       const unsigned max_gprs =
+         (cases[i].tile_m == 64 && cases[i].tile_n == 64)
+            ? (cases[i].dw_a ? 144u : 136u) :
          (cases[i].im2col_a || cases[i].dw_a ||
-          cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW)
+          cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ||
+          (cases[i].tile_m == 64 && cases[i].tile_n == 48))
             ? 128u : 104u;
       if (!compile_and_check_g17p_variant(cases[i].name, alt, max_gprs))
          all_ok = false;
@@ -3853,6 +3867,7 @@ test_gemm_im2col_a_fusion(void)
    };
    const struct {
       bool guarded;
+      uint32_t tile_m;
       uint32_t tile_n;
       uint32_t in_h, in_w_px, ch, kh, kw_px, sh, sw, pad_y, pad_x_px;
       uint32_t N;
@@ -3861,19 +3876,25 @@ test_gemm_im2col_a_fusion(void)
       bool write_im2_dst;
    } cases[] = {
       /* 0: unguarded cmat32, vec4, borderless, M=64 (8x8), K=16, N=64 */
-      { false, 32, 9, 9, 4, 2, 2, 1, 1, 0, 0, 64, true, false, true },
+      { false, 64, 32, 9, 9, 4, 2, 2, 1, 1, 0, 0, 64, true, false, true },
       /* 1: unguarded cmat64, vec4, unit border, M=64 (8x8), K=24 (K%8 tail!), multi-gx (N=128) */
-      { false, 64, 8, 8, 8, 1, 3, 1, 1, 0, 1, 128, false, true, true },
+      { false, 32, 64, 8, 8, 8, 1, 3, 1, 1, 0, 1, 128, false, true, true },
       /* 2: unguarded cmat16, vec4, stride-2, M=64 (8x8), K=24 (K%8 tail!), multi-gx (N=32) */
-      { false, 16, 17, 15, 8, 3, 1, 2, 2, 0, 0, 32, true, true, false },
+      { false, 64, 16, 17, 15, 8, 3, 1, 2, 2, 0, 0, 32, true, true, false },
       /* 3: guarded cmat32, scalar ch=3 kw=9 kh=3 K=27 (Face Detection CMD 1->2 shape!), multi-gx (N=48) */
-      { true,  32, 9, 9, 3, 3, 3, 1, 1, 1, 1, 48, true, true, true },
+      { true,  64, 32, 9, 9, 3, 3, 3, 1, 1, 1, 1, 48, true, true, true },
       /* 4: guarded cmat16, vec4 border, odd M=35 (5x7), N=21, K=36, dst_va == 0 */
-      { true,  16, 5, 7, 4, 3, 3, 1, 1, 1, 1, 21, false, false, false },
+      { true,  64, 16, 5, 7, 4, 3, 3, 1, 1, 1, 1, 21, false, false, false },
       /* 5: unguarded cmat32, scalar ch=2 kw=6 kh=4 M=64 (8x8), K=24 (non-vec4 on unguarded!) */
-      { false, 32, 9, 8, 2, 4, 3, 1, 1, 1, 1, 64, false, false, true },
+      { false, 64, 32, 9, 8, 2, 4, 3, 1, 1, 1, 1, 64, false, false, true },
       /* 6: unguarded cmat24, vec4 ch=4 kw=12 kh=2 M=64 (8x8), K=24 (K%8 tail!), N=48 (multi-gx) */
-      { false, 24, 9, 10, 4, 2, 3, 1, 1, 0, 0, 48, true, true, true },
+      { false, 64, 24, 9, 10, 4, 2, 3, 1, 1, 0, 0, 48, true, true, true },
+      /* 7: unguarded cmat48, vec4, M=64 (8x8), K=24 (K%8 tail!), N=96 (multi-gx) */
+      { false, 64, 48, 8, 8, 8, 1, 3, 1, 1, 0, 1, 96, true, true, true },
+      /* 8: unguarded cmat64x64, vec4, M=64 (8x8), K=32, N=64 */
+      { false, 64, 64, 9, 9, 4, 2, 4, 1, 1, 0, 1, 64, true, true, true },
+      /* 9: unguarded cmat48, COPY1X1 fast path, M=64 (64x1), K=32, N=96 */
+      { false, 64, 48, 64, 1, 32, 1, 1, 1, 1, 0, 0, 96, true, true, true },
    };
 
    for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
@@ -3895,7 +3916,7 @@ test_gemm_im2col_a_fusion(void)
       const uint32_t K = kh * kw;
       const uint32_t N = cases[ci].N;
       const uint32_t tile_n = cases[ci].tile_n;
-      const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+      const uint32_t tile_m = cases[ci].tile_m;
 
       const struct gemm_test_opts opts = {
          .guarded = cases[ci].guarded, .has_bias_buf = true,
@@ -3916,8 +3937,8 @@ test_gemm_im2col_a_fusion(void)
          cases[ci].with_dcopy ? HK_COMPUTE_PAIR_DUAL_COPY : HK_COMPUTE_PAIR_DUAL_NONE;
       const struct hk_nir_clamp_epilogue *ep = cases[ci].with_clamp ? &relu6 : NULL;
       struct hk_pack_loop_bound lb = {0};
-      nir_shader *alt = hk_nir_build_gemm_cmat_with_bound(
-         pre, &m, tile_n, ep, dw, NULL, true, NULL, NULL, &lb);
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         pre, &m, tile_m, tile_n, ep, dw, NULL, true, NULL, NULL, &lb);
       HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
       nir_validate_shader(alt, "gemm_cmat_im2a");
 
@@ -4002,12 +4023,18 @@ test_gemm_im2col_a_fusion(void)
       }
       const uint32_t im2_off = hk_im2col_a_push_offset(m.push_bytes, dw);
       const bool vec4_ok = ((iw | kw | step_x | pad_x) & 3u) == 0;
+      const bool is_copy1x1 =
+         vec4_ok && cases[ci].kh == 1 && cases[ci].kw_px == 1 &&
+         cases[ci].sh == 1 && cases[ci].sw == 1 &&
+         cases[ci].pad_x_px == 0 && cases[ci].pad_y == 0 &&
+         iw == kw && cols == 1u;
       struct hk_im2col_a_push ip = {
          .src_va_lo = (uint32_t)src_va, .src_va_hi = (uint32_t)(src_va >> 32),
          .dst_va_lo = (uint32_t)dst_va, .dst_va_hi = (uint32_t)(dst_va >> 32),
          .iw = iw, .ih = ih, .kw = kw, .cols = cols,
          .step_x = step_x, .sh = sh, .pad_x = pad_x, .pad_y = pad_y,
-         .flags = vec4_ok ? HK_IM2COL_A_FLAG_VEC4 : 0u,
+         .flags = (vec4_ok ? HK_IM2COL_A_FLAG_VEC4 : 0u) |
+                  (is_copy1x1 ? HK_IM2COL_A_FLAG_COPY1X1 : 0u),
       };
       hk_im2col_a_push_init_udiv(&ip);
       memcpy(push_buf + im2_off, &ip, sizeof(ip));
@@ -4073,14 +4100,16 @@ test_gemm_dw_a_fusion(void)
       .lower_bits = hk_eval_f2u(0.0f), .upper_bits = hk_eval_f2u(6.0f),
    };
    const struct {
-      uint32_t in_h, in_w, out_h, out_w, K, N, tile_n;
+      uint32_t in_h, in_w, out_h, out_w, K, N, tile_m, tile_n;
       int32_t sx, px, py;
       bool has_bias, dw_clamp, has_dst2, gemm_dcopy;
    } cases[] = {
-      {  8,  8,  8,  8, 16, 16, 16, 1, -1, -1, true,  true,  true,  true  },
-      { 17, 17,  8,  8, 16, 24, 24, 2,  0,  0, true,  true,  true,  false },
-      {  8,  8,  8,  8, 16, 32, 32, 1, -1, -1, false, false, false, false },
-      {  8,  8,  8,  8, 32, 64, 64, 1, -1, -1, true,  true,  true,  true  },
+      {  8,  8,  8,  8, 16, 16, 64, 16, 1, -1, -1, true,  true,  true,  true  },
+      { 17, 17,  8,  8, 16, 24, 64, 24, 2,  0,  0, true,  true,  true,  false },
+      {  8,  8,  8,  8, 16, 32, 64, 32, 1, -1, -1, false, false, false, false },
+      { 10, 10,  8,  8, 16, 48, 64, 48, 1,  0,  0, true,  true,  true,  true  },
+      {  8,  8,  8,  8, 32, 64, 64, 64, 1, -1, -1, true,  true,  true,  true  },
+      {  8,  8,  8,  8, 32, 64, 32, 64, 1, -1, -1, true,  true,  true,  true  },
    };
 
    for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
@@ -4088,7 +4117,7 @@ test_gemm_dw_a_fusion(void)
       const uint32_t out_h = cases[ci].out_h, out_w = cases[ci].out_w;
       const uint32_t M = out_h * out_w, K = cases[ci].K, N = cases[ci].N;
       const uint32_t tile_n = cases[ci].tile_n;
-      const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+      const uint32_t tile_m = cases[ci].tile_m;
 
       const struct gemm_test_opts ref_opts = {
          .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
@@ -4110,8 +4139,8 @@ test_gemm_dw_a_fusion(void)
       const enum hk_compute_pair_dual_write dw =
          cases[ci].gemm_dcopy ? HK_COMPUTE_PAIR_DUAL_COPY : HK_COMPUTE_PAIR_DUAL_NONE;
       struct hk_pack_loop_bound lb = {0};
-      nir_shader *alt = hk_nir_build_gemm_cmat_with_bound(
-         pre, &m, tile_n, NULL, dw, NULL, false, &dwa_cfg, NULL, &lb);
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         pre, &m, tile_m, tile_n, NULL, dw, NULL, false, &dwa_cfg, NULL, &lb);
       HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
       nir_validate_shader(alt, "gemm_cmat_dwa");
 
@@ -4239,9 +4268,9 @@ test_gemm_dw_a_fusion(void)
       const uint32_t ag[3] = { DIV_ROUND_UP(N, tile_n), DIV_ROUND_UP(M, tile_m), 1u };
       hk_eval_dispatch_wg(alt, ag, sa, n_sa, push_buf, dw_off + sizeof(dp));
 
+      const uint32_t k_step = (tile_m == 32 && tile_n == 64) ? 32u : 16u;
       uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
-      params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] =
-         DIV_ROUND_UP(K, hk_gemm_cmat_k_step(tile_n));
+      params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] = DIV_ROUND_UP(K, k_step);
       uint64_t bound = 0, eff = 0;
       HK_EVAL_CHECK(hk_pack_eval_loop_bound(&lb, params, &bound));
       HK_EVAL_CHECK(bound >= hk_eval_last_max_loop_backedges + 1);
