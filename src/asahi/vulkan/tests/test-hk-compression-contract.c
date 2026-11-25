@@ -362,7 +362,12 @@ check_image_creation(struct hk_physical_device *pdev)
       .drmFormatModifierCount = 1,
       .pDrmFormatModifiers = &modifier,
    };
-   info.pNext = &list;
+   VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .pNext = &list,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   info.pNext = &external;
    info.format = VK_FORMAT_R8G8B8A8_UNORM;
    info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -378,20 +383,31 @@ check_image_creation(struct hk_physical_device *pdev)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
       .drmFormatModifier = modifier,
    };
+   VkPhysicalDeviceExternalImageFormatInfo query_external = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+      .pNext = &query_mod,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
    VkPhysicalDeviceImageFormatInfo2 query = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-      .pNext = &query_mod,
+      .pNext = &query_external,
       .format = info.format,
       .type = info.imageType,
       .tiling = info.tiling,
       .usage = info.usage,
    };
+   VkExternalImageFormatProperties external_props = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+   };
    VkImageFormatProperties2 props = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      .pNext = &external_props,
    };
    assert(hk_GetPhysicalDeviceImageFormatProperties2(
              hk_physical_device_to_handle(pdev), &query, &props) ==
-          VK_ERROR_FORMAT_NOT_SUPPORTED);
+          VK_SUCCESS);
+   assert(external_props.externalMemoryProperties.externalMemoryFeatures &
+          VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
 
    VkSubresourceLayout layout = {.rowPitch = 64 * 4};
    VkImageDrmFormatModifierExplicitCreateInfoEXT import = {
@@ -400,13 +416,7 @@ check_image_creation(struct hk_physical_device *pdev)
       .drmFormatModifierPlaneCount = 1,
       .pPlaneLayouts = &layout,
    };
-   VkExternalMemoryImageCreateInfo external = {
-      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-      .pNext = &import,
-      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-   };
-   info.pNext = &external;
-   info.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   external.pNext = &import;
    assert(hk_CreateImage(device, &info, NULL, &image) == VK_SUCCESS);
    assert(hk_image_from_handle(image)->planes[0].layout.compressed);
    hk_DestroyImage(device, image, NULL);

@@ -963,25 +963,15 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       drm_mod_info &&
       drm_mod_info->drmFormatModifier ==
          DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
-   if (g17p_compressed) {
-      /* Modifier queries have no extent. Use an eligible extent and the
-       * same creation policy as modifier-list selection. */
-      const VkImageCreateInfo probe = {
-         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-         .pNext = pImageFormatInfo->pNext,
-         .flags = pImageFormatInfo->flags,
-         .imageType = pImageFormatInfo->type,
-         .format = pImageFormatInfo->format,
-         .extent = {16, 16, 1},
-         .mipLevels = 1,
-         .arrayLayers = 1,
-         .samples = VK_SAMPLE_COUNT_1_BIT,
-         .tiling = pImageFormatInfo->tiling,
-         .usage = pImageFormatInfo->usage,
-      };
-      if (!hk_can_compress_create_info(&pdev->dev, 0, &probe, false, false))
-         return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   }
+   /* This query also describes explicit imports. Only modifier-list
+    * allocation applies the policy for choosing compression on new images.
+    */
+   if (g17p_compressed &&
+       !hk_g17p_shared_compression_supported(
+          &pdev->dev, pImageFormatInfo->format, pImageFormatInfo->type,
+          pImageFormatInfo->flags, pImageFormatInfo->usage,
+          pImageFormatInfo->pNext))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const uint32_t max_dim = pImageFormatInfo->type == VK_IMAGE_TYPE_3D
                                ? pdev->vk.properties.maxImageDimension3D
