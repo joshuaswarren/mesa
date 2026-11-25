@@ -49,6 +49,8 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include "util/cache_ops.h"
+#include "asahi/lib/agx_m5_va.h"
+#include "asahi/lib/agx_vdm_stream_link_core.h"
 #include "util/list.h"
 #include "util/log.h"
 #include "util/macros.h"
@@ -6698,17 +6700,314 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    return true;
 }
 
+/* Submit-time render packing (hk_render_pack.h): a submission-owned
+ * command buffer that runs a packed run of render command buffers as one
+ * render command. */
+struct hk_render_packet {
+   struct hk_cmd_buffer cmd;
+   struct hk_cs cs;
+};
+
+struct hk_render_pack_run {
+   unsigned first, count;
+   /* The members whose scissor and depth-bias arrays serve every member's
+    * draws (hk_render_pack_array_prefix()). */
+   const struct hk_cs *scissor, *zbias;
+};
+
+static void
+hk_queue_rpack_free_packets(struct hk_queue *queue)
+{
+   for (unsigned i = 0; i < queue->rpack.packets_cap; ++i) {
+      util_dynarray_fini(&queue->rpack.packets[i].cs.render_resources);
+      util_dynarray_fini(&queue->rpack.packets[i].cmd.sync_pass_records);
+   }
+   free(queue->rpack.packets);
+   queue->rpack.packets = NULL;
+   queue->rpack.packets_cap = 0;
+}
+
+static bool
+hk_queue_rpack_ensure_packets(struct hk_queue *queue, unsigned count)
+{
+   if (count <= queue->rpack.packets_cap)
+      return true;
+
+   unsigned cap = MAX2(queue->rpack.packets_cap * 2, 4);
+   cap = MAX2(cap, count);
+   struct hk_render_packet *packets = calloc(cap, sizeof(*packets));
+   if (!packets)
+      return false;
+
+   hk_queue_rpack_free_packets(queue);
+   queue->rpack.packets = packets;
+   queue->rpack.packets_cap = cap;
+   return true;
+}
+
+/* The chips whose render pass continuation hk_m5_pass_merge_begin() takes,
+ * HAL200 and HAL300 alike. ASAHI_MESA_DEBUG=nomerge turns it off with the
+ * other stream merges. */
+static bool
+hk_render_pack_enabled(const struct hk_device *dev)
+{
+   return !dev->dev.is_virtio && !(dev->dev.debug & AGX_DBG_NOMERGE) &&
+          agx_chip_native_or_m5(dev->dev.chip);
+}
+
+/* The target of a stream link to `cs`, as hk_cmd_buffer_emit_cs_jump()
+ * encodes one, without changing `cmd` (a simultaneous-use command buffer may
+ * be submitted from several queues at once). 0 if it has none. */
+static uint64_t
+hk_render_pack_link_target(struct hk_device *dev, struct hk_cmd_buffer *cmd,
+                           const struct hk_cs *cs)
+{
+   uint64_t target = cs->addr;
+   if (hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      const uint64_t alias = hk_g17p_vdm_alias(cmd, cs->addr);
+      target = alias > AGX_G17P_VDM_USER_BASE ? alias - AGX_G17P_VDM_USER_BASE
+                                              : 0;
+   } else if (agx_chip_hal300_path(dev->dev.chip) &&
+              !agx_m5_vdm_compact(cs->addr, &target)) {
+      return 0;
+   }
+
+   struct agx_vdm_stream_link_core link;
+   return target && agx_vdm_stream_link_core_pack(dev->dev.chip, target, &link)
+             ? target
+             : 0;
+}
+
+/* Frame anatomy: the boundary from cmds[a]'s tail to cmds[a + 1]'s head did
+ * not pack, because of `why` or (why NULL) because cmds[m] is no member. */
+static void
+hk_render_pack_note_boundary(struct hk_device *dev,
+                             struct hk_cmd_buffer *const *cmds, unsigned a,
+                             unsigned m, const char *why)
+{
+   struct hk_render_pack_edges *e = &cmds[a]->render_pack;
+   if (likely(!dev->frame_anatomy) || !e->tail ||
+       !cmds[a + 1]->render_pack.head)
+      return;
+   e->next_who = why ? 0 : m == a ? 1 : 2;
+   e->next_why = why ? why : hk_render_pack_member_refusal(cmds[m]);
+   hk_frame_anatomy_note(dev, "pass-merge render pack: cb %u -> %u: %s%s",
+                         a, a + 1,
+                         e->next_who == 1 ? "this: "
+                         : e->next_who == 2 ? "next: "
+                                            : "",
+                         e->next_why);
+}
+
+/* Packs runs of the submission's command buffers into render packets and
+ * writes every command buffer's tail for this submission: a link to the next
+ * member, or the terminate record a command buffer was recorded with. The
+ * tails are written for every submission, packed or not, so a command buffer
+ * an earlier submission linked never runs into a stale neighbour. On true,
+ * `effective` is the submission with the packets in place of their runs. */
+static bool
+hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
+                    const struct vk_queue_submit *submit,
+                    struct vk_queue_submit *effective)
+{
+   const unsigned n = submit->command_buffer_count;
+   struct hk_cmd_buffer *const *cmds =
+      (struct hk_cmd_buffer *const *)submit->command_buffers;
+   const bool enabled = n >= 2 && !submit->buffer_bind_count &&
+                        !submit->image_bind_count &&
+                        !submit->image_opaque_bind_count &&
+                        hk_render_pack_enabled(dev);
+
+   bool linked = false;
+   for (unsigned i = 0; i < n && !linked; ++i)
+      linked = cmds[i]->render_pack.linked != 0;
+   if (!enabled && !linked)
+      return false;
+
+   uint64_t *targets = NULL;
+   struct hk_render_pack_run *runs = NULL;
+   unsigned run_count = 0, packed = 0;
+   if (enabled) {
+      targets = hk_queue_pack_zscratch(&queue->rpack.targets, n,
+                                       sizeof(*targets));
+      runs = hk_queue_pack_scratch(&queue->rpack.runs, n, sizeof(*runs));
+   }
+
+   for (unsigned i = 0; targets && runs && i < n;) {
+      const struct hk_cs *first = hk_render_pack_member(cmds[i]);
+      struct hk_render_pack_run run = {
+         .first = i, .count = 1, .scissor = first, .zbias = first,
+      };
+      enum u_tristate dbias = first ? first->cr.dbias_is_int : U_TRISTATE_UNSET;
+      size_t resources = first ? first->render_resources.size : 0;
+      if (unlikely(dev->frame_anatomy))
+         cmds[i]->render_pack.next_why = NULL;
+      if (!first && i + 1 < n)
+         hk_render_pack_note_boundary(dev, cmds, i, i, NULL);
+
+      while (first && i + run.count < n) {
+         const unsigned a = i + run.count - 1, b = a + 1;
+         const struct hk_cs *as = hk_render_pack_member(cmds[a]);
+         const struct hk_cs *bs = hk_render_pack_member(cmds[b]);
+         if (unlikely(dev->frame_anatomy))
+            cmds[b]->render_pack.next_why = NULL;
+         if (!bs) {
+            hk_render_pack_note_boundary(dev, cmds, a, b, NULL);
+            break;
+         }
+
+         const char *why =
+            hk_render_pack_boundary(cmds[a], as, cmds[b], bs, first);
+         const struct util_dynarray *scissor = NULL, *zbias = NULL;
+         if (!why &&
+             (!hk_render_pack_array_prefix(&run.scissor->scissor,
+                                           &bs->scissor, &scissor) ||
+              !hk_render_pack_array_prefix(&run.zbias->depth_bias,
+                                           &bs->depth_bias, &zbias)))
+            why = "scissor or depth bias array";
+         if (!why && bs->cr.dbias_is_int != U_TRISTATE_UNSET &&
+             dbias != U_TRISTATE_UNSET && bs->cr.dbias_is_int != dbias)
+            why = "depth bias format";
+         /* The resource list and the tile record share a 16-bit size. */
+         if (!why && resources + bs->render_resources.size >
+                        UINT16_MAX - sizeof(struct drm_asahi_render_program_v2))
+            why = "render resources";
+         const uint64_t target =
+            why ? 0 : hk_render_pack_link_target(dev, cmds[b], bs);
+         if (!why && !target)
+            why = "stream link";
+         if (why) {
+            hk_render_pack_note_boundary(dev, cmds, a, b, why);
+            break;
+         }
+
+         targets[a] = target;
+         if (scissor == &bs->scissor)
+            run.scissor = bs;
+         if (zbias == &bs->depth_bias)
+            run.zbias = bs;
+         if (dbias == U_TRISTATE_UNSET)
+            dbias = bs->cr.dbias_is_int;
+         resources += bs->render_resources.size;
+         run.count++;
+      }
+
+      if (run.count >= 2) {
+         runs[run_count++] = run;
+         packed += run.count;
+      }
+      i += run.count;
+   }
+
+   /* The packets, before any tail is written: a failure leaves every
+    * command buffer as recorded. */
+   struct vk_command_buffer **commands = NULL;
+   if (run_count) {
+      commands = hk_queue_pack_scratch(&queue->rpack.commands,
+                                       n - packed + run_count,
+                                       sizeof(*commands));
+      if (!commands || !hk_queue_rpack_ensure_packets(queue, run_count))
+         run_count = 0;
+   }
+
+   unsigned out = 0;
+   for (unsigned r = 0, i = 0; r < run_count && i <= n;) {
+      if (i < runs[r].first) {
+         commands[out++] = submit->command_buffers[i++];
+         continue;
+      }
+
+      const struct hk_render_pack_run *run = &runs[r];
+      struct hk_render_packet *p = &queue->rpack.packets[r];
+      const struct hk_cs *first =
+         list_first_entry(&cmds[run->first]->control_streams, struct hk_cs,
+                          node);
+      uint8_t kinds = 0;
+      for (unsigned m = 0; m < run->count; ++m) {
+         kinds |= list_first_entry(&cmds[run->first + m]->control_streams,
+                                   struct hk_cs, node)->sync.kind;
+      }
+
+      p->cmd.vk.base.device = &dev->vk;
+      hk_render_pack_init(&p->cmd, &p->cs, first, kinds);
+      uint8_t preceding = 0;
+      bool ok = true;
+      for (unsigned m = 0; ok && m < run->count; ++m) {
+         const struct hk_cmd_buffer *source = cmds[run->first + m];
+         const struct hk_cs *item =
+            list_first_entry(&source->control_streams, struct hk_cs, node);
+         ok = hk_render_pack_add(&p->cmd, &p->cs, source, item, m == 0,
+                                 m + 1 == run->count, &preceding);
+      }
+      if (!ok) {
+         run_count = 0;
+         break;
+      }
+      p->cs.uploaded_scissor = run->scissor->uploaded_scissor;
+      p->cs.uploaded_zbias = run->zbias->uploaded_zbias;
+      hk_render_pack_finish(&p->cmd, &p->cs);
+
+      perf_debug_dev(&dev->dev,
+                     "Packing %u render command buffers (%u draws) into one "
+                     "render", run->count, p->cs.stats.cmds);
+      commands[out++] = &p->cmd.vk;
+      i = run->first + run->count;
+      if (++r == run_count) {
+         while (i < n)
+            commands[out++] = submit->command_buffers[i++];
+      }
+   }
+
+   /* The tails, for this submission. */
+   if (!run_count && targets)
+      memset(targets, 0, n * sizeof(*targets));
+   const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+   bool written = false;
+   for (unsigned i = 0; i < n; ++i) {
+      struct hk_render_pack_edges *e = &cmds[i]->render_pack;
+      const uint64_t target = targets ? targets[i] : 0;
+      if (e->linked == target ||
+          !hk_render_pack_write_tail(dev->dev.chip, e, target))
+         continue;
+      if (cached)
+         util_flush_range_no_fence(e->terminate,
+                                   AGX_VDM_STREAM_LINK_CORE_LENGTH);
+      written = true;
+   }
+   if (written) {
+      __sync_synchronize();
+      if (util_has_cache_ops())
+         util_post_flush_fence();
+   }
+
+   if (!run_count)
+      return false;
+
+   assert(out == n - packed + run_count);
+   *effective = *submit;
+   effective->command_buffers = commands;
+   effective->command_buffer_count = out;
+   return true;
+}
+
 static VkResult
 queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
                      struct vk_queue_submit *submit, bool *untouched)
 {
+   /* Render packing first: it also writes back the tails of command
+    * buffers an earlier submission packed (hk_render_pack_runs()). */
+   struct vk_queue_submit rendered;
+   struct vk_queue_submit *original = submit;
+   if (hk_render_pack_runs(dev, queue, submit, &rendered))
+      submit = &rendered;
+
    /* Fast-path single-CB and sparse-bind submits before taking the alias
     * patch rwlock or calling into submit packing (which carries stack buffers
     * for multi-CB runs). */
    if (submit->command_buffer_count < 2 || submit->buffer_bind_count ||
        submit->image_bind_count || submit->image_opaque_bind_count ||
        !hk_pack_runs_enabled(dev))
-      return queue_submit_recordings(dev, queue, submit, submit, NULL, 0,
+      return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
                                      untouched);
 
    /* Packing copies the command buffers' streams: no patch site may be
@@ -6723,13 +7022,13 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
 
    if (!have_runs)
-      return queue_submit_recordings(dev, queue, submit, submit, NULL, 0,
+      return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
                                      untouched);
 
    struct vk_queue_submit effective = *submit;
    effective.command_buffer_count = runs.command_count;
    effective.command_buffers = runs.commands;
-   VkResult result = queue_submit_recordings(dev, queue, &effective, submit,
+   VkResult result = queue_submit_recordings(dev, queue, &effective, original,
                                              util_dynarray_begin(runs.extra_bos),
                                              util_dynarray_num_elements(
                                                 runs.extra_bos, struct agx_bo *),
@@ -7283,6 +7582,10 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    agx_bo_unreference(&dev->dev, queue->host_flush_bo);
    util_dynarray_fini(&queue->sync_resolved);
    hk_queue_pack_free_packets(queue);
+   hk_queue_rpack_free_packets(queue);
+   util_dynarray_fini(&queue->rpack.commands);
+   util_dynarray_fini(&queue->rpack.runs);
+   util_dynarray_fini(&queue->rpack.targets);
    util_dynarray_fini(&queue->pack.members);
    util_dynarray_fini(&queue->pack.runs);
    util_dynarray_fini(&queue->pack.commands);
