@@ -46,6 +46,7 @@
 #include "asahi/libagx/tessellator.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builtin_builder.h"
+#include "compiler/nir/nir_constant_expressions.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/nir/pipe_nir.h"
@@ -380,6 +381,10 @@ agx_create_blend_state(struct pipe_context *ctx,
 
       if (rt.colormask)
          so->store |= (PIPE_CLEAR_COLOR0 << i);
+
+      if (!state->logicop_enable && !state->alpha_to_coverage &&
+          !rt.blend_enable && rt.colormask == PIPE_MASK_RGBA)
+         so->opaque_overwrite |= (PIPE_CLEAR_COLOR0 << i);
    }
 
    return so;
@@ -4255,6 +4260,297 @@ lower_g17g_gather_offset(nir_builder *b, nir_instr *instr, void *data)
    nir_tex_instr_remove_src(tex, offset_idx);
    return true;
 }
+/* Symbolically evaluate an inputless single-block vertex shader for
+ * gl_VertexID in {0, 1, 2} to detect whether a 3-vertex direct draw covers
+ * the full NDC square [-1, 1]^2. Returns 1 for CCW in NDC, 2 for CW in NDC,
+ * or 0 otherwise. */
+uint8_t
+agx_nir_analyze_fullscreen_tri(nir_shader *nir, bool *out_z_in_01,
+                               bool *out_z_in_m11)
+{
+   *out_z_in_01 = false;
+   *out_z_in_m11 = false;
+
+   if (nir->info.stage != MESA_SHADER_VERTEX || nir->info.inputs_read != 0 ||
+       !(nir->info.outputs_written & VARYING_BIT_POS))
+      return 0;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl || impl->ssa_alloc == 0 || impl->ssa_alloc > 512 ||
+       exec_list_length(&impl->body) != 1)
+      return 0;
+
+   nir_cf_node *node = exec_node_data(nir_cf_node, exec_list_get_head(&impl->body),
+                                      node);
+   if (node->type != nir_cf_node_block)
+      return 0;
+
+   nir_block *block = nir_cf_node_as_block(node);
+
+   struct agx_const_eval_val {
+      bool valid;
+      nir_const_value c[4];
+   };
+   struct agx_const_eval_val *vals = calloc(impl->ssa_alloc, sizeof(*vals));
+   if (!vals)
+      return 0;
+
+   float pos[3][4] = {{0}};
+   bool ok = true;
+
+   for (unsigned vid = 0; vid < 3 && ok; ++vid) {
+      memset(vals, 0, impl->ssa_alloc * sizeof(*vals));
+      uint8_t pos_mask = 0;
+
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_load_const) {
+            nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+            if (lc->def.index < impl->ssa_alloc &&
+                lc->def.num_components <= 4) {
+               vals[lc->def.index].valid = true;
+               for (unsigned i = 0; i < lc->def.num_components; ++i)
+                  vals[lc->def.index].c[i] = lc->value[i];
+            }
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_vertex_id:
+            case nir_intrinsic_load_vertex_id_zero_base:
+               if (intr->def.index < impl->ssa_alloc) {
+                  vals[intr->def.index].valid = true;
+                  vals[intr->def.index].c[0].u32 = vid;
+               }
+               break;
+            case nir_intrinsic_load_base_vertex:
+            case nir_intrinsic_load_first_vertex:
+               if (intr->def.index < impl->ssa_alloc) {
+                  vals[intr->def.index].valid = true;
+                  vals[intr->def.index].c[0].u32 = 0;
+               }
+               break;
+            case nir_intrinsic_store_output: {
+               nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+               if (sem.location != VARYING_SLOT_POS)
+                  break;
+               if (!nir_src_is_const(intr->src[1]) ||
+                   nir_src_as_uint(intr->src[1]) != 0) {
+                  pos_mask = 0;
+                  break;
+               }
+               unsigned comp = nir_intrinsic_component(intr);
+               unsigned wmask = nir_intrinsic_write_mask(intr);
+               nir_def *src = intr->src[0].ssa;
+               bool src_valid = src->index < impl->ssa_alloc &&
+                                src->bit_size == 32 && vals[src->index].valid;
+               for (unsigned i = 0; i < src->num_components; ++i) {
+                  if (!(wmask & BITFIELD_BIT(i)))
+                     continue;
+                  unsigned dst_comp = comp + i;
+                  if (dst_comp >= 4)
+                     continue;
+                  if (src_valid) {
+                     pos[vid][dst_comp] = vals[src->index].c[i].f32;
+                     pos_mask |= BITFIELD_BIT(dst_comp);
+                  } else {
+                     pos_mask &= ~BITFIELD_BIT(dst_comp);
+                  }
+               }
+               break;
+            }
+            default:
+               break;
+            }
+         } else if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const nir_op_info *op_info = &nir_op_infos[alu->op];
+            if (alu->def.index >= impl->ssa_alloc ||
+                alu->def.num_components > 4 ||
+                op_info->num_inputs > NIR_ALU_MAX_INPUTS)
+               continue;
+
+            nir_const_value src_vals[NIR_ALU_MAX_INPUTS][4];
+            nir_const_value *src_ptrs[NIR_ALU_MAX_INPUTS];
+            bool all_valid = true;
+
+            for (unsigned i = 0; i < op_info->num_inputs; ++i) {
+               nir_def *s = alu->src[i].src.ssa;
+               unsigned ncomp = nir_ssa_alu_instr_src_components(alu, i);
+               if (s->index >= impl->ssa_alloc || !vals[s->index].valid ||
+                   ncomp > 4) {
+                  all_valid = false;
+                  break;
+               }
+               for (unsigned j = 0; j < ncomp; ++j) {
+                  unsigned swiz = alu->src[i].swizzle[j];
+                  if (swiz >= 4) {
+                     all_valid = false;
+                     break;
+                  }
+                  src_vals[i][j] = vals[s->index].c[swiz];
+               }
+               if (!all_valid)
+                  break;
+               src_ptrs[i] = src_vals[i];
+            }
+
+            if (!all_valid)
+               continue;
+
+            unsigned bit_size = 0;
+            if (!nir_alu_type_get_type_size(op_info->output_type)) {
+               bit_size = alu->def.bit_size;
+            } else {
+               for (unsigned i = 0; i < op_info->num_inputs; ++i) {
+                  if (!nir_alu_type_get_type_size(op_info->input_types[i])) {
+                     bit_size = alu->src[i].src.ssa->bit_size;
+                     break;
+                  }
+               }
+            }
+            if (bit_size == 0)
+               bit_size = 32;
+
+            nir_const_value dst_vals[4] = {0};
+            uint16_t poison = 0;
+            nir_eval_const_opcode(alu->op, dst_vals, &poison,
+                                  alu->def.num_components, bit_size, src_ptrs,
+                                  nir->info.float_controls_execution_mode);
+            if (poison == 0) {
+               vals[alu->def.index].valid = true;
+               for (unsigned i = 0; i < alu->def.num_components; ++i)
+                  vals[alu->def.index].c[i] = dst_vals[i];
+            }
+         }
+      }
+
+      if (pos_mask != 0xf)
+         ok = false;
+   }
+
+   free(vals);
+   if (!ok)
+      return 0;
+
+   float nx[3], ny[3], nz[3];
+   bool z_in_01 = true;
+   bool z_in_m11 = true;
+   for (unsigned i = 0; i < 3; ++i) {
+      for (unsigned c = 0; c < 4; ++c) {
+         if (!isfinite(pos[i][c]))
+            return 0;
+      }
+      if (!(pos[i][3] > 0.0f))
+         return 0;
+      nx[i] = pos[i][0] / pos[i][3];
+      ny[i] = pos[i][1] / pos[i][3];
+      nz[i] = pos[i][2] / pos[i][3];
+      if (!isfinite(nx[i]) || !isfinite(ny[i]) || !isfinite(nz[i]))
+         return 0;
+      z_in_01 &= (nz[i] >= 0.0f && nz[i] <= 1.0f);
+      z_in_m11 &= (nz[i] >= -1.0f && nz[i] <= 1.0f);
+   }
+
+   const float area2 =
+      (nx[1] - nx[0]) * (ny[2] - ny[0]) - (ny[1] - ny[0]) * (nx[2] - nx[0]);
+   if (!(fabsf(area2) > 1e-4f))
+      return 0;
+
+   const bool ccw = area2 > 0.0f;
+   static const float corners[4][2] = {
+      {-1.0f, -1.0f},
+      {1.0f, -1.0f},
+      {1.0f, 1.0f},
+      {-1.0f, 1.0f},
+   };
+
+   for (unsigned c = 0; c < 4; ++c) {
+      for (unsigned e = 0; e < 3; ++e) {
+         const unsigned a = e;
+         const unsigned b = (e + 1) % 3;
+         const float edge = (nx[b] - nx[a]) * (corners[c][1] - ny[a]) -
+                            (ny[b] - ny[a]) * (corners[c][0] - nx[a]);
+         if (ccw ? !(edge >= 0.0f) : !(edge <= 0.0f))
+            return 0;
+      }
+   }
+
+   *out_z_in_01 = z_in_01;
+   *out_z_in_m11 = z_in_m11;
+   return ccw ? 1 : 2;
+}
+
+/* Determine which colour outputs a fragment shader writes unconditionally in
+ * all four channels along its top-level control flow, and whether the shader
+ * can discard/demote/terminate fragments. */
+uint8_t
+agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
+{
+   bool uses_discard = nir->info.fs.uses_discard;
+   uint8_t rt_mask[PIPE_MAX_COLOR_BUFS] = {0};
+   uint8_t broadcast_mask = 0;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl) {
+      *out_uses_discard = true;
+      return 0;
+   }
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+         case nir_intrinsic_demote:
+         case nir_intrinsic_demote_if:
+         case nir_intrinsic_terminate:
+         case nir_intrinsic_terminate_if:
+            uses_discard = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   *out_uses_discard = uses_discard;
+   if (uses_discard)
+      return 0;
+
+   foreach_list_typed(nir_cf_node, cf, node, &impl->body) {
+      if (cf->type != nir_cf_node_block)
+         continue;
+      nir_block *block = nir_cf_node_as_block(cf);
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_jump)
+            return 0;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         if (!nir_src_is_const(intr->src[1]) ||
+             nir_src_as_uint(intr->src[1]) != 0)
+            continue;
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = (nir_intrinsic_write_mask(intr) << comp) & 0xf;
+         if (sem.location == FRAG_RESULT_COLOR) {
+            broadcast_mask |= wmask;
+         } else if (sem.location >= FRAG_RESULT_DATA0 &&
+                    sem.location < FRAG_RESULT_DATA0 + PIPE_MAX_COLOR_BUFS) {
+            rt_mask[sem.location - FRAG_RESULT_DATA0] |= wmask;
+         }
+      }
+   }
+
+   uint8_t full = 0;
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+      if (((rt_mask[rt] | broadcast_mask) & 0xf) == 0xf)
+         full |= BITFIELD_BIT(rt);
+   }
+   return full;
+}
+
 static void
 agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
                       nir_shader *nir, bool support_lod_bias, bool robust)
@@ -4395,6 +4691,8 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       so->info.writes_memory = nir->info.writes_memory;
       so->info.writes_api_sample_mask =
          nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
+      so->info.fs_unconditional_color_outputs =
+         agx_nir_analyze_fs_color_outputs(nir, &so->info.fs_uses_discard);
       so->info.inputs_linear_shaded = nir->info.linear_varyings;
       so->info.inputs_read = nir->info.inputs_read;
       so->info.inputs_flat_shaded = nir->info.inputs_read &
@@ -4418,6 +4716,13 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
               nir->info.stage == MESA_SHADER_TESS_EVAL) {
       so->info.has_edgeflags = nir->info.outputs_written & VARYING_BIT_EDGE;
       so->info.writes_layer = nir->info.outputs_written & VARYING_BIT_LAYER;
+      so->info.writes_viewport =
+         nir->info.outputs_written & VARYING_BIT_VIEWPORT;
+      so->info.writes_clip_distance =
+         (nir->info.outputs_written &
+          (VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
+           VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1)) != 0 ||
+         nir->info.clip_distance_array_size > 0;
       so->info.cull_distance_size = nir->info.cull_distance_array_size;
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       so->info.cull_distance_size = nir->info.cull_distance_array_size;
@@ -4435,6 +4740,12 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_opt_shrink_vectors, true);
    NIR_PASS(_, nir, nir_opt_copy_prop);
+
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      so->info.fullscreen_tri_winding = agx_nir_analyze_fullscreen_tri(
+         nir, &so->info.fullscreen_tri_z_in_01,
+         &so->info.fullscreen_tri_z_in_m11);
+   }
 
    NIR_PASS(
       _, nir, nir_opt_load_store_vectorize,
@@ -6783,6 +7094,8 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct agx_resource *rsrc = tex->rsrc;
       agx_batch_reads(batch, tex->rsrc);
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE)
+         agx_batch_note_vtx_read(batch, rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
       if (dev->chip == AGX_CHIP_G18G && rsrc->base.b.nr_samples > 1 &&
@@ -6861,6 +7174,12 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       }
 
       struct pipe_image_view *view = &ctx->stage[stage].images[i];
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
+         if (view->shader_access & PIPE_IMAGE_ACCESS_WRITE)
+            batch->vtx_needs_render_barrier = true;
+         else
+            agx_batch_note_vtx_read(batch, agx_resource(view->resource));
+      }
       agx_batch_track_image(batch, view);
       if (agx_chip_native_or_g18g(dev->chip) &&
           view->resource->target == PIPE_BUFFER)
@@ -15004,6 +15323,7 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(info->index.resource);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vtx_read(batch, rsrc);
 
    *extent =
       ALIGN_POT(rsrc->layout.size_B - rsrc->layout.level_offsets_B[0], 4);
@@ -15360,6 +15680,7 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vtx_read(batch, rsrc);
    return agx_map_gpu(rsrc) + indirect->offset;
 }
 
@@ -17350,6 +17671,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       if (clean) {
          struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
          agx_batch_reads(clean, indirect_rsrc);
+         agx_batch_note_vtx_read(clean, indirect_rsrc);
          indirect_rsrc_base = agx_map_gpu(indirect_rsrc);
          if (info->index_size)
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
@@ -17411,6 +17733,110 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
          }
       }
    }
+}
+
+static void
+agx_try_elide_color_reload(struct agx_context *ctx, struct agx_batch *batch,
+                           const struct pipe_draw_info *info,
+                           const struct pipe_draw_indirect_info *indirect,
+                           const struct pipe_draw_start_count_bias *draws)
+{
+   if ((batch->load & ~batch->clear & PIPE_CLEAR_COLOR) == 0)
+      return;
+
+   if (indirect || info->index_size || info->mode != MESA_PRIM_TRIANGLES ||
+       draws->start != 0 || draws->count != 3 || info->instance_count < 1)
+      return;
+
+   if (ctx->gs || ctx->in_tess || ctx->cond_query || ctx->zs_merge ||
+       ctx->g17g_mrt_split || !ctx->rast || !ctx->blend || !ctx->zs)
+      return;
+
+   if (util_framebuffer_get_num_layers(&batch->key) != 1 ||
+       batch->key.width == 0 || batch->key.height == 0)
+      return;
+
+   const struct pipe_rasterizer_state *rs = &ctx->rast->base;
+   if (rs->rasterizer_discard || rs->poly_stipple_enable ||
+       rs->fill_front != PIPE_POLYGON_MODE_FILL ||
+       rs->fill_back != PIPE_POLYGON_MODE_FILL ||
+       rs->clip_plane_enable != 0 ||
+       rs->cull_face == PIPE_FACE_FRONT_AND_BACK)
+      return;
+
+   const struct agx_uncompiled_shader *vs =
+      ctx->stage[MESA_SHADER_VERTEX].shader;
+   const struct agx_uncompiled_shader *fs =
+      ctx->stage[MESA_SHADER_FRAGMENT].shader;
+   if (!vs || !fs || vs->info.fullscreen_tri_winding == 0 ||
+       vs->info.writes_clip_distance || vs->info.cull_distance_size != 0 ||
+       vs->info.writes_layer || vs->info.writes_viewport)
+      return;
+
+   if (rs->depth_clip_near || rs->depth_clip_far) {
+      const bool z_ok = rs->clip_halfz ? vs->info.fullscreen_tri_z_in_01
+                                       : vs->info.fullscreen_tri_z_in_m11;
+      if (!z_ok)
+         return;
+   }
+
+   const struct pipe_viewport_state *vp = &ctx->viewport[0];
+   if (!isfinite(vp->scale[0]) || !isfinite(vp->scale[1]) ||
+       !isfinite(vp->translate[0]) || !isfinite(vp->translate[1]) ||
+       vp->scale[0] == 0.0f || vp->scale[1] == 0.0f)
+      return;
+
+   const float abs_sx = fabsf(vp->scale[0]);
+   const float abs_sy = fabsf(vp->scale[1]);
+   if (vp->translate[0] - abs_sx > 0.0f ||
+       vp->translate[0] + abs_sx < (float)batch->key.width ||
+       vp->translate[1] - abs_sy > 0.0f ||
+       vp->translate[1] + abs_sy < (float)batch->key.height)
+      return;
+
+   if (rs->scissor) {
+      const struct pipe_scissor_state *ss = &ctx->scissor[0];
+      if (ss->minx > 0 || ss->miny > 0 || ss->maxx < batch->key.width ||
+          ss->maxy < batch->key.height)
+         return;
+   }
+
+   if (rs->cull_face != PIPE_FACE_NONE) {
+      const bool ndc_ccw = (vs->info.fullscreen_tri_winding == 1);
+      const bool flip_xy = (vp->scale[0] * vp->scale[1]) < 0.0f;
+      /* Window coordinates are Y-down, so cross_win < 0 is CCW. */
+      const bool tri_ccw = (ndc_ccw == flip_xy);
+      const bool is_front = (tri_ccw == agx_front_face_ccw(ctx));
+      if ((is_front && (rs->cull_face & PIPE_FACE_FRONT)) ||
+          (!is_front && (rs->cull_face & PIPE_FACE_BACK)))
+         return;
+   }
+
+   const unsigned nr_samples = util_framebuffer_get_num_samples(&batch->key);
+   if ((ctx->sample_mask & BITFIELD_MASK(nr_samples)) !=
+       BITFIELD_MASK(nr_samples))
+      return;
+
+   if ((ctx->zs->base.depth_enabled &&
+        ctx->zs->base.depth_func != PIPE_FUNC_ALWAYS) ||
+       ctx->zs->base.stencil[0].enabled || ctx->zs->base.alpha_enabled)
+      return;
+
+   if (fs->info.fs_uses_discard || fs->info.uses_fbfetch ||
+       fs->info.writes_api_sample_mask)
+      return;
+
+   uint32_t elide = 0;
+   for (unsigned rt = 0; rt < batch->key.nr_cbufs; ++rt) {
+      const uint32_t bit = PIPE_CLEAR_COLOR0 << rt;
+      if ((fs->info.fs_unconditional_color_outputs & BITFIELD_BIT(rt)) &&
+          (ctx->blend->opaque_overwrite & bit))
+         elide |= bit;
+   }
+
+   batch->load &= ~elide;
+   if (elide & PIPE_CLEAR_COLOR0)
+      batch->g17p_resolve_reload = false;
 }
 
 static void
@@ -17872,6 +18298,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (batch->native_rejected)
       return;
 
+   if (ctx->gs || ctx->in_tess || ctx->streamout.num_targets ||
+       ctx->cond_query ||
+       (ctx->vs && ctx->vs->so && ctx->vs->so->info.writes_memory))
+      batch->vtx_needs_render_barrier = true;
+
    if (IS_DIRTY(VS) || IS_DIRTY(FS) || ctx->gs || IS_DIRTY(VERTEX) ||
        IS_DIRTY(BLEND_COLOR) || IS_DIRTY(QUERY) || IS_DIRTY(POLY_STIPPLE) ||
        IS_DIRTY(RS) || IS_DIRTY(PRIM) || ctx->in_tess) {
@@ -18024,6 +18455,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    assert((!indirect || !indirect->indirect_draw_count) && "multidraw handled");
 
    /* Update batch masks based on current state */
+   const bool first_draw = (batch->draws == 0 && batch->draw == 0);
    if (ctx->dirty & AGX_DIRTY_BLEND) {
       uint32_t store = ctx->blend->store;
       if (ctx->g17g_mrt_split) {
@@ -18168,6 +18600,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_dirty_reset_graphics(ctx);
 
    assert(batch == agx_get_batch(ctx) && "batch should not change under us");
+
+   if (first_draw)
+      agx_try_elide_color_reload(ctx, batch, info, indirect, draws);
 
    batch->draws++;
    if (ctx->stage[MESA_SHADER_FRAGMENT].shader)
