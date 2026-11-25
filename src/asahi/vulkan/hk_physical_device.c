@@ -788,13 +788,8 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
-      /* M5 storage buffer descriptors embed the residency map page of a
-       * sparse buffer (hk_buffer_address::sparse_map_page), and capture/
-       * replay keeps the buffer's VA but not its map's: a replayed
-       * descriptor would name a stale map. */
       .descriptorBufferCaptureReplay =
-         supported_extensions->EXT_descriptor_buffer &&
-         !agx_chip_g17_m5(dev->chip),
+         supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =

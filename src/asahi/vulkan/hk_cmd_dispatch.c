@@ -5299,6 +5299,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
 
    desc->root.cs.group_count_addr = dispatch_addr;
    desc->root.cs.grid_helper_sparse_map_addr =
-      (use_primary && buffer->sparse_map) ? buffer->sparse_map->va->addr : 0;
+      (use_primary && buffer->sparse_map) ? hk_buffer_sparse_map_addr(buffer)
+                                          : 0;
    dispatch(cmd, agx_grid_indirect(dispatch_addr));
 }
