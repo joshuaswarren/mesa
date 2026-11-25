@@ -6822,6 +6822,10 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
 }
 
 static void build_g17p_fs_epilog(nir_builder *b, const void *key_);
+static void build_g18_msaa4_fs_epilog(nir_builder *b, const void *key_);
+static void build_g18_msaa4_fs_epilog_ex(nir_builder *b,
+                                         const struct agx_fs_epilog_key *key,
+                                         struct agx_fs_epilog_result *res);
 static void build_fs_prolog(nir_builder *b, const void *key);
 
 /* Prolog/epilog parts persist in the device's disk cache. The in-memory
@@ -6845,6 +6849,8 @@ hk_prolog_epilog_builder_id(hk_internal_builder_t builder)
       return 4;
    if (builder == agx_nir_fs_epilog)
       return 5;
+   if (builder == build_g18_msaa4_fs_epilog)
+      return 6;
    return 0;
 }
 
@@ -7002,6 +7008,9 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       agx_nir_fs_epilog_g17p_ex(
          &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
+   else if (builder == build_g18_msaa4_fs_epilog)
+      build_g18_msaa4_fs_epilog_ex(
+         &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
    else if (builder == agx_nir_fs_epilog)
       agx_nir_fs_epilog_ex(
          &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
@@ -7039,9 +7048,11 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       backend_key.g17p_emrt =
          ((const struct agx_fs_epilog_key *)key->key)->native_spills;
-   if (builder == build_g17p_fs_epilog ||
-       (agx_chip_g17_m5(dev->dev.chip) &&
-        builder == agx_nir_fs_epilog && nr_samples > 1)) {
+   if (builder == build_g18_msaa4_fs_epilog) {
+      NIR_PASS(_, b.shader, agx_nir_lower_g18_tile_samples, nr_samples);
+   } else if (builder == build_g17p_fs_epilog ||
+              (agx_chip_g17_m5(dev->dev.chip) &&
+               builder == agx_nir_fs_epilog && nr_samples > 1)) {
       /* Preprocessing can unroll any multisample epilog, not only eMRT.
        * Its induction masks then become literals. Materialize the native
        * coverage operands after that transformation, before binary packing. */
@@ -7204,6 +7215,59 @@ static void
 build_g17p_fs_epilog(nir_builder *b, const void *key)
 {
    agx_nir_fs_epilog_g17p(b, key);
+}
+
+static void
+build_g18_msaa4_fs_epilog_ex(nir_builder *b,
+                             const struct agx_fs_epilog_key *key,
+                             struct agx_fs_epilog_result *res)
+{
+   if (key->link.sample_shading) {
+      struct agx_fs_epilog_key pixel = *key;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog_ex(b, &pixel, res);
+
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, key->link.loc_written,
+                                  key->link.size_32, key->link.colour_comps,
+                                  key->link.packed_colour);
+      NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
+      NIR_PASS(_, b->shader, agx_nir_unroll_g17p_samples_layout,
+               key->nr_samples, &layout);
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b->shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b->shader, nir_opt_algebraic);
+      } while (progress);
+      NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
+   } else {
+      agx_nir_fs_epilog_ex(b, key, res);
+      nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
+      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+         if (node->type == nir_cf_node_loop)
+            nir_cf_node_as_loop(node)->control = nir_loop_control_unroll;
+      }
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b->shader, nir_lower_vars_to_ssa);
+         NIR_PASS(progress, b->shader, nir_opt_copy_prop);
+         NIR_PASS(progress, b->shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b->shader, nir_opt_loop_unroll);
+         NIR_PASS(progress, b->shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b->shader, nir_opt_dce);
+      } while (progress);
+   }
+
+   NIR_PASS(_, b->shader, agx_nir_lower_g18_tile_samples, key->nr_samples);
+}
+
+static void
+build_g18_msaa4_fs_epilog(nir_builder *b, const void *key)
+{
+   build_g18_msaa4_fs_epilog_ex(b, key, NULL);
 }
 
 /*
@@ -8193,7 +8257,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    /* A G17P epilog selects each written target's pixel classes from its
     * position among all of the framebuffer's colour targets. */
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       struct agx_tilebuffer_layout tib =
          agx_fs_epilog_tilebuffer_layout(&key->epilog);
       for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
@@ -8307,16 +8371,21 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       return NULL;
    }
 
+   hk_internal_builder_t epilog_builder =
+      (agx_chip_native_agx3(dev->dev.chip) ||
+       (agx_chip_g17_m5(dev->dev.chip) &&
+        (key->epilog.link.sample_shading ||
+         key->epilog.native_spills)))
+         ? build_g17p_fs_epilog
+      : dev->dev.chip == AGX_CHIP_G18G &&
+            (key->epilog.nr_samples == 2 || key->epilog.nr_samples == 4)
+         ? build_g18_msaa4_fs_epilog
+         : agx_nir_fs_epilog;
    struct agx_shader_part *epilog =
       hk_get_prolog_epilog(dev, &key->epilog, sizeof(key->epilog),
-                           (agx_chip_native_agx3(dev->dev.chip) ||
-                            (agx_chip_g17_m5(dev->dev.chip) &&
-                             (key->epilog.link.sample_shading ||
-                              key->epilog.native_spills)))
-                              ? build_g17p_fs_epilog
-                              : agx_nir_fs_epilog,
+                           epilog_builder,
                            true, epilog_stop, 0, g17p_tile_partitions,
-                           agx_chip_native_or_m5(dev->dev.chip)
+                           agx_chip_agx3_path(dev->dev.chip)
                               ? key->epilog.nr_samples
                               : 0);
    if (!epilog) {
@@ -11346,7 +11415,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    bool defer_api_sample_mask = agx_chip_native_agx3(dev->dev.chip) &&
                                 has_sample_mask && !nontrivial_force_early;
 
-   const bool native_samples = agx_chip_native_or_m5(dev->dev.chip);
+   const bool native_samples = agx_chip_agx3_path(dev->dev.chip);
    if (native_samples && fs->info.fs.uses_sample_shading &&
        dyn->ms.rasterization_samples > 1) {
       if (report_errors)
@@ -11389,7 +11458,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        * (agx_nir_apply_api_mask_to_force_early()). */
       .prolog.api_sample_mask =
          has_sample_mask && !defer_api_sample_mask &&
-               (!agx_chip_native_or_m5(dev->dev.chip) ||
+               (!agx_chip_agx3_path(dev->dev.chip) ||
                 !nontrivial_force_early)
             ? api_sample_mask
             : 0xff,

@@ -87,7 +87,7 @@ bool
 agx_nir_apply_api_mask_to_force_early(nir_shader *shader, enum agx_chip chip)
 {
    const bool supported = agx_chip_native_agx3(chip) ||
-      (agx_chip_g17_m5(chip) && !shader->info.fs.uses_sample_shading);
+      (agx_chip_hal300_path(chip) && !shader->info.fs.uses_sample_shading);
    if (!supported || !shader->info.fs.early_fragment_tests)
       return false;
 

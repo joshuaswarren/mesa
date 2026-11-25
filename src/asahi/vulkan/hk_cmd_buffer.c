@@ -2250,9 +2250,9 @@ hk_g17p_basic_fragment_layout(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct agx_tilebuffer_layout *tib = &cmd->state.gfx.render.tilebuffer;
-   if (agx_chip_g17_m5(dev->dev.chip) && tib->nr_samples > 1) {
+   if (agx_chip_hal300_path(dev->dev.chip) && tib->nr_samples > 1) {
       return (tib->nr_samples == 2 || tib->nr_samples == 4 ||
-              tib->nr_samples == 8) &&
+              (agx_chip_g17_m5(dev->dev.chip) && tib->nr_samples == 8)) &&
              (tib->tile_size == 32 * 32 || tib->tile_size == 32 * 16 ||
               tib->tile_size == 16 * 16) &&
              tib->sample_size_B >= 8 && !(tib->sample_size_B & 7) &&
@@ -5492,7 +5492,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * common finalizer will append the native VDM terminator without uploading
     * any ordinary vertex or fragment program.
     */
-   const bool native_eot = agx_chip_native_or_m5(dev->dev.chip);
+   const bool native_eot = agx_chip_agx3_path(dev->dev.chip);
    const bool output_only_through_eot =
       native_eot && render->g17p_direct_color_resolve;
 
@@ -5501,10 +5501,10 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    if (cs->timestamp.start.handle || cs->timestamp.end.handle)
       return false;
 
-   /* M5: a multisample clear-only pass stays a render. As compute it is a
+   /* HAL300: a multisample clear-only pass stays a render. As compute it is a
     * separate job that every later render's vertex half must wait for; as a
     * render that writes only its attachments it is not. */
-   const bool m5_ms_clear = agx_chip_g17_m5(dev->dev.chip) &&
+   const bool m5_ms_clear = agx_chip_hal300_path(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
    if (native_eot &&
        (continuation ||
