@@ -14096,12 +14096,81 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    return true;
 }
 
+/* Consecutive hardware draws may only change the graphics root. Their linked
+ * shaders and fixed-function state are already published in this stream. */
+static bool
+hk_agx2_flush_root(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                   bool ordinary_draw_path, uint32_t draw_id,
+                   struct agx_draw draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!hk_root_dirty(desc) || !ordinary_draw_path || !gfx->root || cmd->in_meta ||
+       agx_is_indirect(draw.b) ||
+       agx_chip_command_stream_generation(dev->dev.chip) !=
+          AGX_CS_GENERATION_AGX2 ||
+       gfx->dirty || gfx->shaders_dirty || gfx->linked_dirty ||
+       vk_dynamic_graphics_state_any_dirty(dyn) || dev->frame_anatomy ||
+       (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples))
+      return false;
+
+   if (!gfx->shaders[MESA_SHADER_VERTEX] || gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] || gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY])
+      return false;
+
+   struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   struct hk_shader *fs = hk_bound_fs(cmd);
+   struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+   struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+   if (!fs || !linked_vs || !linked_fs || fs->local_read_nir ||
+       !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
+       !gfx->fast_link_vs.key.prolog.hw || gfx->fast_link_vs.key.prolog.adjacency ||
+       linked_vs->sw_indexing || hk_fast_link_vs_uvs_stale(cmd, vs) ||
+       gfx->fast_link_vs.key.prolog.robustness.level !=
+          hk_vertex_robustness_level(dev, vs, dyn->vertex_input_robustness) ||
+       hk_stat_enabled(hk_pipeline_stat_addr(
+          cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) !=
+          gfx->fast_link_fs.key.prolog.statistics ||
+       hk_fs_clear_fill_stale(cmd, cs))
+      return false;
+
+   gfx->render.color_written |= gfx->fast_link_fs.app_color_written;
+   gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
+   hk_flush_draw_params_and_id(cmd, vs, linked_vs, draw_id, draw);
+   gfx->root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   if (!gfx->root)
+      return true;
+
+   hk_reserve_scratch(cmd, cs, vs);
+   uint64_t program = hk_upload_usc_words(cmd, vs, linked_vs);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return true;
+
+   uint8_t *out = cs->current;
+   struct hk_agx2_vertex_state state = hk_agx2_pack_vertex_state(cmd, vs);
+   if (!hk_agx2_publish_vertex_state(cmd, &out, &state, program))
+      return true;
+   hk_flush_ppp_state(cmd, cs, &out);
+   cs->current = out;
+   if (!vk_command_buffer_has_error(&cmd->vk))
+      hk_root_mark_clean(desc);
+   return true;
+}
+
 static __attribute__((hot)) void
 hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        uint32_t draw_id, struct agx_draw draw,
                        bool ordinary_draw_path,
                        bool *g17p_native_bind_tail_emitted_out)
 {
+   if (hk_agx2_flush_root(cmd, cs, ordinary_draw_path, draw_id, draw)) {
+      *g17p_native_bind_tail_emitted_out = false;
+      return;
+   }
+
    if (hk_g17p_flush_dynamic_state_fast(cmd, cs, draw_id, draw,
                                         ordinary_draw_path,
                                         g17p_native_bind_tail_emitted_out))
