@@ -7,6 +7,7 @@
 #include "asahi_clc.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/compiler/agx_nir.h"
 #include "compiler/glsl_types.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -100,6 +101,21 @@ target_is_agx3(const char *target)
 {
    const enum agx_chip chip = target_chip(target);
    return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether a target decompresses spilled compressed colour attachments in place
+ * (libagx_agx3_decompress, and libagx_reset_compression_metadata for the
+ * attachments a pass discards): native HAL200, and the chips with private
+ * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). g18g compiles as G17G
+ * (target_chip()) but is asked about as itself, which has no Gen10
+ * compression. */
+static bool
+target_has_spill_decompress(const char *target)
+{
+   const enum agx_chip chip =
+      !strcmp(target, "g18g") ? AGX_CHIP_G18G : target_chip(target);
+   return agx_chip_native_hal200(chip) ||
+          agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION);
 }
 
 static const struct spirv_to_nir_options spirv_options = {
@@ -335,7 +351,7 @@ target_supports_program(const char *target, const nir_function *func)
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
    if (!strcmp(func->name, "libagx_agx3_decompress"))
-      return agx_chip_native_hal200(target_chip(target));
+      return target_has_spill_decompress(target);
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
@@ -378,7 +394,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_gen1_as_empty") ||
           (strcmp(target, "g18g") &&
            !strcmp(func->name, "libagx_fast_clear")) ||
-          (agx_chip_native_hal200(target_chip(target)) &&
+          (target_has_spill_decompress(target) &&
            !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||

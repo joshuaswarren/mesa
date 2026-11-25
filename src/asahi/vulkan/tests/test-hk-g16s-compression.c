@@ -250,7 +250,7 @@ check_shape(VkFormat format, bool is_zs)
  * Cover every admitted colour format, including the smallest ones that can
  * spill next to wide targets, and input/transient attachment combinations.
  * 2x and 4x MSAA colour attachments (single-layer and layered, including
- * input/transient) are all admitted now that hk_hal200_decompress_attachment
+ * input/transient) are all admitted now that hk_agx3_decompress_attachment
  * decompresses any spilled attachment on demand.
  */
 static void

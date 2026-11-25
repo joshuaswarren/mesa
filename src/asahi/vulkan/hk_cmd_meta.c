@@ -5874,7 +5874,16 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       const bool compressed_depth_array = agx_chip_hal300_path(dev->dev.chip) &&
          vk_format_is_depth_or_stencil(dst_image->vk.format) &&
          dst_image->vk.array_layers > 1 && dst_image->planes[0].layout.compressed;
-      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array) {
+      /* A region between a 2D array and a 3D image (the copier above takes
+       * neither when one of them is compressed) is one layered meta draw
+       * otherwise, which on M5 returns every layer past the first wrong
+       * (dEQP-VK.api.copy_and_blit.core.image_to_image.3d_images.2d_to_3d_whole);
+       * one draw per slice is exact. */
+      const bool array_to_volume = agx_chip_agx3_path(dev->dev.chip) &&
+         (src_image->vk.image_type == VK_IMAGE_TYPE_3D) !=
+            (dst_image->vk.image_type == VK_IMAGE_TYPE_3D);
+      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array ||
+          array_to_volume) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */

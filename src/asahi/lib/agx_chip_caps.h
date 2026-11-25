@@ -92,12 +92,16 @@ enum agx_chip_cap {
     * hardware A/B and CTS rows are collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 
-   /* Private Gen10 2D colour and depth compression in Gallium: single-level,
+   /* Private Gen10 colour and depth compression. In Gallium: single-level,
     * single-layer 2D colour at 1x and 2x/4x, and Z32_FLOAT/Z16_UNORM depth at
     * 1x through the compressed Gen10 PBE, texture and ZLS forms. 2x/4x
     * Z32_FLOAT depth additionally needs the kernel to report
     * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION. Measured on M5 (G17S,
-    * G17C); off on G18G until measured there. */
+    * G17C). In Borealis also single-sample colour 2D arrays, cube maps and
+    * single-level 3D (1-8 byte texels), mipmapped one-byte 2D, and 16-byte
+    * single-layer 2D, whose spilled attachments decompress in place
+    * (libagx_agx3_decompress); measured on G17S. Off on G18G until measured
+    * there. */
    AGX_CAP_GEN10_2D_COMPRESSION = 1u << 14,
 };
 

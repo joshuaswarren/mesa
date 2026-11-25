@@ -39,6 +39,7 @@
 #include "hk_native_vertex_template.h"
 #include "hk_frame_anatomy.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -4523,16 +4524,16 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 }
 
 static bool
-hk_hal200_decompress_attachment(struct hk_cmd_buffer *cmd,
-                                struct hk_device *dev,
-                                const struct hk_rendering_state *render,
-                                const struct hk_image *image,
-                                struct ail_layout *layout,
-                                unsigned level, unsigned layer,
-                                uint32_t layer_count, uint64_t base,
-                                VkAttachmentLoadOp load_op,
-                                VkRenderingFlags rendering_flags,
-                                bool incomplete_render_area)
+hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
+                              struct hk_device *dev,
+                              const struct hk_rendering_state *render,
+                              const struct hk_image *image,
+                              struct ail_layout *layout,
+                              unsigned level, unsigned layer,
+                              uint32_t layer_count, uint64_t base,
+                              VkAttachmentLoadOp load_op,
+                              VkRenderingFlags rendering_flags,
+                              bool incomplete_render_area)
 {
    if (!hk_g17p_decompress_image_type_supported(image->vk.image_type))
       return false;
@@ -5248,13 +5249,24 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
 
-               if (agx_chip_native_hal200(dev->dev.chip)) {
-                  if (!hk_hal200_decompress_attachment(
+               /* Native HAL200 decompresses every spilled compressed colour
+                * attachment with libagx_agx3_decompress. Gen10 private
+                * compression (AGX_CAP_GEN10_2D_COMPRESSION) takes the same
+                * program, at its 16x8 metadata tile (ail_metadata_tile()), for
+                * the single-sample 16-byte targets an eight-target pass
+                * spills; 2x/4x RGBA16F takes libagx_m5_decompress_rgba16f
+                * below. */
+               if (agx_chip_native_hal200(dev->dev.chip) ||
+                   (agx_chip_has_cap(dev->dev.chip,
+                                     AGX_CAP_GEN10_2D_COMPRESSION) &&
+                    layout->sample_count_sa == 1 &&
+                    ail_get_blocksize_B(layout) == 16)) {
+                  if (!hk_agx3_decompress_attachment(
                          cmd, dev, render, image, layout, level, layer,
                          layer_count, base,
                          pRenderingInfo->pColorAttachments[i].loadOp,
                          pRenderingInfo->flags, incomplete_render_area)) {
-                     mesa_loge_once("HAL200: spilled render pass with a "
+                     mesa_loge_once("AGX3: spilled render pass with a "
                                     "compressed attachment (%s, %ux) is "
                                     "unsupported",
                                     util_format_short_name(layout->format),
