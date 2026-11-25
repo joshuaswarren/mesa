@@ -698,6 +698,22 @@ if with_tests
   )
 
   test(
+    'hk_g17p_linear_slice_copy',
+    executable(
+      'hk_g17p_linear_slice_copy_test',
+      files('tests/test-hk-g17p-linear-slice-copy.c',
+            'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_image_layout_core',
     executable(
       'hk_image_layout_core_test',

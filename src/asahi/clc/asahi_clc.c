@@ -453,6 +453,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_write_u32s") ||
           !strcmp(func->name, "libagx_reset_query") ||
           !strcmp(func->name, "libagx_copy_uchar") ||
+          !strcmp(func->name, "libagx_copy_uint") ||
           !strcmp(func->name, "libagx_copy_uint4") ||
           !strcmp(func->name, "libagx_fill") ||
           !strcmp(func->name, "libagx_copy_xfb_counters") ||
