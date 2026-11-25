@@ -3505,6 +3505,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
     * that dst, src, and size are all properly aligned. Failing to check for
     * alignment on the buffers causes subtle and hard-to-debug issues!
     */
+   bool ran_uint4 = false;
    if (size >= 16 && (dst & 0xf) == 0 && (src & 0xf) == 0) {
       unsigned uint4s = size / 16;
       unsigned bytes = uint4s * 16;
@@ -3514,6 +3515,25 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
       dst += bytes;
       src += bytes;
       size -= bytes;
+      ran_uint4 = true;
+   }
+
+   /* Use 32-bit copies when 16-byte alignment was unavailable, or when the
+    * remaining tail is a clean 4-byte multiple (avoiding an extra dispatch
+    * before a trailing byte copy). */
+   if (size >= 4 && (dst & 0x3) == 0 && (src & 0x3) == 0 &&
+       (!ran_uint4 || (size & 0x3) == 0)) {
+      size_t uints = size / 4;
+      if (uints <= UINT32_MAX) {
+         size_t bytes = uints * 4;
+
+         libagx_copy_uint(cmd, agx_1d((uint32_t)uints), AGX_BARRIER_ALL, dst,
+                          src);
+
+         dst += bytes;
+         src += bytes;
+         size -= bytes;
+      }
    }
 
    if (size) {

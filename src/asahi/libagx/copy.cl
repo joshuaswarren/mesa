@@ -21,6 +21,15 @@ libagx_copy_uint4(global uint4 *dest, global uint4 *src)
    dest[cl_global_id.x] = src[cl_global_id.x];
 }
 
+KERNEL(32)
+libagx_copy_uint(global uint32_t *dest, global uint32_t *src)
+{
+   assert((((uintptr_t)dest) & 0x3) == 0);
+   assert((((uintptr_t)src) & 0x3) == 0);
+
+   dest[cl_global_id.x] = src[cl_global_id.x];
+}
+
 KERNEL(16)
 libagx_copy_uchar(global uint8_t *dest, global uint8_t *src)
 {
