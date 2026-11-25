@@ -11603,7 +11603,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
     * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
     * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
-   if (runtime_loop_opts) {
+   if (runtime_loop_opts && m5_unroll_factor >= 2) {
       bool jammed = false;
       if (agx3_compute_opts)
          NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
@@ -19351,11 +19351,12 @@ agx_compile_shader_nir_unrolled(nir_shader *nir, struct agx_shader_key *key,
       ok ? agx_occupancy_for_register_count(out->info.nr_gprs).max_threads : 0;
    /* Also when the wider unroll did not compile at all. */
    if (widest > 4 && first < full) {
+      nir_shader *narrow_nir = nir_shader_clone(NULL, clone);
       struct agx_shader_part narrow = {0};
       struct blob narrow_blob;
       blob_init(&narrow_blob);
       *key = saved_key;
-      if (agx_compile_shader_nir_internal(clone, key, &narrow,
+      if (agx_compile_shader_nir_internal(narrow_nir, key, &narrow,
                                           pre_preamble_blob ? &narrow_blob
                                                             : NULL,
                                           false, false, false, 4, NULL) &&
@@ -19376,7 +19377,41 @@ agx_compile_shader_nir_unrolled(nir_shader *nir, struct agx_shader_key *key,
             free(narrow.binary);
          *key = saved_key;
       }
+      ralloc_free(narrow_nir);
       blob_finish(&narrow_blob);
+   }
+
+   /* On a 192-half register file (AGX3B), unrolling an already-wide loop
+    * (such as a tiled multi-pixel stencil) can push register usage past half
+    * the register file (> 96 halves), reducing Dynamic Caching headroom while
+    * 252-half AGX3C targets still fit comfortably. Fall back to compact
+    * (un-unrolled) compilation when it saves registers on AGX3B. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && widest >= 2 &&
+       (!ok || out->info.nr_gprs > AGX3B_NUM_REGS / 2)) {
+      struct agx_shader_part compact = {0};
+      struct blob compact_blob;
+      blob_init(&compact_blob);
+      *key = saved_key;
+      if (agx_compile_shader_nir_internal(clone, key, &compact,
+                                          pre_preamble_blob ? &compact_blob
+                                                            : NULL,
+                                          false, false, false, 1, NULL) &&
+          (!ok || compact.info.nr_gprs < out->info.nr_gprs)) {
+         if (ok)
+            free(out->binary);
+         *out = compact;
+         ok = true;
+         if (pre_preamble_blob) {
+            pre_preamble_blob->size = blob_start;
+            blob_write_bytes(pre_preamble_blob, compact_blob.data,
+                             compact_blob.size);
+         }
+      } else {
+         if (compact.binary && compact.binary != out->binary)
+            free(compact.binary);
+         *key = saved_key;
+      }
+      blob_finish(&compact_blob);
    }
    ralloc_free(clone);
    return ok;

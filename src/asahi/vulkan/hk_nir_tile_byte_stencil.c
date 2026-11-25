@@ -4188,10 +4188,7 @@ emit_rgba8_sliding_stencil(nir_builder *b, nir_deref_instr *sh_tile_u4,
    nir_store_var(b, r_var, load_sh_vec4(b, sh_tile_u4, base_v4), 0xf);
    nir_store_var(b, i4_var, nir_imm_int(b, 0), 0x1);
 
-   /* Four taps across four pixels already expose independent work for all
-    * 16 channel accumulators. Another copy increases register pressure. */
-   nir_loop *taps = nir_push_loop(b);
-   taps->control = nir_loop_control_dont_unroll;
+   nir_push_loop(b);
    {
       nir_def *i4 = nir_load_var(b, i4_var);
       nir_push_if(b, nir_ige(b, i4, n4));
@@ -4570,10 +4567,7 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
                        nir_iadd(b, nir_imul(b, nir_iadd(b, y_start, ly), stride),
                                 gx),
                        0x1);
-         /* The workgroup loads one coalesced row per iteration. Keep this
-          * staging loop compact alongside the four-pixel stencil body. */
-         nir_loop *rows = nir_push_loop(b);
-         rows->control = nir_loop_control_dont_unroll;
+         nir_push_loop(b);
          {
             nir_def *r = nir_load_var(b, r_var);
             nir_push_if(b, nir_ige(b, r, total_rows));
