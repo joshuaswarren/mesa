@@ -1,19 +1,13 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Native M5 Gen3 nodes, derived from the saved 2/4/8/64-triangle AGX
- * captures and agx_rt_blas_gen3.h. One workgroup encodes one independent
- * node: one lane per triangle, two lanes for QTBs, lane zero for the root.
- * Inner nodes read child bounds from the same common build IR.
- * No CPU readback, cross-workgroup synchronization, or global allocator.
+ * Native M5 Gen3 BVH node encoder (see agx_rt_blas_gen3.h). One workgroup
+ * encodes one node (one lane per triangle, two lanes for QTBs, lane 0 for the
+ * root) from common build IR without CPU readback or global allocation.
  *
- * Procedural leaves use the 48-byte native bounding-box record (marker 0x18,
- * minimum at 4, maximum at 16, geometry id/opaque bit at 28, primitive id at
- * 32) captured from public Metal on M5 Pro and read at those offsets by the
- * native runtime's agx.bounding_box_test. Records are packed at a 48-byte
- * stride directly in the child region: the Gen1 format derives the record
- * stride from root word0 bits 5..7 (class 4 = 48 bytes) and identifies the
- * record by the marker's low five bits (24 = bounding box).
+ * Procedural leaves pack 48-byte bounding-box records in the child region
+ * (marker 0x18, min at +4, max at +16, geometry id/opaque bit at +28,
+ * primitive id at +32; root word0 bits 5..7 class 4 = 48-byte stride).
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -201,9 +195,11 @@ encode_instance(hk_agx3_leaf_job job, uint lane)
               DEREF(REF(uint32_t)(blas + 80ul + uint64_t(i) * 4ul)));
    store64(record + 88ul, blas);
    store32(record + 96ul, DEREF(src).custom_instance_and_mask & 0xffffffu);
-   /* Native Metal user_instance_id reads this independent32-bit field. */
+   /* Native ray-tracing hardware reads user_instance_id from this independent
+    * 32-bit field; Vulkan-only metadata lives outside the native 128-byte
+    * instance record.
+    */
    store32(record + 100ul, index);
-   /* Vulkan-only metadata lives outside the native128-byte instance record. */
    store32(job.output_bvh + transform + 48ul, DEREF(src).sbt_offset_and_flags);
    store64(record + 104ul, transform - record_offset);
    store64(job.output_bvh + pointers + 16ul * uint64_t(index), record_offset + 4ul);
@@ -310,14 +306,11 @@ main()
       } else {
          for (uint t = 0; t < 8; ++t)
             root[t] = uint64_t(0);
-         /* Word0 bits 5..7 select the native leaf record stride: class 5
-          * (0xa0) is the 64-byte triangle record, class 7 (0xe1) the 128-byte
-          * instance record and class 4 (0x80) the 48-byte bounding-box record.
-          * Leaves without quantized blocks have slot capacity 0 and, like the
-          * native instance roots, use indexed lane fields (bit 0): the header
-          * codec rejects capacity 0 in count mode, and a count-mode box
-          * cluster returned every lane as record 0 on hardware (only
-          * single-AABB geometries passed). */
+         /* Word0 bits 5..7 select record stride (class 5 = 64B triangle,
+          * class 7 = 128B instance, class 4 = 48B AABB). Non-QTB leaves have
+          * slot capacity 0 and must use indexed lane mode (bit 0); count mode
+          * rejects capacity 0 and breaks multi-AABB clusters.
+          */
          root[0] =
             uint64_t((instances ? 0xe1u
                       : aabbs ? 0x81u
@@ -329,9 +322,9 @@ main()
          uint child = job.child_slot;
          root[5] = uint64_t(child >> 16);
          root[6] = uint64_t(child & 65535u);
-         /* Leaf type 24 is the native bounding-box record marker. Bits 6..7
-          * (0xc0) follow the captured triangle roots; the QTB-only bit 14 is
-          * not set because no quantized triangle block exists. */
+         /* Leaf type 24 is the AABB record marker; bits 6..7 (0xc0) match
+          * triangle roots, and QTB-only bit 14 stays clear.
+          */
          root[7] = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
                    : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
                    : leaf ? uint64_t(0x40c0u | (triangle_type[0] << 8) |

@@ -79,7 +79,11 @@ def declare_options():
 
     debug_options = []
     features_options = []
-    performance_options = []
+    performance_options = [
+        drirc_gen.DrircInt("hk_submit_batch_size", 0, 0, 64,
+          "Maximum GPU commands per kernel submission "
+          "(0 uses the driver default)", c_name="submit_batch_size"),
+    ]
 
     drirc_gen.add_common_vk_options(debug_options, features_options, misc_options,
                                     valid_options=VALID_COMMON_VK_OPTIONS,

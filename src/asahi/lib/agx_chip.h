@@ -176,7 +176,11 @@ enum agx_chip_record {
    AGX_RECORD_HAL300_NATIVE_CAPTURE = 1 << 20,
    AGX_RECORD_PPP_VIEWPORT = 1 << 21,
    AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
+   AGX_RECORD_VDM_STREAM_LINK_AGX2 = 1 << 23,
 };
+
+/* AGX2 chips that use the genxml 8-byte non-returning VDM_STREAM_LINK. */
+#define AGX_RECORDS_AGX2 (AGX_RECORD_VDM_STREAM_LINK_AGX2)
 
 /* The records of every byte-witnessed G15, G16 and G17 identity. */
 #define AGX_RECORDS_G15_G17                                                    \
@@ -220,6 +224,9 @@ enum agx_chip_quirk {
    AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS = 1 << 7,
    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE = 1 << 8,
    AGX_QUIRK_INEXACT_FMA32 = 1 << 9,
+   /* Hardware-qualified HAL200/AGX3B/GPU0 Ioto CProg + preamble (G16G, G17P);
+    * G15* uses RTKit 2419 (G15 CS gen, no CDM TI spill field) and is not
+    * qualified here. */
    AGX_QUIRK_NATIVE_PREAMBLE = 1 << 10,
    AGX_QUIRK_SCHEDULING_STALLS = 1 << 11,
    AGX_QUIRK_M5_PATHS = 1 << 12,
@@ -234,14 +241,14 @@ enum agx_chip_quirk {
 
 /* The native chips that are not G17P: G15G, G15S, G15C and G16G. */
 #define AGX_QUIRKS_NATIVE_PRE_G17                                              \
-   (AGX_QUIRKS_NATIVE | AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS |               \
-    AGX_QUIRK_INEXACT_FMA32)
+   (AGX_QUIRKS_NATIVE | AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS)
 
 #define AGX_QUIRKS_G17P                                                        \
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
     AGX_QUIRK_USC_HELPER_SLOT_PER_CORE |                                       \
     AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS |                                  \
-    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE)
+    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE |        \
+    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS)
 
 /*
  * The chip table: one row per chip, and the only place that says what a chip
@@ -292,10 +299,14 @@ enum agx_chip_quirk {
  * submission model is unknown.
  */
 #define AGX_CHIPS(X, ...)                                                      \
-   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
    X(G15P, AGX2, AGX2, UNKNOWN, UNKNOWN, UNKNOWN, NONE, UNKNOWN, NONE, 0, 0,   \
      __VA_ARGS__)                                                              \
    X(G15G, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
@@ -314,7 +325,7 @@ enum agx_chip_quirk {
      __VA_ARGS__)                                                              \
    X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, CLASSIC, NATIVE_AGX3,    \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
-     AGX_QUIRKS_NATIVE_PRE_G17, __VA_ARGS__)                                   \
+     AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_NATIVE_PREAMBLE, __VA_ARGS__)       \
    X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
    X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
@@ -418,6 +429,12 @@ agx_chip_info(enum agx_chip chip)
 #define AGX_CHIP_ROW_HAS_RECORD(path, records, record)                         \
    (((records) & (record)) != 0)
 #define AGX_CHIP_ROW_ON_PATH(path, records, wanted) ((path) == (wanted))
+#define AGX_CHIP_ROW_TEST_CS(row, isa, encoding, cs, descriptor, sampler,      \
+                             ioto, submission, path, records, quirks, chip,    \
+                             wanted_path, wanted_cs)                           \
+   | (((chip) == AGX_CHIP_##row) &                                             \
+      ((AGX_CHIP_PATH_##path) == (wanted_path)) &                              \
+      ((AGX_CS_GENERATION_##cs) == (wanted_cs)))
 
 /* Whether a chip is witnessed to take a record (enum agx_chip_record). */
 static inline bool
@@ -425,6 +442,15 @@ agx_chip_has_record(enum agx_chip chip, unsigned record)
 {
    return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, AGX_CHIP_ROW_HAS_RECORD,
                           record);
+}
+
+/* Whether a chip is witnessed to take an 8-byte non-returning VDM stream link
+ * (genxml AGX_VDM_STREAM_LINK on AGX2 or agx_vdm_stream_link_core on AGX3). */
+static inline bool
+agx_chip_vdm_stream_link_supported(enum agx_chip chip)
+{
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_STREAM_LINK |
+                                       AGX_RECORD_VDM_STREAM_LINK_AGX2);
 }
 
 /* G17P keeps every colour target in the imageblock past 64 bytes a sample:
@@ -474,6 +500,24 @@ agx_chip_native_agx3(enum agx_chip chip)
 {
    return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, AGX_CHIP_ROW_ON_PATH,
                           AGX_CHIP_PATH_NATIVE_AGX3);
+}
+
+/*
+ * Whether the native AGX3 path runs on Apple's HAL200 command-stream
+ * generation (G16G and G17P) rather than G15 (M3, RTKit 2419).
+ *
+ * HAL200 streams allow post-initial VDM State Updates to elide an unchanged
+ * bind tail and allow standalone 8-byte PPP State Updates carrying only the
+ * 28-byte fragment record.  Root-descriptor trimming and HAL200 libagx DGC
+ * framing are also keyed on this predicate so G16G and G17P share the same
+ * path while G15 stays on its G15 layout.
+ */
+static inline bool
+agx_chip_native_hal200(enum agx_chip chip)
+{
+   return false AGX_CHIPS(AGX_CHIP_ROW_TEST_CS, chip,
+                          AGX_CHIP_PATH_NATIVE_AGX3,
+                          AGX_CS_GENERATION_HAL200);
 }
 
 /* The chip whose record encodings GPU-generated (libagx) command-stream
@@ -730,23 +774,23 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     the G15 and HAL200 records (agx_vdm_hal200_indirect_draw_pack) and the
  *     HAL300 one, which adds only the Unk 2 word before it
  *     (agx_vdm_index_list_indirect_pack_words). That is packet layout.
- *   - Enabled for the M5 HAL300 record family (G17G, G17S, G17C): zero
- *     substitution for out-of-range indices is measured on G17C (J716c) by
+ *   - Enabled for the M5 AGX3C family (G17G, G17S, G17C; agx_chip_g17_m5()):
+ *     zero substitution for out-of-range indices is measured on G17C (J716c)
+ *     and G17S (J714s) by
  *     dEQP-VK.robustness.{index_access,vertex_access.*index*,robustness2}.*,
  *     dEQP-VK.draw.{*indexed*,renderpass.multi_draw.*}, and a 28-case
  *     bit-exact equivalence probe against the software rewrite (partial and
  *     full out-of-range draws, 32-bit firstIndex wrap, signed vertexOffset,
- *     multi-draw firstInstance, primitive restart, indirect count). G17S
- *     (M5 Pro) and G17G (M5) share the same HAL300 indirect record layout;
- *     M5 Pro hardware verification is the merge gate.
+ *     multi-draw firstInstance, primitive restart, indirect count).
+ *   - Enabled for G17P (HAL200): zero substitution past index_buffer_size_word
+ *     is measured on A18 Pro (G17P B1) by the same 28-case bit-exact
+ *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
- *   - G18G uses HAL300 records too, but has no stream-link continuation for
- *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
- *     out-of-range index behaviour is unmeasured, so it stays off.
- *   - G15, G16G and G17P (G15/HAL200 records) keep the software rewrite until
- *     hardware rows (M3, M4, A18 Pro, M4 Pro) prove zero substitution past
- *     the size word.
+ *   - G18G uses HAL300 records too, but its out-of-range hardware index
+ *     behaviour is unmeasured, so it keeps the software rewrite.
+ *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
+ *     hardware rows (M3, M4) prove zero substitution past the size word.
  *   - AGX2 does not have it: its Index List does not read out-of-range
  *     indices as zero (libagx_draw_robust_index).
  *
@@ -800,23 +844,6 @@ agx_chip_native_g15(enum agx_chip chip)
 {
    return agx_chip_native_agx3(chip) &&
           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
-}
-
-/*
- * Whether the native AGX3 path runs on Apple's HAL200 command-stream
- * generation (G16G and G17P) rather than G15 (M3, RTKit 2419).
- *
- * HAL200 streams allow post-initial VDM State Updates to elide an unchanged
- * bind tail and allow standalone 8-byte PPP State Updates carrying only the
- * 28-byte fragment record.  Root-descriptor trimming is also keyed on this
- * predicate so G16G and G17P run the same fast-flush and trimmed-root path,
- * while G15 stays on the full-tail / full-root path until verified on M3.
- */
-static inline bool
-agx_chip_native_hal200(enum agx_chip chip)
-{
-   return agx_chip_native_agx3(chip) &&
-          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200;
 }
 
 /* Whether the kernel presents the T8140 native render context: a fixed Bind0
@@ -940,13 +967,23 @@ agx_chip_g17p_or_m5(enum agx_chip chip)
    return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
 }
 
+/* Whether hardware/firmware orders command start stamps after a command's
+ * waits. G17P and M5 (G17G/G17S/G17C) latch start stamps when firmware takes
+ * the command, before barriers resolve, so Borealis places timestamps on
+ * command completion (end stamps) instead. */
+static inline bool
+agx_chip_start_stamps_ordered(enum agx_chip chip)
+{
+   return !agx_chip_g17p_or_m5(chip);
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
- * explicit barriers; every other record (internal or indirect launch, cache
- * flush, link, stream end) still follows a barrier.  On the native AGX3 CDM
- * (G15, HAL200 and M5 HAL300) the barrier holds the next launch until every
- * kernel launched before it has finished; without it the threadgroups of
- * consecutive launches run side by side. */
+ * explicit barriers; every other record (internal launch, non-M5 indirect
+ * launch, cache flush, link, stream end) still follows a barrier.  On the
+ * native AGX3 CDM (G15, HAL200 and M5 HAL300) the barrier holds the next
+ * launch until every kernel launched before it has finished; without it the
+ * threadgroups of consecutive launches run side by side. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
@@ -1068,6 +1105,41 @@ agx_chip_native_imageblock(enum agx_chip chip)
 }
 
 /*
+ * Whether single-sample 2D colour images are losslessly compressed in the
+ * Gen9 form Borealis implements for G17P. The image is GPU-tiled, and 8 bytes
+ * of metadata per 16x16 tile follow it in the same allocation. The texture
+ * descriptor sets bit 59 (compressed) and bit 127 (extended) and carries the
+ * metadata address >> 4 in its third word. The PBE sets word 0 bit 59 and
+ * word 1 bit 63, with the same third word.
+ *
+ * G16G: macOS 27.2 (26B123) on the M4 allocates a 4096x4096 RGBA8 texture as
+ * 64 MiB of image plus 512 KiB of metadata, and its blit copy into that
+ * texture reads and writes it through these exact descriptors. The capture
+ * shows no compressed depth, multisampled or layered image, so those stay on
+ * agx_chip_gen9_extended_compression().
+ *
+ * The selection is by chip because no device property reports compression.
+ */
+static inline bool
+agx_chip_gen9_color_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
+/*
+ * The compressed shapes beyond single-sample colour, measured on the G17P
+ * parts (A18 Pro, M4 Pro, M4 Max):
+ *  - depth and stencil through the ZLS unit;
+ *  - 2x and 4x attachments;
+ *  - the M4 Pro's layered, cube and 3D shapes.
+ */
+static inline bool
+agx_chip_gen9_extended_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/*
  * Whether the defect applies that drops the upper bytes of a wide multisample
  * sample on a tile no geometry covered
  * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro, and on
@@ -1147,6 +1219,18 @@ agx_chip_exact_fma32(enum agx_chip chip)
    return !(agx_chip_info(chip)->quirks & AGX_QUIRK_INEXACT_FMA32);
 }
 
+/* Whether agx_nir_lower_denorm_preserve() guarantees FP32 DenormPreserve
+ * across every advertised shader stage and encoding: native AGX3 (AGX3B) and
+ * M5 (AGX3C), where agx_compile_shader_nir() runs the exact integer lowering
+ * unconditionally. AGX2 and bring-up G18G stay off. */
+static inline bool
+agx_chip_has_fp32_denorm_preserve(enum agx_chip chip)
+{
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   return (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+          agx_chip_native_or_m5(chip);
+}
+
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
  * layout has a bias field; Gen4 does not, so the shader applies the bias. */
 static inline bool
@@ -1158,8 +1242,13 @@ agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 
 /*
  * Whether native shaders may carry an Ioto constant program (CProg) and a
- * shader preamble.  Only the G17P Ioto preamble sequence is qualified; other
- * native chips compile every stage with no_preamble.
+ * shader preamble.  G16G and G17P share HAL200 (cs_generation = HAL200,
+ * sampler_generation = GEN4_HAL200), AGX3B, and GPU0 Ioto and are both
+ * hardware-qualified for native CProg.  G15* uses the older G15 (RTKit 2419)
+ * command-stream generation (its direct CDM launch has no TI spill field for
+ * agx_chip_query_ti_spill(), and native preambles have not been hardware-
+ * qualified on M3/J615), so G15* remains excluded and compiles every stage
+ * with no_preamble.
  */
 static inline bool
 agx_chip_native_preamble(enum agx_chip chip)
@@ -1237,13 +1326,49 @@ bool agx_chip_has_hardware_ray_tracing(enum agx_chip chip);
 
 bool agx_chip_needs_scheduling_stalls(enum agx_chip chip);
 
-/* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
- * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
+/* AGX2 (G13/G14 via simd_matrix_fmadd and software fallback for partial
+ * subgroups; G15P is an uncharacterized A16 part), every AGX3B part
+ * (8x8 matmad), and M5 (AGX3C matrix16/matmad8) support subgroup-scope
+ * cooperative matrices. */
 static inline bool
 agx_chip_cooperative_matrix_supported(enum agx_chip chip)
 {
-   return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B ||
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   return (enc == AGX_ISA_ENCODING_AGX2 && chip != AGX_CHIP_G15P) ||
+          enc == AGX_ISA_ENCODING_AGX3B ||
           agx_chip_g17_m5(chip);
+}
+
+/* Hardware ray-query opcodes (intersect_ray, continue_ray, inc_stk) share one
+ * instruction encoding per AGX3B / AGX3C ISA family; AGX3D (G18G) and AGX2
+ * parts do not use these packers. */
+static inline bool
+agx_chip_has_agx3_ray_opcodes(enum agx_chip chip)
+{
+   return agx_isa_is_agx3(agx_chip_isa_encoding(chip));
+}
+
+/*
+ * Whether Borealis may keep in-pass color input-attachment reads
+ * (VK_KHR_dynamic_rendering_local_read and in-subpass self-dependencies) in
+ * on-chip tile memory via the monolithic local-read pixel-class protocol.
+ *
+ * Selected by ISA encoding and command-stream generation rather than a chip
+ * list: HAL200/AGX3B (M4 / M4 Pro / M4 Max / A18 Pro, including G16G, G16S,
+ * G16C, and G17P) and HAL300/AGX3C (M5 family: G17G, G17S, G17C) share the
+ * monolithic AGX3B/AGX3C pixel-class tilebuffer protocol. G15 (M3, unverified
+ * command-stream generation) and AGX3D (G18G, no AGX3D local-read encoder)
+ * remain on the DRAM fallback path.
+ */
+static inline bool
+agx_chip_local_read_tilebuffer(enum agx_chip chip)
+{
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   const enum agx_command_stream_generation cs =
+      agx_chip_command_stream_generation(chip);
+
+   return (enc == AGX_ISA_ENCODING_AGX3B && cs == AGX_CS_GENERATION_HAL200) ||
+          (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
 }
 
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */

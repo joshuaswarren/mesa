@@ -119,6 +119,13 @@ struct hk_descriptor_pool {
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 
+struct hk_storage_backing {
+   uint64_t address;
+   uint64_t offset;
+   uint32_t size;
+   uint32_t handle;
+};
+
 struct hk_descriptor_set {
    struct vk_object_base base;
 
@@ -132,8 +139,14 @@ struct hk_descriptor_set {
    /* mapped_ptr is in a CPU-cached pool BO (hk_descriptor_pool::cpu_cached). */
    bool cpu_cached;
 
+   /* Optional CPU provenance, for ordinary single-element storage bindings. */
+   struct hk_storage_backing *storage_backings;
+
    struct hk_buffer_address dynamic_buffers[];
 };
+
+bool hk_descriptor_set_storage_backing(const struct hk_descriptor_set *set,
+                                       uint32_t binding, struct hk_storage_backing *backing);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_descriptor_set, base, VkDescriptorSet,
                                VK_OBJECT_TYPE_DESCRIPTOR_SET)

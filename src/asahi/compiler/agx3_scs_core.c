@@ -485,18 +485,9 @@ decode(enum agx_isa_encoding enc, const uint8_t *bytes, size_t length,
          return false;
    }
 
-   /*
-    * Trial decode.  Every candidate is re-encoded and compared byte-for-byte,
-    * so a wrong guess fails closed instead of reporting a wrong field.  The
-    * first candidate is exactly what this decoder tried before -- the address
-    * kind read from the mode bit, a single component and no explicit selector
-    * -- so previously accepted encodings still take the same path and yield
-    * the same descriptor.
-    *
-    * Later candidates cover the register-base kinds, whose base register
-    * shares slot B with the uniform field, and the vector component masks.
-    * AGX3c uses the same split slot-B field for uniform and register bases.
-    */
+   /* Trial decode: each candidate is re-encoded and byte-compared so invalid
+    * guesses fail closed. Tries the single-component mode-bit form first, then
+    * register-base (shared slot-B with uniform base) and vector-mask forms. */
    static const uint8_t mask_candidates[] = {1, 3, 15, 2, 4, 5, 6, 7,
                                              8, 9, 10, 11, 12, 13, 14};
    const enum agx3_scs_address_kind decoded_kind = d.address_kind;

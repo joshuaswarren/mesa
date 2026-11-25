@@ -29,6 +29,7 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"],
                      capabilities = [SpvCapabilitySignedZeroInfNanPreserve],
                      SpvExecutionModeSignedZeroInfNanPreserve, 32);
 
+#ifndef VK_LEAF_HELPERS_ONLY
 layout(local_size_x_id = SUBGROUP_SIZE_ID, local_size_y = 1, local_size_z = 1) in;
 
 #ifdef VK_BATCH_LEAVES
@@ -37,6 +38,7 @@ leaf_args args;
 layout(push_constant) uniform CONSTS {
    leaf_args args;
 };
+#endif
 #endif
 
 bool
@@ -226,6 +228,7 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
    return true;
 }
 
+#ifndef VK_LEAF_HELPERS_ONLY
 void
 main(void)
 {
@@ -291,17 +294,30 @@ main(void)
    DEREF(INDEX(uint32_t, args.ids, primitive_id)) = id;
 
    uvec4 ballot = subgroupBallot(is_active);
-   if (subgroupElect())
-      atomicAdd(DEREF(args.header).active_leaf_count, subgroupBallotBitCount(ballot));
+   uint32_t active_count = subgroupBallotBitCount(ballot);
+   if (active_count != 0) {
+      if (subgroupElect())
+         atomicAdd(DEREF(args.header).active_leaf_count, active_count);
 
-   /* Uniform-address atomics are issued per lane where the compiler does not
-    * combine them, so a refit, which never reads these bounds, skips them. */
-   if (is_active && !VK_TEST_BUILD_FLAG_NO_HEADER_BOUNDS) {
-      atomicMin(DEREF(args.header).min_bounds[0], to_emulated_float(bounds.min.x));
-      atomicMin(DEREF(args.header).min_bounds[1], to_emulated_float(bounds.min.y));
-      atomicMin(DEREF(args.header).min_bounds[2], to_emulated_float(bounds.min.z));
-      atomicMax(DEREF(args.header).max_bounds[0], to_emulated_float(bounds.max.x));
-      atomicMax(DEREF(args.header).max_bounds[1], to_emulated_float(bounds.max.y));
-      atomicMax(DEREF(args.header).max_bounds[2], to_emulated_float(bounds.max.z));
+      /* Reduce scene bounds within the subgroup before updating the shared
+       * header so contention scales with subgroups rather than invocations. */
+      if (!VK_TEST_BUILD_FLAG_NO_HEADER_BOUNDS) {
+         int32_t min_x = subgroupMin(is_active ? to_emulated_float(bounds.min.x) : 0x7fffffff);
+         int32_t min_y = subgroupMin(is_active ? to_emulated_float(bounds.min.y) : 0x7fffffff);
+         int32_t min_z = subgroupMin(is_active ? to_emulated_float(bounds.min.z) : 0x7fffffff);
+         int32_t max_x = subgroupMax(is_active ? to_emulated_float(bounds.max.x) : int32_t(0x80000000u));
+         int32_t max_y = subgroupMax(is_active ? to_emulated_float(bounds.max.y) : int32_t(0x80000000u));
+         int32_t max_z = subgroupMax(is_active ? to_emulated_float(bounds.max.z) : int32_t(0x80000000u));
+
+         if (subgroupElect()) {
+            atomicMin(DEREF(args.header).min_bounds[0], min_x);
+            atomicMin(DEREF(args.header).min_bounds[1], min_y);
+            atomicMin(DEREF(args.header).min_bounds[2], min_z);
+            atomicMax(DEREF(args.header).max_bounds[0], max_x);
+            atomicMax(DEREF(args.header).max_bounds[1], max_y);
+            atomicMax(DEREF(args.header).max_bounds[2], max_z);
+         }
+      }
    }
 }
+#endif

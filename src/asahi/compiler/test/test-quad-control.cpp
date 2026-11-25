@@ -204,16 +204,27 @@ TEST(QuadControl, OnlyDerivativesDisableG17PTriangleMerging)
 
 TEST(QuadControl, BallotFusionStaysWithinEncodingDomain)
 {
-   for (unsigned profile = 0; profile < 3; ++profile) {
-      const bool g17p = profile != 0, quad_control = profile == 1;
+   /* 0: AGX2. 1: AGX3B with quad control. 2: AGX3B without it. 3: AGX3C.
+    * Every AGX3 encoder's half-width quad ballot only compares a register
+    * against zero, whatever the device exposes, so only that predicate fuses
+    * there. */
+   for (unsigned profile = 0; profile < 4; ++profile) {
+      const bool agx3 = profile != 0, quad_control = profile == 1;
+      const enum agx_chip chip = profile == 0   ? AGX_CHIP_G14G
+                                 : profile == 3 ? AGX_CHIP_G17S
+                                                : AGX_CHIP_G17P;
+      const enum agx_isa_encoding encoding = profile == 0 ? AGX_ISA_ENCODING_AGX2
+                                             : profile == 3
+                                                ? AGX_ISA_ENCODING_AGX3C
+                                                : AGX_ISA_ENCODING_AGX3B;
       for (unsigned predicate = 0; predicate < 4; ++predicate) {
+         SCOPED_TRACE(::testing::Message() << profile << ":" << predicate);
          void *mem = ralloc_context(NULL);
          agx_builder *b = agx_test_builder(mem);
          agx_shader_key key = {};
-         key.dev.chip = g17p ? AGX_CHIP_G17P : AGX_CHIP_G14G;
+         key.dev.chip = chip;
          key.dev.shader_quad_control = quad_control;
-         key.dev.encoding =
-            g17p ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX2;
+         key.dev.encoding = encoding;
          b->shader->key = &key;
          agx_index x = agx_preload(b, agx_register(4, AGX_SIZE_32));
          agx_index y = agx_preload(b, agx_register(6, AGX_SIZE_32));
@@ -230,7 +241,7 @@ TEST(QuadControl, BallotFusionStaysWithinEncodingDomain)
          agx_optimizer_backward(b->shader);
          agx_optimizer_forward(b->shader);
          agx_dce(b->shader, true);
-         const bool keep_predicate = quad_control && predicate != 3;
+         const bool keep_predicate = agx3 && predicate != 3;
          unsigned unfused = 0, fused = 0;
          agx_foreach_instr_global(b->shader, I) {
             unfused += I->op == AGX_OPCODE_QUAD_BALLOT;

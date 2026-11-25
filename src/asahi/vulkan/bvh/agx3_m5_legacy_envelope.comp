@@ -209,11 +209,10 @@ main()
                0x00000101, 0x00010000, 0x00010000, 0x00ff0001, 0x02000000,
                0x01000005, 0x03000000, 1, 0, 0x3f800000, 0, 0, 0, 0, 0, 0);
    if (aabbs) {
-      /* Descriptor word 16 selects the native geometry class: 4 is the
-       * bounding-box class (8 is the instance class and 0/2/10 the triangle
-       * classes). Word 20 mirrors word 16 in both captured triangle and
-       * instance descriptors; the remaining words keep the triangle values,
-       * which no native bounding-box capture has yet confirmed or refuted. */
+      /* Descriptor words 16 and 20 select the native geometry class: 4 = AABB,
+       * 8 = instance, 0/2/10 = triangle. Remaining words keep the triangle
+       * template (not independently verified for AABB descriptors).
+       */
       descriptor[16] = 4;
       descriptor[20] = 4;
    }

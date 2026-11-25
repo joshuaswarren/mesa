@@ -225,10 +225,35 @@ bool hk_g17p_build_mip_axis(uint32_t src_extent, uint32_t dst_extent,
  */
 #define HK_G17P_MIP_PBE_MIN_TEXELS (1u << 17)
 
+/* Classic-submission (G16G) crossover measured per level on Apple M4
+ * (G16G B0, g17p-vulkan-compressed-mip-blit --grid, 42/42 bit-exact PASS
+ * across gradient, texture and noise): a PBE render pass in a chain costs
+ * about 0.13-0.24 ms up to 960x540 (vs ~0.04 ms on dual-submission G17P),
+ * while compute takes about 0.13-0.24 ns per texel. Compute is 24-37x
+ * faster at 32x32-64x64, 3.7-5.0x at 512x512, 1.9-3.0x at 960x540
+ * (518,400 texels) and 1.18-1.53x at 768x768 (589,824 texels); they cross
+ * between 1280x720 (921,600 texels: 1.012x gradient, 0.853x texture,
+ * 1.030x noise) and 1024x1024 (1,048,576 texels = 2^20), above which PBE
+ * wins across all content classes (whole-chain 4096x4096 1.23-3.41x vs
+ * plain storage).
+ */
+#define HK_CLASSIC_MIP_PBE_MIN_TEXELS (1u << 20)
+
 static inline bool
 hk_g17p_mip_level_through_pbe(uint32_t width, uint32_t height)
 {
    return (uint64_t)width * height >= HK_G17P_MIP_PBE_MIN_TEXELS;
+}
+
+/* The crossover for the chip's submission model. */
+static inline bool
+hk_mip_level_through_pbe(enum agx_chip chip, uint32_t width, uint32_t height)
+{
+   const uint64_t min_texels =
+      agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_CLASSIC
+         ? HK_CLASSIC_MIP_PBE_MIN_TEXELS
+         : HK_G17P_MIP_PBE_MIN_TEXELS;
+   return (uint64_t)width * height >= min_texels;
 }
 
 /* The 16x16 metadata tiles of one compressed level, as libagx_fast_clear
@@ -248,3 +273,22 @@ bool hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
 /* The 64-bit metadata word index of tile (x_tl, y_tl). */
 uint32_t hk_g17p_metadata_tile_index(const struct hk_g17p_metadata_grid *grid,
                                      uint32_t x_tl, uint32_t y_tl);
+
+/* Dispatch grid for the AGX3 Gen10 compressed buffer-to-image compute upload.
+ * Each 64-thread workgroup covers 32x16 texels (two adjacent 16x16 compression
+ * blocks aligned to 16-texel boundaries, one block per 32-lane warp). */
+struct hk_agx3_compressed_buf2img_grid {
+   uint32_t tile_x0;
+   uint32_t tile_y0;
+   uint32_t groups_x;
+   uint32_t groups_y;
+};
+
+/* Whether a canonical integer storage-PBE view format is supported by the
+ * AGX3 Gen10 compressed buffer-to-image compute upload. */
+bool hk_agx3_compressed_buf2img_view_format_supported(VkFormat view_format);
+
+bool hk_agx3_compressed_buf2img_grid_init(
+   uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+   uint32_t max_groups_x, uint32_t max_groups_y,
+   struct hk_agx3_compressed_buf2img_grid *grid);

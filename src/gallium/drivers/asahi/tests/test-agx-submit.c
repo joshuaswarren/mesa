@@ -113,7 +113,11 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    struct drm_asahi_cmd_render r = {0};
    uint64_t last_seqid = ctx->flush_last_seqid;
    agx_batch_submit(ctx, batch, compute ? &c : NULL, render ? &r : NULL);
-   CHECK(calls == (split && dev->chip == AGX_CHIP_G17P ? 2 : 1));
+   /* A HAL200 kernel limited to one command splits a mixed batch in two
+    * (split_compute in agx_batch_submit()). */
+   const bool split_compute =
+      split && compute && render && agx_chip_native_hal200(dev->chip);
+   CHECK(calls == (split_compute ? 2 : 1));
    CHECK(computes == compute && renders == render);
    CHECK(ctx->submit_perf.batches == 1);
    CHECK(ctx->submit_perf.mixed_batches == (compute && render));

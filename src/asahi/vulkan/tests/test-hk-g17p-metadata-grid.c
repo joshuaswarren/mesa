@@ -214,11 +214,189 @@ check_layered_layouts(void)
    }
 }
 
+/* Exact 2x2 fast-path rounding in build_g17p_mip_shader() must match the
+ * general fixed4 ties-toward-128 formula bit-for-bit across all 2x2 sums. */
+static void
+check_exact_2x2_rounding(void)
+{
+   for (uint32_t sum = 0; sum <= 4u * 255u; ++sum) {
+      const uint32_t value = sum * 16384u;
+      const uint32_t fixed4 = (value + 2048u) >> 12;
+      const uint32_t ref_out = fixed4 >> 4;
+      const uint32_t rem = fixed4 & 15u;
+      const uint32_t up = rem > 8u || (rem == 8u && ref_out < 128u);
+      const uint32_t want = ref_out + up;
+      const uint32_t got = (sum + 2u - (sum >> 9)) >> 2;
+      if (got != want) {
+         EXPECT(false, "exact_2x2 sum %u: got %u, want %u", sum, got, want);
+         return;
+      }
+   }
+}
+
+static uint32_t
+compact_bits_8(uint32_t v)
+{
+   v &= 0x55u;
+   v = (v | (v >> 1)) & 0x33u;
+   return (v | (v >> 2)) & 0x0fu;
+}
+
+/* Verify that build_g17p_mip_shader()'s 16x16 Morton workgroup dispatch maps
+ * 1:1 to 16x16 metadata tiles and matches AIL's 64x64 tiled element offset
+ * for every pixel without spread_bits. */
+static void
+check_mip_16x16_tile64_morton(void)
+{
+   static const uint32_t dims[][2] = {
+      {2560, 1440}, {1920, 1080}, {1280, 720}, {160, 90},
+   };
+
+   for (unsigned d = 0; d < sizeof(dims) / sizeof(dims[0]); ++d) {
+      struct ail_layout layout = {
+         .width_px = dims[d][0],
+         .height_px = dims[d][1],
+         .depth_px = 1,
+         .sample_count_sa = 1,
+         .levels = util_logbase2(MAX2(dims[d][0], dims[d][1])) + 1,
+         .tiling = AIL_TILING_GPU,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .compressed = true,
+      };
+      ail_make_miptree(&layout);
+
+      for (uint32_t l = 1; l < layout.levels; ++l) {
+         const uint32_t w = u_minify(layout.width_px, l);
+         const uint32_t h = u_minify(layout.height_px, l);
+         const uint32_t gx = DIV_ROUND_UP(w, 16u);
+         const uint32_t gy = DIV_ROUND_UP(h, 16u);
+
+         if (ail_is_level_logically_compressed(&layout, l)) {
+            EXPECT(gx == ail_metadata_width_tl(&layout, l) &&
+                      gy == ail_metadata_height_tl(&layout, l),
+                   "%ux%u level %u: 16x16 groups (%ux%u) != metadata grid (%ux%u)",
+                   dims[d][0], dims[d][1], l, gx, gy,
+                   ail_metadata_width_tl(&layout, l),
+                   ail_metadata_height_tl(&layout, l));
+         }
+
+         const struct ail_tile tile = layout.tilesize_el[l];
+         if (tile.width_el != 64 || tile.height_el != 64)
+            continue;
+
+         struct hk_g17p_tile_address_config cfg;
+         EXPECT(hk_g17p_tile_address_config_init(layout.stride_el[l],
+                                                 tile.width_el, tile.height_el,
+                                                 &cfg),
+                "%ux%u level %u: tile config refused", dims[d][0], dims[d][1],
+                l);
+
+         /* Check full pixel coverage and address identity on levels up to
+          * 320x180, and border/interior workgroups on larger levels. */
+         const bool full_scan = w <= 320 && h <= 180;
+         uint8_t *seen = full_scan ? calloc((size_t)w * h, 1) : NULL;
+         for (uint32_t wy = 0; wy < gy; ++wy) {
+            if (!full_scan && wy > 4 && wy + 2 < gy)
+               continue;
+            for (uint32_t wx = 0; wx < gx; ++wx) {
+               if (!full_scan && wx > 4 && wx + 2 < gx)
+                  continue;
+               const uint32_t tile_idx =
+                  (wy >> 2) * cfg.tiles_per_row + (wx >> 2);
+               const uint32_t morton_hi =
+                  ((wx & 1u) << 8) | ((wy & 1u) << 9) |
+                  ((wx & 2u) << 9) | ((wy & 2u) << 10);
+               for (uint32_t idx = 0; idx < 256u; ++idx) {
+                  const uint32_t x = (wx << 4) | compact_bits_8(idx);
+                  const uint32_t y = (wy << 4) | compact_bits_8(idx >> 1);
+                  if (x >= w || y >= h)
+                     continue;
+                  const uint32_t got = (tile_idx << 12) | morton_hi | idx;
+                  const uint32_t ref_tile =
+                     (y >> 6) * cfg.tiles_per_row + (x >> 6);
+                  const uint32_t ref_morton =
+                     ail_space_bits(x & 63u) | (ail_space_bits(y & 63u) << 1);
+                  const uint32_t want = (ref_tile << 12) | ref_morton;
+                  if (got != want) {
+                     EXPECT(false,
+                            "%ux%u level %u (%u,%u): element %u, want %u",
+                            dims[d][0], dims[d][1], l, x, y, got, want);
+                     free(seen);
+                     return;
+                  }
+                  if (seen)
+                     seen[y * w + x]++;
+               }
+            }
+         }
+         if (seen) {
+            for (uint32_t p = 0; p < w * h; ++p) {
+               if (seen[p] != 1) {
+                  EXPECT(false, "%ux%u level %u pixel %u hit %u times",
+                         dims[d][0], dims[d][1], l, p, seen[p]);
+                  free(seen);
+                  return;
+               }
+            }
+            free(seen);
+         }
+      }
+   }
+}
+
+static void
+check_g18g_meta_copy_admission(void)
+{
+   const struct hk_g17p_buffer_to_image_copy comp = {
+      .chip = AGX_CHIP_G18G,
+      .format = VK_FORMAT_ASTC_4x4_SRGB_BLOCK,
+      .plane_format_renderable = false,
+      .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .image_type = VK_IMAGE_TYPE_3D,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .plane_count = 1,
+      .mip_levels = 1,
+      .array_layers = 1,
+      .image_extent = {16, 16, 4},
+      .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+      .mip_level = 0,
+      .base_array_layer = 0,
+      .layer_count = 1,
+      .image_offset = {0, 0, 0},
+      .copy_extent = {16, 16, 4},
+   };
+   struct hk_g17p_compressed_copy_plan plan;
+   EXPECT(hk_g17p_compressed_buffer_to_image_copy_plan(&comp, 0, 16384, &plan),
+          "G18G compressed 3D buffer-to-image plan refused");
+
+   struct hk_g17p_buffer_to_image_copy color = comp;
+   color.format = VK_FORMAT_R8G8B8A8_UNORM;
+   color.plane_format_renderable = true;
+   EXPECT(hk_g17p_buffer_to_image_copy_supported(&color),
+          "G18G graphics buffer-to-image copy refused");
+
+   const VkImageCopy2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .extent = {16, 16, 4},
+   };
+   VkImageCopy2 slice;
+   EXPECT(hk_g17p_image_copy_slice(AGX_CHIP_G18G, VK_IMAGE_TYPE_3D,
+                                   VK_IMAGE_TYPE_3D, 4, 4, &region, 2, &slice) &&
+             slice.extent.depth == 1 && slice.srcOffset.z == 2 &&
+             slice.dstOffset.z == 2,
+          "G18G 3D image copy slice helper refused");
+}
+
 int
 main(void)
 {
+   check_g18g_meta_copy_admission();
    check_layered_layouts();
    check_mip_split();
+   check_exact_2x2_rounding();
+   check_mip_16x16_tile64_morton();
    for (uint32_t h = 1; h <= 70; ++h) {
       for (uint32_t w = 1; w <= 70; ++w)
          check_grid(w, h);
