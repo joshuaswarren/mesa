@@ -121,6 +121,72 @@ main(void)
           (gen1_refit_B != m5_refit_B ||
            memcmp(gen1_refit, m5_refit, gen1_refit_B)));
 
+   size_t refit_top_B;
+   const uint32_t *refit_top = hk_gen1_agx3_refit_top_spirv(&refit_top_B);
+   assert(refit_top && refit_top != gen1_refit && refit_top != m5_refit);
+   assert(spirv_local_size_x(refit_top, refit_top_B) == HK_AGX3_REFIT_TOP_LANES);
+
+   size_t refit_direct_B;
+   const uint32_t *refit_direct =
+      hk_gen1_agx3_refit_encode_direct_spirv(&refit_direct_B);
+   assert(refit_direct && refit_direct != gen1_enc && refit_direct != m5_enc);
+   assert(spirv_local_size_x(refit_direct, refit_direct_B) ==
+          HK_AGX3_GEN1_NODE_GROUP_LANES);
+
+   /* GEN1 refit scheduling policy: small/medium updates fuse every inner level
+    * and envelope into one direct workgroup; larger updates fuse the top three
+    * levels plus envelope and keep aligned prepare grids. */
+   assert(hk_agx3_refit_fused_all(0));
+   assert(hk_agx3_refit_fused_all(1));
+   assert(hk_agx3_refit_fused_all(256));
+   assert(hk_agx3_refit_fused_all(2048));
+   assert(hk_agx3_refit_fused_all(HK_AGX3_REFIT_FUSED_MAX_LEAVES));
+   assert(!hk_agx3_refit_fused_all(HK_AGX3_REFIT_FUSED_MAX_LEAVES + 1));
+   assert(!hk_agx3_refit_fused_all(1u << 20));
+   assert(hk_agx3_refit_top_levels(2048) == 16u);
+   assert(hk_agx3_refit_top_levels(HK_AGX3_REFIT_FUSED_MAX_LEAVES) == 16u);
+   assert(hk_agx3_refit_top_levels(HK_AGX3_REFIT_FUSED_MAX_LEAVES + 1) ==
+          HK_AGX3_REFIT_TOP_LEVELS);
+   assert(hk_agx3_refit_prepare_threads(2048, 4095, 0, false, false) ==
+          HK_AGX3_REFIT_PREPARE_GROUP_SIZE);
+   assert(hk_agx3_refit_prepare_threads(272, 543, 0, false, true) == 320u);
+   assert(hk_agx3_refit_prepare_threads(65536, 131071, 0, false, false) ==
+          HK_AGX3_REFIT_PREPARE_MAX_THREADS);
+   assert(hk_agx3_refit_prepare_threads(1u << 20, (2u << 20) - 1, 1ull << 26,
+                                        true, false) ==
+          HK_AGX3_REFIT_COPY_MAX_THREADS);
+   static const uint32_t sample_leaves[] = {0, 1, 17, 256, 2048, 8192, 65536};
+   for (unsigned i = 0; i < sizeof(sample_leaves) / sizeof(sample_leaves[0]); ++i) {
+      const uint32_t n = sample_leaves[i];
+      for (unsigned copy = 0; copy < 2; ++copy) {
+         for (unsigned inst = 0; inst < 2; ++inst) {
+            const uint32_t t = hk_agx3_refit_prepare_threads(
+               n, n ? 2 * n - 1 : 0, (uint64_t)n * 64, copy, inst);
+            assert(t >= HK_AGX3_REFIT_PREPARE_GROUP_SIZE);
+            assert(t % HK_AGX3_REFIT_PREPARE_GROUP_SIZE == 0);
+         }
+      }
+   }
+
+   /* Direct leaf-job refit dispatch sizing and single-geometry triangle fast
+    * path predicates. */
+   assert(hk_agx3_refit_direct_leaf_invocations(0) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(1) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(4) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(5) == 64u);
+   assert(hk_agx3_refit_direct_leaf_invocations(256) == 2048u);
+   assert(hk_agx3_refit_direct_leaf_invocations(272) == 2176u);
+   assert(hk_agx3_refit_direct_leaf_invocations(2048) == 16384u);
+   assert(hk_agx3_refit_direct_leaf_invocations(8192) == 65536u);
+   assert(hk_agx3_refit_uses_direct_triangles(true, true, 1, 2048, 2048));
+   assert(hk_agx3_refit_uses_direct_triangles(true, true, 1, 8192, 8192));
+   assert(!hk_agx3_refit_uses_direct_triangles(false, true, 1, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, false, 1, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 2, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 1024, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 0, 0));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 8193, 8193));
+
    /* The layouts differ exactly where the formats do. */
    struct hk_agx3_as_layout g, m;
    assert(hk_gen1_as_layout_init(64, &g) && hk_agx3_as_layout_init(64, &m));

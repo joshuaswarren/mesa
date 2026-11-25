@@ -2,24 +2,12 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 transcendental / rounding funops: the single-source 10-byte family.
+ * AGX3 single-source 10-byte transcendental and rounding funops.
  *
- * floor/ceil/trunc/roundeven are one hardware operation, f32rint,
- * discriminated by the 2-bit rounding-mode field f43 (0=rint 1=trunc 2=ceil
- * 3=floor -- the composer applies Apple's LUT). log2, exp2, sinc and the
- * fragment gradient ops dfdx/dfdy are distinct mnemonics on AGX3b and one
- * f34-op-selected encoding class on AGX3c. Operand roles are uniform across
- * the family: dest=f2, src=f18, abs=f30, neg=f31, and on AGX3c only a native
- * saturate bit f14 (Apple lowers saturate on AGX3b as a separate f32add, so a
- * saturating funop is refused there rather than mis-encoded).
- *
- * This core exists beside agx3_alu_table.h rather than inside it: that table
- * is machine-generated from the hand packers and its generator is not in any
- * checked-out tree, and its row shape (dest/src0/src1/src2/imm) cannot carry
- * the f43 mode or the abs/neg/saturate modifier bits anyway.
- *
- * Every encoding this core produces matches Apple's own compiler output
- * byte for byte on both encodings; dfdx/dfdy come from its fragment programs.
+ * Rounding ops share `f32rint` (f43: 0=rint, 1=trunc, 2=ceil, 3=floor);
+ * log2/exp2/sinc/dfdx/dfdy use distinct mnemonics on AGX3B and an f34 selector
+ * on AGX3C. Operands: dest=f2, src=f18, abs=f30, neg=f31, and saturate=f14
+ * (AGX3C only; AGX3B refuses saturate since it lowers via a separate f32add).
  */
 
 #pragma once

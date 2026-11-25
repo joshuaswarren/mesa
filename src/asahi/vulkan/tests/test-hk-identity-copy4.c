@@ -14,6 +14,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "hk_identity_copy4.h"
 #include "hk_nir_eval_test.h"
+#include "hk_nir_wgid.h"
 
 static nir_deref_instr *
 make_ssbo_elem_deref(nir_builder *b, unsigned set, unsigned binding,
@@ -1032,6 +1033,303 @@ test_permuted_layout_im2col_bit_exact(void)
    ralloc_free(orig);
 }
 
+static void
+rewrite_gid_axis_to_wgid(nir_shader *s, unsigned target_axis, unsigned wg_axis,
+                         bool add_base, unsigned base_axis, uint32_t base_scale)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), wg_axis);
+   if (add_base) {
+      nir_def *bwg =
+         nir_channel(&b, nir_load_base_workgroup_id(&b, 32), base_axis);
+      if (base_scale != 1)
+         bwg = nir_imul_imm(&b, bwg, base_scale);
+      wg = nir_iadd(&b, wg, bwg);
+   }
+   nir_def *repl = nir_vec3(&b, target_axis == 0 ? wg : nir_channel(&b, gid, 0),
+                            target_axis == 1 ? wg : nir_channel(&b, gid, 1),
+                            target_axis == 2 ? wg : nir_channel(&b, gid, 2));
+   nir_foreach_block(blk, impl) {
+      nir_foreach_instr(instr, blk) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         if (intrin->intrinsic == nir_intrinsic_load_global_invocation_id &&
+             &intrin->def != gid)
+            nir_def_rewrite_uses(&intrin->def, repl);
+      }
+   }
+   nir_opt_dce(s);
+   nir_validate_shader(s, "rewrite_gid_axis_to_wgid");
+}
+
+static void
+test_unit_axis_wgid_matchers(void)
+{
+   /* Shaders that read SPIR-V WorkgroupId (gl_WorkGroupID) directly on a unit
+    * workgroup axis (local_size[axis] == 1) lower to load_workgroup_id[axis]
+    * (plus load_base_workgroup_id[axis] when base workgroup offsets are
+    * lowered). Verify bit-exact orig-vs-alt outputs for im2col, linear_1d, and
+    * pad4d, plus negative guards and zero-base dispatch gating. */
+
+   /* 1. im2col (both 1x1 identity copy and 3x3 padded im2col), wg=32x1x1. */
+   const struct im2col_layout im_layout = {
+      .bw = 0, .bh = 4, .iw = 8, .ih = 12, .kw = 16,
+      .pw = 20, .ph = 24, .sw = 28, .sh = 32, .ch = 40,
+      .push_range = 44,
+   };
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      nir_shader *orig = build_im2col_shader(&im_layout, false);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 1, add_base != 0, 1, 1);
+
+      struct hk_identity_copy4 info = {0};
+      nir_shader *id_alt = hk_nir_copy_identity4(orig, &info);
+      HK_EVAL_CHECK(id_alt != NULL);
+      HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_IM2COL_1X1 &&
+                    info.im2col_vec4_ok && info.local[0] == 32 &&
+                    info.local[1] == 1);
+      nir_shader *vec4_alt = hk_nir_im2col_vec4(orig);
+      HK_EVAL_CHECK(vec4_alt != NULL);
+
+      /* 1a. 1x1 identity copy bit-exactness (orig vs id_alt & vec4_alt). */
+      {
+         const uint32_t pw = 48, ph = 12, elems = pw * ph;
+         uint32_t push[16] = {0};
+         push[im_layout.iw / 4] = pw;
+         push[im_layout.ih / 4] = ph;
+         push[im_layout.kw / 4] = pw;
+         push[im_layout.pw / 4] = pw;
+         push[im_layout.ph / 4] = ph;
+         push[im_layout.sw / 4] = 1;
+         push[im_layout.sh / 4] = 1;
+         push[im_layout.ch / 4] = pw;
+         uint32_t *src = calloc(elems, 4);
+         uint32_t *dst_orig = calloc(elems, 4);
+         uint32_t *dst_id = calloc(elems, 4);
+         uint32_t *dst_v4 = calloc(elems, 4);
+         fill_pattern_u32(src, elems, 100 + add_base);
+         struct hk_eval_ssbo so[2] = { {0, 0, src, elems * 4}, {0, 1, dst_orig, elems * 4} };
+         struct hk_eval_ssbo si[2] = { {0, 0, src, elems * 4}, {0, 1, dst_id, elems * 4} };
+         struct hk_eval_ssbo sv[2] = { {0, 0, src, elems * 4}, {0, 1, dst_v4, elems * 4} };
+         uint32_t go[3] = { DIV_ROUND_UP(pw, 32), ph, 1 };
+         uint32_t gi[3] = { DIV_ROUND_UP(elems / 4, 128 * 4), 1, 1 };
+         uint32_t gv[3] = {
+            DIV_ROUND_UP(pw / 4, vec4_alt->info.workgroup_size[0]),
+            DIV_ROUND_UP(1u, vec4_alt->info.workgroup_size[1]),
+            DIV_ROUND_UP(ph, vec4_alt->info.workgroup_size[2]),
+         };
+         hk_eval_dispatch(orig, go, so, 2, push, im_layout.push_range);
+         hk_eval_dispatch(id_alt, gi, si, 2, push, im_layout.push_range);
+         hk_eval_dispatch(vec4_alt, gv, sv, 2, push, im_layout.push_range);
+         HK_EVAL_CHECK(memcmp(dst_orig, dst_id, elems * 4) == 0);
+         HK_EVAL_CHECK(memcmp(dst_orig, dst_v4, elems * 4) == 0);
+         free(src);
+         free(dst_orig);
+         free(dst_id);
+         free(dst_v4);
+      }
+
+      /* 1b. 3x3 padded im2col bit-exactness (orig vs vec4_alt). */
+      {
+         const int32_t bw = 1, bh = 1, ch = 8, iw = 7 * ch, ih = 5;
+         const int32_t kw = 3 * ch, pw = kw * 3, ph = 7 * 5;
+         uint32_t push[16] = {0};
+         push[im_layout.bw / 4] = bw;
+         push[im_layout.bh / 4] = bh;
+         push[im_layout.iw / 4] = iw;
+         push[im_layout.ih / 4] = ih;
+         push[im_layout.kw / 4] = kw;
+         push[im_layout.pw / 4] = pw;
+         push[im_layout.ph / 4] = ph;
+         push[im_layout.sw / 4] = 1;
+         push[im_layout.sh / 4] = 1;
+         push[im_layout.ch / 4] = ch;
+         const uint32_t src_elems = (uint32_t)(iw * ih);
+         const uint32_t dst_elems = (uint32_t)(pw * ph);
+         uint32_t *src = calloc(src_elems, 4);
+         uint32_t *dst_orig = calloc(dst_elems, 4);
+         uint32_t *dst_v4 = calloc(dst_elems, 4);
+         fill_pattern_u32(src, src_elems, 120 + add_base);
+         struct hk_eval_ssbo so[2] = { {0, 0, src, src_elems * 4}, {0, 1, dst_orig, dst_elems * 4} };
+         struct hk_eval_ssbo sv[2] = { {0, 0, src, src_elems * 4}, {0, 1, dst_v4, dst_elems * 4} };
+         uint32_t go[3] = { DIV_ROUND_UP((uint32_t)pw, 32), (uint32_t)ph, 1 };
+         uint32_t gv[3] = {
+            DIV_ROUND_UP((uint32_t)kw / 4, vec4_alt->info.workgroup_size[0]),
+            DIV_ROUND_UP((uint32_t)(pw / kw), vec4_alt->info.workgroup_size[1]),
+            DIV_ROUND_UP((uint32_t)(ph / (pw / kw)), vec4_alt->info.workgroup_size[2]),
+         };
+         hk_eval_dispatch(orig, go, so, 2, push, im_layout.push_range);
+         hk_eval_dispatch(vec4_alt, gv, sv, 2, push, im_layout.push_range);
+         HK_EVAL_CHECK(memcmp(dst_orig, dst_v4, dst_elems * 4) == 0);
+         free(src);
+         free(dst_orig);
+         free(dst_v4);
+      }
+
+      ralloc_free(vec4_alt);
+      ralloc_free(id_alt);
+
+      /* Negative 1: same load_workgroup_id.y with local_size[1] == 2 rejects. */
+      orig->info.workgroup_size[1] = 2;
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* Negative 2: wrong-axis base (wg.y + base.x) rejects. */
+   {
+      nir_shader *orig = build_im2col_shader(&im_layout, false);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 1, true, 0, 1);
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* Negative 3: base scaled by wrong constant (wg.y + base.y * 2) rejects. */
+   {
+      nir_shader *orig = build_im2col_shader(&im_layout, false);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 1, true, 1, 2);
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* Negative 4: wg.x used as row index with local_size[0] == 32 rejects. */
+   {
+      nir_shader *orig = build_im2col_shader(&im_layout, false);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 0, false, 0, 1);
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* 2. match_linear_1d with unit local_size = 1x1x1 reading wg.x (+ base.x). */
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      nir_shader *orig = build_linear_shader(
+         HK_IDENTITY_COPY4_LINEAR_COPY, glsl_float_type(),
+         ACCESS_NON_WRITEABLE, false, false, 0, 0, 0, 12);
+      orig->info.workgroup_size[0] = 1;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 0, 0, add_base != 0, 0, 1);
+
+      struct hk_identity_copy4 info = {0};
+      nir_shader *alt = hk_nir_copy_identity4(orig, &info);
+      HK_EVAL_CHECK(alt != NULL);
+      HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_LINEAR_COPY &&
+                    info.local[0] == 1);
+
+      const uint32_t count = 524;
+      uint32_t *src = calloc(count, 4);
+      uint32_t *dst_orig = calloc(count, 4);
+      uint32_t *dst_alt = calloc(count, 4);
+      fill_pattern_u32(src, count, 140 + add_base);
+      uint32_t push[3] = { count, 0, 0 };
+      struct hk_eval_ssbo so[2] = { {0, 0, src, count * 4}, {0, 1, dst_orig, count * 4} };
+      struct hk_eval_ssbo sa[2] = { {0, 0, src, count * 4}, {0, 1, dst_alt, count * 4} };
+      uint32_t go[3] = { count, 1, 1 };
+      uint32_t ga[3] = { DIV_ROUND_UP(count / 4, 128 * 4), 1, 1 };
+      hk_eval_dispatch(orig, go, so, 2, push, sizeof(push));
+      hk_eval_dispatch(alt, ga, sa, 2, push, sizeof(push));
+      HK_EVAL_CHECK(memcmp(dst_orig, dst_alt, count * 4) == 0);
+      free(src);
+      free(dst_orig);
+      free(dst_alt);
+      ralloc_free(alt);
+
+      orig->info.workgroup_size[0] = 4;
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* 3. match_pad4d with wg=32x1x1 reading wg.y (+ base.y). */
+   const uint16_t in_off[4] = { 40, 28, 12, 4 };
+   const uint16_t out_off[4] = { 32, 20, 8, 44 };
+   const uint32_t pad_idx[4] = { 0, 2, 4, 6 };
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      nir_shader *orig = build_pad4d_shader(in_off, out_off, pad_idx, 48, true);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 1, add_base != 0, 1, 1);
+
+      struct hk_identity_copy4 info = {0};
+      nir_shader *alt = hk_nir_copy_identity4(orig, &info);
+      HK_EVAL_CHECK(alt != NULL);
+      HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_PAD4 &&
+                    info.local[0] == 32 && info.local[1] == 1);
+
+      const int32_t in_s[4] = { 1, 5, 7, 8 };
+      const int32_t out_s[4] = { 1, 7, 9, 8 };
+      const int32_t pad[4] = { 0, 1, 1, 0 };
+      const uint32_t in_n = (uint32_t)(in_s[0] * in_s[1] * in_s[2] * in_s[3]);
+      const uint32_t out_n = (uint32_t)(out_s[0] * out_s[1] * out_s[2] * out_s[3]);
+      uint32_t *in_buf = calloc(in_n, 4);
+      uint32_t *dst_orig = calloc(out_n, 4);
+      uint32_t *dst_alt = calloc(out_n, 4);
+      fill_pattern_u32(in_buf, in_n, 160 + add_base);
+      int32_t pad_buf[8] = {0};
+      int32_t push[12] = {0};
+      for (unsigned d = 0; d < 4; ++d) {
+         pad_buf[pad_idx[d]] = pad[d];
+         push[in_off[d] / 4] = in_s[d];
+         push[out_off[d] / 4] = out_s[d];
+      }
+      struct hk_eval_ssbo so[3] = {
+         {0, 0, in_buf, in_n * 4}, {0, 1, pad_buf, sizeof(pad_buf)}, {0, 2, dst_orig, out_n * 4},
+      };
+      struct hk_eval_ssbo sa[3] = {
+         {0, 0, in_buf, in_n * 4}, {0, 1, pad_buf, sizeof(pad_buf)}, {0, 2, dst_alt, out_n * 4},
+      };
+      const uint32_t orig_x = (uint32_t)(out_s[2] * out_s[3]);
+      const uint32_t orig_y = (uint32_t)(out_s[0] * out_s[1]);
+      uint32_t go[3] = { DIV_ROUND_UP(orig_x, 32), orig_y, 1 };
+      uint32_t ga[3] = {
+         DIV_ROUND_UP(orig_x / 4, alt->info.workgroup_size[0]),
+         DIV_ROUND_UP(orig_y, alt->info.workgroup_size[1]),
+         1,
+      };
+      hk_eval_dispatch(orig, go, so, 3, push, sizeof(push));
+      hk_eval_dispatch(alt, ga, sa, 3, push, sizeof(push));
+      HK_EVAL_CHECK(memcmp(dst_orig, dst_alt, out_n * 4) == 0);
+      free(in_buf);
+      free(dst_orig);
+      free(dst_alt);
+      ralloc_free(alt);
+
+      orig->info.workgroup_size[1] = 2;
+      struct hk_identity_copy4 bad = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(orig, &bad) == NULL);
+      ralloc_free(orig);
+   }
+
+   /* 4. Dispatch-side nonzero base_group refusal gate (required for bare
+    *    load_workgroup_id[axis] soundness). */
+   const uint32_t zero_base[3] = { 0, 0, 0 };
+   const uint32_t nz_x[3] = { 1, 0, 0 };
+   const uint32_t nz_y[3] = { 0, 1, 0 };
+   const uint32_t nz_z[3] = { 0, 0, 1 };
+   HK_EVAL_CHECK(hk_nir_dispatch_zero_base(zero_base));
+   HK_EVAL_CHECK(!hk_nir_dispatch_zero_base(nz_x));
+   HK_EVAL_CHECK(!hk_nir_dispatch_zero_base(nz_y));
+   HK_EVAL_CHECK(!hk_nir_dispatch_zero_base(nz_z));
+}
+
 int
 main(void)
 {
@@ -1042,6 +1340,7 @@ main(void)
    test_im2col_bit_exact();
    test_borderless_im2col_bit_exact();
    test_permuted_layout_im2col_bit_exact();
+   test_unit_axis_wgid_matchers();
 
    /* Negative: writable source load, extra store, or unsigned guard must reject. */
    {

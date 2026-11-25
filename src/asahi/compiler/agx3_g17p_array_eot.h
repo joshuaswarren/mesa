@@ -1,22 +1,8 @@
 /* SPDX-License-Identifier: MIT */
-/* Native G17P builtin end-of-tile texts for 2D-ARRAY (layered) attachments,
- * two through eight targets in one imageblock partition. Captured offline
- * with Apple Metal Toolchain 27.1.5194.15 for applegpu_g17p, using the
- * recorded BTNF builtin schema with the attachment dimension byte set to 3
- * (2D array) instead of 2 (2D). The same pipeline reproduces the non-array
- * texts of agx3_g17p_quad_eot.h byte for byte, and the native two- to
- * four-target raw32/rgba8 array texts.
- *
- * Each target contributes one 12-byte IMGWBLK whose byte 8 is 0x28 (the
- * array form; the 2D form is 0xa8) and whose byte 9 is the per-format
- * lane-class selector. The texts below carry selector 0x35; a differential
- * capture against the format-3 (U8NORM) build shows byte 9 is the only
- * format-dependent byte at every count. A 2D-MULTISAMPLE-ARRAY attachment
- * (BTNF dimension 8) differs from the array text in exactly those selector
- * bytes, whose low nibble becomes 0 -- the same rule the one-target layered
- * program already applies in agx3_pack_binary.c. No other byte changes, and
- * in particular the array texts need none of the PACK_IMGWIR wire-width
- * change that the non-array 2D->2D-multisample transition requires. */
+/* Native G17P end-of-tile binaries for 2..8 layered (2D-array) targets in one
+ * imageblock partition. Each target is a 12-byte IMGWBLK with byte 8 = 0x28
+ * (array form) and byte 9 = per-format lane-class selector (0x35 placeholder;
+ * 2D-multisample-array clears byte 9's low nibble with no wire-width change). */
 #ifndef AGX3_G17P_ARRAY_EOT_H
 #define AGX3_G17P_ARRAY_EOT_H
 #include <stdint.h>

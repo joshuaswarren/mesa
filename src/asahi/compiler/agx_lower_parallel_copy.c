@@ -116,20 +116,27 @@ do_swap(agx_builder *b, const struct agx_copy *copy)
    }
 }
 
+#define PCOPY_STACK_REGS    AGX_NUM_REGS
+#define PCOPY_STACK_ENTRIES 128
+
 struct copy_ctx {
-   /* Number of copies being processed */
+   /* Number of copies being processed and allocated capacity */
    unsigned entry_count;
+   unsigned entry_cap;
+
+   /* Number of modeled registers tracked in the tables below */
+   unsigned reg_count;
 
    /* For each physreg, the number of pending copy entries that use it as a
     * source. Once this drops to zero, then the physreg is unblocked and can
     * be moved to.
     */
-   unsigned physreg_use_count[AGX_NUM_MODELED_REGS];
+   unsigned *physreg_use_count;
 
    /* For each physreg, the pending copy_entry that uses it as a dest. */
-   struct agx_copy *physreg_dest[AGX_NUM_MODELED_REGS];
+   struct agx_copy **physreg_dest;
 
-   struct agx_copy entries[AGX_NUM_MODELED_REGS];
+   struct agx_copy *entries;
 };
 
 static bool
@@ -157,6 +164,8 @@ split_32bit_copy(struct copy_ctx *ctx, struct agx_copy *entry)
    assert(!entry->done);
    assert(is_real(entry));
    assert(agx_size_align_16(entry->src.size) == 2);
+   assert(ctx->entry_count < ctx->entry_cap);
+   assert(entry->dest + 1 < ctx->reg_count);
    struct agx_copy *new_entry = &ctx->entries[ctx->entry_count++];
 
    new_entry->dest = entry->dest + 1;
@@ -174,24 +183,98 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
                                    unsigned num_copies, bool cls,
                                    agx_index temp)
 {
-   /* First, lower away 64-bit copies to smaller chunks, since we don't have
-    * 64-bit ALU so we always want to split.
+   /* A GPR temporary lets a cycle be broken with one extra move: save the
+    * value a blocked copy is about to overwrite, retarget the copies that read
+    * it, and the cycle becomes a path for step 1.  Only GPR copies use it;
+    * memory copies keep the swap path. */
+   const bool use_temp = !cls && !agx_is_null(temp) &&
+                         temp.type == AGX_INDEX_REGISTER && !temp.memory;
+
+   /* Count matching entries (splitting 64-bit copies into two 32-bit chunks)
+    * and find the tight register bound so GPR copies stay on a small stack
+    * scratch buffer and high-slot memory copies only size to the slots used.
     */
-   struct agx_copy *copies2 = calloc(sizeof(copies[0]), num_copies * 2);
-   unsigned num_copies2 = 0;
+   unsigned num_entries = 0;
+   unsigned reg_count = 0;
 
    for (unsigned i = 0; i < num_copies; ++i) {
-      struct agx_copy copy = copies[i];
+      const struct agx_copy *copy = &copies[i];
+      if (copy->dest_mem != cls)
+         continue;
 
-      /* Filter by class */
+      const unsigned width = agx_size_align_16(copy->src.size);
+      assert(copy->dest + width <= AGX_NUM_MODELED_REGS);
+      num_entries += (copy->src.size == AGX_SIZE_64) ? 2 : 1;
+      reg_count = MAX2(reg_count, copy->dest + width);
+
+      if (copy->src.type == AGX_INDEX_REGISTER &&
+          copy->dest_mem == copy->src.memory) {
+         assert(copy->src.value + width <= AGX_NUM_MODELED_REGS);
+         reg_count = MAX2(reg_count, copy->src.value + width);
+      }
+   }
+
+   if (num_entries == 0)
+      return;
+
+   if (use_temp)
+      reg_count = MAX2(reg_count, MIN2(temp.value + 3, (unsigned)AGX_NUM_REGS));
+
+   /* Each 32-bit entry can split at most once into two 16-bit entries. */
+   const unsigned entry_cap = num_entries * 2;
+
+   unsigned stack_use_count[PCOPY_STACK_REGS];
+   struct agx_copy *stack_dest[PCOPY_STACK_REGS];
+   struct agx_copy stack_entries[PCOPY_STACK_ENTRIES];
+   void *heap_buf = NULL;
+
+   struct copy_ctx ctx_storage = {
+      .entry_count = num_entries,
+      .entry_cap = entry_cap,
+      .reg_count = reg_count,
+   };
+   struct copy_ctx *ctx = &ctx_storage;
+
+   if (reg_count <= PCOPY_STACK_REGS && entry_cap <= PCOPY_STACK_ENTRIES) {
+      memset(stack_use_count, 0, reg_count * sizeof(stack_use_count[0]));
+      memset(stack_dest, 0, reg_count * sizeof(stack_dest[0]));
+      ctx->physreg_use_count = stack_use_count;
+      ctx->physreg_dest = stack_dest;
+      ctx->entries = stack_entries;
+   } else {
+      const size_t dest_bytes = reg_count * sizeof(ctx->physreg_dest[0]);
+      const size_t entries_bytes = entry_cap * sizeof(ctx->entries[0]);
+      const size_t use_bytes = reg_count * sizeof(ctx->physreg_use_count[0]);
+      static_assert(_Alignof(struct agx_copy) <= _Alignof(struct agx_copy *),
+                    "entries naturally aligned after pointer table");
+      static_assert(_Alignof(unsigned) <= _Alignof(struct agx_copy),
+                    "use_count naturally aligned after entries");
+
+      heap_buf = calloc(1, dest_bytes + entries_bytes + use_bytes);
+      if (heap_buf == NULL)
+         UNREACHABLE("failed to allocate parallel-copy context");
+
+      uint8_t *p = heap_buf;
+      ctx->physreg_dest = (struct agx_copy **)p;
+      p += dest_bytes;
+      ctx->entries = (struct agx_copy *)p;
+      p += entries_bytes;
+      ctx->physreg_use_count = (unsigned *)p;
+   }
+
+   /* Lower away 64-bit copies to 32-bit chunks directly into ctx->entries,
+    * since we don't have 64-bit ALU so we always want to split.
+    */
+   unsigned out_idx = 0;
+   for (unsigned i = 0; i < num_copies; ++i) {
+      struct agx_copy copy = copies[i];
       if (copy.dest_mem != cls)
          continue;
 
-      assert(copy.dest < AGX_NUM_MODELED_REGS);
-
+      copy.done = false;
       if (copy.src.size == AGX_SIZE_64) {
          copy.src.size = AGX_SIZE_32;
-         copies2[num_copies2++] = copy;
+         ctx->entries[out_idx++] = copy;
 
          if (copy.src.type == AGX_INDEX_IMMEDIATE) {
             static_assert(sizeof(copy.src.value) * 8 == 32, "known size");
@@ -204,38 +287,15 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
          }
 
          copy.dest += 2;
-         copies2[num_copies2++] = copy;
+         ctx->entries[out_idx++] = copy;
       } else {
-         copies2[num_copies2++] = copy;
+         ctx->entries[out_idx++] = copy;
       }
    }
-
-   if (num_copies2 == 0) {
-      free(copies2);
-      return;
-   }
-
-   copies = copies2;
-   num_copies = num_copies2;
-
-   /* Set up the bookkeeping.  copy_ctx carries three AGX_NUM_MODELED_REGS
-    * (2048) entry arrays -- roughly 72 KiB -- and this runs on whatever
-    * thread the application called into the driver on.  A 1 MiB thread
-    * stack does not have that to spare underneath the rest of the compiler,
-    * so keep it on the heap.
-    */
-   struct copy_ctx *ctx = calloc(1, sizeof(*ctx));
-   if (ctx == NULL) {
-      free(copies2);
-      UNREACHABLE("failed to allocate parallel-copy context");
-   }
-
-   ctx->entry_count = num_copies;
+   assert(out_idx == ctx->entry_count);
 
    for (unsigned i = 0; i < ctx->entry_count; i++) {
-      struct agx_copy *entry = &copies[i];
-
-      ctx->entries[i] = *entry;
+      struct agx_copy *entry = &ctx->entries[i];
 
       for (unsigned j = 0; j < agx_size_align_16(entry->src.size); j++) {
          if (is_real(entry))
@@ -243,7 +303,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
 
          /* Copies should not have overlapping destinations. */
          assert(!ctx->physreg_dest[entry->dest + j]);
-         ctx->physreg_dest[entry->dest + j] = &ctx->entries[i];
+         ctx->physreg_dest[entry->dest + j] = entry;
       }
    }
 
@@ -261,7 +321,8 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
          continue;
 
       unsigned next_dest = entry->dest + 1;
-      assert(next_dest < ARRAY_SIZE(ctx->physreg_dest) && "aligned reg");
+      if (next_dest >= ctx->reg_count)
+         continue;
 
       struct agx_copy *next_copy = ctx->physreg_dest[next_dest];
       if (!next_copy)
@@ -281,13 +342,6 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       entry->src.size = AGX_SIZE_32;
       next_copy->done = true;
    }
-
-   /* A GPR temporary lets a cycle be broken with one extra move: save the
-    * value a blocked copy is about to overwrite, retarget the copies that read
-    * it, and the cycle becomes a path for step 1.  Only GPR copies use it;
-    * memory copies keep the swap path. */
-   const bool use_temp = !cls && !agx_is_null(temp) &&
-                         temp.type == AGX_INDEX_REGISTER && !temp.memory;
 
    bool progress = true;
    while (progress) {
@@ -499,8 +553,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       entry->done = true;
    }
 
-   free(ctx);
-   free(copies2);
+   free(heap_buf);
 }
 
 void

@@ -28,11 +28,9 @@ static inline uint64_t wmask(unsigned width) {
    return width >= 64 ? ~0ull : (1ull << width) - 1;
 }
 
-/* A predicate that is not "field == small value". */
-static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
-                         const agx3_pred *p)
+static inline bool pred_holds(const agx3_table *t, const agx3_pred *p,
+                              uint64_t v)
 {
-   uint64_t v = fields[p->field];
    switch (p->kind) {
    case 0: return v == p->a;
    case 1: {
@@ -44,6 +42,18 @@ static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
    case 3: return ((v >> p->shift) & wmask(p->width)) == p->a;
    default: return false;
    }
+}
+
+bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v)
+{
+   return pred_holds(t, p, v);
+}
+
+/* A predicate that is not "field == small value". */
+static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
+                         const agx3_pred *p)
+{
+   return pred_holds(t, p, fields[p->field]);
 }
 
 /* Inline, and on the table and the fields rather than the ctx, so that the
@@ -62,7 +72,7 @@ static inline bool preds_test(const agx3_table *t, const uint64_t *fields,
    return true;
 }
 
-static bool deposit(ctx *c, uint8_t word, uint16_t mask, uint16_t value)
+static inline bool deposit(ctx *c, uint8_t word, uint16_t mask, uint16_t value)
 {
    if (c->written[word] & mask & (c->words[word] ^ value)) return false;
    c->words[word] = (uint16_t)((c->words[word] & ~mask) | (value & mask));
@@ -137,13 +147,23 @@ static bool apply_group(ctx *c, const agx3_group *g)
 
    for (;; alt++) {
       /* Most alternatives fail their predicates without modifying state.
-       * Only snapshot the encoder once an alternative can actually apply. */
+       * Only snapshot the active encoder state once an alternative can apply. */
       alt = find_alt(t, fields, alt, end);
       if (alt == end) return false;
-      ctx saved = *c;
+      const size_t nbytes = c->nwords * sizeof(c->words[0]);
+      uint16_t saved_words[AGX3_MAX_WORDS], saved_written[AGX3_MAX_WORDS];
+      uint64_t saved_wide[3] = {c->wide[0], c->wide[1], c->wide[2]};
+      const uint8_t saved_path_n = c->path_n;
+      memcpy(saved_words, c->words, nbytes);
+      memcpy(saved_written, c->written, nbytes);
       if (apply_node(c, alt))
          return true;
-      *c = saved;
+      memcpy(c->words, saved_words, nbytes);
+      memcpy(c->written, saved_written, nbytes);
+      c->wide[0] = saved_wide[0];
+      c->wide[1] = saved_wide[1];
+      c->wide[2] = saved_wide[2];
+      c->path_n = saved_path_n;
    }
 }
 
@@ -187,30 +207,55 @@ bool agx3_compose_known(const agx3_table *t, uint32_t form,
    const agx3_form *f = &t->forms[form];
    if (f->size % 2 || f->size / 2 > AGX3_MAX_WORDS) return false;
 
+   const agx3_node *root = &t->nodes[f->node];
+   if (!preds_test(t, fields, root)) return false;
+
    /* Composition is used by parallel shader compilers.  Keep all mutable
     * traversal state on this invocation; the generated tables are immutable. */
    const agx3_node *path[AGX3_MAX_PATH];
-   ctx c = {0};
+   const uint8_t nwords = f->size / 2;
+   ctx c;
    ctx *cp = &c;
    cp->t = t;
    cp->fields = fields;
-   cp->nwords = f->size / 2;
+   memset(cp->words, 0, nwords * sizeof(cp->words[0]));
+   memset(cp->written, 0, nwords * sizeof(cp->written[0]));
+   cp->nwords = nwords;
+   cp->path_n = 0;
    cp->path = path;
+   cp->wide[0] = 0;
+   cp->wide[1] = 0;
+   cp->wide[2] = 0;
 
-   const agx3_node *root = &t->nodes[f->node];
-   if (!preds_test(t, fields, root)) return false;
    if (!apply_node(cp, root)) return false;
 
    /* strict: every nonzero field must have been consumed, and a directly
     * deposited value must fit its slices unless a predicate or a LUT of an
     * applied node covers the field. */
-   uint64_t use[6] = {0};
-   for (unsigned i = 0; i < cp->path_n; i++) {
-      for (unsigned w = 0; w < 6; w++)
-         use[w] |= t->uses[path[i]->use_off + w];
-   }
-   for (unsigned w = 0; w < 3; w++) {
-      if ((nonzero[w] & ~use[w]) | (cp->wide[w] & ~use[3 + w])) return false;
+   uint64_t u0 = 0, u1 = 0, u2 = 0;
+   if ((cp->wide[0] | cp->wide[1] | cp->wide[2]) == 0) {
+      for (unsigned i = 0; i < cp->path_n; i++) {
+         const uint64_t *u = &t->uses[path[i]->use_off];
+         u0 |= u[0];
+         u1 |= u[1];
+         u2 |= u[2];
+      }
+      if ((nonzero[0] & ~u0) | (nonzero[1] & ~u1) | (nonzero[2] & ~u2))
+         return false;
+   } else {
+      uint64_t u3 = 0, u4 = 0, u5 = 0;
+      for (unsigned i = 0; i < cp->path_n; i++) {
+         const uint64_t *u = &t->uses[path[i]->use_off];
+         u0 |= u[0];
+         u1 |= u[1];
+         u2 |= u[2];
+         u3 |= u[3];
+         u4 |= u[4];
+         u5 |= u[5];
+      }
+      if ((nonzero[0] & ~u0) | (nonzero[1] & ~u1) | (nonzero[2] & ~u2) |
+          (cp->wide[0] & ~u3) | (cp->wide[1] & ~u4) | (cp->wide[2] & ~u5))
+         return false;
    }
 
    for (unsigned w = 0; w < cp->nwords; w++) {

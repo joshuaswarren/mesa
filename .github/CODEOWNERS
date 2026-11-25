@@ -1,0 +1,35 @@
+# Code owners for aurora-silicon/mesa.
+#
+# Every PR is reviewed by Core or Omarchy Mac; an approval from either team
+# counts everywhere. The '# area:' sections only route: they add the area's
+# specialists to the review request and give the readiness bot its area:
+# labels (https://github.com/aurora-silicon/agent-guidelines/blob/main/docs/MAINTAINER-HANDBOOK.md).
+# Later lines win, as in every CODEOWNERS file, so keep the team pair on
+# every line.
+
+*                                   @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: compiler
+/src/asahi/compiler/                @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/src/asahi/isa/                     @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/src/asahi/clc/                     @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/src/asahi/libagx/                  @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+
+# area: borealis
+/src/asahi/vulkan/                  @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+
+# area: gallium
+/src/gallium/drivers/asahi/         @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+
+# area: asahi-common
+/src/asahi/lib/                     @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/src/asahi/layout/                  @aurora-silicon/core @aurora-silicon/omarchy-m
+/src/asahi/genxml/                  @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/src/asahi/drm-shim/                @aurora-silicon/core @aurora-silicon/omarchy-m
+/src/asahi/tools/                   @aurora-silicon/core @aurora-silicon/omarchy-m
+/src/asahi/ci/                      @aurora-silicon/core @aurora-silicon/omarchy-m
+/include/drm-uapi/asahi_drm.h       @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+
+# area: ci
+/.github/                           @RyanTheTide @DjDeveloperr
+# end-area

@@ -2327,11 +2327,15 @@ nir_function_impl_lower_instructions(nir_function_impl *impl,
    nir_metadata preserved = nir_metadata_control_flow;
 
    bool progress = false;
-   nir_cursor iter = nir_before_impl(impl);
-   nir_instr *instr;
-   while ((instr = cursor_next_instr(iter)) != NULL) {
+   nir_instr *instr = cursor_next_instr(nir_before_impl(impl));
+   while (instr != NULL) {
       if (filter && !filter(instr, cb_data)) {
-         iter = nir_after_instr(instr);
+         nir_instr *next = nir_instr_next(instr);
+         if (likely(next != NULL)) {
+            instr = next;
+         } else {
+            instr = cursor_next_instr(nir_after_block(instr->block));
+         }
          continue;
       }
 
@@ -2356,6 +2360,7 @@ nir_function_impl_lower_instructions(nir_function_impl *impl,
 
       b.cursor = nir_after_instr(instr);
       nir_def *new_def = lower(&b, instr, cb_data);
+      nir_cursor iter;
       if (new_def && new_def != NIR_LOWER_INSTR_PROGRESS &&
           new_def != NIR_LOWER_INSTR_PROGRESS_REPLACE) {
          assert(old_def != NULL);
@@ -2371,6 +2376,7 @@ nir_function_impl_lower_instructions(nir_function_impl *impl,
             iter = nir_after_instr(instr);
          }
          progress = true;
+         instr = cursor_next_instr(iter);
       } else {
          /* We didn't end up lowering after all.  Put the uses back */
          if (old_def)
@@ -2381,11 +2387,15 @@ nir_function_impl_lower_instructions(nir_function_impl *impl,
             assert(!old_def);
             iter = nir_instr_free_and_dce(instr);
             progress = true;
-         } else
-            iter = nir_after_instr(instr);
-
-         if (new_def == NIR_LOWER_INSTR_PROGRESS)
-            progress = true;
+            instr = cursor_next_instr(iter);
+         } else {
+            if (new_def == NIR_LOWER_INSTR_PROGRESS)
+               progress = true;
+            nir_instr *next = nir_instr_next(instr);
+            instr = likely(next != NULL)
+                       ? next
+                       : cursor_next_instr(nir_after_block(instr->block));
+         }
       }
    }
 
@@ -3272,22 +3282,6 @@ nir_op_vec(unsigned num_components)
    /* clang-format on */
 }
 
-bool
-nir_op_is_vec(nir_op op)
-{
-   switch (op) {
-   case nir_op_vec2:
-   case nir_op_vec3:
-   case nir_op_vec4:
-   case nir_op_vec5:
-   case nir_op_vec8:
-   case nir_op_vec16:
-      return true;
-   default:
-      return false;
-   }
-}
-
 nir_component_mask_t
 nir_alu_instr_src_read_mask(const nir_alu_instr *instr, unsigned src)
 {
@@ -3299,15 +3293,6 @@ nir_alu_instr_src_read_mask(const nir_alu_instr *instr, unsigned src)
       read_mask |= (1 << instr->src[src].swizzle[c]);
    }
    return read_mask;
-}
-
-unsigned
-nir_ssa_alu_instr_src_components(const nir_alu_instr *instr, unsigned src)
-{
-   if (nir_op_infos[instr->op].input_sizes[src] > 0)
-      return nir_op_infos[instr->op].input_sizes[src];
-
-   return instr->def.num_components;
 }
 
 #define CASE_ALL_SIZES(op) \

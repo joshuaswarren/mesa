@@ -257,6 +257,11 @@ op("fmul", encoding = (0x1A, 4, 6), srcs = 2, is_float = True)
 op("hadd", encoding = (0x26, 4, 6), srcs = 2, is_float = True)
 op("hfma", encoding = (0x36, 6, 8), srcs = 3, is_float = True)
 op("hmul", encoding = (0x16, 4, 6), srcs = 2, is_float = True)
+# Apple G13/G14 hardware matrix multiply-accumulate: D = A*B + C over an 8x8x8
+# tile, SIMD-group-wide. opcode 0x6F, bit27 fixed, bit26 = precision (1 = fp32,
+# 0 = fp16). Paired-register operands; bit63 is applied in agx_pack.c.
+op("simd_matrix_fmadd32", encoding = (0x6F | (0x1 << 26) | (0x1 << 27), 8, _), srcs = 3, is_float = False, can_reorder = False)
+op("simd_matrix_fmadd16", encoding = (0x6F | (0x1 << 27), 8, _), srcs = 3, is_float = False, can_reorder = False)
 op("matmad8_agx3", None, srcs = 3, imms = [MATRIX_TYPE], can_reorder = False)
 op("matmad16_agx3", None, srcs = 3, imms = [MATRIX_TYPE], can_reorder = False)
 # Apple's AGX3 backend calls the same semantic operation `ldimm`.  This is the
@@ -622,10 +627,13 @@ memory_barrier("device_barrier_1", 3, 1, 9)
 memory_barrier("device_barrier_2", 3, 2, 9)
 
 op("doorbell", (0x60020 | 0x28 << 32, 6, _), dests = 0,
-      can_eliminate = False, can_reorder = False, imms = [IMM])
+      can_eliminate = False, can_reorder = False, imms = [IMM],
+      schedule_class = "barrier")
 
-op("stack_unmap", (0x00075, 8, _), dests = 1, srcs = 0, can_eliminate = False, can_reorder = False, imms = [IMM])
-op("stack_map",   (0x10075, 8, _), dests = 0, srcs = 1, can_eliminate = False, can_reorder = False, imms = [IMM])
+op("stack_unmap", (0x00075, 8, _), dests = 1, srcs = 0, can_eliminate = False,
+      can_reorder = False, imms = [IMM], schedule_class = "barrier")
+op("stack_map",   (0x10075, 8, _), dests = 0, srcs = 1, can_eliminate = False,
+      can_reorder = False, imms = [IMM], schedule_class = "barrier")
 
 op("stack_adjust", encoding = (0x10100b5, 8, _),
       dests = 0, srcs = 0, can_eliminate = False, can_reorder = False,
