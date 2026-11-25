@@ -31,7 +31,7 @@
  * which leaves the other layers without any geometry.
  *
  *   vulkan-msaa-mrt [formats=rgba8,r11g11b10f,none] [attachments=3] [samples=4]
- *                   [pass2=load|clear] [write=clear|layer0|draw|a2c|none] [layers=1]
+ *                   [pass2=load|clear] [write=clear|layer0|draw|a2c|none] [layers=1] [discard-mask=0]
  *   formats: one name repeated `attachments` times, or a comma-separated list
  *   with one name per attachment ("none" = VK_NULL_HANDLE view):
  *   rgba16f rgba8 rg16f r32f rg32f rgba32f rgb10a2 bgr10a2 r11g11b10f r8 rg8
@@ -257,6 +257,7 @@ main(int argc, char **argv)
    const bool none = !strcmp(write, "none");
    const bool layer0 = !strcmp(write, "layer0");
    layers = argc > 6 ? atoi(argv[6]) : 1;
+   unsigned discard_mask = argc > 7 ? strtoul(argv[7], NULL, 0) : 0;
    /* The draw writes layer 0 only. */
    if ((!draw && !none && !layer0 && strcmp(write, "clear")) || !layers ||
        (draw && layers > 1))
@@ -280,7 +281,7 @@ main(int argc, char **argv)
    if (!listed || !count || count > MAX_ATT) {
    usage:
       fprintf(stderr, "usage: %s [format[,format...]] [attachments<=8] [samples] [load|clear] "
-                      "[clear|layer0|draw|a2c|none] [layers (not draw|a2c)]\n",
+                      "[clear|layer0|draw|a2c|none] [layers (not draw|a2c)] [discard-mask]\n",
               argv[0]);
       return 2;
    }
@@ -401,6 +402,8 @@ main(int argc, char **argv)
          };
          /* A single-sample pass has nothing to resolve: read it back. */
          if (pass && fmt[i] && samples > 1) {
+            if (discard_mask & (1u << i))
+               att[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
             att[i].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
             att[i].resolveImageView = res_view[i];
             att[i].resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;

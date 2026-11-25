@@ -58,6 +58,8 @@ enum agx_bg_eot_op {
 struct agx_bg_eot_key {
    struct agx_tilebuffer_layout tib;
    enum agx_bg_eot_op op[8];
+   /* AGX2 targets resolved through a single-sample PBE at end of tile. */
+   uint8_t resolve_mask;
    unsigned reserved_preamble;
    /* Replicate a single-sample WSI colour into every multisample tile lane. */
    bool single_sample_reload;

@@ -795,6 +795,7 @@ struct hk_rendering_state {
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
+   uint8_t agx2_resolve_mask;
 
    /* Exact admission result for the current physical tilebuffer layout.
     * The layout is immutable after BeginRendering except for the one

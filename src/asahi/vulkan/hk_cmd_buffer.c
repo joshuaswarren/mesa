@@ -5920,11 +5920,14 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     */
    const bool native_eot = agx_chip_agx3_path(dev->dev.chip);
    const bool output_only_through_eot =
-      native_eot && render->g17p_direct_color_resolve;
+      (native_eot && render->g17p_direct_color_resolve) ||
+      render->agx2_resolve_mask;
 
-   /* A timestamp rides on this exact command; replacing the render with
-    * image clears would drop it. Keep the render. */
-   if (cs->timestamp.start.handle || cs->timestamp.end.handle)
+   /* A timestamp belongs to this render. A direct AGX2 resolve also needs
+    * the neutral raster state below when there are no draws.
+    */
+   if ((cs->timestamp.start.handle || cs->timestamp.end.handle) &&
+       !(render->agx2_resolve_mask && cs->cr.process_empty_tiles))
       return false;
 
    /* HAL300: a multisample clear-only pass stays a render. As compute it is a
@@ -5932,11 +5935,11 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * render that writes only its attachments it is not. */
    const bool m5_ms_clear = agx_chip_hal300_path(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
-   if (native_eot &&
-       (continuation ||
-        (cs->cr.process_empty_tiles &&
-         (output_only_through_eot || m5_ms_clear ||
-          !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
+   if ((cs->cr.process_empty_tiles && output_only_through_eot) ||
+       (native_eot &&
+        (continuation || (cs->cr.process_empty_tiles &&
+                          (m5_ms_clear ||
+                           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4)))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
        * has_sample_locations uncommitted, just like other meta operations.
