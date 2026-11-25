@@ -5546,6 +5546,60 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                                &dst_tile_config));
          assert(addressed);
 
+         const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+         const uint64_t linear_slice_B =
+            (src_level < src_layout->levels && dst_level < dst_layout->levels &&
+             src_level + 1 < ARRAY_SIZE(src_layout->level_offsets_B) &&
+             dst_level + 1 < ARRAY_SIZE(dst_layout->level_offsets_B))
+               ? hk_g17p_linear_tiled_slice_bytes(
+                    &(struct hk_g17p_linear_tiled_slice_copy){
+                       .src_tiled = src_tiled,
+                       .dst_tiled = dst_tiled,
+                       .src_compressed = src_layout->compressed,
+                       .dst_compressed = dst_layout->compressed,
+                       .src_sparse =
+                          (src->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .dst_sparse =
+                          (dst->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .src_type = src->vk.image_type,
+                       .dst_type = dst->vk.image_type,
+                       .src_samples = src->vk.samples,
+                       .dst_samples = dst->vk.samples,
+                       .src_w_el = DIV_ROUND_UP(
+                          u_minify(src_layout->width_px, src_level),
+                          util_format_get_blockwidth(src_layout->format)),
+                       .src_h_el = DIV_ROUND_UP(
+                          u_minify(src_layout->height_px, src_level),
+                          util_format_get_blockheight(src_layout->format)),
+                       .dst_w_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->width_px, dst_level),
+                          util_format_get_blockwidth(dst_layout->format)),
+                       .dst_h_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->height_px, dst_level),
+                          util_format_get_blockheight(dst_layout->format)),
+                       .src_tile_w_el = src_tile.width_el,
+                       .src_tile_h_el = src_tile.height_el,
+                       .dst_tile_w_el = dst_tile.width_el,
+                       .dst_tile_h_el = dst_tile.height_el,
+                       .src_tiles_per_row = src_tile_config.tiles_per_row,
+                       .dst_tiles_per_row = dst_tile_config.tiles_per_row,
+                       .raw_block_size_B = raw_block_size_B,
+                       .src_level = src_level,
+                       .src_levels = src_layout->levels,
+                       .dst_level = dst_level,
+                       .dst_levels = dst_layout->levels,
+                       .src_level_size_B =
+                          ail_get_level_size_B(src_layout, src_level),
+                       .dst_level_size_B =
+                          ail_get_level_size_B(dst_layout, dst_level),
+                       .max_groups_x =
+                          dev->vk.physical->properties.maxComputeWorkGroupCount[0],
+                       .plan = plan,
+                    })
+               : 0;
+
          for (uint32_t slice = 0; slice < src_slices; ++slice) {
             VkImageCopy2 one;
             const bool sliced = hk_g17p_image_copy_slice(
@@ -5560,11 +5614,25 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                dst->vk.image_type == VK_IMAGE_TYPE_3D
                   ? one.dstOffset.z
                   : one.dstSubresource.baseArrayLayer;
+            const uint64_t dst_off =
+               ail_get_layer_level_B(dst_layout, dst_slice, dst_level);
+            const uint64_t src_off =
+               ail_get_layer_level_B(src_layout, src_slice, src_level);
+            const uint64_t dst_addr = hk_image_base_address(dst, dst_plane) + dst_off;
+            const uint64_t src_addr = hk_image_base_address(src, src_plane) + src_off;
+            if (linear_slice_B &&
+                hk_g17p_linear_tiled_slice_addrs_valid(
+                   dst_addr, dst_off, dst_layout->size_B, src_addr, src_off,
+                   src_layout->size_B, linear_slice_B)) {
+               libagx_copy_uint4(cmd, agx_1d((uint32_t)(linear_slice_B >> 4)),
+                                 AGX_BARRIER_NONE, dst_addr, src_addr);
+               if (vk_command_buffer_has_error(&cmd->vk))
+                  return;
+               continue;
+            }
             const struct libagx_copy_image_args args = {
-               .dest = hk_image_base_address(dst, dst_plane) +
-                       ail_get_layer_level_B(dst_layout, dst_slice, dst_level),
-               .src = hk_image_base_address(src, src_plane) +
-                      ail_get_layer_level_B(src_layout, src_slice, src_level),
+               .dest = dst_addr,
+               .src = src_addr,
                .width_el = plan.width_el,
                .height_el = plan.height_el,
                .dest_x_el = plan.dst_x_el,
