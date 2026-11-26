@@ -865,16 +865,21 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    perf_debug(cmd, "Reset query pool");
 
    /* The reset runs after every earlier use of the pool and before every
-    * later one: it is a transfer operation (Vulkan 1.3, 17.1) whose result
-    * every later query command on the queue observes without further
-    * synchronization. Zeroing is compute on every generation, so the
-    * ordering is one compute stream everything after waits on. */
+    * later one (Vulkan 1.4, 17.2): its result every later query command on
+    * the queue observes without further synchronization. Zeroing is compute
+    * on every generation.
+    *
+    * Only timestamp writes and query commands use timestamp queries, and both
+    * order themselves after the reset (hk_query_reset_cs()), so nothing else
+    * waits for it. The other query types are written by draws and dispatches
+    * as well: everything after their reset waits on it. */
    if (!queryCount)
       return;
 
-   cmd->sync.kind_override = HK_SYNC_ALL;
+   const bool stamps = pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
+   cmd->sync.kind_override = stamps ? HK_SYNC_QRESET : HK_SYNC_ALL;
    cmd->state.query_reset_recording = true;
-   struct hk_cs *cs = hk_query_command_cs(cmd);
+   struct hk_cs *cs = stamps ? hk_query_reset_cs(cmd) : hk_query_command_cs(cmd);
    if (cs) {
       cmd->sync.has_gpu_query_reset = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
@@ -884,8 +889,11 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    if (!cs)
       return;
 
-   hk_sync_after_stream(cmd, cmd->current_cs.cs ? cmd->current_cs.cs : cs,
-                        HK_SYNC_ALL);
+   struct hk_cs *last = cmd->current_cs.cs ? cmd->current_cs.cs : cs;
+   if (stamps)
+      hk_sync_query_reset_done(cmd, last);
+   else
+      hk_sync_after_stream(cmd, last, HK_SYNC_ALL);
 }
 
 VKAPI_ATTR void VKAPI_CALL

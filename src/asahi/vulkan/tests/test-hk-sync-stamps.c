@@ -934,6 +934,86 @@ test_pass_merge_end_stamp(void)
    }
 }
 
+/* vkCmdResetQueryPool on a timestamp pool, as hk_CmdResetQueryPool()
+ * records it: one reset launch in the stream hk_query_reset_cs() returns. */
+static struct hk_cs *
+reset_stamps(struct hk_cmd_buffer *cmd)
+{
+   cmd->sync.kind_override = HK_SYNC_QRESET;
+   struct hk_cs *cs = hk_query_reset_cs(cmd);
+   cs->stats.cmds++;
+   cmd->sync.kind_override = 0;
+   hk_sync_query_reset_done(cmd, cs);
+   return cs;
+}
+
+/* The barrier field a render's vertex half was given. */
+static uint16_t
+vertex_barrier(const struct hk_cs *r, unsigned sq)
+{
+   return r->sync.ta_split ? r->sync.barrier_ta[sq] : r->sync.barrier[sq];
+}
+
+/* A timestamp query reset is ordered against the timestamps and query
+ * commands that use its queries, not against application work or other
+ * timestamp resets. */
+static void
+test_timestamp_resets_order_query_work_only(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         /* Within one command buffer. */
+         struct hk_cmd_buffer *cmd = new_cmd(chips[c], exact);
+         struct hk_cs *d0 = dispatch(cmd);
+         struct hk_cs *z0 = reset_stamps(cmd);
+         T("reset waits for earlier work",
+           z0 == d0 || z0->sync.dep[HK_SYNC_CDM].cut == d0);
+         T("reset is a reset stream",
+           (z0->sync.kind & HK_SYNC_QRESET) &&
+           cmd->sync.last[util_logbase2(HK_SYNC_QRESET)][HK_SYNC_CDM] == z0);
+         hk_cmd_buffer_end_compute(cmd);
+         struct hk_cs *z1 = reset_stamps(cmd);
+         T("second reset does not wait for the first",
+           z1 != z0 && (!z1->sync.dep[HK_SYNC_CDM].cut ||
+                        z1->sync.dep[HK_SYNC_CDM].cut == d0));
+         hk_cmd_buffer_end_compute(cmd);
+         struct hk_cs *r = begin_render(cmd);
+         T("render does not wait for the resets",
+           !r->sync.dep[HK_SYNC_CDM].cut && !r->sync.dep_ta[HK_SYNC_CDM].cut);
+         stamp(cmd, VK_PIPELINE_STAGE_2_NONE, 0);
+         T("top-of-pipe stamp in the pass waits for the resets",
+           r->sync.dep[HK_SYNC_CDM].cut == z1);
+         end_render(cmd);
+         struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+         hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, NULL, dep);
+         T("query command follows the resets",
+           dep[HK_SYNC_CDM].cut && dep[HK_SYNC_CDM].cut->sync.seq >= z1->sync.seq);
+
+         /* Reset-only command buffers ahead of a stamped render, in one
+          * submission. */
+         struct hk_cmd_buffer *a = new_cmd(chips[c], exact);
+         struct hk_cs *za = reset_stamps(a);
+         struct hk_cmd_buffer *b = new_cmd(chips[c], exact);
+         struct hk_cs *zb = reset_stamps(b);
+         struct hk_cmd_buffer *g = new_cmd(chips[c], exact);
+         hk_sync_barrier(g, HK_SYNC_ALL, HK_SYNC_ALL);
+         struct hk_cs *rg = begin_render(g);
+         stamp_all(g, 1);
+         end_render(g);
+         struct hk_cmd_buffer *all[] = {a, b, g};
+         T("reset submission resolves", submit(new_queue(exact), all, 3));
+         T("resets of separate command buffers do not chain",
+           za->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           zb->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+         T("stamped render follows both resets",
+           is_end(rg, 1) && rg->sync.barrier[HK_SYNC_CDM] == zb->sync.index &&
+           zb->sync.index > za->sync.index);
+         T("stamped render's vertex half does not wait for the resets",
+           vertex_barrier(rg, HK_SYNC_CDM) == DRM_ASAHI_BARRIER_NONE);
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -950,6 +1030,7 @@ main(void)
    test_copies_order_no_application_work();
    test_copy_consumers_wait();
    test_pass_merge_end_stamp();
+   test_timestamp_resets_order_query_work_only();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
