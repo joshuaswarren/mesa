@@ -174,7 +174,8 @@ enum agx_chip_cap {
 #define AGX_CAPS_NATIVE                                                        \
    (AGX_CAP_NATIVE_INDIRECT_COMPUTE | AGX_CAP_NATIVE_IMAGEBLOCK |              \
     AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
-    AGX_CAP_DESCRIPTOR_BUFFER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_MOD3_REG_BANK_RA |                     \
+    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
@@ -182,9 +183,8 @@ enum agx_chip_cap {
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_BINDING |           \
     AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
-    AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
-    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |                                    \
-    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
+    AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                                      \
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_CDM_OVERLAP_SPLIT |        \
     AGX_CAP_CACHED_CMD_MEMORY)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
