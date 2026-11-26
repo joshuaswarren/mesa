@@ -245,14 +245,6 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
       uint8_t init_dst;
       const bool init =
          brl_discard_init_prepare(cmd, &pDependencyInfos[i], &init_dst);
-
-      /* AGX2 has no polling wait; this boundary is an ordering dependency
-       * like a pipeline barrier. Carry it to the next CDM launch (or to the
-       * trailing edge of the open compute stream when it closes). */
-      if (agx_chip_command_stream_generation(dev->dev.chip) ==
-              AGX_CS_GENERATION_AGX2 &&
-          !HK_PERF(dev, ALWAYSCDMBARRIER))
-         cmd->state.cs.cdm_barrier_pending = true;
       hk_sync_barrier(cmd, src_kinds, dst_kinds);
       if (init)
          brl_discard_init_record(cmd, &pDependencyInfos[i], init_dst);
