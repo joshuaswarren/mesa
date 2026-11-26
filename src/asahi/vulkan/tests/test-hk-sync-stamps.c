@@ -1064,6 +1064,76 @@ test_leading_stamp_rides_first_stream(void)
          T("leading stamp's render follows the reset",
            same_req(rv->timestamp.vtx_end, query(2)) &&
            vertex_barrier(rv, HK_SYNC_CDM) == zr->sync.index);
+
+         /* A top-of-pipe stamp has an empty first scope: its render does not
+          * wait for the earlier command buffer's dispatch. A transfer-only
+          * barrier keeps the stamp from riding on a start stamp. */
+         struct hk_cmd_buffer *w = new_cmd(chips[c], exact);
+         struct hk_cs *wd = dispatch(w);
+         struct hk_cmd_buffer *t = new_cmd(chips[c], exact);
+         hk_sync_barrier(t, HK_SYNC_XFER, HK_SYNC_XFER);
+         stamp(t, VK_PIPELINE_STAGE_2_NONE, 3);
+         struct hk_cs *rt = render(t);
+         struct hk_cmd_buffer *wt[] = {w, t};
+         (void)wd;
+         T("top-of-pipe leading stamp submission resolves",
+           submit(new_queue(exact), wt, 2));
+         T("top-of-pipe leading stamp adds no wait on earlier work",
+           same_req(rt->timestamp.vtx_end, query(3)) &&
+           vertex_barrier(rt, HK_SYNC_CDM) == DRM_ASAHI_BARRIER_NONE);
+
+         /* An ALL_COMMANDS stamp ahead of every stream rides on the first
+          * one too, which then waits for the stamp's first scope: the
+          * earlier command buffer's dispatch, as a command of its own would
+          * have. */
+         struct hk_cmd_buffer *a = new_cmd(chips[c], exact);
+         struct hk_cs *ad = dispatch(a);
+         struct hk_cmd_buffer *s = new_cmd(chips[c], exact);
+         hk_sync_barrier(s, HK_SYNC_XFER, HK_SYNC_XFER);
+         stamp_all(s, 4);
+         T("leading ALL_COMMANDS stamp waits for a stream",
+           list_is_empty(&s->control_streams) && s->sync.lead_ts.handle);
+         struct hk_cs *rs = begin_render(s);
+         stamp_all(s, 5);
+         end_render(s);
+         T("leading ALL_COMMANDS stamp is the render's vertex end",
+           same_req(rs->timestamp.vtx_end, query(4)) && is_end(rs, 5) &&
+           list_is_singular(&s->control_streams));
+         struct hk_cmd_buffer *as[] = {a, s};
+         T("leading ALL_COMMANDS stamp submission resolves",
+           submit(new_queue(exact), as, 2));
+         T("leading ALL_COMMANDS stamp's vertex half follows earlier work",
+           vertex_barrier(rs, HK_SYNC_CDM) == ad->sync.index);
+
+         /* The same on a dispatch, after an earlier render. */
+         struct hk_cmd_buffer *g = new_cmd(chips[c], exact);
+         struct hk_cs *gr = render(g);
+         struct hk_cmd_buffer *h = new_cmd(chips[c], exact);
+         stamp_all(h, 6);
+         struct hk_cs *hd = dispatch(h);
+         struct hk_cmd_buffer *gh[] = {g, h};
+         T("leading ALL_COMMANDS stamp is the dispatch's end",
+           is_end(hd, 6) && list_is_singular(&h->control_streams) &&
+           submit(new_queue(exact), gh, 2));
+         T("leading ALL_COMMANDS stamp's dispatch follows the render",
+           hd->sync.barrier[HK_SYNC_VDM] == gr->sync.index);
+
+         /* A query command first: the stamp gets a command of its own,
+          * after its first scope. */
+         struct hk_cmd_buffer *m = new_cmd(chips[c], exact);
+         struct hk_cs *mr = render(m);
+         struct hk_cmd_buffer *n = new_cmd(chips[c], exact);
+         stamp_all(n, 7);
+         struct hk_cs *nq = copy_query_results(n);
+         struct hk_cs *nk = list_first_entry(&n->control_streams,
+                                             struct hk_cs, node);
+         struct hk_cmd_buffer *mn[] = {m, n};
+         T("leading ALL_COMMANDS stamp before a query command is a carrier",
+           nk != nq && is_end(nk, 7) &&
+           (nk->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           submit(new_queue(exact), mn, 2));
+         T("leading ALL_COMMANDS carrier follows the earlier render",
+           nk->sync.barrier[HK_SYNC_VDM] == mr->sync.index);
       }
    }
 }

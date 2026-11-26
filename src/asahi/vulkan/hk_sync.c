@@ -1176,13 +1176,14 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       st->pending_start_ts_unordered = false;
    }
 
-   /* The command buffer's leading top-of-pipe timestamp rides on the first
-    * stream's first end stamp (hk_sync_write_timestamp()), which waits for
-    * the earlier resets of timestamp queries: a render's vertex half, or the
-    * compute stream. */
+   /* The command buffer's leading timestamp rides on the first stream's
+    * first end stamp (hk_sync_write_timestamp()), which waits for the
+    * stamp's first scope: a render's vertex half, or the compute stream.
+    * Nothing was recorded between the stamp and this stream, so the scope
+    * names the same earlier work it did then. */
    if (st->lead_ts.handle) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-      qreset_dep(cmd, cs, dep);
+      hk_sync_src_dep(cmd, st->lead_scope, cs, dep);
       if (cs->type == HK_CS_VDM) {
          assert(!cs->timestamp.vtx_end.handle);
          cs->timestamp.vtx_end = st->lead_ts;
@@ -1989,9 +1990,9 @@ sync_state_has_req(const struct hk_sync_state *st)
    return false;
 }
 
-/* A leading top-of-pipe timestamp (hk_sync_state::lead_ts) that no stream
- * took: a command of its own, ordered after nothing but the recorded
- * requirements, as hk_sync_write_timestamp() records one. */
+/* A leading timestamp (hk_sync_state::lead_ts) that no stream took: a
+ * command of its own, ordered after its first scope, as
+ * hk_sync_write_timestamp() records one. */
 static void
 flush_lead_timestamp(struct hk_cmd_buffer *cmd)
 {
@@ -2001,7 +2002,7 @@ flush_lead_timestamp(struct hk_cmd_buffer *cmd)
    st->epoch++;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   qreset_dep(cmd, NULL, dep);
+   hk_sync_src_dep(cmd, st->lead_scope, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
@@ -2197,13 +2198,18 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
-   /* A top-of-pipe stamp ahead of every stream of the command buffer, on a
-    * chip whose start stamps latch before barriers resolve: the first stream
-    * carries it on an end stamp (hk_sync_state::lead_ts). A command of its
-    * own would sit between that stream and the command buffer's earlier
-    * neighbours, and every later timestamp would wait for it. */
-   if (!tail && !src_kinds && !start_stamps_ordered(cmd)) {
+   /* A stamp ahead of every stream of the command buffer, on a chip whose
+    * start stamps latch before barriers resolve: the first stream carries it
+    * on an end stamp and waits for its first scope (hk_sync_state::lead_ts).
+    * A command of its own would sit between that stream and the command
+    * buffer's earlier neighbours, and every later timestamp would wait for
+    * it: a render ending in a timestamp would wait for a compute command
+    * that waits for the previous render. A top-of-pipe stamp keeps the wait
+    * on the resets of timestamp queries alone, as its first scope is empty.
+    */
+   if (!tail && !start_stamps_ordered(cmd)) {
       st->lead_ts = req;
+      st->lead_scope = src_kinds ? scope : HK_SYNC_QRESET;
       return;
    }
 

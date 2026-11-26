@@ -436,12 +436,16 @@ struct hk_sync_state {
    bool pending_start_ts_unordered;
 
    /* On chips whose start stamps latch before barriers resolve: a
-    * top-of-pipe timestamp recorded before any stream of the command buffer,
-    * waiting for the first one to carry it on an end stamp, which is latched
-    * after that stream's barriers (a render's vertex end, a compute stream's
-    * end). The first scope is empty, so any such later point is a valid
-    * result, and the stream needs no extra wait for it. */
+    * timestamp recorded before any stream of the command buffer, waiting for
+    * the first one to carry it on an end stamp, which is latched after that
+    * stream's barriers (a render's vertex end, a compute stream's end). That
+    * stream waits for lead_scope, the kinds of the stamp's first scope as
+    * hk_sync_src_dep() takes them: the resets of timestamp queries alone for
+    * a top-of-pipe stamp, whose first scope is empty; the earlier work of
+    * its stages and the earlier timestamps for any other. Then the end stamp
+    * is latched no earlier than a command of its own could latch it. */
    struct agx_timestamp_req lead_ts;
+   uint8_t lead_scope;
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
 
