@@ -606,16 +606,20 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        dev->dev.replay_heap_initialized) {
       const uint64_t fixed_addr =
          capture_info ? capture_info->opaqueCaptureAddress : 0;
+      /* The range follows the requested size, not the BO's: a BO from the
+       * cache can be up to twice as large, so its size differs between
+       * capture and replay, and a larger replayed range would cover the next
+       * captured address. Bindings only reach offsets below that size. */
       mem->replay_va = agx_va_alloc(
-         &dev->dev, mem->bo->size, 64 * 1024,
+         &dev->dev, aligned_size, 64 * 1024,
          AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
       if (mem->replay_va &&
           (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
-                       mem->bo->size, 0,
+                       aligned_size, 0,
                        DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
            agx_bo_bind(&dev->dev, mem->bo,
                        agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
-                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+                       aligned_size, 0, DRM_ASAHI_BIND_READ))) {
          agx_va_free(&dev->dev, mem->replay_va, true);
          mem->replay_va = NULL;
          agx_bo_unreference(&dev->dev, mem->bo);
