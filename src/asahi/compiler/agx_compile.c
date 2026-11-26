@@ -15302,8 +15302,9 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       /* AGX3B and AGX3C main programs use bounded pressure-aware CSE so
        * uniform-source copies can merge without exceeding the shader's
        * existing peak register pressure. */
-      if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-           ctx->stage != MESA_SHADER_VERTEX) ||
+      if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+            key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+           !ctx->is_preamble && ctx->stage != MESA_SHADER_VERTEX) ||
           m5_bounded_cse) {
          AGX_PASS(ctx, agx_opt_cse_bounded);
       } else {
