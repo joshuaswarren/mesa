@@ -4625,9 +4625,11 @@ hk_nir_constant_offset(nir_scalar s, unsigned depth, uint64_t *value)
 
 /* The HK_ROOT_READS_* classes of the root bytes one use of load_root_agx can
  * read: an immediate offset loaded as is falls in the classes of its bytes,
- * anything else could read any byte. */
+ * with statically indexed dynamic_buffers[] slots recorded in *dynbuf_reads
+ * instead of the opaque HK_ROOT_READS_DYNAMIC_BUFFERS bit; anything else could
+ * read any byte. */
 static uint8_t
-hk_nir_root_use_reads(nir_src *use)
+hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads)
 {
    const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                        HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
@@ -4646,6 +4648,12 @@ hk_nir_root_use_reads(nir_src *use)
                                8, &offset))
       return any;
 
+   const uint64_t dyn_start = hk_root_descriptor_offset(dynamic_buffers);
+   const uint64_t dyn_stride = sizeof(struct hk_buffer_address);
+   const uint64_t dyn_end = dyn_start + HK_MAX_DYNAMIC_BUFFERS * dyn_stride;
+   static_assert(HK_MAX_DYNAMIC_BUFFERS <= 64,
+                 "agx3_dynbuf_reads bitmask fits all dynamic buffer slots");
+
    uint8_t reads = 0;
    nir_foreach_use_including_if(load_use, &add->def) {
       if (nir_src_is_if(load_use) ||
@@ -4659,17 +4667,32 @@ hk_nir_root_use_reads(nir_src *use)
           load_use != &load->src[0])
          return any;
 
-      reads |= hk_root_reads_of(
-         offset, offset + load->def.num_components * load->def.bit_size / 8);
+      const uint64_t end =
+         offset + load->def.num_components * load->def.bit_size / 8;
+      uint8_t span_reads = hk_root_reads_of(offset, end);
+      if (span_reads & HK_ROOT_READS_DYNAMIC_BUFFERS) {
+         const uint64_t lo = MAX2(offset, dyn_start);
+         const uint64_t hi = MIN2(end, dyn_end);
+         if (hi > lo) {
+            const unsigned first = (unsigned)((lo - dyn_start) / dyn_stride);
+            const unsigned last = (unsigned)((hi - 1 - dyn_start) / dyn_stride);
+            for (unsigned slot = first; slot <= last; ++slot)
+               *dynbuf_reads |= BITFIELD64_BIT(slot);
+         }
+         span_reads &= ~HK_ROOT_READS_DYNAMIC_BUFFERS;
+      }
+      reads |= span_reads;
    }
    return reads;
 }
 
-/* hk_shader_info::agx3_root_reads, gathered where hk_nir_uses_root() is. */
+/* hk_shader_info::agx3_root_reads and agx3_dynbuf_reads, gathered where
+ * hk_nir_uses_root() is. */
 static uint8_t
-hk_nir_root_reads(const nir_shader *nir)
+hk_nir_root_reads(const nir_shader *nir, uint64_t *dynbuf_reads_out)
 {
    uint8_t reads = 0;
+   uint64_t dynbuf_reads = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -4680,11 +4703,12 @@ hk_nir_root_reads(const nir_shader *nir)
 
             nir_foreach_use_including_if(use,
                                          &nir_instr_as_intrinsic(instr)->def)
-               reads |= hk_nir_root_use_reads(use);
+               reads |= hk_nir_root_use_reads(use, &dynbuf_reads);
          }
       }
    }
 
+   *dynbuf_reads_out = dynbuf_reads;
    return reads;
 }
 
@@ -6261,7 +6285,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    bool wg_coalesce_cand = false;
    if (agx_chip_agx3_path(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
-      shader->info.agx3_root_reads = hk_nir_root_reads(nir);
+      shader->info.agx3_root_reads =
+         hk_nir_root_reads(nir, &shader->info.agx3_dynbuf_reads);
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
@@ -6869,6 +6894,7 @@ hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
    s->info.set_count = meta->set_count;
    s->info.agx3_uses_root = meta->agx3_uses_root;
    s->info.agx3_root_reads = meta->agx3_root_reads;
+   s->info.agx3_dynbuf_reads = meta->agx3_dynbuf_reads;
    s->info.agx3_root_uniform = meta->agx3_root_uniform;
    s->info.agx3_gen1_fragment_rq = false;
    s->info.agx3_combined_sampler_valid = meta->agx3_combined_sampler_valid;
@@ -7520,7 +7546,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, hk_lower_uvs_index, MESA_SHADER_FRAGMENT, 0, 0);
    meta.agx3_uses_root = hk_nir_uses_root(nir);
-   meta.agx3_root_reads = hk_nir_root_reads(nir);
+   meta.agx3_root_reads = hk_nir_root_reads(nir, &meta.agx3_dynbuf_reads);
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);

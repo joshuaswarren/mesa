@@ -11495,20 +11495,42 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
 
       if (changed) {
-         struct agx_ptr upload =
-            hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
-         if (!upload.cpu)
-            return;
-         memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
-
+         const unsigned all_records =
+            BITFIELD_MASK(AGX_PPP_HAL300_GRAPHICS_RECORDS);
          uint8_t *start = *out;
-         u_foreach_bit(i, changed) {
-            if (!hk_ppp_emit_state(dev->dev.chip, out,
-                                   upload.gpu + state.offsets[i],
-                                   state.lengths[i])) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_FEATURE_NOT_PRESENT);
+         if (changed == all_records) {
+            struct agx_ptr upload =
+               hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
+            if (!upload.cpu)
                return;
+            memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
+            for (unsigned i = 0; i < AGX_PPP_HAL300_GRAPHICS_RECORDS; ++i) {
+               if (!hk_ppp_emit_state(dev->dev.chip, out,
+                                      upload.gpu + state.offsets[i],
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+            }
+         } else {
+            uint32_t total = 0;
+            u_foreach_bit(i, changed)
+               total += state.lengths[i];
+            struct agx_ptr upload = hk_pool_vdm_alloc(cmd, total, 64);
+            if (!upload.cpu)
+               return;
+            uint32_t off = 0;
+            u_foreach_bit(i, changed) {
+               memcpy((uint8_t *)upload.cpu + off,
+                      state.bytes + state.offsets[i], state.lengths[i]);
+               if (!hk_ppp_emit_state(dev->dev.chip, out, upload.gpu + off,
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+               off += state.lengths[i];
             }
          }
          if (unlikely(dev->frame_anatomy))
@@ -14313,7 +14335,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             const bool use_shadow =
                verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
             const uint64_t fs_root = hk_agx3_fragment_root_select(
-               gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
+               gfx, fs_src->info.agx3_root_reads,
+               fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
                true, use_shadow);
             if (fs_root != prev_fs_root) {
                const uint64_t fragment_program =
