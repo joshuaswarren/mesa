@@ -4390,8 +4390,16 @@ hk_rt_loaded_groups_valid(const struct hk_ray_tracing_pipeline *pipeline)
       malloc(MAX2(pipeline->stage_count, 1) * sizeof(*stages));
    if (!stages)
       return false;
-   for (uint32_t i = 0; i < pipeline->stage_count; ++i)
-      stages[i] = mesa_to_vk_shader_stage(pipeline->stages[i]->nir->info.stage);
+   for (uint32_t i = 0; i < pipeline->stage_count; ++i) {
+      /* The stored NIR names its own stage; only the six ray tracing stages
+       * belong in the pipeline, and the conversion needs a valid enum. */
+      const mesa_shader_stage stage = pipeline->stages[i]->nir->info.stage;
+      if (!mesa_shader_stage_is_rt(stage)) {
+         free(stages);
+         return false;
+      }
+      stages[i] = mesa_to_vk_shader_stage(stage);
+   }
 
    bool valid = true;
    for (uint32_t i = 0; valid && i < pipeline->group_count; ++i)

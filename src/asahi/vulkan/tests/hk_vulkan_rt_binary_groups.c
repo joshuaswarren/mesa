@@ -20,6 +20,7 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 #include "hk_ray_tracing_core.h"
+#include "compiler/shader_info.h"
 #include "util/mesa-blake3.h"
 #include "hk_vulkan_rt_binary_groups_shaders.h"
 
@@ -256,6 +257,48 @@ read32(const struct binary *b, size_t offset)
    return v;
 }
 
+/* The byte holding shader_info::stage (a bitfield) in the stage's
+ * serialized NIR: after the groups, each stage is a u32 size and its NIR,
+ * which nir_serialize() starts with an index-table size, flags, the strings
+ * the flags name and then the raw shader_info. */
+static size_t
+nir_stage_byte(const struct binary *b, unsigned stage)
+{
+   struct shader_info probe;
+   memset(&probe, 0, sizeof(probe));
+   probe.stage = 0x5a;
+   size_t in_info = sizeof(probe);
+   for (size_t i = 0; i < sizeof(probe); ++i) {
+      if (((const uint8_t *)&probe)[i] == 0x5a) {
+         REQUIRE(in_info == sizeof(probe));
+         in_info = i;
+      }
+   }
+   REQUIRE(in_info < sizeof(probe));
+
+   size_t offset = BIN_GROUPS_B + GROUP_COUNT * sizeof(struct hk_ray_tracing_group);
+   for (unsigned i = 0;; ++i) {
+      offset = (offset + 3) & ~(size_t)3;
+      const uint32_t size = read32(b, offset);
+      const size_t nir = offset + 4;
+      if (i == stage) {
+         const uint32_t flags = read32(b, nir + 4);
+         size_t at = nir + 8;
+         /* NIR_SERIALIZE_SHADER_NAME, _LABEL and _SPEC each add a string. */
+         for (unsigned bit = 0; bit < 4; ++bit) {
+            if (bit == 2 || !(flags & (1u << bit)))
+               continue;
+            while (at < b->size && b->data[at])
+               ++at;
+            ++at;
+         }
+         REQUIRE(at + in_info < nir + size);
+         return at + in_info;
+      }
+      offset = nir + size;
+   }
+}
+
 int
 main(void)
 {
@@ -443,6 +486,30 @@ main(void)
       expect_refused(what, &b, GROUP_HIT, ahit, past[i]);
       snprintf(what, sizeof(what), "hit group intersection %u", past[i]);
       expect_refused(what, &b, GROUP_HIT, isec, past[i]);
+   }
+
+   /* A stored shader whose NIR claims a stage that is not a ray tracing
+    * stage, or no stage at all, is refused before its stage is used. */
+   {
+      const size_t at = nir_stage_byte(&b, STAGE_RGEN);
+      REQUIRE(b.data[at] == MESA_SHADER_RAYGEN);
+      const uint8_t bad[] = {MESA_SHADER_COMPUTE, MESA_SHADER_FRAGMENT,
+                             MESA_SHADER_KERNEL, 200, 0xff};
+      for (unsigned i = 0; i < ARRAY_SIZE(bad); ++i) {
+         struct binary t = {malloc(b.size), b.size};
+         REQUIRE(t.data);
+         memcpy(t.data, b.data, b.size);
+         t.data[at] = bad[i];
+         VkPipeline pipeline;
+         result = import(&t, &pipeline);
+         if (result == VK_SUCCESS)
+            vkDestroyPipeline(dev, pipeline, NULL);
+         char what[64];
+         snprintf(what, sizeof(what), "raygen shader NIR stage %u", bad[i]);
+         printf("INFO %s: result %d\n", what, result);
+         expect(what, result != VK_SUCCESS);
+         free(t.data);
+      }
    }
 
    /* In range, but a shader of a stage the slot does not take. */
