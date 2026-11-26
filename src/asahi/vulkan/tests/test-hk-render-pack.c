@@ -750,6 +750,10 @@ test_fold(bool exact)
    first_cs(b4)->sync.vtx_images = true;
    struct hk_cmd_buffer *ab4[] = {a4, b4};
    packet = pack(ab4, 2, &cs);
+   T(N("a later member's image reads carry an earlier tail to the vertex half"),
+     cs->sync.vtx_images &&
+        (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
+
    /* A leading top-of-pipe stamp on the first member's vertex end and an
     * end stamp on the last member's fragment end ride on the packet. */
    struct hk_cmd_buffer *a5 = split(10), *b5 = split(10);
@@ -762,10 +766,6 @@ test_fold(bool exact)
    T(N("the packet carries the members' vertex-end and fragment-end stamps"),
      cs->timestamp.vtx_end.offset_B == 8 && cs->timestamp.end.offset_B == 16 &&
         !cs->timestamp.start.handle);
-
-   T(N("a later member's image reads carry an earlier tail to the vertex half"),
-     cs->sync.vtx_images &&
-        (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
 #undef N
 }
 
