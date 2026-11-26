@@ -39,6 +39,65 @@ input_reload(uint16_t dest, uint16_t tps_half)
    return I;
 }
 
+/* A fragment sample under the separate-staging policy: staging on slot 6
+ * (transient), the result on slots 1..5, two results per slot. */
+static struct agx3_slot_instr
+staged_sample(uint16_t d)
+{
+   struct agx3_slot_instr I = ld(d);
+   I.transient_slots = 1u << 5;
+   I.max_slot = 5;
+   I.join_class = 2;
+   I.join_limit = 2;
+   return I;
+}
+
+static void
+check_sample_runs(void)
+{
+   struct agx3_slot_result r[16];
+
+   /* Nine independent samples, then their sum: no sample waits an earlier
+    * result. The first five take slots 1..5 and the next four join them. */
+   {
+      struct agx3_slot_instr p[11];
+      for (unsigned i = 0; i < 9; ++i)
+         p[i] = staged_sample(2 * i);
+      p[9] = alu(20, 0, 16);
+      p[10] = st(20);
+      CHECK(agx3_slot_assign(p, 11, 6, r));
+      for (unsigned i = 0; i < 9; ++i) {
+         CHECK(r[i].wait_mask == 0);
+         CHECK(r[i].slot >= 1 && r[i].slot <= 5);
+      }
+      CHECK(r[0].slot == r[5].slot);
+      CHECK(r[9].wait_mask ==
+            ((1u << (r[0].slot - 1)) | (1u << (r[8].slot - 1))));
+   }
+
+   /* Without the policy, the seventh of nine samples on six slots waits the
+    * first sample's result before it can reuse that slot. */
+   {
+      struct agx3_slot_instr p[9];
+      for (unsigned i = 0; i < 9; ++i)
+         p[i] = ld(2 * i);
+      CHECK(agx3_slot_assign(p, 9, 6, r));
+      CHECK(r[6].slot == r[0].slot);
+      CHECK(r[6].wait_mask == (1u << (r[0].slot - 1)));
+   }
+
+   /* A joined slot holds at most two results: an eleventh sample waits. */
+   {
+      struct agx3_slot_instr p[11];
+      for (unsigned i = 0; i < 11; ++i)
+         p[i] = staged_sample(2 * i);
+      CHECK(agx3_slot_assign(p, 11, 6, r));
+      for (unsigned i = 0; i < 10; ++i)
+         CHECK(r[i].wait_mask == 0);
+      CHECK(r[10].wait_mask != 0);
+   }
+}
+
 static void
 check_live_inputs(void)
 {
@@ -157,6 +216,7 @@ int main(void)
 {
    struct agx3_slot_result r[64];
    check_live_inputs();
+   check_sample_runs();
 
    /* SMP latches only its staging group through completion. A descriptor
     * GPR may be reused immediately; a staging rewrite must wait for SMP. */
