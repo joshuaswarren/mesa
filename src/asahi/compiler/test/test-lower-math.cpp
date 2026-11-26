@@ -30,6 +30,8 @@ class LowerMathTest : public ::testing::Test {
       mem_ctx = ralloc_context(NULL);
       b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options,
                                          "lower math test");
+      /* Driver-internal shaders take the exact forms on every op. */
+      b.shader->info.internal = true;
    }
 
    ~LowerMathTest() override { ralloc_free(mem_ctx); }
@@ -295,6 +297,74 @@ TEST_F(LowerMathTest, SinCosThenElseArmsShareAboveIf)
 
    agx_nir_lower_sincos(b.shader);
 
+   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
+   nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
+}
+
+/* The opt-in gate: on application shaders only ops carrying the full
+ * nir_fp_exact mask take the correctly rounded forms. These tests build on
+ * the fixture's compute shader with internal cleared. */
+
+TEST_F(LowerMathTest, AppShaderMarkedOpsOptInUnmarkedStayFast)
+{
+   b.shader->info.internal = false;
+   nir_def *a = nir_undef(&b, 1, 32);
+   nir_def *d = nir_undef(&b, 1, 32);
+   nir_fdiv(&b, a, d);
+   nir_def *e = nir_fdiv(&b, a, d);
+   nir_instr_as_alu(nir_def_instr(e))->fp_math_ctrl |= nir_fp_exact;
+
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
+
+   /* Unmarked: a * frcp(d). Marked: the Markstein sequence. */
+   EXPECT_EQ(count_alu(nir_op_fdiv), 0u);
+   EXPECT_EQ(count_alu(nir_op_frcp), 2u);
+   EXPECT_EQ(count_alu(nir_op_fmul), 2u);
+   EXPECT_EQ(count_alu(nir_op_ffma), 4u);
+   EXPECT_EQ(count_alu(nir_op_fneg), 2u);
+   EXPECT_EQ(count_alu(nir_op_bcsel), 2u);
+   EXPECT_EQ(count_alu(nir_op_fneu), 2u);
+   EXPECT_EQ(count_alu(nir_op_feq), 1u);
+}
+
+TEST_F(LowerMathTest, AppShaderNoContractionAloneStaysFast)
+{
+   /* DXVK stamps NoContraction on every op; a single bit is not the
+    * opt-in. */
+   b.shader->info.internal = false;
+   nir_def *a = nir_undef(&b, 1, 32);
+   nir_def *d = nir_undef(&b, 1, 32);
+   nir_def *q = nir_fdiv(&b, a, d);
+   nir_instr_as_alu(nir_def_instr(q))->fp_math_ctrl |= nir_fp_no_contract;
+
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
+
+   EXPECT_EQ(count_alu(nir_op_frcp), 1u);
+   EXPECT_EQ(count_alu(nir_op_fmul), 1u);
+   EXPECT_EQ(count_alu(nir_op_ffma), 0u);
+}
+
+TEST_F(LowerMathTest, AppShaderUnmarkedTrigStaysStock)
+{
+   b.shader->info.internal = false;
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_fsin(&b, x);
+
+   /* The pass owns nothing here: no copy-prop/cse, no lowering. */
+   EXPECT_FALSE(agx_nir_lower_sincos(b.shader));
+   EXPECT_EQ(count_alu(nir_op_fsin), 1u);
+}
+
+TEST_F(LowerMathTest, AppShaderMarkedSinOptsIn)
+{
+   b.shader->info.internal = false;
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_def *s = nir_fsin(&b, x);
+   nir_instr_as_alu(nir_def_instr(s))->fp_math_ctrl |= nir_fp_exact;
+
+   ASSERT_TRUE(agx_nir_lower_sincos(b.shader));
+
+   EXPECT_EQ(count_alu(nir_op_fsin), 0u);
    EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
    nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
 }
