@@ -274,8 +274,8 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
 {
    /* Verify mod-3 tie-breaking, loop_phi_targets, and rmw_web stay strictly
     * gated on AGX_CAP_MOD3_REG_BANK_RA and non-preamble shaders: disabled on
-    * AGX3D (G18G), on non-capable AGX3B chips (G16G), and on G17P/M5
-    * preambles. Use the same k/pad0/pad1/m loop that G17P and M5 resolve to 0
+    * AGX3D (G18G), on non-capable AGX2 chips (G13G), and on G17P/M5
+    * preambles. Use the same k/pad0/pad1/m loop that AGX3B and M5 resolve to 0
     * conflicts and confirm it stays untouched (k=r1, m=r4) when gated off. */
    for (unsigned mode = 0; mode < 4; ++mode) {
       nir_builder nb = make_compute_shader("g17p-mod3-gating");
@@ -287,8 +287,8 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
          key.dev.chip = AGX_CHIP_G18G;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3D;
       } else if (mode == 1) {
-         key.dev.chip = AGX_CHIP_G16G;
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G13G;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX2;
       } else if (mode == 2) {
          key.dev.chip = AGX_CHIP_G17P;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
@@ -353,22 +353,26 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
 
 TEST(G17PMod3RA, M5ResolvesMod3Conflicts)
 {
-   /* Verify M5 (G17G, G17S, G17C) carries AGX_CAP_MOD3_REG_BANK_RA and
-    * resolves the same co-read loop to zero mod-3 bank conflicts without
-    * spilling. */
-   const enum agx_chip m5_chips[] = {
+   /* Verify native AGX3 (G15, G16G) and M5 (G17G, G17S, G17C) carry
+    * AGX_CAP_MOD3_REG_BANK_RA and resolve the same co-read loop to zero
+    * mod-3 bank conflicts without spilling. */
+   const enum agx_chip cap_chips[] = {
+      AGX_CHIP_G15G,
+      AGX_CHIP_G15S,
+      AGX_CHIP_G15C,
+      AGX_CHIP_G16G,
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
    };
-   for (unsigned i = 0; i < ARRAY_SIZE(m5_chips); ++i) {
+   for (unsigned i = 0; i < ARRAY_SIZE(cap_chips); ++i) {
       nir_builder nb = make_compute_shader("m5-mod3-loop");
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
       struct agx_shader_info out = {};
-      key.dev.chip = m5_chips[i];
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = cap_chips[i];
+      key.dev.encoding = agx_chip_isa_encoding(cap_chips[i]);
       b->shader->key = &key;
       b->shader->out = &out;
       b->shader->nir = nb.shader;
