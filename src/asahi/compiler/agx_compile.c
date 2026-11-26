@@ -7668,9 +7668,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* AGX3C's tied min/max consumes full register operands in both
-       * positions. Keep constants tied after compact-constant folding. */
+       * positions. Keep constants tied after compact-constant folding.
+       * Check the opcode and operand counts before touching dest[0]: this
+       * loop also visits instructions without a destination, such as
+       * BEGIN_CF. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
+          I->op == AGX_OPCODE_FCMPSEL && I->nr_dests == 1 &&
+          I->nr_srcs == 4 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
                 (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
@@ -7854,13 +7859,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
 
             /* A tied minimum/maximum selects the same minifloat it compares.
              * The select slot reads a bit pattern, so keep the tie through
-             * the register instead of leaving the minifloat there. */
-            const agx_index sel = I->src[s + 2];
+             * the register instead of leaving the minifloat there. FCMP has
+             * no select slots, so only look at them on FCMPSEL. */
             if (I->op == AGX_OPCODE_FCMPSEL &&
-                I->dest[0].size == AGX_SIZE_32 &&
-                sel.type == AGX_INDEX_IMMEDIATE && sel.value == src.value &&
-                sel.abs == src.abs && sel.neg == src.neg)
-               I->src[s + 2] = I->src[s];
+                I->dest[0].size == AGX_SIZE_32) {
+               const agx_index sel = I->src[s + 2];
+               if (sel.type == AGX_INDEX_IMMEDIATE &&
+                   sel.value == src.value && sel.abs == src.abs &&
+                   sel.neg == src.neg)
+                  I->src[s + 2] = I->src[s];
+            }
          }
       }
 
@@ -8179,6 +8187,12 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             I->src[0] = I->src[1];
             I->src[1] = tmp;
          }
+
+         /* The add was allocated with two sources. Give the FMA a source
+          * array with room for its addend before writing src[2]. */
+         agx_index *src = ralloc_array(ctx, agx_index, 3);
+         memcpy(src, I->src, 2 * sizeof(*src));
+         I->src = src;
 
          const bool product_neg = I->src[0].neg;
          I->src[0].neg = false;
