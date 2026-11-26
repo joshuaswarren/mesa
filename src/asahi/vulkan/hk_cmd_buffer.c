@@ -836,11 +836,11 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* A G17P compute root consumes a whole command BO. Keep control-stream
-    * roots on their own bump cursor so allocating one cannot evict a partially
-    * used main-upload BO and move that allocator's slow path into the next
-    * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_chip_native_agx3(dev->dev.chip)
+   /* Keep control-stream roots on their own bump cursor on native AGX3 and M5
+    * so allocating one cannot evict a partially used main-upload BO and so
+    * unlinked stream BOs are marked stream_only for exact-extent cache cleans
+    * at vkEndCommandBuffer(). Ownership remains on the ordinary main BO list. */
+   struct hk_uploader *uploader = agx_chip_native_or_m5(dev->dev.chip)
                                      ? &cmd->uploader.streams
                                      : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
