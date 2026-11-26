@@ -14943,7 +14943,7 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
          !batch->g17p_bind_tail_latched || varyings_dirty ||
          (ctx->dirty & ~(AGX_DIRTY_VS | AGX_DIRTY_VERTEX)) != 0 ||
          batch->g17p_latched_vs_shader != vs ||
-         batch->g17p_fragment_shader != ctx->fs ||
+         batch->g17p_fragment_shader != agx_fs_launch_shader(ctx) ||
          batch->g17p_fragment_linked != ctx->linked.fs ||
          (vs_emitted &&
           (!batch->g17p_have_latched_vs ||
