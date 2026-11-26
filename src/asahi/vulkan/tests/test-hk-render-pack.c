@@ -437,70 +437,80 @@ test_member(void)
    T("a secondary command buffer is not", !hk_render_pack_member(c));
 }
 
+/* hk_render_pack_boundary() for a run of A alone, as the submission starts
+ * one at A. */
+static const char *
+boundary(const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b)
+{
+   struct hk_render_pack_run_state run;
+   hk_render_pack_run_start(&run, a, first_cs(a));
+   return hk_render_pack_boundary(&run, a, b, first_cs(b), first_cs(a));
+}
+
 static void
 test_boundary(void)
 {
    struct hk_cmd_buffer *a = split(10), *b = split(20);
    struct hk_cs *as = first_cs(a), *bs = first_cs(b);
-   T("adjacent splits pack", !hk_render_pack_boundary(a, as, b, bs, as));
+   T("adjacent splits pack", !boundary(a, b));
 
    b->render_pack.head = false;
-   T("no head refuses", hk_render_pack_boundary(a, as, b, bs, as));
+   T("no head refuses", boundary(a, b));
    b->render_pack.head = true;
    a->render_pack.tail = false;
-   T("no tail refuses", hk_render_pack_boundary(a, as, b, bs, as));
+   T("no tail refuses", boundary(a, b));
    a->render_pack.tail = true;
 
    a->usage_flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
    T("a simultaneous-use command buffer never links",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    a->usage_flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
    T("a one-time command buffer links",
-     !hk_render_pack_boundary(a, as, b, bs, as));
+     !boundary(a, b));
    a->usage_flags = 0;
 
    b->render_pack.head_dep = HK_M5_MERGE_DEP_END;
    T("a layout transition between them refuses",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
 
    b->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
    T("an ordered dependency between memory-free streams packs",
-     !hk_render_pack_boundary(a, as, b, bs, as));
+     !boundary(a, b));
    as->m5_shader_writes_memory = true;
    T("not when A's shaders write memory",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    as->m5_shader_writes_memory = false;
    bs->m5_shader_writes_memory = true;
    T("not when B's shaders write memory",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    bs->m5_shader_writes_memory = false;
    bs->render_pack_unsafe = true;
    T("not when B draws with a hazard",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    bs->render_pack_unsafe = false;
    b->render_pack.head_pass.layout_proof = false;
    T("not when B's attachments may be descriptors",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    b->render_pack.head_pass.layout_proof = true;
    b->m5_pushed_images = _mesa_pointer_set_create(test_context);
    _mesa_set_add(b->m5_pushed_images, images[0]);
    T("not when B pushed an attachment as a descriptor",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    b->m5_pushed_images = NULL;
 
    b->render_pack.head_dep = HK_M5_MERGE_DEP_LOCAL;
    as->m5_shader_writes_memory = bs->m5_shader_writes_memory = true;
    T("a local dependency packs even when the shaders write memory",
-     !hk_render_pack_boundary(a, as, b, bs, as));
+     !boundary(a, b));
    as->m5_ordered = true;
    T("an ordered in-buffer continuation of A makes it ordered",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
    as->m5_ordered = false;
    as->m5_shader_writes_memory = bs->m5_shader_writes_memory = false;
 
    bs->render_pack_elided = 1;
    T("streams programming another tile pass refuse",
-     hk_render_pack_boundary(a, as, b, bs, as));
+     boundary(a, b));
 }
 
 /* The tails a submission writes, and that every later submission writes
@@ -554,6 +564,61 @@ test_tails(void)
      !hk_render_pack_write_tail(chip, &none, to1));
 }
 
+/* An ordered dependency anywhere in a run needs the memory-equivalence proof
+ * over every member, not only over the two command buffers around it: in one
+ * tile pass a later member's vertex work runs ahead of every earlier
+ * member's fragment work. */
+static void
+test_run_hazard(void)
+{
+   /* [CB0, CB1, CB2]: CB0's shaders write a storage buffer, CB0 -> CB1 is
+    * framebuffer-local, CB1 -> CB2 orders fragment writes before vertex
+    * reads. */
+   struct hk_cmd_buffer *c0 = split(10), *c1 = split(10), *c2 = split(10);
+   first_cs(c0)->m5_shader_writes_memory = true;
+   c2->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
+   struct hk_render_pack_run_state run;
+   hk_render_pack_run_start(&run, c0, first_cs(c0));
+   T("CB0 and CB1 pack over a framebuffer-local dependency",
+     !hk_render_pack_boundary(&run, c0, c1, first_cs(c1), first_cs(c0)));
+   hk_render_pack_run_join(&run, c0, c1, first_cs(c1));
+   const char *why =
+      hk_render_pack_boundary(&run, c1, c2, first_cs(c2), first_cs(c0));
+   T("CB2 does not join a run whose CB0 writes memory",
+     why && !strcmp(why, "ordered, writes memory"));
+   struct hk_render_pack_run_state from_c1;
+   hk_render_pack_run_start(&from_c1, c1, first_cs(c1));
+   T("which CB1 and CB2 alone do not show",
+     !hk_render_pack_boundary(&from_c1, c1, c2, first_cs(c2), first_cs(c1)));
+
+   /* The ordered dependency first, the writer after it. */
+   c0 = split(10), c1 = split(10), c2 = split(10);
+   c1->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
+   first_cs(c2)->m5_shader_writes_memory = true;
+   hk_render_pack_run_start(&run, c0, first_cs(c0));
+   T("an ordered run of memory-free members packs",
+     !hk_render_pack_boundary(&run, c0, c1, first_cs(c1), first_cs(c0)));
+   hk_render_pack_run_join(&run, c0, c1, first_cs(c1));
+   T("a writer does not join a run with an ordered dependency",
+     hk_render_pack_boundary(&run, c1, c2, first_cs(c2), first_cs(c0)));
+
+   /* An ordered continuation inside the joining member reaches back to every
+    * earlier member, and a hazard draw of an earlier member counts. */
+   c0 = split(10), c1 = split(10);
+   first_cs(c0)->m5_shader_writes_memory = true;
+   first_cs(c1)->m5_ordered = true;
+   hk_render_pack_run_start(&run, c0, first_cs(c0));
+   T("B's own ordered continuation makes the boundary ordered",
+     hk_render_pack_boundary(&run, c0, c1, first_cs(c1), first_cs(c0)));
+   c0 = split(10), c1 = split(10), c2 = split(10);
+   first_cs(c0)->render_pack_unsafe = true;
+   c2->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
+   hk_render_pack_run_start(&run, c0, first_cs(c0));
+   hk_render_pack_run_join(&run, c0, c1, first_cs(c1));
+   T("CB0's hazard draw refuses an ordered CB2",
+     hk_render_pack_boundary(&run, c1, c2, first_cs(c2), first_cs(c0)));
+}
+
 /* Builds the packet of members cmds[0..count) the way hk_render_pack_runs()
  * does. */
 static struct hk_cmd_buffer *
@@ -562,10 +627,7 @@ pack(struct hk_cmd_buffer **cmds, unsigned count, struct hk_cs **out)
    struct hk_cmd_buffer *packet = new_cmd();
    struct hk_cs *cs = test_alloc(sizeof(*cs));
    util_dynarray_init(&cs->render_resources, NULL);
-   uint8_t kinds = 0;
-   for (unsigned m = 0; m < count; ++m)
-      kinds |= first_cs(cmds[m])->sync.kind;
-   hk_render_pack_init(packet, cs, first_cs(cmds[0]), kinds);
+   hk_render_pack_init(packet, cs, cmds, count);
    uint8_t preceding = 0;
    for (unsigned m = 0; m < count; ++m)
       hk_render_pack_add(packet, cs, cmds[m], first_cs(cmds[m]), m == 0,
@@ -662,6 +724,22 @@ test_fold(bool exact)
                          struct hk_sync_pass_record, r)
       moved &= r->first == cs && r->last == cs;
    T(N("the members' tile footprints are the packet's"), moved);
+
+   /* [A, B]: A's tail orders compute work before image reads of
+    * pre-rasterization shaders (COMPUTE -> VERTEX_SHADER on an image), and
+    * only B's vertex shader reads images. Unpacked, the resolver applies
+    * A's carried requirement to B's vertex half; packed, the packet's vertex
+    * half must carry it too, though A, folded first, does not read images
+    * there. */
+   struct hk_cmd_buffer *a4 = split(10);
+   hk_sync_barrier(a4, HK_SYNC_COMPUTE, HK_SYNC_GFX_IMG);
+   struct hk_cmd_buffer *b4 = split(10);
+   first_cs(b4)->sync.vtx_images = true;
+   struct hk_cmd_buffer *ab4[] = {a4, b4};
+   packet = pack(ab4, 2, &cs);
+   T(N("a later member's image reads carry an earlier tail to the vertex half"),
+     cs->sync.vtx_images &&
+        (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
 #undef N
 }
 
@@ -779,6 +857,7 @@ main(void)
       test_arrays();
       test_member();
       test_boundary();
+      test_run_hazard();
       test_tails();
       test_fold(false);
       test_fold(true);

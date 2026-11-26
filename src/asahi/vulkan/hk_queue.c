@@ -6841,6 +6841,9 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       };
       enum u_tristate dbias = first ? first->cr.dbias_is_int : U_TRISTATE_UNSET;
       size_t resources = first ? first->render_resources.size : 0;
+      struct hk_render_pack_run_state state;
+      if (first)
+         hk_render_pack_run_start(&state, cmds[i], first);
       if (unlikely(dev->frame_anatomy))
          cmds[i]->render_pack.next_why = NULL;
       if (!first && i + 1 < n)
@@ -6848,7 +6851,6 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
       while (first && i + run.count < n) {
          const unsigned a = i + run.count - 1, b = a + 1;
-         const struct hk_cs *as = hk_render_pack_member(cmds[a]);
          const struct hk_cs *bs = hk_render_pack_member(cmds[b]);
          if (unlikely(dev->frame_anatomy))
             cmds[b]->render_pack.next_why = NULL;
@@ -6858,7 +6860,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          }
 
          const char *why =
-            hk_render_pack_boundary(cmds[a], as, cmds[b], bs, first);
+            hk_render_pack_boundary(&state, cmds[a], cmds[b], bs, first);
          const struct util_dynarray *scissor = NULL, *zbias = NULL;
          if (!why &&
              (!hk_render_pack_array_prefix(&run.scissor->scissor,
@@ -6890,6 +6892,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (dbias == U_TRISTATE_UNSET)
             dbias = bs->cr.dbias_is_int;
          resources += bs->render_resources.size;
+         hk_render_pack_run_join(&state, cmds[a], cmds[b], bs);
          run.count++;
       }
 
@@ -6920,17 +6923,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
       const struct hk_render_pack_run *run = &runs[r];
       struct hk_render_packet *p = &queue->rpack.packets[r];
-      const struct hk_cs *first =
-         list_first_entry(&cmds[run->first]->control_streams, struct hk_cs,
-                          node);
-      uint8_t kinds = 0;
-      for (unsigned m = 0; m < run->count; ++m) {
-         kinds |= list_first_entry(&cmds[run->first + m]->control_streams,
-                                   struct hk_cs, node)->sync.kind;
-      }
-
       p->cmd.vk.base.device = &dev->vk;
-      hk_render_pack_init(&p->cmd, &p->cs, first, kinds);
+      hk_render_pack_init(&p->cmd, &p->cs, cmds + run->first, run->count);
       uint8_t preceding = 0;
       bool ok = true;
       for (unsigned m = 0; ok && m < run->count; ++m) {

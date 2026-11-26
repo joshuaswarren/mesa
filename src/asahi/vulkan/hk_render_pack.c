@@ -221,8 +221,53 @@ hk_render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b)
    return NULL;
 }
 
+/* Whether `cmd` pushed one of the attachments of `pass` as a descriptor. */
+static bool
+pushes_attachment(const struct hk_cmd_buffer *cmd,
+                  const struct hk_render_pack_pass *pass)
+{
+   if (!cmd->m5_pushed_images)
+      return false;
+   set_foreach(cmd->m5_pushed_images, entry) {
+      for (unsigned i = 0; i < HK_RENDER_PACK_SLOTS; ++i) {
+         if (pass->att[i].image == entry->key)
+            return true;
+      }
+   }
+   return false;
+}
+
+void
+hk_render_pack_run_start(struct hk_render_pack_run_state *run,
+                         const struct hk_cmd_buffer *cmd,
+                         const struct hk_cs *cs)
+{
+   *run = (struct hk_render_pack_run_state){
+      .ordered = cs->m5_ordered,
+      .writes_memory = cs->m5_shader_writes_memory,
+      .unsafe = cs->render_pack_unsafe,
+      .pushed_attachment =
+         pushes_attachment(cmd, &cmd->render_pack.tail_pass),
+   };
+}
+
+/* Whether the run is ordered once `b` follows `a`: a dependency recorded
+ * between them, or one inside either stream (as hk_m5_pass_merge_begin()
+ * counts one recorded before an earlier continuation of a stream; its first
+ * scope reaches every earlier member, its second every later one), or one
+ * earlier in the run. */
+static bool
+run_ordered(const struct hk_render_pack_run_state *run,
+            const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b,
+            const struct hk_cs *bs)
+{
+   const uint8_t dep = MAX2(a->render_pack.tail_dep, b->render_pack.head_dep);
+   return run->ordered || dep == HK_M5_MERGE_DEP_ORDERED || bs->m5_ordered;
+}
+
 const char *
-hk_render_pack_boundary(const struct hk_cmd_buffer *a, const struct hk_cs *as,
+hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
+                        const struct hk_cmd_buffer *a,
                         const struct hk_cmd_buffer *b, const struct hk_cs *bs,
                         const struct hk_cs *first)
 {
@@ -239,35 +284,38 @@ hk_render_pack_boundary(const struct hk_cmd_buffer *a, const struct hk_cs *as,
    if (dep >= HK_M5_MERGE_DEP_END)
       return "dependency";
 
-   /* As hk_m5_pass_merge_begin(): a dependency recorded before an earlier
-    * continuation of A's stream counts too. */
-   const bool ordered = dep == HK_M5_MERGE_DEP_ORDERED || as->m5_ordered;
+   const bool ordered = run_ordered(run, a, b, bs);
    const char *why = hk_render_pack_continues(&ea->tail_pass, &eb->head_pass,
                                               ordered);
    if (why)
       return why;
 
-   /* hk_m5_ordered_refusal() and hk_m5_ordered_draw_hazard(), over both
-    * whole streams: neither writes memory but its attachments, none of
+   /* hk_m5_ordered_refusal() and hk_m5_ordered_draw_hazard(), over every
+    * member's whole stream: none writes memory but its attachments, none of
     * their draws has a stage that runs ahead of the tile pass, and no
-    * descriptor B pushed names an attachment (descriptor sets cannot,
+    * descriptor a member pushed names an attachment (descriptor sets cannot,
     * hk_render_pack_continues() requires attachment-only layouts). */
    if (ordered) {
-      if (as->m5_shader_writes_memory || bs->m5_shader_writes_memory)
+      if (run->writes_memory || bs->m5_shader_writes_memory)
          return "ordered, writes memory";
-      if (as->render_pack_unsafe || bs->render_pack_unsafe)
+      if (run->unsafe || bs->render_pack_unsafe)
          return "ordered, draw hazard";
-      if (b->m5_pushed_images) {
-         set_foreach(b->m5_pushed_images, entry) {
-            for (unsigned i = 0; i < HK_RENDER_PACK_SLOTS; ++i) {
-               if (eb->head_pass.att[i].image == entry->key)
-                  return "ordered, attachment pushed as a descriptor";
-            }
-         }
-      }
+      if (run->pushed_attachment || pushes_attachment(b, &eb->head_pass))
+         return "ordered, attachment pushed as a descriptor";
    }
 
    return hk_render_pack_streams_match(first, bs);
+}
+
+void
+hk_render_pack_run_join(struct hk_render_pack_run_state *run,
+                        const struct hk_cmd_buffer *a,
+                        const struct hk_cmd_buffer *b, const struct hk_cs *bs)
+{
+   run->ordered = run_ordered(run, a, b, bs);
+   run->writes_memory |= bs->m5_shader_writes_memory;
+   run->unsafe |= bs->render_pack_unsafe;
+   run->pushed_attachment |= pushes_attachment(b, &b->render_pack.head_pass);
 }
 
 bool
@@ -395,8 +443,19 @@ hk_render_pack_write_tail(enum agx_chip chip, struct hk_render_pack_edges *e,
 
 void
 hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
-                    const struct hk_cs *first, uint8_t kinds)
+                    struct hk_cmd_buffer *const *members, unsigned count)
 {
+   const struct hk_cs *first =
+      list_first_entry(&members[0]->control_streams, struct hk_cs, node);
+   uint8_t kinds = 0;
+   bool vtx_images = false;
+   for (unsigned m = 0; m < count; ++m) {
+      const struct hk_cs *item =
+         list_first_entry(&members[m]->control_streams, struct hk_cs, node);
+      kinds |= item->sync.kind;
+      vtx_images |= item->sync.vtx_images;
+   }
+
    /* The packet keeps its own resource list across submissions; the rest of
     * the stream is the first member's, which the packet only reads. */
    struct util_dynarray resources = cs->render_resources;
@@ -412,6 +471,12 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
    memset(&cs->sync, 0, sizeof(cs->sync));
    cs->sync.seq = 1;
    cs->sync.kind = kinds;
+   /* Whether a carried requirement reaches the vertex half depends on every
+    * member, a later one included: a member's tail requirement on images
+    * applies to the vertex half of every member after it that reads images
+    * there, as the resolver applies it to that command buffer's own render
+    * (hk_render_pack_add()). */
+   cs->sync.vtx_images = vtx_images;
 
    /* Summed or joined over the members by hk_render_pack_add(). */
    memset(&cs->stats, 0, sizeof(cs->stats));
@@ -545,11 +610,10 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
     * one wait for its tail, as separate command buffers would: the resolver
     * applies a carried requirement to each destination class of a stream,
     * the whole render's (hk_sync_full_kinds()) and its vertex half's (its
-    * kinds and, drawing with image-reading pre-rasterization shaders, the
-    * image class). A tail that names a member makes later command buffers
-    * wait for the packet; so does a prior-only render tail of a kind an
-    * earlier member already ran. */
-   cs->sync.vtx_images |= item->sync.vtx_images;
+    * kinds and, if any member draws with image-reading pre-rasterization
+    * shaders, the image class: hk_render_pack_init()). A tail that names a
+    * member makes later command buffers wait for the packet; so does a
+    * prior-only render tail of a kind an earlier member already ran. */
    const uint8_t carry = hk_sync_full_kinds(cs->sync.kind);
    const uint8_t ta_carry =
       cs->sync.kind | (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0);

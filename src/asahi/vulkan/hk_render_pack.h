@@ -170,16 +170,44 @@ const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
                                      const struct hk_render_pack_pass *b,
                                      bool ordered);
 
-/* Whether member `b` (stream `bs`) may follow member `a` (stream `as`) in a
- * packed run whose first member's stream is `first`: their edges continue
- * (hk_render_pack_continues()), an ordered dependency between them has the
- * memory-equivalence proof, and `bs` programs the tile pass `first` does
- * (hk_render_pack_streams_match()). Returns NULL or why not. */
-const char *hk_render_pack_boundary(const struct hk_cmd_buffer *a,
-                                    const struct hk_cs *as,
+/* What the members a packed run holds so far bring to its next boundary. In
+ * one tile pass every member's vertex work may run ahead of every earlier
+ * member's fragment work, so an ordered dependency anywhere in the run needs
+ * the memory-equivalence proof over all of them, as the merged stream of an
+ * in-buffer continuation carries it (hk_m5_pass_merge_begin()). */
+struct hk_render_pack_run_state {
+   /* An ordered dependency inside the run, between members or inside one. */
+   bool ordered;
+   /* A member's shaders write memory other than its attachments. */
+   bool writes_memory;
+   /* A member draws with a stage that runs ahead of the tile pass
+    * (hk_cs::render_pack_unsafe). */
+   bool unsafe;
+   /* A member pushed one of its attachments as a descriptor. */
+   bool pushed_attachment;
+};
+
+/* The run of one member, `cmd` (stream `cs`). */
+void hk_render_pack_run_start(struct hk_render_pack_run_state *run,
+                              const struct hk_cmd_buffer *cmd,
+                              const struct hk_cs *cs);
+
+/* Whether member `b` (stream `bs`) may follow member `a` at the end of
+ * `run`, whose first member's stream is `first`: their edges continue
+ * (hk_render_pack_continues()), an ordered dependency in the run has the
+ * memory-equivalence proof over every member, and `bs` programs the tile pass
+ * `first` does (hk_render_pack_streams_match()). Returns NULL or why not. */
+const char *hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
+                                    const struct hk_cmd_buffer *a,
                                     const struct hk_cmd_buffer *b,
                                     const struct hk_cs *bs,
                                     const struct hk_cs *first);
+
+/* `b` (stream `bs`) joins `run` after `a`, its boundary accepted. */
+void hk_render_pack_run_join(struct hk_render_pack_run_state *run,
+                             const struct hk_cmd_buffer *a,
+                             const struct hk_cmd_buffer *b,
+                             const struct hk_cs *bs);
 
 /* Whether two render streams program the same tile pass, so `b`'s draws may
  * follow `a`'s in one render command. Returns NULL or why not. */
@@ -211,14 +239,15 @@ bool hk_render_pack_write_tail(enum agx_chip chip,
                                struct hk_render_pack_edges *e,
                                uint64_t target);
 
-/* Packet assembly: `cs` becomes a copy of the first member's stream owned by
- * `packet` (the packet only reads what the copy shares with the member), of
- * synchronization kinds `kinds` (every member's) and with the
- * synchronization of nothing yet; members are then added in order and the
- * packet finished. The packet keeps its render resource list and tile
- * footprints across submissions. */
+/* Packet assembly for the `count` members `members`: `cs` becomes a copy of
+ * the first member's stream owned by `packet` (the packet only reads what the
+ * copy shares with the member), of every member's synchronization kinds and
+ * vertex-half image reads, and with the synchronization of nothing yet; the
+ * members are then added in order and the packet finished. The packet keeps
+ * its render resource list and tile footprints across submissions. */
 void hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
-                         const struct hk_cs *first, uint8_t kinds);
+                         struct hk_cmd_buffer *const *members,
+                         unsigned count);
 
 /* Adds member `item` (the stream of `source`): its draws, flags and
  * resources, its synchronization (as hk_pack_fold_member() folds a compute
