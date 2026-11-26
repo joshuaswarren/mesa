@@ -423,7 +423,7 @@ bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
 bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
                                        bool no_textures);
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
-bool agx_nir_shrink_memory_loads(struct nir_shader *nir);
+bool agx_nir_shrink_memory_loads(struct nir_shader *nir, bool byte_offsets);
 
 bool agx_nir_merge_global_words(struct nir_shader *shader);
 bool agx_nir_hoist_readonly_loop_loads(struct nir_shader *shader);
