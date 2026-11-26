@@ -542,6 +542,11 @@ static nir_def *
 lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 {
    nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   /* A pair partner below already produced this result. */
+   if (instr->pass_flags)
+      return nir_mov_alu(b, alu->src[0], 1);
+
    const uint32_t saved_ctrl = b->fp_math_ctrl;
    b->fp_math_ctrl = nir_fp_no_fast_math;
    nir_def *x = nir_mov_alu(b, alu->src[0], 1);
@@ -566,6 +571,11 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    nir_def *k = nir_if_phi(b, ph.k, cw.k);
    nir_def *fq = nir_if_phi(b, ph.fq, cw.fq);
    nir_def *fq_lo = nir_if_phi(b, ph.fq_lo, cw.fq_lo);
+
+   /* The reduction is shared between sin and cos: cos(x) = sin(x + pi/2)
+    * selects one quadrant later. Keep the unshifted k for a pair partner.
+    */
+   nir_def *k_base = k;
 
    /* cos(x) = sin(x + pi/2): one more quadrant */
    if (alu->op == nir_op_fcos)
@@ -644,6 +654,71 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
          v = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, v);
    }
 
+   /* sin(x) and cos(x) differ only in the quadrant select: the reduction and
+    * both polynomials are identical, so a sin/cos pair on one argument (the
+    * shape of every rotary-embedding and twiddle kernel) needs only one
+    * sequence. The argument's other uses name the candidates; the partner
+    * must sit in the join block after everything emitted above, where the
+    * shared values dominate. Rewriting its uses lets the flag check above
+    * skip its own pass.
+    */
+   const nir_op partner_op = alu->op == nir_op_fsin ? nir_op_fcos : nir_op_fsin;
+   nir_instr *boundary = nir_def_instr(v);
+   nir_def *vp32 = NULL, *vp16 = NULL;
+   list_for_each_entry(nir_src, use, &alu->src[0].src.ssa->uses, use_link) {
+      nir_instr *ins = nir_src_is_if(use) ? NULL : nir_src_use_instr(use);
+      if (ins == NULL)
+         continue;
+      if (ins->type != nir_instr_type_alu ||
+          ins->block != boundary->block)
+         continue;
+
+      nir_alu_instr *p = nir_instr_as_alu(ins);
+      if (p->op != partner_op || p->def.bit_size > 32 ||
+          use != &p->src[0].src ||
+          p->src[0].swizzle[0] != alu->src[0].swizzle[0])
+         continue;
+
+      /* Everything emitted above precedes the partner's program order. */
+      nir_instr *scan = nir_instr_next(boundary);
+      for (; scan && scan != ins; scan = nir_instr_next(scan))
+         ;
+      if (scan != ins)
+         continue;
+
+      nir_def *cache = p->def.bit_size == 16 ? vp16 : vp32;
+      if (cache) {
+         nir_def_rewrite_uses(&p->def, cache);
+         p->instr.pass_flags = 1;
+         continue;
+      }
+
+      nir_def *k_p = nir_iadd_imm(b, k_base, alu->op == nir_op_fsin ? 1 : 0);
+      nir_def *odd_p = nir_ine_imm(b, nir_iand_imm(b, k_p, 1), 0);
+      nir_def *neg_p = nir_ine_imm(b, nir_iand_imm(b, k_p, 2), 0);
+      nir_def *vp = nir_bcsel(b, odd_p, cs, sn);
+      vp = nir_bcsel(b, neg_p, nir_fneg(b, vp), vp);
+      vp = nir_bcsel(b, nir_flt_imm(b, ax, INFINITY), vp, nan);
+
+      if (p->op == nir_op_fsin) {
+         if (nir_is_denorm_flush_to_zero(
+                b->shader->info.float_controls_execution_mode, 32))
+            vp = nir_bcsel(b, nir_feq_imm(b, x, 0.0),
+                           nir_iand_imm(b, x, 0x80000000), vp);
+         else
+            vp = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, vp);
+      }
+
+      if (p->def.bit_size == 16) {
+         vp = nir_f2f16(b, vp);
+         vp16 = vp;
+      } else {
+         vp32 = vp;
+      }
+      nir_def_rewrite_uses(&p->def, vp);
+      p->instr.pass_flags = 1;
+   }
+
    if (bit_size == 16)
       v = nir_f2f16(b, v);
 
@@ -654,5 +729,6 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 bool
 agx_nir_lower_sincos(nir_shader *s)
 {
+   nir_shader_clear_pass_flags(s);
    return nir_shader_lower_instructions(s, sincos_filter, lower_sincos, NULL);
 }

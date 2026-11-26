@@ -173,3 +173,33 @@ TEST_F(LowerMathTest, SinPreserveKeepsSelect)
    EXPECT_EQ(count_iand_imm(0x80000000), 0u);
 }
 
+TEST_F(LowerMathTest, SinCosPairSharesReduction)
+{
+   set_mode(0);
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_fsin(&b, x);
+   nir_fcos(&b, x);
+
+   agx_nir_lower_sincos(b.shader);
+
+   /* The pair runs one argument reduction and one polynomial set; the
+    * Cody-Waite branch's fround_even is the counter for it.
+    */
+   EXPECT_EQ(count_alu(nir_op_fsin), 0u);
+   EXPECT_EQ(count_alu(nir_op_fcos), 0u);
+   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
+   EXPECT_EQ(count_alu(nir_op_feq), 1u);
+}
+
+TEST_F(LowerMathTest, SinCosDistinctArgsReduceSeparately)
+{
+   set_mode(0);
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_def *y = nir_fadd(&b, x, nir_imm_float(&b, 1.0f));
+   nir_fsin(&b, x);
+   nir_fcos(&b, y);
+
+   agx_nir_lower_sincos(b.shader);
+
+   EXPECT_EQ(count_alu(nir_op_fround_even), 2u);
+}
