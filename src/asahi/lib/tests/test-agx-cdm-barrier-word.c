@@ -51,12 +51,18 @@ main(void)
    assert(agx2_cdm_barrier_emit_word(AGX_CDM_BARRIER_FULL_WORD, false,
                                     false) == AGX_CDM_BARRIER_FULL_WORD);
 
-   /* Pure compute-to-compute SSBO word: 0x160 on measured G13X and G14X
-    * gen-14, chip default everywhere else, still upgrading under
+   /* Pure compute-to-compute SSBO word: derived from the device's measured
+    * default word (0x1ff -> 0x160; full word unchanged), still upgrading under
     * sparse/force_full. */
-   assert(agx2_cdm_barrier_ssbo_word(AGX_CHIP_G14X, 14) == 0x160u);
-   assert(agx2_cdm_barrier_ssbo_word(AGX_CHIP_G13X, 13) == 0x160u);
-   assert(agx2_cdm_barrier_ssbo_word(AGX_CHIP_G14G, 14) ==
+   assert(agx2_cdm_barrier_ssbo_word(0x1ffu) == AGX_CDM_BARRIER_SSBO_WORD);
+   assert(agx2_cdm_barrier_ssbo_word(AGX_CDM_BARRIER_FULL_WORD) ==
+          AGX_CDM_BARRIER_FULL_WORD);
+   assert(agx2_cdm_barrier_ssbo_word(
+             agx2_cdm_barrier_default_word(AGX_CHIP_G14X, 14)) == 0x160u);
+   assert(agx2_cdm_barrier_ssbo_word(
+             agx2_cdm_barrier_default_word(AGX_CHIP_G13X, 13)) == 0x160u);
+   assert(agx2_cdm_barrier_ssbo_word(
+             agx2_cdm_barrier_default_word(AGX_CHIP_G14G, 14)) ==
           AGX_CDM_BARRIER_FULL_WORD);
    assert(agx2_cdm_barrier_emit_word(0x160u, false, false) == 0x160u);
    assert(agx2_cdm_barrier_emit_word(0x160u, true, false) ==

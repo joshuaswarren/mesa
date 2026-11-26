@@ -1584,34 +1584,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          return;
       }
 
-      /* The app declared a memory dependency: the next CDM launch carries
-       * the full barrier set (hk_cmd_dispatch.c). Launches before the
-       * barrier were already flushed by the previous launch's gating. */
-      const bool track = !HK_PERF(dev, FULLCDMBARRIER);
-      const bool gfx_open = cmd->current_cs.gfx ||
-                            cmd->current_cs.pre_gfx ||
-                            cmd->current_cs.post_gfx;
-      if (track) {
-         if (!cmd->state.cs.cdm_barrier_pending) {
-            cmd->state.cs.cdm_barrier_pending = true;
-            cmd->state.cs.cdm_barrier_full_needed = false;
-         }
-         if (gfx_open || !cmd->current_cs.cs ||
-             cmd->current_cs.cs->stats.cmds == 0 ||
-             cmd->state.cs.cdm_stream_has_images ||
-             !hk_dependency_is_pure_compute_ssbo(pDependencyInfo)) {
-            cmd->state.cs.cdm_barrier_full_needed = true;
-         }
-      }
-
-      /* Outside a render pass only a CDM control stream can be open; the
-       * pending flag orders it against the next launch. Ending the compute
-       * batch here would only produce the stream merge_control_streams
-       * stitches back together at hk_EndCommandBuffer, plus a stream link
-       * and a fresh chunk per barrier; keep it open. The batch must end
-       * when a graphics batch is open: the dependency then spans batch
-       * types and the kernel orders the resulting commands. */
-      if (!track || gfx_open)
+      /* On AGX2 outside a render pass, keep an open compute stream alive
+       * across the barrier so the next pure compute SSBO launch can narrow
+       * the previous launch's trailing barrier word in place (hk_cmd_dispatch.c).
+       * Non-AGX2 command streams (such as G18G/HAL300), fullcdmbarrier, and
+       * open graphics batches still end the compute stream as on the base. */
+      if (hk_cdm_record_pipeline_barrier(cmd, pDependencyInfo))
          hk_cmd_buffer_end_compute(cmd);
 
       hk_cmd_buffer_end_graphics(cmd);

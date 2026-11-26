@@ -3357,6 +3357,13 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
  * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
+/* Record a non-native pipeline barrier against the open compute stream.
+ * Returns true when the caller must end the open compute stream (non-AGX2
+ * command streams such as G18G/HAL300, fullcdmbarrier, or an open graphics
+ * batch). */
+bool hk_cdm_record_pipeline_barrier(struct hk_cmd_buffer *cmd,
+                                    const VkDependencyInfo *dep);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -3904,7 +3911,8 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (s->info.reads_images || s->b.info.texture_state_count != 0 ||
        s->b.info.sampler_state_count != 0 || s->b.info.uses_sampler_heap ||
-       s->b.info.uses_txf || s->info.stage != MESA_SHADER_COMPUTE) {
+       s->b.info.uses_txf || s->info.stage != MESA_SHADER_COMPUTE ||
+       cmd->in_meta) {
       cmd->state.cs.cdm_barrier_full_needed = true;
       cmd->state.cs.cdm_stream_has_images = true;
    }

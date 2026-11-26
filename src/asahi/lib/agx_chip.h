@@ -786,16 +786,14 @@ agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
 
 /* The reduced AGX2 CDM barrier word for pure compute-to-compute storage-buffer
  * dependencies inside an open CDM stream (hk_CmdPipelineBarrier2 /
- * hk_cdm_flush()). Measured on G13X (M1 Max) and G14X gen-14 (M2 Max): drops
- * bit 3 (USC cache invalidate) and PBE/texture-cache maintenance bits; other
- * chips keep their default word until measured. */
+ * hk_cdm_flush()). Derived from the device's measured default word so no chip
+ * list is added: parts already on the 0x1ff default word drop bit 3 (USC cache
+ * invalidate) and PBE/texture-cache maintenance bits {0,1,2,4,7} to emit
+ * 0x160; parts still on the full word keep their default word unchanged. */
 static inline uint32_t
-agx2_cdm_barrier_ssbo_word(enum agx_chip chip, uint32_t gpu_generation)
+agx2_cdm_barrier_ssbo_word(uint32_t default_word)
 {
-   if (chip == AGX_CHIP_G13X ||
-       (chip == AGX_CHIP_G14X && gpu_generation == 14))
-      return AGX_CDM_BARRIER_SSBO_WORD;
-   return agx2_cdm_barrier_default_word(chip, gpu_generation);
+   return default_word == 0x1ffu ? AGX_CDM_BARRIER_SSBO_WORD : default_word;
 }
 
 /* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
