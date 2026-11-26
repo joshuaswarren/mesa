@@ -651,7 +651,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16_SNORM:
    case VK_FORMAT_R16_UINT:
    case VK_FORMAT_R16_SINT: bit = 1024; break;
-   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_UNORM: bit = 8192; break;
    case VK_FORMAT_R8G8_UNORM:
    case VK_FORMAT_R8G8_SNORM:
    case VK_FORMAT_R8G8_UINT:
@@ -659,7 +659,17 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R8_UNORM:
    case VK_FORMAT_R8_SNORM:
    case VK_FORMAT_R8_UINT:
-   case VK_FORMAT_R8_SINT: bit = 8192; break;
+   case VK_FORMAT_R8_SINT:
+      /* Only as colour attachments too. A storage-only image of one- or
+       * two-byte texels is written by shader stores alone, each merging into
+       * a compressed tile, for little saved bandwidth: BeamNG's
+       * full-resolution R8 compute targets ran about 1.6 % slower
+       * compressed. vkd3d-proton's typeless R8/RG8 render targets are also
+       * end-of-tile stores, which write whole compressed tiles. */
+      if (!(info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+         return false;
+      bit = 8192;
+      break;
    case VK_FORMAT_R32G32_UINT:
    case VK_FORMAT_R32G32_SINT:
    case VK_FORMAT_R32G32B32A32_UINT:
