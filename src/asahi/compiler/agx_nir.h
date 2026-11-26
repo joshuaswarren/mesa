@@ -14,8 +14,6 @@ struct nir_instr;
 struct nir_intrinsic_instr;
 struct nir_builder;
 struct nir_def;
-struct nir_alu_instr;
-struct hash_table;
 
 /* BASE bit3 selects an explicit byte-scaled AGX3 load/store index. */
 #define AGX_NIR_MEMORY_INDEX_BYTES 8u
@@ -416,8 +414,6 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
 bool agx_nir_opt_nonneg_idiv(struct nir_shader *shader);
 
 bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
-bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
-                                  struct hash_table *cache);
 bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
 bool agx_nir_has_loop(const struct nir_shader *nir);

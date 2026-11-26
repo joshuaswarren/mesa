@@ -16134,10 +16134,10 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 
 /*
  * Lower 32-bit integer division. When the compile forms a preamble, a division
- * by a uniform value uses magic multipliers (agx_nir_opt_uniform_idiv), whose
- * calculation the preamble then runs once. Without a preamble that calculation
- * would run in every invocation and cost more than nir_lower_idiv's
- * reciprocal, so everything takes nir_lower_idiv.
+ * by a uniform value uses an exact reciprocal (agx_nir_opt_uniform_idiv),
+ * which the preamble then computes once. Without a preamble that calculation
+ * would run in every invocation and save nothing over nir_lower_idiv, so
+ * everything takes nir_lower_idiv.
  */
 bool
 agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
