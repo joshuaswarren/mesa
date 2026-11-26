@@ -6545,7 +6545,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
-      !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
+      !preserve_raw_mono && agx_chip_native_or_m5(dev->dev.chip) &&
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&

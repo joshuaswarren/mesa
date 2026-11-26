@@ -8077,24 +8077,42 @@ hk_g17p_mono_own_layout(const struct hk_shader *shader,
    return hk_g17p_inline_blend_own_layout(&shader->b, part);
 }
 
-/* Every G17P fragment program that touches the tile opens the pixel
- * transaction with the entry gate and ends it with a final release
- * (PIXREL with 0x200) just before END. The packer only emits that
- * protocol for shapes it has proven; a shape it does not recognise
- * would come back without it rather than failing, so check the bytes. */
+/* Every native AGX3 / M5 fragment program that touches the tile opens the
+ * pixel transaction with the entry gate and ends it with a final release
+ * (PIXREL with 0x200) just before END. The packer only emits that protocol
+ * for shapes it has proven; a shape it does not recognise would come back
+ * without it rather than failing, so check the bytes. */
 static const char *
-hk_g17p_mono_part_refusal(const struct hk_shader *shader,
+hk_g17p_mono_part_refusal(enum agx_chip chip, const struct hk_shader *shader,
                           const struct agx_shader_part *part)
 {
-   static const uint8_t gate[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
    const uint8_t *code = (const uint8_t *)part->binary + part->info.main_offset;
    const size_t n = part->info.main_size;
    bool has_gate = false;
-   for (size_t o = 0; o + sizeof(gate) <= n && !has_gate; o += 2)
-      has_gate = !memcmp(code + o, gate, sizeof(gate));
-   const bool final_release = n >= 10 && code[n - 4] == 0x0e &&
-      code[n - 10] == 0x07 && code[n - 9] == 0x02 && code[n - 8] == 0x54 &&
-      (code[n - 6] & 0x02) && code[n - 5] == 0x00;
+   bool final_release = false;
+
+   if (agx_chip_g17_m5(chip)) {
+      static const uint8_t gate_c[6] = {0x07, 0x30, 0x00, 0x05, 0x00, 0x00};
+      if (part->info.agx3_colour_link.rt_query_write_acquired)
+         return "ray query write acquired";
+      if (part->info.agx3_colour_link.entry_emitted) {
+         const uint32_t off = part->info.agx3_colour_link.entry_offset;
+         has_gate = (off & 1) == 0 && off <= n && n - off >= sizeof(gate_c) &&
+                    !memcmp(code + off, gate_c, sizeof(gate_c));
+      }
+      /* AGX3C pixrel(..., last=true, wait=0) immediately before END (0x0e). */
+      final_release = n >= 10 && code[n - 4] == 0x0e &&
+         (code[n - 10] & 0x07) == 0x07 && (code[n - 9] & 0x10) != 0 &&
+         code[n - 8] == 0x00 && code[n - 7] == 0x04 &&
+         code[n - 6] == 0x00 && code[n - 5] == 0x00;
+   } else {
+      static const uint8_t gate[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+      for (size_t o = 0; o + sizeof(gate) <= n && !has_gate; o += 2)
+         has_gate = !memcmp(code + o, gate, sizeof(gate));
+      final_release = n >= 10 && code[n - 4] == 0x0e &&
+         code[n - 10] == 0x07 && code[n - 9] == 0x02 && code[n - 8] == 0x54 &&
+         (code[n - 6] & 0x02) && code[n - 5] == 0x00;
+   }
    if (!has_gate || !final_release)
       return "pixel protocol not proven";
 
@@ -8171,7 +8189,7 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
       memcpy(parts, partitions, sizeof(parts));
 
    /* Bumped when the admission changes: refusals are cached as well. */
-   const char magic[8] = "hkmono7";
+   const char magic[8] = "hkmono8";
    const uint8_t preopt_flag = shader->g17p_mono_preoptimized ? 1 : 0;
    const size_t rodata_size =
       shader->b.binary ? shader->b.info.rodata.size_16 * 2 : 0;
@@ -8208,7 +8226,7 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
 static struct agx_shader_part *
 hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                            const struct agx_fs_epilog_key *ekey,
-                           const BITSET_WORD *partitions)
+                           const BITSET_WORD *partitions, bool uniform_blend)
 {
    /* A refusal of these inputs is final: remember it with the programs. */
 #define HK_MONO_REFUSE(why)                                                    \
@@ -8234,8 +8252,6 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    const bool inline_samples = shader->info.fs.m5_inline_sample_shading;
    const bool agx2 =
       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
-   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
-                              !inline_samples;
    if (uniform_blend && !hk_uniform_blend_key(ekey))
       HK_MONO_REFUSE("uniform blend shape");
    if ((ekey->native_spills && !inline_samples) ||
@@ -8264,7 +8280,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                    ? !hk_uniform_blend_part(shader, part)
                    : inline_samples
                    ? hk_g17p_mono_layout_mismatch(&expected, part, false) != NULL
-                   : hk_g17p_mono_part_refusal(shader, part) != NULL)
+                   : hk_g17p_mono_part_refusal(dev->dev.chip, shader, part) != NULL)
                HK_MONO_FAIL("cached program");
             ralloc_free(mem);
             return part;
@@ -8323,13 +8339,20 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       pixel.defer_monolithic_msaa = true;
       agx_nir_fs_epilog_ex(&eb, &pixel, &epilog_res);
       agx_nir_lower_sample_exports_to_end(nir);
-   } else if (uniform_blend) {
+   } else if (uniform_blend ||
+              (agx_chip_g17_m5(dev->dev.chip) && !ekey->link.sample_shading &&
+               !ekey->native_spills)) {
       agx_nir_fs_epilog_ex(&eb, ekey, &epilog_res);
    } else {
       agx_nir_fs_epilog_g17p_ex(&eb, ekey, &epilog_res);
    }
    agx_preprocess_nir(eb.shader);
-   if (!inline_samples && !uniform_blend)
+   if (!inline_samples && !uniform_blend && !ekey->link.sample_shading &&
+       (hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_store_zs_agx) > 1 ||
+        hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_sample_mask_agx) > 1))
+      NIR_PASS(_, eb.shader, agx_nir_hoist_g17p_zs_writes);
+   if (!inline_samples && !uniform_blend &&
+       (!agx_chip_g17_m5(dev->dev.chip) || ekey->nr_samples > 1))
       NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
 
    /* Epilog code reading uniforms (blend constants and the like) would
@@ -8497,7 +8520,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                ? (hk_uniform_blend_part(shader, part) ? NULL
                                                          : "uniform blend launch")
             : inline_samples ? hk_g17p_mono_layout_mismatch(&expected, part, false)
-                             : hk_g17p_mono_part_refusal(shader, part);
+                             : hk_g17p_mono_part_refusal(dev->dev.chip, shader, part);
       if (!why || !without)
          break;
 
@@ -8994,13 +9017,14 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
    const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
                               !shader->info.fs.m5_inline_sample_shading &&
+                              !shader->g17p_mono_preoptimized &&
                               hk_uniform_blend_key(&key->epilog);
    if ((uniform_blend || shader->info.fs.m5_inline_sample_shading ||
-        (agx_chip_native_agx3(dev->dev.chip) &&
+        (agx_chip_native_or_m5(dev->dev.chip) &&
          (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
        !prolog && key->nr_samples_shaded == 0 && shader->g17p_mono_nir) {
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
-         dev, shader, &key->epilog, g17p_tile_partitions);
+         dev, shader, &key->epilog, g17p_tile_partitions, uniform_blend);
       if (mono) {
          struct hk_fast_link_key *mono_key_clone =
             ralloc_memdup(shader->linked.ht, key, sizeof(*key));
