@@ -64,6 +64,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
+   {"compsched", AGX_DBG_COMPSCHED,  "Run the register-pressure scheduler on compute shaders"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -15347,10 +15348,19 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    if (likely(!(agx_compiler_debug & AGX_DBG_NOOPT)))
       AGX_PASS(ctx, agx_opt_sink_immediates);
 
-   if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED))) {
+   /* The bottom-up register-pressure scheduler moves each load next to its
+    * use, which serializes the memory round trips of small compute kernels
+    * (the LLM decode chain: +1.7% tokens/s with it off, bit-identical
+    * results). Compute shaders therefore skip it unless
+    * AGX_MESA_DEBUG=compsched is set. */
+   bool skip_sched = (agx_compiler_debug & AGX_DBG_NOSCHED) ||
+                     (nir->info.stage == MESA_SHADER_COMPUTE &&
+                      !(agx_compiler_debug & AGX_DBG_COMPSCHED));
+   if (likely(!skip_sched)) {
       AGX_PASS(ctx, agx_pressure_schedule);
-      AGX_PASS(ctx, agx_ilp_schedule);
    }
+   if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED)))
+      AGX_PASS(ctx, agx_ilp_schedule);
 
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
 
