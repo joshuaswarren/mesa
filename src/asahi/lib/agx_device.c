@@ -2078,6 +2078,7 @@ agx_gather_device_key(struct agx_device *dev)
    struct agx_device_key key = {
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
+      .g13 = dev->params.gpu_generation == 13,
    };
    agx_device_key_set_target(&key, dev->chip);
    key.shader_quad_control = agx_chip_agx3_shader_quad_control(key.chip);

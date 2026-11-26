@@ -15546,10 +15546,12 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    /* The bottom-up register-pressure scheduler moves each load next to its
     * use, which serializes the memory round trips of small compute kernels
     * (the LLM decode chain: +1.7% tokens/s with it off, bit-identical
-    * results). Compute shaders therefore skip it unless
-    * AGX_MESA_DEBUG=compsched is set. */
+    * results). Compute shaders on G13 therefore skip it unless
+    * AGX_MESA_DEBUG=compsched is set. Other generations keep it until they
+    * are measured. */
    bool skip_sched = (agx_compiler_debug & AGX_DBG_NOSCHED) ||
                      (nir->info.stage == MESA_SHADER_COMPUTE &&
+                      ctx->key->dev.g13 &&
                       !(agx_compiler_debug & AGX_DBG_COMPSCHED));
    if (likely(!skip_sched)) {
       AGX_PASS(ctx, agx_pressure_schedule);
@@ -19594,7 +19596,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
    }
 
-   if (!(agx_compiler_debug & AGX_DBG_NOLOCALFOLD)) {
+   if (key->dev.g13 && !(agx_compiler_debug & AGX_DBG_NOLOCALFOLD)) {
       NIR_PASS(_, nir, agx_fold_shared_offsets);
       NIR_PASS(_, nir, nir_opt_dce);
    }
