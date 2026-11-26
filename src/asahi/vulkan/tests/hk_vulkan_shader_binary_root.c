@@ -47,6 +47,7 @@
 /* vk_shader.c's binary header: magic, driver ID, UUID, version, size, then
  * the BLAKE3 of the header (with a zero digest) and the payload. */
 #define BIN_HEADER_B 80
+#define BIN_SIZE_B   40
 #define BIN_BLAKE3_B 48
 
 /* hk_api_shader_serialize(): stage and three flag bytes, then one marker
@@ -188,6 +189,24 @@ expect_edit(const char *shader, const char *what, const struct binary *b,
    free(t.data);
 }
 
+/* Cut a copy of b short at `size` bytes, fix up the header's size field (a
+ * u64 after the magic, driver ID, UUID and version) and reseal it. */
+static void
+expect_truncated(const char *shader, const char *what, const struct binary *b,
+                 size_t size)
+{
+   REQUIRE(size > BIN_HEADER_B && size < b->size);
+   struct binary t = {malloc(size), size};
+   REQUIRE(t.data);
+   memcpy(t.data, b->data, size);
+   const uint64_t size64 = size;
+   write_bytes(&t, BIN_SIZE_B, &size64, sizeof(size64));
+   reseal(&t);
+   expect(shader, what, import(&t, NULL),
+          VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   free(t.data);
+}
+
 /* With the uniform DMA spans dropped, only the set-pointer floor bounds the
  * root prefix: set the set count and prefix and import. */
 static void
@@ -258,6 +277,17 @@ check_shader(const char *name, const uint32_t *spirv, size_t spirv_size)
              ? VK_SUCCESS : VK_ERROR_UNKNOWN,
           VK_SUCCESS);
    free(again.data);
+
+   /* Every device: a binary that ends inside the shader info, or right
+    * after it, is refused before any of the info is used. */
+   const size_t cuts[] = {BIN_INFO_B + 1,
+                          BIN_INFO_B + offsetof(struct hk_shader_info, set_count),
+                          BIN_INFO_END_B - 1, BIN_INFO_END_B};
+   for (unsigned i = 0; i < ARRAY_SIZE(cuts); ++i) {
+      char what[64];
+      snprintf(what, sizeof(what), "binary cut at byte %zu", cuts[i]);
+      expect_truncated(name, what, &b, cuts[i]);
+   }
 
    /* Every device: the root layout cannot name more sets than exist, nor
     * more DMA spans than the shader info holds. */
