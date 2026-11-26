@@ -23,6 +23,7 @@ enum hk_2d_stencil_kind {
    HK_2D_STENCIL_BOX_BLUR_U8 = 0,
    HK_2D_STENCIL_STEREO_SAD_U8 = 1,
    HK_2D_STENCIL_SOBEL_3X3_U8 = 2,
+   HK_2D_STENCIL_FAST9_U8 = 3,
 };
 
 struct hk_2d_stencil_binding {
@@ -47,6 +48,8 @@ struct hk_2d_stencil_plan {
    uint16_t d_min_pc_offset_B;
    uint16_t d_max_pc_offset_B;
    uint16_t cost_stride_pc_offset_B;
+   uint16_t border_pc_offset_B;
+   uint16_t threshold_pc_offset_B;
    uint16_t pad2;
 
    /* Up to 6 SSBO bindings:
@@ -54,6 +57,8 @@ struct hk_2d_stencil_plan {
     * - STEREO_SAD_U8: [0]=left(u8), [1]=right(u8), [2]=prev_disp(u8),
     *                  [3]=prev_cost(u32), [4]=dst_disp(u8), [5]=dst_cost(u32)
     * - SOBEL_3X3_U8:  [0]=src(u8), [1]=dir(i32), [2]=mag(f32)
+    * - FAST9_U8:      [0]=src(u8), [1]=dst_score(f32), [2]=dst_count(u32),
+    *                  [3]=dst_pts(ivec2)
     */
    struct hk_2d_stencil_binding bufs[6];
 };
