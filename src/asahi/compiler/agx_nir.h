@@ -132,6 +132,7 @@ bool agx_nir_share_bounds(struct nir_shader *s, bool size_below_u32_max);
 bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
 bool agx_nir_opt_canonical_minmax(struct nir_shader *s);
 bool agx_nir_lower_fdiv(struct nir_shader *s);
+bool agx_nir_lower_fdiv_late(struct nir_shader *s);
 bool agx_nir_lower_log(struct nir_shader *s);
 bool agx_nir_lower_sincos(struct nir_shader *s);
 
