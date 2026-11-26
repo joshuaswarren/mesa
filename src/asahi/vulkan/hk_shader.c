@@ -5135,7 +5135,7 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
 /* This deliberately accepts only direct constant-offset push loads. The root
  * access set is unchanged when their arithmetic moves into a constant program. */
 static bool
-hk_m5_push_colour_load(const nir_intrinsic_instr *load)
+hk_push_colour_load(const nir_intrinsic_instr *load)
 {
    if (load->intrinsic != nir_intrinsic_load_global_constant ||
        load->def.bit_size != 32 || load->def.num_components > 4)
@@ -5167,7 +5167,7 @@ hk_m5_push_colour_load(const nir_intrinsic_instr *load)
 /* Keep straight-line uniform RT0 exports without descriptors or hidden effects.
  * The clone retains the original clamps and floating-point controls. */
 static bool
-hk_m5_uniform_colour(nir_shader *nir)
+hk_uniform_colour(nir_shader *nir)
 {
    if (nir->info.stage != MESA_SHADER_FRAGMENT || nir->info.internal ||
        nir->info.writes_memory || nir->info.fs.uses_discard ||
@@ -5200,7 +5200,7 @@ hk_m5_uniform_colour(nir_shader *nir)
                return false;
             break;
          case nir_intrinsic_load_global_constant:
-            if (!hk_m5_push_colour_load(intr))
+            if (!hk_push_colour_load(intr))
                return false;
             break;
          default:
@@ -6281,9 +6281,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * every driver-synthesized root load while trimming unused push-constant,
     * dynamic-buffer and trailing tail bytes. Round up for native
     * uniform/global load granularity. */
-   if (agx_chip_native_hal200(dev->dev.chip))
+   const bool trimmed_root =
+      agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip);
+   if (trimmed_root)
       shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (agx_chip_native_hal200(dev->dev.chip) &&
+   if (trimmed_root &&
        (sw_stage == MESA_SHADER_COMPUTE ||
         sw_stage == MESA_SHADER_FRAGMENT ||
         (sw_stage == MESA_SHADER_VERTEX &&
@@ -6478,14 +6480,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    assert(nir->info.io_lowered);
 
-   /* Preserve NIR for optional native inline blending, M5 uniform-colour
+   /* Preserve NIR for optional native inline blending, uniform-colour
     * blending and mandatory M5 sample shading whose split exports exceed the
     * register file. Native AGX3 inline blending captures the shader's
     * pre-preamble NIR during the standalone compile below so fast-link does
     * not repeat the pre-preamble optimization pipeline. */
    const bool preserve_raw_mono =
-      (agx_chip_g17_m5(dev->dev.chip) && sw_stage == MESA_SHADER_FRAGMENT &&
-       hk_m5_uniform_colour(nir)) ||
+      (sw_stage == MESA_SHADER_FRAGMENT &&
+       (agx_chip_g17_m5(dev->dev.chip) ||
+        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2) &&
+       hk_uniform_colour(nir)) ||
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
@@ -7168,6 +7172,7 @@ hk_nir_scan_input_attachments(const nir_shader *nir,
    }
 
    bool eligible = true;
+   unsigned other_samples = 0;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
@@ -7291,11 +7296,13 @@ hk_nir_scan_input_attachments(const nir_shader *nir,
          }
 
          out->ia_mask |= BITFIELD_BIT(ia_idx);
-         if (ms_by_sample_id)
-            out->ms_mask |= BITFIELD_BIT(ia_idx);
+         if (!ms_by_sample_id)
+            other_samples |= BITFIELD_BIT(ia_idx);
       }
    }
 
+   /* Every access to a multisample input must refer to the current sample. */
+   out->ms_mask = out->ia_mask & ~other_samples;
    if (!eligible || !out->ia_mask) {
       memset(out, 0, sizeof(*out));
       return false;
@@ -7393,7 +7400,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    if (!nir)
       return;
 
-   if (!agx_chip_local_read_tilebuffer(dev->dev.chip) || nir->info.internal ||
+   if (!hk_local_read_tilebuffer(dev->dev.chip) || nir->info.internal ||
        (key && key->fs.zs_self_dep) || hk_nir_has_ray_query(nir) ||
        (nir->info.outputs_written &
         (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
@@ -7403,12 +7410,16 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
       return;
    }
 
+   const bool agx2 = agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool force_samples = key && key->fs.force_sample_shading;
+   const bool sample_rate = nir->info.fs.uses_sample_shading || (agx2 && force_samples);
    const unsigned native_samples =
       key ? hk_native_fs_samples(dev->dev.chip, &key->fs) : 0;
-   const unsigned lr_samples =
-      native_samples ? native_samples
-                     : (nir->info.fs.uses_sample_shading ? 0 : 1);
-   if (lr_samples == 0) {
+   /* An AGX2 sample-rate program gets its loop bound from the draw's epilog
+    * key after its tile loads and stores have been combined into one shader. */
+   const bool dynamic_samples = agx2 && sample_rate;
+   const unsigned lr_samples = native_samples ? native_samples : (sample_rate ? 0 : 1);
+   if (!lr_samples && !dynamic_samples) {
       ralloc_free(nir);
       return;
    }
@@ -7422,7 +7433,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
       return;
    }
 
-   nir->info.fs.uses_sample_shading |= key && key->fs.force_sample_shading;
+   nir->info.fs.uses_sample_shading |= force_samples;
    if (lr_samples == 1)
       NIR_PASS(_, nir, agx_nir_lower_g17p_1x_sample_shading);
    if (agx_chip_g17_m5(dev->dev.chip) && lr_samples > 4)
@@ -7430,7 +7441,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    else
       NIR_PASS(_, nir, agx_nir_lower_sample_intrinsics, false);
 
-   if (lr_samples > 1 && nir->info.fs.uses_sample_shading &&
+   if (lr_samples != 1 && nir->info.fs.uses_sample_shading &&
        nir->info.fs.uses_discard) {
       ralloc_free(nir);
       return;
@@ -7491,7 +7502,8 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    }
 
    NIR_PASS(_, nir, agx_nir_apply_api_mask_to_force_early, dev->dev.chip);
-   NIR_PASS(_, nir, agx_nir_specialize_sample_count, lr_samples);
+   if (lr_samples)
+      NIR_PASS(_, nir, agx_nir_specialize_sample_count, lr_samples);
 
    if (!nir->info.fs.uses_sample_shading)
       NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
@@ -8834,7 +8846,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_info, &scanned_ia);
          has_ia |= scanned_ia;
-         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+         if (lr_ok && hk_local_read_tilebuffer(dev->dev.chip) &&
              !mesh_fs && !nir->info.internal) {
             lr_nir = nir_shader_clone(NULL, nir);
             if (lr_nir) {
@@ -10809,7 +10821,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_infos[i], &has_ias[i]);
-         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+         if (lr_ok && hk_local_read_tilebuffer(dev->dev.chip) &&
              !is_multiview && !has_mesh && !nir->info.internal) {
             lr_nirs[i] = nir_shader_clone(NULL, nir);
             if (lr_nirs[i]) {
@@ -11338,7 +11350,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
    const uint32_t root_descriptor_size =
-      agx_chip_native_hal200(dev->dev.chip) ? blob_read_uint32(blob) : 0;
+      (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
+         ? blob_read_uint32(blob)
+         : 0;
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
@@ -11933,9 +11947,9 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        (has_stencil_2d && stage != MESA_SHADER_COMPUTE) ||
        (has_compute_opt && stage != MESA_SHADER_COMPUTE) ||
        (has_local_read && (stage != MESA_SHADER_FRAGMENT ||
-                           !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
+                           !hk_local_read_tilebuffer(dev->dev.chip))) ||
        (has_sample_lr && (!has_source || stage != MESA_SHADER_FRAGMENT ||
-                          !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
+                          !hk_local_read_tilebuffer(dev->dev.chip))) ||
        (has_preamble_nir && (stage != MESA_SHADER_VERTEX ||
                              !agx_chip_native_or_m5(dev->dev.chip))) ||
        (has_source && !sample_variants) ||
@@ -11946,7 +11960,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
                                 ? !m5_sample_variants
                                 : !agx_chip_native_or_g18g(dev->dev.chip)))) ||
        (has_mono && (stage != MESA_SHADER_FRAGMENT ||
-                     !agx_chip_native_or_m5(dev->dev.chip))))
+                     (!agx_chip_native_or_m5(dev->dev.chip) &&
+                      agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX2))))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    /* Compiled with a custom-border emulation that this GPU, with no sampler
@@ -12167,7 +12182,11 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          const void *mono_key =
             blob_read_bytes(blob, sizeof(shader->g17p_mono_key));
          const uint8_t mono_preopt = blob_read_uint8(blob);
-         const bool bad_blob = blob->overrun || mono_preopt > 1;
+         /* AGX2 saves the raw uniform-colour shader. Only the native
+          * compiler path captures a preoptimized monolithic shader. */
+         const bool bad_blob =
+            blob->overrun || mono_preopt > 1 ||
+            (mono_preopt && agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2);
          shader->g17p_mono_nir = bad_blob ? NULL : malloc(mono_size);
          if (!shader->g17p_mono_nir) {
             const VkResult result = bad_blob
@@ -12766,7 +12785,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (agx_chip_native_hal200(dev->dev.chip))
+   if (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
       blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)

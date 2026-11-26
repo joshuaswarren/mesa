@@ -119,6 +119,7 @@ bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_reassociate_loop_invariant_eq(struct nir_shader *shader);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
+bool agx_nir_opt_licm_agx2_integer(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_licm_direct_sfu(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);

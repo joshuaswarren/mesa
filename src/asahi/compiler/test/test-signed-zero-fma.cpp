@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "agx_test.h"
+#include <cmath>
+#include <cstring>
 #include <gtest/gtest.h>
 
 TEST(SignedZeroFMA, PreservesProductSignAndAddendModifiers)
@@ -110,7 +112,7 @@ TEST(SignedZeroFMA, KeepsNativeModifierShapes)
          I = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32), agx_neg(x),
                          agx_immediate(64), h);
          break;
-      case 4: /* fma(2.0, -x, 1.0): two minifloats, still materialized */
+      case 4: /* fma(2.0, -x, 1.0): two minifloats, the sign folds */
          I = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32), agx_immediate(64),
                          agx_neg(x), agx_immediate(48));
          keep = false;
@@ -127,6 +129,89 @@ TEST(SignedZeroFMA, KeepsNativeModifierShapes)
          modified |= I->src[s].abs || I->src[s].neg;
       EXPECT_EQ(modified, keep) << mode;
       ralloc_free(mem);
+   }
+}
+
+/* fma(-x, #k, #c) and fma(#k, -x, #c) take the negation in the minifloat
+ * multiplier's sign bit, fma(x, #-k, #c): no sign bit is materialized and no
+ * XOR is emitted. For -|x| only the absolute value is still materialized. The
+ * two forms give the same bits for every x. */
+TEST(SignedZeroFMA, NegatedMultiplicandFoldsIntoImmediate)
+{
+   struct {
+      enum agx_chip chip;
+      enum agx_isa_encoding encoding;
+   } parts[] = {
+      {AGX_CHIP_G17P, AGX_ISA_ENCODING_AGX3B},
+      {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C},
+   };
+   const float xs[] = {0.0f, -0.0f, 1.5f, -3.0f, 1e-40f, -1e-40f,
+                       3.4e38f, INFINITY, -INFINITY};
+   for (auto part : parts) {
+      for (unsigned k : {0x00u, 0x80u, 0x30u, 0x40u, 0xb0u, 0x7fu, 0xffu}) {
+         for (bool swap : {false, true}) {
+            for (bool absolute : {false, true}) {
+               SCOPED_TRACE(part.chip);
+               SCOPED_TRACE(k);
+               SCOPED_TRACE(swap);
+               SCOPED_TRACE(absolute);
+               void *mem = ralloc_context(NULL);
+               agx_builder *b = agx_test_builder(mem);
+               agx_shader_key key = {};
+               key.dev.chip = part.chip;
+               key.dev.encoding = part.encoding;
+               b->shader->key = &key;
+               agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+               agx_index mx = agx_neg(absolute ? agx_abs(x) : x);
+               agx_instr *I = agx_ffma_to(
+                  b, agx_temp(b->shader, AGX_SIZE_32),
+                  swap ? agx_immediate(k) : mx, swap ? mx : agx_immediate(k),
+                  agx_immediate(0x30) /* 1.0 */);
+               agx_lower_agx3_fma_sources(b->shader);
+
+               const unsigned r = swap ? 1 : 0;
+               ASSERT_EQ(I->op, AGX_OPCODE_FFMA);
+               EXPECT_FALSE(I->src[r].neg);
+               EXPECT_FALSE(I->src[r].abs);
+               if (!absolute) {
+                  EXPECT_EQ(I->src[r].type, AGX_INDEX_NORMAL);
+                  EXPECT_EQ(I->src[r].value, x.value);
+               }
+               EXPECT_EQ(I->src[1 - r].type, AGX_INDEX_IMMEDIATE);
+               EXPECT_EQ(I->src[1 - r].value, k ^ 0x80);
+               EXPECT_EQ(I->src[2].type, AGX_INDEX_IMMEDIATE);
+               EXPECT_EQ(I->src[2].value, 0x30u);
+
+               unsigned mov_imm = 0, bitop = 0, others = 0;
+               agx_foreach_instr_global(b->shader, J) {
+                  if (J == I)
+                     continue;
+                  if (J->op == AGX_OPCODE_MOV_IMM) {
+                     EXPECT_EQ(J->imm, UINT32_C(0x7fffffff));
+                     mov_imm++;
+                  } else if (J->op == AGX_OPCODE_BITOP) {
+                     EXPECT_EQ(J->truth_table, 0x8u);
+                     bitop++;
+                  } else {
+                     others++;
+                  }
+               }
+               EXPECT_EQ(mov_imm, absolute ? 1u : 0u);
+               EXPECT_EQ(bitop, absolute ? 1u : 0u);
+               EXPECT_EQ(others, 0u);
+
+               const float pk = agx_minifloat_decode(k);
+               const float nk = agx_minifloat_decode(k ^ 0x80);
+               for (float v : xs) {
+                  const float a = absolute ? fabsf(v) : v;
+                  const float want = fmaf(-a, pk, 1.0f);
+                  const float got = fmaf(a, nk, 1.0f);
+                  EXPECT_EQ(memcmp(&want, &got, sizeof(want)), 0) << v;
+               }
+               ralloc_free(mem);
+            }
+         }
+      }
    }
 }
 

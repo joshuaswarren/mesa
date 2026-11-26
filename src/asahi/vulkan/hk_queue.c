@@ -591,7 +591,7 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
 
    /* Complete the cache cleans of CPU-cached descriptor writes
     * (hk_descriptor_set_publish()) before the GPU can read them. */
-   if (dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops())
+   if (hk_g17p_cached_cmd_memory(&dev->dev))
       util_post_flush_fence();
 
    if (dev->dev.is_virtio) {
@@ -1544,6 +1544,43 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
+/* Wait directly on the queue's DRM timeline syncobj at its latest submitted
+ * point instead of creating a temporary binary syncobj, issuing an empty
+ * transfer submit, waiting on the copy, and destroying it. Threaded,
+ * deferred, and emulated queues fall back to the common implementation. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueueWaitIdle(VkQueue _queue)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   if (vk_device_is_lost(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+
+   if (queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE ||
+       vk_queue_is_emulated(&queue->vk) || !queue->drm.syncobj)
+      return vk_common_QueueWaitIdle(_queue);
+
+   uint64_t target = queue->drm.timeline_value;
+   if (target > p_atomic_read(&queue->drm.signalled_value)) {
+      int err;
+      do {
+         err = drmSyncobjTimelineWait(
+            dev->dev.fd, &queue->drm.syncobj, &target, 1, INT64_MAX,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+      } while (err == -EINTR || (err < 0 && errno == EINTR));
+
+      if (err)
+         return vk_queue_set_lost(
+            &queue->vk, "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT failed: %m");
+
+      hk_queue_note_signalled(queue, target);
+   }
+
+   return vk_device_check_status(&dev->vk);
+}
+
 /* Sibling kernel queues (hk_queue::sib) on G17P: kernel queues per VkQueue,
  * the primary included. macOS spreads one Metal queue over up to three
  * firmware compute queues of one context and runs two kicks at once
@@ -2009,7 +2046,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool cumulative_signals = hk_queue_uses_cumulative_signals(&dev->dev);
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
-      agx_chip_g17_m5(dev->dev.chip) &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_OVERLAP_SPLIT) &&
       command_count > max_commands_per_submit(dev);
    const bool kernel_cumulative = hk_queue_kernel_cumulative_supported(
       &dev->dev, cumulative_signals, chunk_timelines, submit->signal_count);
@@ -2559,7 +2596,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * work that only its fragment half waits for. Every other render
              * keeps the forms below, which the kernel can publish directly.
              */
-            const bool g17p_staged =
+            bool g17p_staged =
                agx_chip_native_hal200(dev->dev.chip) &&
                !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
@@ -2568,10 +2605,6 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
                 ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
-            if (g17p_staged) {
-               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "HAL200 staged render");
-            }
 
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
@@ -2605,9 +2638,11 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
             /* Native HAL200: a vertex half that still names earlier renders
              * can use the fragment-only barriers too when the order of tiling
-             * kicks already covers what it names. A staged render takes
-             * neither the flag nor part in ta_cover: its tiling waits only
-             * for its narrower tiling prefix. */
+             * kicks already covers what it names. Otherwise, when the vertex
+             * half still depends on an earlier render than the fragment half,
+             * send the narrower tiling prefix via a staged render instead of
+             * stalling tiling on the whole prefix. A staged render takes
+             * neither FRAGMENT_BARRIERS nor part in ta_cover. */
             if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
@@ -2619,11 +2654,26 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const uint64_t vertex = hk_drm_render_prefix(
                   base, cs->sync.barrier_ta[HK_SYNC_VDM],
                   cs->sync.prior_ta[HK_SYNC_VDM]);
+               uint64_t next_cover = queue->sync.ta_cover;
                if (hk_drm_g17p_tiling_ordered(
                       base, nr_vdm, whole, vertex,
                       cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
-                      &queue->sync.ta_cover))
+                      &next_cover)) {
                   cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+                  queue->sync.ta_cover = next_cover;
+               } else if (agx_chip_has_cap(dev->dev.chip,
+                                           AGX_CAP_CDM_OVERLAP_SPLIT) &&
+                          (dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+                          cs->sync.ta_split && vertex < whole) {
+                  g17p_staged = true;
+               } else {
+                  queue->sync.ta_cover = next_cover;
+               }
+            }
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* Likewise for compute: when the vertex half depends on less
@@ -4057,8 +4107,11 @@ compute_pair_dw_gemm_match(const struct hk_compute_pair_dispatch *dw,
       return false;
    memcpy(&k_i, gemm->push + p->k_offset_B, sizeof(k_i));
    const uint32_t k_step = hk_compute_pair_alt_gemm_k_step(gemm->alt_kind);
+   const bool can_fallback_64x16 =
+      gemm->alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X16_UNGUARDED &&
+      ((uint32_t)k_i % 16u) == 0 && (gemm->exec_threads[1] & 1u) == 0;
    if (k_i <= 0 || (uint32_t)k_i != (uint32_t)ch ||
-       ((uint32_t)k_i % k_step) != 0)
+       (((uint32_t)k_i % k_step) != 0 && !can_fallback_64x16))
       return false;
 
    struct hk_nir_direct_shape ps = {gemm->push, sizeof(gemm->push)};
@@ -4301,20 +4354,31 @@ compute_pair_gemm_pad4_dw_match(const struct hk_compute_pair_dispatch *gemm,
       return false;
 
    enum hk_compute_pair_alt_kind eff_alt = gemm->alt_kind;
+   const uint32_t orig_tm = hk_compute_pair_alt_gemm_tile_m(eff_alt);
    const uint32_t orig_tn = hk_compute_pair_alt_gemm_tile_n(eff_alt);
-   if (orig_tn == 64 || orig_tn == 48) {
-      if ((n_u % 32u) == 0) {
+   /* tile_n=48 allocates 15.5 KiB shared memory (2 WGs/core), so only select it
+    * for single-K-step (K <= 16) fused GEMM+DW where cutting A re-reads outweighs
+    * higher occupancy; larger K stays on 32/24 (3-4 WGs/core). */
+   if (orig_tm != 64 || orig_tn == 64 || (orig_tn == 48 && k_i > 16)) {
+      if ((n_u % 48u) == 0 && k_i <= 16) {
+         eff_alt = HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED;
+      } else if ((n_u % 32u) == 0) {
          eff_alt = gemm->info.gemm.is_guarded
                       ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED
                       : HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
       } else if ((n_u % 24u) == 0) {
          eff_alt = HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED;
+      } else if ((n_u % 16u) == 0) {
+         eff_alt = gemm->info.gemm.is_guarded
+                      ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED
+                      : HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
       } else {
          return false;
       }
    }
    const uint32_t eff_tile_n = hk_compute_pair_alt_gemm_tile_n(eff_alt);
-   if ((eff_tile_n != 16 && eff_tile_n != 24 && eff_tile_n != 32) ||
+   if (hk_compute_pair_alt_gemm_tile_m(eff_alt) != 64u ||
+       (eff_tile_n != 16 && eff_tile_n != 24 && eff_tile_n != 32 && eff_tile_n != 48) ||
        (n_u % eff_tile_n) != 0 || (m_u % 64u) != 0 ||
        n_u / eff_tile_n > 65535u || m_u / 64u > 65535u)
       return false;
@@ -5341,6 +5405,16 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                              ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED
                                              : HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
                         }
+                     } else if (eff_alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X16_UNGUARDED) {
+                        int32_t k_dw = 0;
+                        memcpy(&k_dw, p->push + p->info.gemm.k_offset_B, 4);
+                        if (k_dw > 0 && ((uint32_t)k_dw % 32u) != 0 &&
+                            ((uint32_t)k_dw % 16u) == 0 &&
+                            (p->exec_threads[1] & 1u) == 0) {
+                           eff_alt_kind = p->info.gemm.is_guarded
+                                             ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED
+                                             : HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
+                        }
                      }
                   }
                }
@@ -5417,6 +5491,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 32u &&
                              hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 64u) {
                      eff_p.exec_threads[1] = p->exec_threads[1] * 2u;
+                  } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 64u &&
+                             hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 32u) {
+                     eff_p.exec_threads[1] = p->exec_threads[1] / 2u;
                   }
                }
                if (!cand || !hk_fused_compute_shader_eligible(dev, cand, &eff_p))
@@ -6295,6 +6372,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 32u &&
                          hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 64u) {
                         tmp_disp.exec_threads[1] = p_disp->exec_threads[1] * 2u;
+                     } else if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 64u &&
+                                hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 32u) {
+                        tmp_disp.exec_threads[1] = p_disp->exec_threads[1] / 2u;
                      }
                   }
                   if (root_ok && pl->im2col_idx_off) {

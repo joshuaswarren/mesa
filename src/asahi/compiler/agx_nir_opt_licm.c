@@ -39,6 +39,7 @@ struct sim_block {
 };
 
 struct licm_estimate {
+   enum agx_isa_encoding encoding;
    uint8_t *halves;
    BITSET_DECLARE(non_load_uniform_pair, AGX_NUM_UNIFORMS / 4);
    unsigned reserve;
@@ -50,7 +51,8 @@ struct licm_estimate {
 };
 
 static bool
-pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out)
+pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out,
+                        enum agx_isa_encoding encoding)
 {
    nir_instr *instr = nir_def_instr(def);
    if (instr->type != nir_instr_type_alu)
@@ -77,7 +79,7 @@ pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out)
    unsigned hi_base = nir_intrinsic_base(hi_i) + 2 * alu->src[1].swizzle[0];
    if ((lo_base & 3) != 0 || hi_base != lo_base + 2 ||
        lo_base >= AGX_NUM_UNIFORMS ||
-       !agx_instr_accepts_uniform(AGX_ISA_ENCODING_AGX3C, AGX_OPCODE_DEVICE_LOAD,
+       !agx_instr_accepts_uniform(encoding, AGX_OPCODE_DEVICE_LOAD,
                                   0, lo_base, AGX_SIZE_64))
       return false;
 
@@ -120,7 +122,7 @@ def_is_zero_half_uniform(const struct licm_estimate *est, nir_def *def)
     * GPRs, provided no pack of that same uniform pair in the function has a
     * non-load use that post-LICM CSE could merge into it. */
    unsigned lo_base;
-   if (pack_preamble_pair_base(def, &lo_base) &&
+   if (pack_preamble_pair_base(def, &lo_base, est->encoding) &&
        !BITSET_TEST(est->non_load_uniform_pair, lo_base / 4))
       return true;
 
@@ -165,7 +167,7 @@ scan_shader_ra_props(struct licm_estimate *est, nir_function_impl *impl,
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
          unsigned lo_base;
-         if (def && pack_preamble_pair_base(def, &lo_base) &&
+         if (def && pack_preamble_pair_base(def, &lo_base, est->encoding) &&
              !pack_uses_are_load_bases(def))
             BITSET_SET(est->non_load_uniform_pair, lo_base / 4);
 
@@ -333,6 +335,7 @@ enum licm_spec_mode {
    LICM_SPEC_NONE = 0,
    LICM_SPEC_ALL,
    LICM_SPEC_SFU_CHAIN,
+   LICM_SPEC_AGX2_INTEGER,
 };
 
 struct licm_sim {
@@ -408,6 +411,38 @@ static bool
 block_is_direct_loop_body(const nir_block *block, const nir_loop *loop)
 {
    return block->cf_node.parent == &loop->cf_node;
+}
+
+/* These instructions are safe to execute even when the loop exits before
+ * its first iteration. Keep conditional arithmetic in its original branch.
+ */
+static bool
+agx2_integer_invariant(nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_intrinsic)
+      return nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_preamble;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_imul:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_umin:
+   case nir_op_umax:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx2_integer_licm_filter(nir_instr *instr, nir_loop *loop, bool dominates_exit)
+{
+   return block_is_direct_loop_body(instr->block, loop) &&
+          agx2_integer_invariant(instr);
 }
 
 static nir_block *
@@ -613,6 +648,8 @@ sim_instr_invariant(nir_instr *instr, struct licm_sim *sim, bool dom_exit,
    case nir_instr_type_deref:
       if (!nir_foreach_src(instr, sim_defined_before_loop, sim))
          return false;
+      if (sim->spec_mode == LICM_SPEC_AGX2_INTEGER)
+         return direct_body && agx2_integer_invariant(instr);
       if (dom_exit)
          return true;
       if (sim->spec_mode == LICM_SPEC_ALL)
@@ -1081,6 +1118,8 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
 
       void *mem_ctx = ralloc_context(NULL);
       struct licm_estimate est = {
+         .encoding = spec_mode == LICM_SPEC_AGX2_INTEGER
+                        ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3C,
          .halves = rzalloc_array(mem_ctx, uint8_t, impl->ssa_alloc),
          .mem_ctx = mem_ctx,
       };
@@ -1143,7 +1182,7 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
 
       if (hoisted) {
          any_hoist = true;
-         if (spec_mode == LICM_SPEC_ALL)
+         if (spec_mode == LICM_SPEC_ALL || spec_mode == LICM_SPEC_AGX2_INTEGER)
             any_useful |= sim.hoisted_non_const;
          else if (spec_mode == LICM_SPEC_SFU_CHAIN)
             any_useful |= sim.hoisted_sfu;
@@ -1275,4 +1314,15 @@ agx_nir_opt_licm_direct_sfu(nir_shader *shader, unsigned budget)
       return false;
 
    return nir_opt_licm(shader, agx_licm_filter_sfu);
+}
+
+bool
+agx_nir_opt_licm_agx2_integer(nir_shader *shader, unsigned budget)
+{
+   bool any_hoist = false;
+   if (!simulate_shader_licm(shader, budget, false, LICM_SPEC_AGX2_INTEGER,
+                             &any_hoist) || !any_hoist)
+      return false;
+
+   return nir_opt_licm(shader, agx2_integer_licm_filter);
 }

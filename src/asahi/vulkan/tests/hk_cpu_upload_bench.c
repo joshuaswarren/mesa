@@ -691,25 +691,27 @@ reuse_correctness(struct fixture *f)
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
    /* A retained or adversarial short-prefix value must have no effect on
-    * any non-HAL200 chip, including the native-encoding M3 (G15) path. */
+    * chips without trimmed root uploads, including the native-encoding M3 (G15) path. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
-      if (agx_chip_native_hal200(chip))
+      if (agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip))
          continue;
       f->dev.dev.chip = chip;
       CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
       CHECK(cd->uploaded_root_size == sizeof(cd->root));
    }
-   const enum agx_chip hal200_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G16G};
+   const enum agx_chip trimmed_chips[] = {
+      AGX_CHIP_G17P, AGX_CHIP_G16G, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C
+   };
    const size_t gfx_small_B =
       ALIGN_POT(hk_root_descriptor_offset(push) + 16, 16);
    const size_t gfx_large_B =
       ALIGN_POT(hk_root_descriptor_offset(push) + 64, 16);
-   for (unsigned i = 0; i < ARRAY_SIZE(hal200_chips); ++i) {
-      f->dev.dev.chip = hal200_chips[i];
+   for (unsigned i = 0; i < ARRAY_SIZE(trimmed_chips); ++i) {
+      f->dev.dev.chip = trimmed_chips[i];
       CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
       CHECK(cd->uploaded_root_size == small_B);
 
-      /* Graphics root trimming + growth detection on both G17P and G16G. */
+      /* Graphics root trimming + growth detection on HAL200 and M5. */
       f->vs_api->variants[HK_VS_VARIANT_HW].root_descriptor_size = gfx_small_B;
       f->fs_api->variants[0].root_descriptor_size =
          ALIGN_POT(hk_root_descriptor_offset(push), 16);
@@ -1931,6 +1933,80 @@ graphics_launch_replay_correctness(struct fixture *f)
    reset(f);
 }
 
+static void
+cached_root_snapshot_elision_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   const enum agx_chip saved_chip = f->dev.dev.chip;
+   const unsigned saved_debug = f->dev.dev.debug;
+
+   /* G17P and M5 use the CPU-cached HK_CMD_BO_ROOT pool: identical roots reuse
+    * without a new allocation, and root_fragment_snapshot_publish() is skipped
+    * unless AGX_DBG_VERIFY is set. */
+   const enum agx_chip cached_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17C};
+   for (unsigned i = 0; i < ARRAY_SIZE(cached_chips); ++i) {
+      reset(f);
+      f->dev.dev.chip = cached_chips[i];
+      f->dev.dev.debug = 0;
+      cmd->uploader.root.cpu_cached = true;
+
+      desc->root.sets[0] = 0x10000 + i * 0x100;
+      const uint64_t r1 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r1 != 0);
+      CHECK(desc->uploaded_root_cpu_cached);
+      CHECK(cmd->state.gfx.root_cpu_cached);
+      CHECK(cmd->state.gfx.root_fragment_snapshot_cpu == NULL);
+
+      /* Identical root reuses r1 without populating a shadow snapshot. */
+      const uint64_t r2 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r2 == r1);
+      CHECK(cmd->state.gfx.root_fragment_snapshot_cpu == NULL);
+
+      /* AGX_DBG_VERIFY populates the shadow snapshot on reuse and fresh upload. */
+      f->dev.dev.debug = AGX_DBG_VERIFY;
+      const uint64_t r3 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r3 == r1);
+      CHECK(cmd->state.gfx.root_fragment_snapshot_cpu ==
+            cmd->state.gfx.root_cpu);
+
+      desc->root.sets[0] ^= 0x40;
+      const uint64_t r4 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r4 != 0 && r4 != r1);
+      CHECK(cmd->state.gfx.root_fragment_snapshot_cpu ==
+            cmd->state.gfx.root_cpu);
+   }
+
+   /* Uncached (WC) roots must never reuse via memcmp readback and must retain
+    * the CPU shadow snapshot on HAL200/M5. */
+   reset(f);
+   f->dev.dev.chip = AGX_CHIP_G16G;
+   f->dev.dev.debug = 0;
+   cmd->uploader.main.cpu_cached = false;
+   cmd->uploader.root.cpu_cached = false;
+   desc->root.sets[0] = 0x20000;
+   const uint64_t wc1 =
+      hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(wc1 != 0);
+   CHECK(!desc->uploaded_root_cpu_cached);
+   CHECK(!cmd->state.gfx.root_cpu_cached);
+   CHECK(cmd->state.gfx.root_fragment_snapshot_cpu == cmd->state.gfx.root_cpu);
+   const uint64_t wc2 =
+      hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(wc2 != 0 && wc2 != wc1);
+   CHECK(cmd->state.gfx.root_fragment_snapshot_cpu == cmd->state.gfx.root_cpu);
+
+   f->dev.dev.chip = saved_chip;
+   f->dev.dev.debug = saved_debug;
+   cmd->uploader.main.cpu_cached = true;
+   cmd->uploader.root.cpu_cached = true;
+   reset(f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1943,6 +2019,7 @@ main(int argc, char **argv)
    vertex_input_elision_correctness(f);
    xfer_clean_isolation_correctness(f);
    combined_sampler_retention_correctness(f);
+   cached_root_snapshot_elision_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);

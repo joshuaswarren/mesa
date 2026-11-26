@@ -246,7 +246,10 @@ struct spill_ctx {
    /* Base memory index reserved for spilled indices */
    unsigned spill_base;
 
-   /* If true, we cannot use scratch and must only rematerialize. */
+   /* If true, we cannot use scratch and must only rematerialize. Values that
+    * cannot be rematerialized then stay in registers even when that exceeds
+    * k (see keep_in_registers()).
+    */
    bool remat_only;
 };
 
@@ -587,11 +590,9 @@ static void
 insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 {
    if (!ctx->remat[node]) {
-      /* The remat-only budget is an estimate; when a value that cannot be
-       * rematerialized must leave the register file, spill it to scratch and
-       * let register allocation finish with real spilling under the full
-       * budget instead of failing the compile
-       * (ssbo.phys.layout.random.8bit.nested_structs_arrays.20). */
+      /* Values that cannot be rematerialized go to scratch. Only the full
+       * spill pass evicts them: the remat-only pass keeps them in registers
+       * (keep_in_registers()). */
       record_spill(ctx);
 
       agx_index idx = reconstruct_index(ctx, node);
@@ -651,6 +652,26 @@ struct candidate {
    unsigned node;
    dist_t dist;
 };
+
+/*
+ * The remat-only pass is an occupancy optimization: it lowers pressure towards
+ * a smaller budget by rematerializing constants, but the program already fits
+ * the full register file without it. Its budget is only an estimate, so it may
+ * be unreachable by rematerialization alone. Never move a value that cannot be
+ * rematerialized out of the register file to meet it: keep the value and let
+ * W exceed k. Register allocation measures the result and allocates it under
+ * the full budget when the estimate was missed (agx_ra()). The pressure of the
+ * result never exceeds the original program's, since every rematerialized
+ * value is recreated inside the live range of the value it replaces.
+ *
+ * Any other choice introduces scratch traffic that the program without
+ * rematerialization does not need.
+ */
+static bool
+keep_in_registers(const struct spill_ctx *ctx, unsigned node)
+{
+   return ctx->remat_only && !ctx->remat[node];
+}
 
 static int
 cmp_dist(const void *left_, const void *right_, void *ctx_)
@@ -718,6 +739,9 @@ limit(struct spill_ctx *ctx, agx_instr *I, unsigned m)
       unsigned comps = node_size(ctx, v);
 
       if ((new_weight + comps) <= m) {
+         new_weight += comps;
+      } else if (keep_in_registers(ctx, v) &&
+                 candidates[i].dist < DIST_INFINITY) {
          new_weight += comps;
       } else {
          /* Insert a spill if we haven't spilled before and there is
@@ -1015,7 +1039,9 @@ min_algorithm(struct spill_ctx *ctx)
 
    /* Iterate each instruction in forward order */
    agx_foreach_instr_in_block(ctx->block, I) {
-      assert(ctx->nW <= ctx->k && "invariant");
+      assert((ctx->nW <= ctx->k ||
+              (ctx->remat_only && ctx->nW <= AGX_NUM_REGS)) &&
+             "invariant");
 
       /* Debug to check against our RA demand calculations */
       if (0) {
@@ -1325,14 +1351,15 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
             through += comps;
          }
 
-         if ((ctx->nW + comps) <= ctx->k) {
+         if ((ctx->nW + comps) <= ctx->k || keep_in_registers(ctx, node)) {
             insert_W(ctx, node);
             sb->W_entry[sb->nW_entry++] = node;
          }
       }
    }
 
-   assert(ctx->nW <= ctx->k);
+   assert(ctx->nW <= ctx->k ||
+          (ctx->remat_only && ctx->nW <= AGX_NUM_REGS));
    free(used);
 }
 
@@ -1406,9 +1433,10 @@ compute_w_entry(struct spill_ctx *ctx)
 
       /* Heuristic: if any phi source is spilled, spill the whole phi. This is
        * suboptimal, but it massively reduces pointless fill/spill chains with
-       * massive phi webs.
+       * massive phi webs. A remat-only pass never spills: the missing sources
+       * are constants, rematerialized along their edges.
        */
-      if (!all_found)
+      if (!all_found && !ctx->remat_only)
          continue;
 
       candidates[j++] = (struct candidate){
@@ -1425,13 +1453,15 @@ compute_w_entry(struct spill_ctx *ctx)
       unsigned node = candidates[i].node;
       unsigned comps = node_size(ctx, node);
 
-      if ((ctx->nW + comps) <= ctx->k) {
+      if ((ctx->nW + comps) <= ctx->k || keep_in_registers(ctx, node)) {
          insert_W(ctx, node);
          sb->W_entry[sb->nW_entry++] = node;
       }
    }
 
-   assert(ctx->nW <= ctx->k && "invariant");
+   assert((ctx->nW <= ctx->k ||
+           (ctx->remat_only && ctx->nW <= AGX_NUM_REGS)) &&
+          "invariant");
 
    /* Restore touched freq[] entries sparsely for the next block. */
    agx_foreach_predecessor(ctx->block, P) {

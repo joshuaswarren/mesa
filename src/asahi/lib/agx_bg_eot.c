@@ -800,7 +800,9 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       nir_image_store_block_agx(
          &b, nir_imm_intN_t(&b, rt, 16), nir_imm_int(&b, offset_B), coords,
          .format = physical,
-         .image_dim = dim, .image_array = key->tib.layered,
+         .image_dim = (key->resolve_mask & BITFIELD_BIT(rt))
+                         ? GLSL_SAMPLER_DIM_2D : dim,
+         .image_array = key->tib.layered,
          .explicit_coord = explicit);
 
       if (key->store_and_resolve) {

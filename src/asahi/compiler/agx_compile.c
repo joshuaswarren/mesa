@@ -1091,6 +1091,8 @@ agx_pack_integer_8_agx3(agx_builder *b, const agx_index *channels,
    return n;
 }
 
+static agx_index agx_g17p_shift_boundary(agx_builder *b, unsigned shift);
+
 /* A multi-component W8 payload is byte-packed in the register file: two
  * adjacent components occupy the low/high bytes of one 16-bit register. NIR
  * keeps each 8-bit component in its own 16-bit or zero-extended 32-bit lane,
@@ -1101,12 +1103,21 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
 {
    agx_index channels[4] = {agx_null()};
 
-   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
-    * the low byte and odd bytes shift right by 8, clearing the upper byte. */
-   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       !b->shader->key->dev.emit_agx3d) {
+   /* AGX3B and AGX3C: unpack each byte in one 16-bit operation: even bytes
+    * mask the low byte and odd bytes shift right by 8, clearing the upper
+    * byte. AGX3B's half-register SRL has no immediate count: it takes the
+    * register count a NIR 16-bit ushr gets (agx_g17p_shift_boundary), and
+    * one count serves every odd byte of the payload. This replaces the
+    * widen, 32-bit shift, re-narrow and mask of the form below per byte. */
+   const bool agx3b =
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   if (agx3b || (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+                 !b->shader->key->dev.emit_agx3d)) {
+      const agx_index count = agx3b && nr_channels > 1
+                                 ? agx_g17p_shift_boundary(b, 8)
+                                 : agx_immediate(8);
       for (unsigned i = 0; i < nr_channels; ++i) {
-         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
+         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], count)
                                : agx_and(b, halfs[i / 2], agx_immediate(0xff));
          if (dest.size == AGX_SIZE_32) {
             agx_index zext = agx_temp(b->shader, AGX_SIZE_32);
@@ -5867,6 +5878,21 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
          }
          if (native_shape)
             continue;
+      }
+
+      /* A minifloat multiplier takes the other multiplicand's negation in its
+       * sign bit. The exact product's sign is the XOR of the operand signs
+       * and the FMA still rounds once, so fma(-x, #k, c) is fma(x, #-k, c)
+       * for every x, including zeros, infinities and NaNs. Only an absolute
+       * value is left to materialize below. */
+      for (unsigned s = 0; s < 2; ++s) {
+         agx_index *imm = &I->src[1 - s];
+         if (I->src[s].neg && I->src[s].type != AGX_INDEX_IMMEDIATE &&
+             imm->type == AGX_INDEX_IMMEDIATE && imm->value <= 0xff &&
+             !imm->memory) {
+            I->src[s].neg = false;
+            imm->value ^= 0x80;
+         }
       }
 
       agx_foreach_src(I, s) {
@@ -14754,12 +14780,11 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
 
 
 static bool
-agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts)
+                         unsigned ra_budget_cut, bool agx3_reg_float_consts)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -15115,24 +15140,13 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
-   if (disable_remat)
-      agx_ra_without_remat(ctx);
-   else
-      agx_ra(ctx);
+   agx_ra(ctx);
 
    /* A failed allocation is refused and retried below; its AIR is not a
     * program to validate (agx_validate exits on it). */
    if (!ctx->ra_failed)
-      agx_validate(ctx, disable_remat ? "agx_ra_without_remat" : "agx_ra");
+      agx_validate(ctx, "agx_ra");
 
-   /* The occupancy rematerialization attempt has already modified AIR.
-    * Discard the entire context; changing its budget cannot undo spills. */
-   if (retry_without_remat && ctx->remat_fallback_spilled) {
-      *retry_without_remat = true;
-      binary->size = initial_binary_size;
-      ralloc_free(ctx);
-      return false;
-   }
    if (ctx->ra_failed) {
       /* Spilling only targets total demand; pinned values can still leave the
        * shuffle no room. Recompile with an ever smaller spill budget unless
@@ -15144,10 +15158,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          binary->size = initial_binary_size;
          /* Constant promotion and others accumulate into out. */
          *out = initial_out;
-         return agx_compile_function_nir_attempt(
+         return agx_compile_function_nir(
             nir, impl, key, binary, out, offset_out,
-            ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts);
+            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -16044,61 +16057,6 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
    }
 
    ralloc_free(memctx);
-}
-
-/* Retry eligible preambles without changing scratch admission or launch rules. */
-static bool
-agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
-                         struct agx_shader_key *key,
-                         struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out,
-                         bool agx3_reg_float_consts)
-{
-   const bool eligible =
-      impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-      (key->g17p_native_uniforms || key->agx3_native_cprog) &&
-      debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
-   if (!eligible)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   /* Preserve all compiler-owned state, including earlier main code/rodata.
-    * The first attempt owns a deep NIR clone and a fresh AIR context. */
-   nir_shader *attempt = nir_shader_clone(NULL, nir);
-   if (!attempt)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   nir_function_impl *attempt_impl = NULL;
-   nir_foreach_function_with_impl(func, candidate, attempt) {
-      if (func->is_preamble) {
-         assert(attempt_impl == NULL);
-         attempt_impl = candidate;
-      }
-   }
-   assert(attempt_impl != NULL);
-   const struct agx_shader_info saved_info = *out;
-   const struct agx_shader_key saved_key = *key;
-   const size_t saved_size = binary->size;
-   bool retry = false;
-   bool success = agx_compile_function_nir_attempt(
-      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts);
-   ralloc_free(attempt);
-   if (!retry)
-      return success;
-
-   assert(!success && binary->size == saved_size);
-   *out = saved_info;
-   *key = saved_key;
-   binary->size = saved_size;
-   /* Exactly one retry. Real full-budget spills retain the old refusal. */
-   return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                          offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts);
 }
 
 /*
@@ -19008,6 +18966,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(post_opt_progress, nir,
                   agx_nir_reassociate_loop_invariant_eq);
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
+   } else if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+              nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+              !key->is_helper) {
+      const unsigned threads = nir->info.workgroup_size_variable ? 1024 :
+         nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+         nir->info.workgroup_size[2];
+      if (threads)
+         NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm_agx2_integer,
+                  agx_max_registers_for_occupancy(threads));
    }
 
    if (is_agx3 && !key->dev.emit_agx3d)
@@ -19352,7 +19319,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       const struct agx_shader_key saved_key = *key;
       const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, false);
+                                               &out->info, &offset, 0, false);
 
       /* The G17G packer refuses shapes it has no grounded encoding for and
        * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
@@ -19365,7 +19332,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          *key = saved_key;
          binary.size = saved_size;
          compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, true);
+                                             &out->info, &offset, 0, true);
       }
 
       if (!compiled) {

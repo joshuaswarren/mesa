@@ -729,8 +729,10 @@ typedef struct {
    /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
    bool agx3_cem_low_scratch;
 
-   /* The remat-only spiller had to spill a value to scratch; register
-    * allocation must finish with real spilling under the full budget. */
+   /* A remat-only spill pass left a value in memory. The remat-only spiller
+    * keeps every value it cannot rematerialize in a register, so this is a
+    * backstop for memory values that other paths create; when set, register
+    * allocation finishes with real spilling under the full budget. */
    bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
@@ -807,7 +809,7 @@ typedef struct {
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;
-   /* Set by agx_ra_impl() while it assigns registers: a failed allocation
+   /* Set by agx_ra() while it assigns registers: a failed allocation
     * that has no legal region left at all leaves RA through it (a
     * jmp_buf *), see find_best_region_to_evict(). */
    void *ra_abort;
@@ -1421,7 +1423,6 @@ bool agx_fold_agx3_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
-void agx_ra_without_remat(agx_context *ctx);
 bool agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
                              unsigned align, unsigned minimum, unsigned limit,
                              unsigned *out);

@@ -152,6 +152,14 @@ bool agx3_g18g_tile_program_generate(
    const struct agx3_g17p_graphics_program_desc *desc, bool store,
    struct agx3_g17p_graphics_program *program);
 
+/* G18G general HAL300 tile shaders (any admitted M5 imageblock shape), emitted
+ * as single-cluster G17G canonical GPU1 so agx3_transcode_agx3d_ioto() doubles
+ * the SR14 helper base from 0x100 to the witnessed G18G 0x200 base regardless
+ * of the host device's cluster count. */
+bool agx3_g18g_general_tile_program_generate(
+   const struct agx3_g17p_graphics_program_desc *desc, bool store,
+   struct agx3_g17p_graphics_program *program);
+
 struct agx3_g17p_graphics_program_template {
    struct agx3_g17p_graphics_program program;
    struct agx_ioto_load_relocation
