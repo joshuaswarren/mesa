@@ -12373,15 +12373,22 @@ pre_preamble:
       if (fused_selects)
          NIR_PASS(_, nir, nir_opt_remove_phis);
       NIR_PASS(_, nir, nir_opt_dce);
+      /* The packed form is emitted final: its byte extract has an in-range
+       * offset, so no shift lowering applies. Running the main
+       * nir_opt_algebraic here, after nir_opt_algebraic_late, would undo the
+       * late forms of the whole shader (every isub splits back into an ineg
+       * plus an iadd). */
       bool packed_lut = false;
       NIR_PASS(packed_lut, nir, agx_nir_opt_pack_byte_lut_select);
       if (packed_lut) {
          late_progress = true;
-         NIR_PASS(_, nir, nir_opt_algebraic);
-         NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
          NIR_PASS(_, nir, nir_opt_copy_prop);
          NIR_PASS(_, nir, nir_opt_dce);
       }
+      /* agx_nir_fuse_selects hoists negations out of select trees for a
+       * downstream add to absorb; nir_opt_algebraic_late, which forms isub,
+       * has already run, so make those adds subtracts here. */
+      NIR_PASS(late_progress, nir, agx_nir_fold_ineg_add);
    } else {
       NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
    }
