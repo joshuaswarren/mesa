@@ -423,6 +423,10 @@ typedef struct {
    /* Invert icond/fcond */
    bool invert_cond : 1;
 
+   /* if_*cmp/else_*cmp of a NIR if whose condition is the same for every lane
+    * of the subgroup. */
+   bool uniform_cond : 1;
+
    /*
     * G17P carries a texture coordinate offset as an immediate field in the
     * sample instruction (f43), while the depth comparator is a staged

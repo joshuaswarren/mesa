@@ -10139,6 +10139,7 @@ emit_if(agx_context *ctx, nir_if *nif)
                                 NULL /* filled in later */);
    const bool divergent = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
                           nir_src_is_divergent(&nif->condition);
+   if_->uniform_cond = !nir_src_is_divergent(&nif->condition);
    ctx->loop_nesting++;
    ctx->total_nesting++;
    ctx->divergent_nesting += divergent;
@@ -10161,7 +10162,9 @@ emit_if(agx_context *ctx, nir_if *nif)
     * If it fails, we fall through to the logical end of the last else block.
     */
    _b.cursor = agx_before_block(else_block);
-   agx_else_fcmp(&_b, agx_zero(), agx_zero(), 1, AGX_FCOND_EQ, false, end_else);
+   agx_instr *else_ = agx_else_fcmp(&_b, agx_zero(), agx_zero(), 1,
+                                    AGX_FCOND_EQ, false, end_else);
+   else_->uniform_cond = if_->uniform_cond;
 
    ctx->after_block = agx_create_block(ctx);
 
