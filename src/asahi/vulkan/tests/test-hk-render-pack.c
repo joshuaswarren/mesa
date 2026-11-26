@@ -75,6 +75,7 @@ add_stream(struct hk_cmd_buffer *c, bool compute)
 {
    struct hk_cs *s = test_alloc(sizeof(*s));
    s->type = compute ? HK_CS_CDM : HK_CS_VDM;
+   s->cmd = c;
    list_addtail(&s->node, &c->control_streams);
    hk_sync_stream_created(c, s, &s, compute);
    util_dynarray_init(&s->scissor, NULL);
@@ -607,6 +608,9 @@ test_fold(bool exact)
    struct hk_cmd_buffer *packet = pack(ab, 2, &cs);
    T(N("the packet runs both members' draws"),
      cs->stats.cmds == 30 && cs->render_pack_members == 2);
+   T(N("the packet's stream memory is the first member's recording"),
+     cs->cmd == packet && cs->stream_owner == a &&
+     cs->addr == first_cs(a)->addr);
    T(N("the packet waits for compute work as B did"),
      cs->sync.dep[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE);
    T(N("the packet is one tile pass of two instances"),

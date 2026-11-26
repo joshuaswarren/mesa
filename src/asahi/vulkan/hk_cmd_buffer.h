@@ -1465,6 +1465,11 @@ struct hk_cs {
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
 
+   /* The command buffer whose recording holds the control stream at addr,
+    * when that is not cmd: a submission's render packet runs the first
+    * member's stream (hk_render_pack_init()). */
+   struct hk_cmd_buffer *stream_owner;
+
    /* Data master */
    enum hk_cs_type type;
 

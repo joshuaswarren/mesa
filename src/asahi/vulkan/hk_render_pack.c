@@ -406,6 +406,9 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
 
    list_inithead(&cs->node);
    cs->cmd = packet;
+   /* The stream memory, and the low VDM aliases HAL200 names it through
+    * (hk_g17p_vdm_alias()), belong to the first member's recording. */
+   cs->stream_owner = first->cmd;
    memset(&cs->sync, 0, sizeof(cs->sync));
    cs->sync.seq = 1;
    cs->sync.kind = kinds;
