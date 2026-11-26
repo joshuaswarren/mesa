@@ -432,7 +432,10 @@ hk_frame_anatomy_init(struct hk_device *dev)
            "store: S D N; c compressed u uncompressed; '?' unknown\n"
            "# z/s=<fmt>:<L|-><S|->:<c|u>  (ZLS control as submitted)  "
            "pass=<B|.><E|.> B: stream begins the API pass, E: ends it; '..' "
-           "is a continuation\n"
+           "is a continuation; xcb=<n>: n command buffers packed into this "
+           "render at submission; rp=<H|-><T|->: the recording's head and tail "
+           "for that packing, rp_head/rp_tail: why not, rp_next: why its tail "
+           "did not pack with the next command buffer's head\n"
            "# bar=v<n>,c<n>: header vdm/cdm barrier as submitted ('-' = NONE, "
            "n = relative command count in the ioctl); prior=: exact-prior "
            "ordinals\n"
@@ -677,6 +680,23 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
                 c->utile_height_px, c->sample_size_B, cs->stats.cmds,
                 cs->stats.calls, cs->g17p_pass_begins ? 'B' : '.',
                 cs->g17p_pass_ends ? 'E' : '.', c->flags);
+   if (cs->render_pack_members > 1) {
+      HK_FA_APPEND(" xcb=%u", cs->render_pack_members);
+   } else if (cs->cmd) {
+      /* Submit-time render packing edges of the recording (hk_render_pack.h). */
+      const struct hk_render_pack_edges *e = &cs->cmd->render_pack;
+      HK_FA_APPEND(" rp=%c%c", e->head ? 'H' : '-', e->tail ? 'T' : '-');
+      if (!e->head && e->head_why)
+         HK_FA_APPEND(" rp_head=\"%s\"", e->head_why);
+      if (!e->tail && e->tail_why)
+         HK_FA_APPEND(" rp_tail=\"%s\"", e->tail_why);
+      if (e->tail && e->next_why)
+         HK_FA_APPEND(" rp_next=\"%s%s\"",
+                      e->next_who == 1   ? "this: "
+                      : e->next_who == 2 ? "next: "
+                                         : "",
+                      e->next_why);
+   }
 
    /* Depth/stencil exactly as the ZLS unit is programmed for this command. */
    agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, zls);
