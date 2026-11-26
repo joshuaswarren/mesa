@@ -1,0 +1,22 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+// Scattered (or full) stores of an exactly representable pattern into a storage image of any format.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform writeonly image2D img;
+layout(push_constant) uniform PC { uint seed; uint mode; uint w; uint h; } pc;
+void main()
+{
+   uvec2 p = gl_GlobalInvocationID.xy;
+   if (p.x >= pc.w || p.y >= pc.h)
+      return;
+   uint hsh = (p.x * 73856093u) ^ (p.y * 19349663u) ^ (pc.seed * 83492791u);
+   if (pc.mode == 1u && (hsh % 7u) != 0u)
+      return; /* sparse: about one texel in seven, every tile partially written */
+   if (pc.mode == 2u && ((p.x + p.y) & 1u) != 0u)
+      return; /* checkerboard */
+   vec4 v = vec4(float((hsh >> 0) & 4u) * 0.25, float((hsh >> 3) & 3u) * 0.25,
+                 float((hsh >> 6) & 3u) * 0.25, float((hsh >> 9) & 1u));
+   imageStore(img, ivec2(p), v);
+}

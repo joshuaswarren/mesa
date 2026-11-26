@@ -1546,6 +1546,15 @@ if with_tests
   )
 
   executable(
+    'vulkan-storage-alias',
+    files('tests/vulkan_storage_alias.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
     'vulkan-dynamic-offset-draws',
     files('tests/vulkan_dynamic_offset_draws.c'),
     include_directories : [inc_include],
