@@ -57,6 +57,7 @@
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/glsl_types.h"
 
+#include "asahi/vulkan/hk_g17p_meta_copy_core.h"
 #include "agx_native_descriptor.h"
 #include "agx_public.h"
 #include "agx_state.h"
@@ -2159,6 +2160,25 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       return false;
    }
 
+   /* The driver renders each exact 2x2 reduction whose destination is at or
+    * above the chip's crossover, then generates the rest with compute. On
+    * G17P that is levels 1 and 2 of this chain; the classic submission
+    * model's crossover is above 1280x720, so it renders none. */
+   unsigned expected_levels = 0;
+   for (unsigned l = 0; l < big_tmpl.last_level; ++l) {
+      const unsigned w = u_minify(big_tmpl.width0, l);
+      const unsigned h = u_minify(big_tmpl.height0, l);
+      if ((w | h) & 1 || !hk_mip_level_through_pbe(mdev->chip, w / 2, h / 2))
+         break;
+      expected_levels |= BITFIELD_BIT(l + 1);
+   }
+   if (mdev->chip == AGX_CHIP_G17P &&
+       expected_levels != (BITFIELD_BIT(1) | BITFIELD_BIT(2))) {
+      fprintf(stderr, "G17P mip crossover no longer renders levels 1 and 2\n");
+      pipe_resource_reference(&big_tex, NULL);
+      return false;
+   }
+
    struct agx_context *mctx = agx_context(pctx);
    mip_blit = pctx->blit;
    rendered_levels = 0;
@@ -2167,14 +2187,14 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       pctx, big_tex, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 11, 0, 0);
    pctx->blit = mip_blit;
    if (!generated || !mctx->batch || !mctx->batch->cdm.bo ||
-       (chain_compresses && rendered_levels != (BITFIELD_BIT(1) | BITFIELD_BIT(2)))) {
-      fprintf(stderr, "mipmap render levels %#x, expected two large levels and a compute tail\n",
-              rendered_levels);
+       (chain_compresses && rendered_levels != expected_levels)) {
+      fprintf(stderr, "mipmap render levels %#x, expected %#x\n",
+              rendered_levels, expected_levels);
       pipe_resource_reference(&big_tex, NULL);
       return false;
    }
-   /* For 2560x1440, levels 1 and 2 are large enough to render. Level 3
-    * samples the result and levels 4 and 5 still share one compute launch. */
+   /* The compute tail starts after the last rendered level; its small levels
+    * still share fused launches. */
    if (chain_compresses) {
       const uint8_t *cdm_base = agx_bo_map(mctx->batch->cdm.bo);
       const size_t cdm_len = (size_t)(mctx->batch->cdm.current - cdm_base);
