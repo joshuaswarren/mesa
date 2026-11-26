@@ -298,6 +298,11 @@ agx3_reads_quad_lanes(const agx_instr *I)
 static bool
 agx3_append(struct util_dynarray *emission, const uint8_t *bytes, uint8_t len)
 {
+   /* Some encoders emit nothing (a barrier the hardware does not need).
+    * util_dynarray_grow_bytes() divides by the element size. */
+   if (len == 0)
+      return true;
+
    memcpy(util_dynarray_grow_bytes(emission, 1, len), bytes, len);
    return true;
 }
