@@ -307,6 +307,19 @@ agx3_g17g_tile_program_generate(
 }
 
 bool
+agx3_g18g_general_tile_program_generate(
+   const struct agx3_g17p_graphics_program_desc *desc, bool store,
+   struct agx3_g17p_graphics_program *program)
+{
+   if (!desc)
+      return false;
+   struct agx3_g17p_graphics_program_desc g18_desc = *desc;
+   g18_desc.usc_clusters = 1;
+   return agx3_g17g_tile_program_generate(AGX_CHIP_G17G, &g18_desc, store,
+                                          program);
+}
+
+bool
 agx3_g17g_graphics_program_template_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    struct agx3_g17p_graphics_program_template *program)

@@ -2208,7 +2208,7 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
                    struct agx3_g17p_graphics_program *program)
 {
    if (dev->dev.chip == AGX_CHIP_G18G) {
-      if (!agx3_g17g_tile_program_generate(AGX_CHIP_G17G, d, store, program))
+      if (!agx3_g18g_general_tile_program_generate(d, store, program))
          return false;
       struct util_dynarray code;
       util_dynarray_init(&code, NULL);
