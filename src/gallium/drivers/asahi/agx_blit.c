@@ -1114,8 +1114,8 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
       bool renderable = true;
       for (unsigned level = base_level + 1;
            level <= last_level && renderable; ++level) {
-         renderable = agx_g17g_level_renderable(agx_context(pctx), prsc,
-                                                format, level, 0);
+         renderable = agx_level_renderable(agx_context(pctx), prsc,
+                                           format, level, 0);
       }
       if (renderable)
          return false;
@@ -1784,6 +1784,19 @@ agx_generate_mipmap_sampled(struct pipe_context *pctx,
        last_level - base_level > PIPE_MAX_TEXTURE_LEVELS)
       return false;
 
+   /* Large levels amortize a render pass and benefit from the PBE storing
+    * compressed tiles for the next level. Use the same crossover as image
+    * blits. Only switch exact 2x2 reductions with a renderable destination. */
+   const unsigned first_src = base_level;
+   while ((prsc->bind & PIPE_BIND_RENDER_TARGET) && base_level < last_level) {
+      const unsigned w = u_minify(prsc->width0, base_level);
+      const unsigned h = u_minify(prsc->height0, base_level);
+      if ((w | h) & 1 || !hk_mip_level_through_pbe(dev->chip, w / 2, h / 2) ||
+          !agx_level_renderable(ctx, &rsrc->base.b, format, base_level + 1, 0))
+         break;
+      ++base_level;
+   }
+
    /* Level base_level may hold compressed tiles and is decoded through the
     * sampled compute shader into raw GPU-tiled level base_level + 1. Every
     * subsequent level reads that uncompressed level and can run directly via
@@ -1812,6 +1825,14 @@ agx_generate_mipmap_sampled(struct pipe_context *pctx,
          if (!ctx->compute_blitter.g17p_mip_cs[plan->key])
             return false;
       }
+   }
+
+   if (base_level > first_src) {
+      if (!util_gen_mipmap(pctx, &rsrc->base.b, format, first_src, base_level,
+                           first_layer, last_layer, PIPE_TEX_FILTER_LINEAR))
+         return false;
+      if (base_level == last_level)
+         return true;
    }
 
    asahi_compute_save(ctx);

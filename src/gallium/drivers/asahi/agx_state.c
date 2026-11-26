@@ -2577,9 +2577,9 @@ agx_batch_upload_pbe(struct agx_batch *batch,
  * another way ask first.
  */
 bool
-agx_g17g_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
-                          enum pipe_format format, unsigned level,
-                          unsigned layer)
+agx_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
+                     enum pipe_format format, unsigned level,
+                     unsigned layer)
 {
    /* The packer only reads the device through the batch. */
    struct agx_batch scratch = {.ctx = ctx};
