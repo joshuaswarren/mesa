@@ -7670,6 +7670,34 @@ hk_fs_sample_source_destroy(struct hk_fs_sample_source *src)
    free(src);
 }
 
+nir_shader *
+hk_deserialize_nested_nir(void *mem_ctx, const void *data, size_t size,
+                          mesa_shader_stage stage)
+{
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   nir_shader *nir = nir_deserialize(mem_ctx, &agx_nir_options, &reader);
+   if (nir && (reader.overrun || reader.current != reader.end ||
+               nir->info.stage != stage || !nir_shader_get_entrypoint(nir))) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   return nir;
+}
+
+/* A source a shader cannot draw without (a sample-variant or twin source) is
+ * checked when the shader is imported: a binary that holds a bad one is
+ * refused, and a cache entry that does is compiled again. Optional programs
+ * are checked when first built, since they fall back when missing.
+ */
+static bool
+hk_nested_nir_valid(const void *data, size_t size, mesa_shader_stage stage)
+{
+   nir_shader *nir = hk_deserialize_nested_nir(NULL, data, size, stage);
+   ralloc_free(nir);
+   return nir != NULL;
+}
+
 /* Compile the `samples` variant of obj from nir, which it consumes. */
 static VkResult
 hk_compile_fs_sample_variant(struct hk_device *dev,
@@ -7706,17 +7734,14 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
       obj->variants[i].info.fs.has_input_attachments |=
          src->has_input_attachments;
       if (src->lr_nir) {
-         struct blob_reader lr_reader;
-         blob_reader_init(&lr_reader, src->lr_nir, src->lr_nir_size);
          nir_shader *lr_nir =
-            nir_deserialize(NULL, &agx_nir_options, &lr_reader);
-         if (lr_nir && !lr_reader.overrun) {
+            hk_deserialize_nested_nir(NULL, src->lr_nir, src->lr_nir_size,
+                                      MESA_SHADER_FRAGMENT);
+         if (lr_nir) {
             hk_prepare_local_read_nir(dev, lr_nir, &src->lr_info,
                                       &src->robustness, &key, src->features,
                                       src->set_layout_count,
                                       src->static_set_mask, &obj->variants[i]);
-         } else {
-            ralloc_free(lr_nir);
          }
       }
       p_atomic_set(&src->ready_mask, src->ready_mask | BITFIELD_BIT(i));
@@ -7896,9 +7921,8 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
          src->owned_mask |= BITFIELD_BIT(i);
          p_atomic_set(&src->ready_mask, src->ready_mask | BITFIELD_BIT(i));
       } else {
-         struct blob_reader reader;
-         blob_reader_init(&reader, src->nir, src->nir_size);
-         nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+         nir_shader *nir = hk_deserialize_nested_nir(
+            NULL, src->nir, src->nir_size, MESA_SHADER_FRAGMENT);
          if (nir) {
             src->owned_mask |= BITFIELD_BIT(i);
             result = hk_compile_fs_sample_variant(dev, NULL, nir, obj, samples);
@@ -9968,9 +9992,8 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                 struct hk_api_shader **built)
 {
    *built = NULL;
-   struct blob_reader reader;
-   blob_reader_init(&reader, src->nir, src->nir_size);
-   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+   nir_shader *nir =
+      hk_deserialize_nested_nir(NULL, src->nir, src->nir_size, obj->vk.stage);
    if (!nir)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -11542,11 +11565,15 @@ hk_fs_sample_source_deserialize(struct hk_api_shader *obj,
    src->static_set_mask = blob_read_uint8(blob);
    src->nir_size = blob_read_uint32(blob);
    const void *nir = blob_read_bytes(blob, src->nir_size);
-   src->nir = blob->overrun ? NULL : malloc(src->nir_size);
+   if (blob->overrun ||
+       !hk_nested_nir_valid(nir, src->nir_size, MESA_SHADER_FRAGMENT)) {
+      free(src);
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+   }
+   src->nir = malloc(src->nir_size);
    if (!src->nir) {
       free(src);
-      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
-                           : VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    memcpy(src->nir, nir, src->nir_size);
    simple_mtx_init(&src->lock, mtx_plain);
@@ -11562,7 +11589,7 @@ hk_fs_sample_source_deserialize(struct hk_api_shader *obj,
 
 static VkResult
 hk_border_source_deserialize(struct hk_border_source **out,
-                             struct blob_reader *blob)
+                             struct blob_reader *blob, mesa_shader_stage stage)
 {
    struct hk_border_source *src = calloc(1, sizeof(*src));
    if (!src)
@@ -11578,11 +11605,14 @@ hk_border_source_deserialize(struct hk_border_source **out,
    src->static_set_mask = blob_read_uint8(blob);
    src->nir_size = blob_read_uint32(blob);
    const void *nir = blob_read_bytes(blob, src->nir_size);
-   src->nir = blob->overrun ? NULL : malloc(src->nir_size);
+   if (blob->overrun || !hk_nested_nir_valid(nir, src->nir_size, stage)) {
+      free(src);
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+   }
+   src->nir = malloc(src->nir_size);
    if (!src->nir) {
       free(src);
-      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
-                           : VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    memcpy(src->nir, nir, src->nir_size);
    simple_mtx_init(&src->lock, mtx_plain);
@@ -12270,7 +12300,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_border_source) {
-      VkResult result = hk_border_source_deserialize(&obj->border_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->border_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -12278,7 +12309,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_mesh_source) {
-      VkResult result = hk_border_source_deserialize(&obj->mesh_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->mesh_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -12286,7 +12318,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_fbl_source) {
-      VkResult result = hk_border_source_deserialize(&obj->fbl_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->fbl_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -13130,10 +13163,9 @@ hk_shader_get_preamble_cs(struct hk_device *dev, struct hk_shader *vs)
    }
 
    struct hk_shader *cs = NULL;
-   struct blob_reader reader;
-   blob_reader_init(&reader, vs->preamble_nir, vs->preamble_nir_size);
-   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
-   if (nir && !reader.overrun) {
+   nir_shader *nir = hk_deserialize_nested_nir(
+      NULL, vs->preamble_nir, vs->preamble_nir_size, MESA_SHADER_COMPUTE);
+   if (nir) {
       cs = calloc(1, sizeof(*cs));
       if (cs) {
          struct agx_shader_key cs_key = {

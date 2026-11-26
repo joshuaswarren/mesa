@@ -622,6 +622,12 @@ struct hk_api_shader {
    struct hk_shader variants[];
 };
 
+/* Deserialize NIR that a shader keeps in a blob of its own (from the shader
+ * binary or the cache) to build from later. NULL unless the blob holds exactly
+ * one shader of `stage` with an entrypoint. */
+nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
+                                      size_t size, mesa_shader_stage stage);
+
 /* The custom-border-emulating twin of a shader with a border source, built
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,

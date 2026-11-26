@@ -7880,10 +7880,10 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       }
    }
 
-   struct blob_reader reader;
-   blob_reader_init(&reader, shader->g17p_mono_nir, shader->g17p_mono_nir_size);
-   nir = nir_deserialize(mem, &agx_nir_options, &reader);
-   if (!nir || reader.overrun)
+   nir = hk_deserialize_nested_nir(mem, shader->g17p_mono_nir,
+                                   shader->g17p_mono_nir_size,
+                                   MESA_SHADER_FRAGMENT);
+   if (!nir)
       HK_MONO_FAIL("nir");
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -8275,11 +8275,10 @@ hk_g17p_local_read_inline_epilog_part(
       }
    }
 
-   struct blob_reader reader;
-   blob_reader_init(&reader, shader->local_read_nir,
-                    shader->local_read_nir_size);
-   nir = nir_deserialize(mem, &agx_nir_options, &reader);
-   if (!nir || reader.overrun)
+   nir = hk_deserialize_nested_nir(mem, shader->local_read_nir,
+                                   shader->local_read_nir_size,
+                                   MESA_SHADER_FRAGMENT);
+   if (!nir)
       HK_LR_FAIL("nir");
 
    struct agx_fs_epilog_key lr_ekey = *ekey;
