@@ -64,7 +64,6 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
-   {"exactmath", AGX_DBG_EXACTMATH, "Correctly rounded fp32 math on application shaders"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -16429,20 +16428,15 @@ agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
    };
    NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
 
-   /* Has to run after nir_lower_idiv. Skipped when the exact path owns the
-    * shader (internal shaders, or the exactmath debug flag): it refines
-    * every frcp itself, so this pass would only refine the idiv reciprocal
-    * a second time. */
-   const bool exact_fp32 =
-      nir->info.internal ||
-      ((agx_get_compiler_debug() | agx_compiler_debug) & AGX_DBG_EXACTMATH);
-   if (!exact_fp32)
+   /* Has to run after nir_lower_idiv. Skipped on internal shaders: the
+    * exact path refines every frcp itself, so this pass would only refine
+    * the idiv reciprocal a second time. */
+   if (!nir->info.internal)
       NIR_PASS(progress, nir, nir_shader_alu_pass, libagx_lower_fdiv,
                nir_metadata_control_flow, NULL);
 
-   /* fdiv has no hardware: every stage gets a * frcp(d). Shaders the
-    * exactmath flag or internal status selects additionally get correctly
-    * rounded frcp/fdiv/log.
+   /* fdiv has no hardware: every stage gets a * frcp(d). Internal shaders
+    * additionally get correctly rounded frcp/fdiv/log.
     */
    NIR_PASS(progress, nir, agx_nir_lower_fdiv);
    NIR_PASS(progress, nir, agx_nir_lower_log);
@@ -16683,7 +16677,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
       /* Chips with a native sinc keep it on every stage, internal
        * shaders included; everywhere else the exact lowering runs first
        * and the stock approximation lowers whatever it skipped (all of it
-       * on application shaders without the exactmath flag). */
+       * on application shaders). */
       const unsigned native =
          g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0;
       if (native) {
@@ -18825,6 +18819,7 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_bit_size, lower_bit_size_callback, NULL);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+   NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
@@ -18999,6 +18994,12 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
       NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
+      /* Bit-size and scalar lowering can still emit fdiv here; the
+       * a * frcp(d) rewrite must land before denorm-preserve so the
+       * emitted multiply gets the preserve expansion -- the ordering
+       * .lower_fdiv had inside nir_opt_algebraic.
+       */
+      NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
       NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
 
       /* Late VBO lowering creates constant udiv instructions */

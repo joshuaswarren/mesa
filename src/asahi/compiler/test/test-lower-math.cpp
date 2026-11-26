@@ -7,7 +7,6 @@
 
 extern "C" {
 #include "agx_compiler.h"
-#include "agx_debug.h"
 #include "agx_nir.h"
 }
 
@@ -303,10 +302,10 @@ TEST_F(LowerMathTest, SinCosThenElseArmsShareAboveIf)
    nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
 }
 
-/* The switch is shader-level: driver-internal shaders and the exactmath
- * debug flag take the exact forms; nothing the app declares per-op can
- * reach them. These tests build on the fixture's compute shader with
- * internal cleared. */
+/* The switch is shader-level: driver-internal shaders take the exact
+ * forms and nothing the app declares or sets per-op can reach them.
+ * These tests build on the fixture's compute shader with internal
+ * cleared. */
 
 TEST_F(LowerMathTest, AppShaderMarkedOpsStayFast)
 {
@@ -338,26 +337,56 @@ TEST_F(LowerMathTest, AppShaderUnmarkedTrigStaysStock)
    EXPECT_EQ(count_alu(nir_op_fsin), 1u);
 }
 
-TEST_F(LowerMathTest, ExactmathFlagOptsIn)
+TEST_F(LowerMathTest, DivPreserveModeLowersEmittedMul)
 {
-   /* With the flag set an ordinary application shader takes the exact
-    * forms: Markstein for the divide, one reduction for the sin. */
+   /* The a * frcp(d) rewrite runs before denorm-preserve lowering, the
+    * ordering .lower_fdiv had inside nir_opt_algebraic, so the emitted
+    * multiply gets the preserve expansion under DenormPreserve fp32. */
    b.shader->info.internal = false;
-   const int saved_debug = agx_compiler_debug;
-   agx_compiler_debug = saved_debug | AGX_DBG_EXACTMATH;
+   set_mode(FLOAT_CONTROLS_DENORM_PRESERVE_FP32);
    nir_def *a = nir_undef(&b, 1, 32);
    nir_def *d = nir_undef(&b, 1, 32);
    nir_fdiv(&b, a, d);
-   nir_def *x = nir_undef(&b, 1, 32);
-   nir_fsin(&b, x);
 
-   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
-   ASSERT_TRUE(agx_nir_lower_sincos(b.shader));
-   agx_compiler_debug = saved_debug;
+   ASSERT_TRUE(agx_nir_lower_fdiv_late(b.shader));
+   ASSERT_TRUE(agx_nir_lower_denorm_preserve(b.shader));
 
    EXPECT_EQ(count_alu(nir_op_fdiv), 0u);
    EXPECT_EQ(count_alu(nir_op_frcp), 1u);
-   EXPECT_EQ(count_alu(nir_op_fsin), 0u);
-   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
-   nir_validate_shader(b.shader, "after exactmath lowering");
+   /* The preserve expansion computes denormal products in integer; the
+    * msb hunt in exact_mul marks it ran on the emitted fmul. */
+   EXPECT_GT(count_alu(nir_op_ufind_msb), 0u);
+   nir_validate_shader(b.shader, "after fdiv denorm preserve");
+}
+
+TEST_F(LowerMathTest, DivFallbackKeepsFpMathCtrl)
+{
+   /* The stock rewrite keeps the source op's float controls: a divide the
+    * app marked NoContraction (which SPIR-V maps to full nir_fp_exact)
+    * must not come back as a contractible fmul * frcp pair. */
+   b.shader->info.internal = false;
+   nir_def *a = nir_undef(&b, 1, 32);
+   nir_def *d = nir_undef(&b, 1, 32);
+   nir_def *e = nir_fdiv(&b, a, d);
+   nir_instr_as_alu(nir_def_instr(e))->fp_math_ctrl |= nir_fp_exact;
+
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
+
+   unsigned marked = 0, total = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_fmul || alu->op == nir_op_frcp) {
+               total++;
+               if ((alu->fp_math_ctrl & nir_fp_exact) == nir_fp_exact)
+                  marked++;
+            }
+         }
+      }
+   }
+   EXPECT_EQ(total, 2u);
+   EXPECT_EQ(marked, 2u);
 }

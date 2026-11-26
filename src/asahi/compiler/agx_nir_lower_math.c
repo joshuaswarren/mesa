@@ -10,7 +10,6 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "agx_compiler.h"
-#include "agx_debug.h"
 #include "agx_nir.h"
 
 /*
@@ -60,21 +59,16 @@ div_rn(nir_builder *b, nir_def *a, nir_def *d)
 }
 
 /* Driver-internal shaders take the correctly rounded forms throughout.
- * Application shaders keep the stock lowerings they always had unless the
- * exactmath debug flag is set: the forms cost ~1-3% on a decode-heavy
- * compute workload for results that are bit-identical anyway, so nothing
- * the app merely declares (float controls, NoContraction -- DXVK stamps it
- * on every op and SPIR-V maps it to full nir_fp_exact) can be the switch.
- *
- * The debug global is only refreshed at agx_compile_shader_nir, which runs
- * after these passes, so read the option directly too.
+ * Application shaders keep the stock lowerings they always had: the forms
+ * cost ~1-3% on a decode-heavy compute workload for results that are
+ * bit-identical anyway, so nothing the app merely declares (float
+ * controls, NoContraction -- DXVK stamps it on every op and SPIR-V maps it
+ * to full nir_fp_exact) can be the switch.
  */
 static bool
 wants_exact_fp32(const nir_shader *s)
 {
-   return s->info.internal ||
-          ((agx_get_compiler_debug() | agx_compiler_debug) &
-           AGX_DBG_EXACTMATH);
+   return s->info.internal;
 }
 
 static bool
@@ -112,8 +106,12 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
       nir_def *d = nir_ssa_for_alu_src(b, alu, 1);
 
       const uint32_t saved_ctrl = b->fp_math_ctrl;
-      if (exact)
-         b->fp_math_ctrl = nir_fp_no_fast_math;
+      /* The stock rewrite keeps the source op's float controls, the same
+       * propagation nir_opt_algebraic did for .lower_fdiv: a division the
+       * app marked NoContraction (which SPIR-V maps to full nir_fp_exact)
+       * must not come back as a contractible fmul * frcp pair.
+       */
+      b->fp_math_ctrl = exact ? nir_fp_no_fast_math : alu->fp_math_ctrl;
 
       /* 1.0f / d is RN(1/d): the Markstein sequence degenerates to the rcp
        * refinement, so skip the quotient steps. Reciprocal-frequency table
