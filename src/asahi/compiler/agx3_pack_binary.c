@@ -3307,6 +3307,12 @@ agx3_g17g_runtime_gather(const agx_instr *I)
 static bool
 agx3_g18g_indirect_gather(const agx_instr *I)
 {
+   /* Callers ask about every instruction. Check the shape before reading
+    * the descriptor operands. */
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1)
+      return false;
+
    const bool cube = I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY;
    const bool tex_imm = I->src[3].type == AGX_INDEX_IMMEDIATE;
    const bool smp_imm = I->src[4].type == AGX_INDEX_IMMEDIATE;
@@ -3393,6 +3399,10 @@ agx3_g18g_binding_sample(const agx_instr *I)
     * descriptor pairs for full-vector cube colour and scalar depth compares,
     * with explicit levels or implicit fragment LOD. Native816 adds fragment
     * register bias for the same descriptor pairs and masks. */
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1)
+      return false;
+
    const bool cube = I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY;
    const bool comparison_dim = I->dim == AGX_DIM_2D ||
                                I->dim == AGX_DIM_2D_ARRAY || cube;
