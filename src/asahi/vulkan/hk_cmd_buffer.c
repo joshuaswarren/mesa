@@ -13,6 +13,7 @@
 #include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
+#include "hk_g17p_varyings.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -2661,12 +2662,12 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||
                                 cull_slot;
          if (!user_slot || (cull_slot && (b->perspective || !b->smooth)) ||
-             (b->perspective && !has_rhw) ||
-             b->offset + b->count > vs->info.uvs.components[b->slot])
+             (b->perspective && !has_rhw))
             return false;
          ++user_bindings;
-         const unsigned slot = gfx->linked_varyings.slots[b->slot];
-         if (slot < 4 || slot + b->offset + b->count > vs->info.uvs.size)
+         if (!hk_g17p_user_varying_binding_fits(
+                b->offset, b->count, vs->info.uvs.components[b->slot],
+                gfx->linked_varyings.slots[b->slot], vs->info.uvs.size))
             return false;
       }
       next_cf += b->count;
