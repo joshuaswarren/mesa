@@ -10618,6 +10618,8 @@ agx3_g17p_local_read_protocol(agx_context *ctx)
    bool all_stores_in_exit_after_cf = true;
    agx_block *last_store_block = NULL;
    unsigned total_loads = 0, total_stores = 0;
+   /* Per recorded offset, the end of the widest access starting there. */
+   uint8_t ends[ARRAY_SIZE(p.offsets)] = {0};
 
    agx_foreach_block(ctx, block) {
       if (block == exit_block) {
@@ -10684,11 +10686,33 @@ agx3_g17p_local_read_protocol(agx_context *ctx)
             return agx3_g17p_mrt_refused();
          }
 
+         /* A tile access names a byte offset and a lane width, not a
+          * partition (agx3_emit_tile()). One that spans adjacent targets'
+          * bytes, such as a sample-equivalence probe merging their words,
+          * also touches every partition starting inside it, and must hold
+          * their pixel classes as well as its first one's, whether or not
+          * any other access reaches them. The key's partitions are in
+          * ascending order; without them, a span reaching another recorded
+          * access fails closed below. */
+         const int width = agx3_tile_format_width(I->format);
+         if (width < 0)
+            return agx3_g17p_mrt_refused();
+         const unsigned end =
+            I->pixel_offset + (util_last_bit(I->mask) << width);
+         if (end > AGX_G17P_MAX_BYTES_PER_SAMPLE)
+            return agx3_g17p_mrt_refused();
+         ends[i] = MAX2(ends[i], end);
+         unsigned last = i;
+         while (partitions && last + 1 < p.count && p.offsets[last + 1] < end)
+            last++;
+
          if (load) {
             if (block != first_block || saw_block0_cf || saw_store)
                all_loads_before_cf_and_stores = false;
-            if (p.loads[i] < UINT8_MAX)
-               p.loads[i]++;
+            for (unsigned j = i; j <= last; ++j) {
+               if (p.loads[j] < UINT8_MAX)
+                  p.loads[j]++;
+            }
             total_loads++;
          } else {
             saw_store = true;
@@ -10696,10 +10720,21 @@ agx3_g17p_local_read_protocol(agx_context *ctx)
                all_stores_in_exit_after_cf = false;
             else
                saw_store_in_exit = true;
-            if (p.stores[i] < UINT8_MAX)
-               p.stores[i]++;
+            for (unsigned j = i; j <= last; ++j) {
+               if (p.stores[j] < UINT8_MAX)
+                  p.stores[j]++;
+            }
             total_stores++;
             last_store_block = block;
+         }
+      }
+   }
+
+   if (!partitions) {
+      for (unsigned i = 0; i < p.count; ++i) {
+         for (unsigned j = 0; j < p.count; ++j) {
+            if (p.offsets[j] > p.offsets[i] && p.offsets[j] < ends[i])
+               return agx3_g17p_mrt_refused();
          }
       }
    }

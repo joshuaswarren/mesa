@@ -1235,6 +1235,86 @@ TEST(G17PMsaaEpilog, LocalReadEquivMergesAdjacentProbesIntoTwoOrFourWords)
    }
 }
 
+TEST(G17PMsaaEpilog, LocalReadMergedProbeHoldsEveryPartitionItReads)
+{
+   /* Targets 0 and 1 are adjacent RGBA8 targets, so the sample-equivalence
+    * probe compares both with one 2x32-bit read per sample at offset 0. The
+    * body never uses target 1, so dead-code elimination leaves the merged
+    * probe as the only access to partition 4. The local-read protocol must
+    * still hold that partition's pixel classes (pair 1), or the probe reads
+    * its bytes unordered against overlapping fragments. Targets 0, 1 and 2
+    * are partitions 0, 1 and 2, so pairs 0, 1 and 2 are all held. */
+   const unsigned samples = 4;
+   static const unsigned partition_offsets[] = {0, 4, 8};
+
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+      SCOPED_TRACE(chip);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options,
+         "local-read merged probe of a dead target");
+      b.shader->info.fs.uses_sample_shading = true;
+      b.shader->info.fs.uses_fbfetch_output = true;
+
+      nir_def *used = equiv_test_load_pixel(&b, 0, 0);
+      equiv_test_load_pixel(&b, 4, 1);
+      equiv_test_store_pixel(&b, nir_fmul_imm(&b, used, 0.5f), 8, 2);
+
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, BITFIELD_BIT(2), BITFIELD_BIT(2),
+                                  0xf, false);
+      ASSERT_TRUE(agx_nir_lower_to_per_sample(b.shader));
+      ASSERT_TRUE(agx_nir_unroll_g17p_samples_equiv(b.shader, samples, &layout));
+
+      bool progress;
+      do {
+         progress = false;
+         progress |= nir_opt_constant_folding(b.shader);
+         progress |= nir_opt_algebraic(b.shader);
+         progress |= nir_opt_dce(b.shader);
+      } while (progress);
+      agx_nir_hoist_g17p_zs_writes(b.shader);
+      agx_nir_lower_g17p_tile_samples(b.shader, samples);
+      b.shader->info.fs.uses_sample_shading = false;
+      nir_validate_shader(b.shader, "merged probe of a dead target");
+
+      unsigned merged = 0, partition1_loads = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_local_pixel_agx)
+               continue;
+            merged += nir_intrinsic_base(intr) == 0 &&
+                      nir_intrinsic_format(intr) == PIPE_FORMAT_R32_UINT &&
+                      intr->def.num_components == 2;
+            partition1_loads += nir_intrinsic_base(intr) == 4;
+         }
+      }
+      /* The case under test: one merged read per sample, and nothing else
+       * reads partition 4. */
+      EXPECT_EQ(merged, 4u);
+      EXPECT_EQ(partition1_loads, 0u);
+
+      agx_preprocess_nir(b.shader);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      key.no_preamble = true;
+      key.agx3_local_read = true;
+      key.fs.nr_samples = samples;
+      for (unsigned off : partition_offsets)
+         BITSET_SET(key.g17p_tile_partitions, off);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      EXPECT_EQ(part.info.agx3_colour_link.colour_classes, 0x7u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(G17PMsaaEpilog, LocalReadFirstMaskMatchesEpilogAndPartitions)
 {
    /* Deferred 5-RT 4x MSAA tile pass where RT4 (final lighting output) is
