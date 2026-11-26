@@ -8226,6 +8226,64 @@ TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
    }
 }
 
+/* agx_materialize_agx3_alu_constants() visits every instruction, including
+ * ones without a destination such as BEGIN_CF. Its AGX3C tied min/max check
+ * must look at the opcode before reading dest[0]; run it over a BEGIN_CF
+ * beside a tied and an untied 32-bit FCMPSEL. A sanitizer build reports the
+ * out-of-bounds read if the order regresses. */
+TEST(NativeForms, Agx3MaterializeConstantsSkipsDestinationlessInstructions)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = target.encoding;
+      key.dev.chip = target.chip;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index y = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_instr *cf = agx_begin_cf(b);
+
+      /* Tied max(x, 0.0) */
+      agx_instr *tied =
+         agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32), x,
+                        agx_immediate(0), x, agx_immediate(0), AGX_FCOND_GTN);
+      /* Untied (x < y) ? y : x */
+      agx_instr *untied = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                         x, y, y, x, AGX_FCOND_LT);
+      agx_unit_test(b, tied->dest[0]);
+      agx_unit_test(b, untied->dest[0]);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+
+      EXPECT_EQ(cf->op, AGX_OPCODE_BEGIN_CF);
+      EXPECT_EQ(cf->nr_dests, 0u);
+      EXPECT_EQ(cf->nr_srcs, 0u);
+
+      /* The pair stays tied. On AGX3C the zero is loaded into one register
+       * used in both positions. */
+      EXPECT_TRUE(agx_is_equiv(tied->src[1], tied->src[3]));
+      if (target.encoding == AGX_ISA_ENCODING_AGX3C)
+         EXPECT_EQ(tied->src[1].type, AGX_INDEX_NORMAL);
+
+      EXPECT_TRUE(agx_is_equiv(untied->src[0], x));
+      EXPECT_TRUE(agx_is_equiv(untied->src[1], y));
+      EXPECT_TRUE(agx_is_equiv(untied->src[2], y));
+      EXPECT_TRUE(agx_is_equiv(untied->src[3], x));
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, Agx3bUsatSub32NativeAnd16Lowered)
 {
    /* 32-bit usub_sat compiles to a native saturating IADD on AGX3B, while

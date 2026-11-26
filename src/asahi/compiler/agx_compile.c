@@ -7668,9 +7668,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* AGX3C's tied min/max consumes full register operands in both
-       * positions. Keep constants tied after compact-constant folding. */
+       * positions. Keep constants tied after compact-constant folding.
+       * Check the opcode and operand counts before touching dest[0]: this
+       * loop also visits instructions without a destination, such as
+       * BEGIN_CF. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
+          I->op == AGX_OPCODE_FCMPSEL && I->nr_dests == 1 &&
+          I->nr_srcs == 4 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
                 (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
