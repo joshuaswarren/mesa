@@ -564,8 +564,14 @@ main()
 
       subgroup_bitonic_merge(local_kvs);
 
-      /* Intra-workgroup cooperative merging steps */
+      /* Intra-workgroup cooperative merging steps. Once one sorted run
+       * holds every key this workgroup loaded, the other runs hold only
+       * padding (INVALID_KEY, the largest key, all alike), so the steps
+       * left would only merge padding behind it: stop. */
+      uint32_t wg_kv_count = min(KEYVALS_PER_WG, kv_count - wg_base);
       for (uint multiplier = gl_SubgroupSize * 2; multiplier <= MORTON_SORT_WORKGROUP_SIZE; multiplier *= 2) {
+         if ((multiplier / 2) * MORTON_SORT_KVS_PER_THREAD >= wg_kv_count)
+            break;
          intra_wg_merge(local_kvs, multiplier);
          barrier();
       }
