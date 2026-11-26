@@ -1203,6 +1203,9 @@ struct agx_context {
 
    uint32_t syncobj;
    uint32_t dummy_syncobj;
+   /* Private output of the last successful submit, owned until a GL fence
+    * takes it or another submission replaces it. */
+   uint32_t last_submit_fence;
    int in_sync_fd;
    uint32_t in_sync_obj;
    uint64_t flush_last_seqid;

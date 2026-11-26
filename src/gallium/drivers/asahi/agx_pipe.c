@@ -2767,6 +2767,8 @@ agx_destroy_context(struct pipe_context *pctx)
 
    drmSyncobjDestroy(dev->fd, ctx->in_sync_obj);
    drmSyncobjDestroy(dev->fd, ctx->dummy_syncobj);
+   if (ctx->last_submit_fence)
+      drmSyncobjDestroy(dev->fd, ctx->last_submit_fence);
    if (ctx->in_sync_fd != -1)
       close(ctx->in_sync_fd);
 
