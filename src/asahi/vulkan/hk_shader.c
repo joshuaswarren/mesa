@@ -10957,7 +10957,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                   hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
                   NULL);
 
-      if (agx_chip_native_or_m5(dev->dev.chip)) {
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip)) {
          enum hk_nir_widen_16bit_varyings_mode mode = 0;
 
          if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -10992,7 +10993,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          nir_io_add_intrinsic_xfb_info(nir);
       }
 
-      if (agx_chip_native_or_m5(dev->dev.chip))
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_widen_integer_io,
                   nir_metadata_control_flow, NULL);
 
