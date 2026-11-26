@@ -6850,6 +6850,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       struct hk_render_pack_run_state state;
       if (first)
          hk_render_pack_run_start(&state, cmds[i], first);
+      unsigned stamps = first ? hk_render_pack_stamp_slots(first) : 0;
       if (unlikely(dev->frame_anatomy))
          cmds[i]->render_pack.next_why = NULL;
       if (!first && i + 1 < n)
@@ -6881,6 +6882,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (!why && resources + bs->render_resources.size >
                         UINT16_MAX - sizeof(struct drm_asahi_render_program_v2))
             why = "render resources";
+         if (!why && (stamps & hk_render_pack_stamp_slots(bs)))
+            why = "timestamp slot";
          const uint64_t target =
             why ? 0 : hk_render_pack_link_target(dev, cmds[b], bs);
          if (!why && !target)
@@ -6899,6 +6902,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             dbias = bs->cr.dbias_is_int;
          resources += bs->render_resources.size;
          hk_render_pack_run_join(&state, cmds[a], cmds[b], bs);
+         stamps |= hk_render_pack_stamp_slots(bs);
          run.count++;
       }
 
