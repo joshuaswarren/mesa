@@ -14295,8 +14295,17 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              cmd,
              VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) ==
              gfx->fast_link_fs.key.prolog.statistics) {
-         if (!hk_root_dirty(&gfx->descriptors) && !hw_vs->b.info.uses_draw_id &&
-             !linked_vs->b.uses_base_param)
+         struct hk_descriptor_state *desc = &gfx->descriptors;
+         const bool push_launch_fits =
+            hk_root_push_only_dirty(desc) && !agx_is_indirect(draw.b) &&
+            !hw_vs->b.info.has_preamble &&
+            !(fs_src->info.agx3_root_reads &
+              (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
+            !hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                         hk_gfx_root_descriptor_size(cmd));
+
+         if (hk_root_launch_current(desc, push_launch_fits) &&
+             !hw_vs->b.info.uses_draw_id && !linked_vs->b.uses_base_param)
             return;
 
          if (!linked_vs->b.uses_base_param && !hw_vs->b.info.uses_draw_id &&
@@ -14309,15 +14318,22 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             gfx->render.color_written |= gfx->fast_link_fs.color_written;
             gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
 
+            uint64_t pipeline_program = 0;
+            if (push_launch_fits && hk_root_push_only_dirty(desc))
+               pipeline_program =
+                  hk_agx3_try_push_only_vs_program(cmd, hw_vs, linked_vs);
+            const bool push_only = pipeline_program != 0;
+
             const uint64_t prev_fs_root = gfx->fs_root;
-            gfx->root =
-               hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-            if (unlikely(!gfx->root))
-               return;
+            if (!push_only) {
+               gfx->root =
+                  hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+               if (unlikely(!gfx->root))
+                  return;
+               pipeline_program = hk_upload_usc_words(cmd, hw_vs, linked_vs);
+            }
 
             uint8_t *out = cs->current;
-            const uint64_t pipeline_program =
-               hk_upload_usc_words(cmd, hw_vs, linked_vs);
             if (unlikely(vk_command_buffer_has_error(&cmd->vk))) {
                cs->current = out;
                return;
@@ -14331,30 +14347,35 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out =
                hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
 
-            const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
-            const bool use_shadow =
-               verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
-            const uint64_t fs_root = hk_agx3_fragment_root_select(
-               gfx, fs_src->info.agx3_root_reads,
-               fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
-               true, use_shadow);
-            if (fs_root != prev_fs_root) {
-               const uint64_t fragment_program =
-                  hk_upload_usc_words(cmd, fs, linked_fs);
-               if (unlikely(vk_command_buffer_has_error(&cmd->vk))) {
-                  cs->current = out;
-                  return;
-               }
-               if (fragment_program != cs->m5_ppp_emitted.fragment_program &&
-                   unlikely(!hk_m5_emit_ppp_fragment_program(
-                      cmd, cs, &out, fragment_program))) {
-                  cs->current = out;
-                  return;
+            if (!push_only) {
+               const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
+               const bool use_shadow =
+                  verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
+               const uint64_t fs_root = hk_agx3_fragment_root_select(
+                  gfx, fs_src->info.agx3_root_reads,
+                  fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
+                  true, use_shadow);
+               if (fs_root != prev_fs_root) {
+                  const uint64_t fragment_program =
+                     hk_upload_usc_words(cmd, fs, linked_fs);
+                  if (unlikely(vk_command_buffer_has_error(&cmd->vk))) {
+                     cs->current = out;
+                     return;
+                  }
+                  if (fragment_program != cs->m5_ppp_emitted.fragment_program &&
+                      unlikely(!hk_m5_emit_ppp_fragment_program(
+                         cmd, cs, &out, fragment_program))) {
+                     cs->current = out;
+                     return;
+                  }
                }
             }
 
             cs->current = out;
-            hk_root_mark_clean(&gfx->descriptors);
+            if (push_only)
+               hk_root_mark_push_launched(desc);
+            else
+               hk_root_mark_clean(desc);
             return;
          }
       }
