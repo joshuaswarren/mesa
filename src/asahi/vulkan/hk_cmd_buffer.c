@@ -3450,7 +3450,7 @@ hk_g17p_graphics_uniform_ranges(
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
       if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr,
-                                   &ranges[count]))
+                                   hk_shader_root_size(s), &ranges[count]))
          return hk_g17p_graphics_ranges_refused(range_count, count);
       sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
       count++;

@@ -49,23 +49,37 @@ hk_nir_dispatch_zero_base(const uint32_t base_group[3])
    return base_group[0] == 0 && base_group[1] == 0 && base_group[2] == 0;
 }
 
-/* Compute the trimmed root descriptor upload size for a shader stage.
- * Uniform lowering loads the root pointer and set bases separately, so retain
- * that prefix.  Hardware VS and FS prologs/epilogs access only the draw arm
- * preceding push constants, so flooring graphics stages at push_offset
- * preserves every driver-synthesized root load while trimming unused
- * push-constant, dynamic-buffer, and trailing tail bytes. */
+/* The part of the root every launch of a stage reads, whatever its NIR.
+ * Uniform lowering loads the root pointer and set bases separately, and the
+ * root uniform range loads both (8 * (1 + set_count) bytes from the root), so
+ * retain that prefix.  Hardware VS and FS prologs/epilogs access only the
+ * draw arm preceding push constants, so flooring graphics stages at
+ * push_offset preserves every driver-synthesized root load. */
+static inline uint32_t
+hk_shader_root_descriptor_floor(mesa_shader_stage sw_stage,
+                                unsigned set_count, unsigned sets_offset,
+                                unsigned push_offset, unsigned full_size)
+{
+   unsigned bytes = sets_offset + set_count * (unsigned)sizeof(uint64_t);
+   if (sw_stage != MESA_SHADER_COMPUTE)
+      bytes = MAX2(bytes, push_offset);
+   return MIN2(ALIGN_POT(bytes, 16), full_size);
+}
+
+/* Compute the trimmed root descriptor upload size for a shader stage: its
+ * floor (above) and every root byte the shader itself reads, trimming
+ * unused push-constant, dynamic-buffer, and trailing tail bytes. */
 static inline uint32_t
 hk_shader_root_descriptor_size(const nir_shader *nir,
                                mesa_shader_stage sw_stage,
                                unsigned set_count, unsigned sets_offset,
                                unsigned push_offset, unsigned full_size)
 {
-   unsigned bytes = hk_nir_root_size(nir, full_size);
-   bytes = MAX2(bytes, sets_offset + set_count * (unsigned)sizeof(uint64_t));
-   if (sw_stage != MESA_SHADER_COMPUTE)
-      bytes = MAX2(bytes, push_offset);
-   return MIN2(ALIGN_POT(bytes, 16), full_size);
+   const unsigned bytes = hk_nir_root_size(nir, full_size);
+   return MAX2(MIN2(ALIGN_POT(bytes, 16), full_size),
+               hk_shader_root_descriptor_floor(sw_stage, set_count,
+                                               sets_offset, push_offset,
+                                               full_size));
 }
 
 /* Active graphics root prefix: maximum of the bound VS and optional FS

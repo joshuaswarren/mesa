@@ -465,16 +465,17 @@ hk_agx3_g17p_indexed_storage_pointers(
 
 bool
 hk_agx3_g17p_root_range(uint16_t start_halfs, uint8_t set_count,
-                        uint64_t root_va,
+                        uint64_t root_va, uint32_t root_size_B,
                         struct agx3_ioto_uniform_range *range)
 {
+   const uint32_t size_halfs = 4 * (1 + (uint32_t)set_count);
    if (!range || root_va == 0 || (start_halfs & 1) != 0 ||
-       set_count > HK_AGX3_G17P_MAX_ROOT_SETS)
+       set_count > HK_AGX3_G17P_MAX_ROOT_SETS || size_halfs * 2 > root_size_B)
       return false;
 
    *range = (struct agx3_ioto_uniform_range){
       .start_halfs = start_halfs,
-      .size_halfs = 4 * (1 + set_count),
+      .size_halfs = size_halfs,
       .address = root_va,
    };
    return true;

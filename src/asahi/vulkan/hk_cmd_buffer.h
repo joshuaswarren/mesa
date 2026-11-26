@@ -3165,6 +3165,16 @@ hk_bound_fs(struct hk_cmd_buffer *cmd)
                         cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
+/* The root prefix a launch of s reads from: its trimmed size, or the whole
+ * table when it was not trimmed. Every root uploaded for s holds at least
+ * this much. */
+static inline uint32_t
+hk_shader_root_size(const struct hk_shader *s)
+{
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   return s->root_descriptor_size ? MIN2(s->root_descriptor_size, full) : full;
+}
+
 static inline size_t
 hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
 {

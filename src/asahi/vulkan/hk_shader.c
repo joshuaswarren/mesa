@@ -11368,6 +11368,40 @@ hk_pack_loop_bound_deserialize(struct blob_reader *blob,
    return !blob->overrun;
 }
 
+/* A binary's digest is not keyed, so its root prefix is untrusted. Accept
+ * only a size the compile path can produce (hk_shader_root_descriptor_size())
+ * for the shader's stage and layout: zero (not trimmed, so the whole table is
+ * uploaded) or at most the whole table, in 16-byte steps, and holding the
+ * stage's floor -- the set pointers the root uniform range loads -- and every
+ * root-relative uniform DMA span the launch loads. */
+static bool
+hk_deserialized_root_valid(const struct hk_shader_info *info,
+                           const struct agx_shader_info *b_info,
+                           uint32_t root_descriptor_size)
+{
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   if (info->set_count > HK_MAX_SETS ||
+       b_info->agx3_uniform_dma_count > AGX3_UNIFORM_DMA_MAX_SPANS ||
+       root_descriptor_size > full ||
+       (root_descriptor_size % 16 && root_descriptor_size != full))
+      return false;
+
+   const uint32_t size = root_descriptor_size ? root_descriptor_size : full;
+   if (size < hk_shader_root_descriptor_floor(
+                 info->stage, info->set_count, hk_root_descriptor_offset(sets),
+                 hk_root_descriptor_offset(push), full))
+      return false;
+
+   for (unsigned i = 0; i < b_info->agx3_uniform_dma_count; ++i) {
+      const struct agx3_uniform_dma_span *span = &b_info->agx3_uniform_dma[i];
+      if (span->source == AGX3_UNIFORM_DMA_POINTER &&
+          span->pointer == info->agx3_root_uniform &&
+          (uint64_t)span->offset_B + 2 * span->halfs > size)
+         return false;
+   }
+   return true;
+}
+
 VkResult
 hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
                       struct hk_shader *shader, bool absent,
@@ -11375,6 +11409,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
+   /* A short read leaves info as it was: use none of it. */
+   if (blob->overrun)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    const uint32_t root_descriptor_size =
       (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
          ? blob_read_uint32(blob)
@@ -11385,6 +11422,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 
    struct agx_shader_info b_info;
    blob_copy_bytes(blob, &b_info, sizeof(b_info));
+   if (blob->overrun ||
+       !hk_deserialized_root_valid(&info, &b_info, root_descriptor_size))
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
    if (!hk_agx3_vdm_program_cache_deserialize(blob,
@@ -13606,7 +13646,8 @@ hk_m5_fragment_variant_preflight(struct hk_device *dev,
    struct agx3_ioto_uniform_range ranges[2];
    size_t count = 1;
    if (!hk_agx3_g17p_root_range(AGX_ABI_FUNI_ROOT, 0,
-                                 dev->dev.shader_base + 0x10000, &ranges[0]))
+                                 dev->dev.shader_base + 0x10000,
+                                 hk_shader_root_size(s), &ranges[0]))
       return false;
    if (s->b.info.rodata.size_16) {
       const struct agx_rodata *rodata = &s->b.info.rodata;

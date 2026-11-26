@@ -1,0 +1,10 @@
+#version 450
+/* One descriptor set and no push constants: the root prefix a launch reads
+ * is the root pointer and the set-0 pointer. */
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Data { uint v[]; } data;
+
+void main()
+{
+   data.v[gl_GlobalInvocationID.x] += 1u;
+}
