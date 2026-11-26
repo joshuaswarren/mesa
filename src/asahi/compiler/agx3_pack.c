@@ -1448,6 +1448,21 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
     * applied. A rendezvous in its place would count arrivals that a fence
     * in divergent control flow never gets from the rest of the workgroup.
     */
+   /* The imageblock memory class is f27, between threadgroup (f26) and
+    * texture (f28); the rest is the threadgroup barrier: f29 rendezvous, f30
+    * scope 2, f39 threadgroup memory scope. Compiled from our own imageblock
+    * compute kernels, which separate their imageblock stores from the block
+    * store with it. */
+   if (scope == AGX3_BARRIER_SCOPE_IMAGEBLOCK) {
+      if (out == NULL || encoding != AGX_ISA_ENCODING_AGX3B)
+         return false;
+      const struct agx3_field_kv fields[] = {
+         {27, 1}, {29, 1}, {30, 2}, {39, 1},
+      };
+      memset(out, 0, sizeof(*out));
+      return agx3_bind_compose(encoding, AGX3_MN_barrier, 0, fields, 4, NULL,
+                               0, out->bytes, &out->length);
+   }
    if (scope == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE) {
       if (out == NULL || (encoding != AGX_ISA_ENCODING_AGX3B &&
                           encoding != AGX_ISA_ENCODING_AGX3C))
