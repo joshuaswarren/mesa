@@ -114,6 +114,22 @@ void agx3_build_usc_base_page(uint8_t *image, size_t size, enum agx_chip chip,
                               unsigned cores_per_cluster,
                               unsigned num_clusters);
 
+/* Whether the coefficient bindings and code extents a part's info names fit
+ * its binding array and binary, as they do for every part the compiler
+ * builds. A part restored from storage that need not have come from the
+ * compiler, such as the disk cache, must pass before it is linked. */
+static inline bool
+agx_shader_part_info_valid(const struct agx_shader_info *info)
+{
+   return info->varyings.fs.nr_bindings <=
+             ARRAY_SIZE(info->varyings.fs.bindings) &&
+          info->main_offset <= info->binary_size &&
+          info->main_size <= info->binary_size - info->main_offset &&
+          (!info->has_preamble ||
+           (info->preamble_offset <= info->binary_size &&
+            info->preamble_size <= info->binary_size - info->preamble_offset));
+}
+
 /* `uvs_map` (agx_uvs_relocation_map()) places the varyings of a vertex
  * program with a relocatable UVS layout, which cannot link without it. */
 bool agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,

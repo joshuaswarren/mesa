@@ -34,8 +34,8 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    if (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip)) {
       if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
          const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
-         if (s && s->root_descriptor_size)
-            root_size = MIN2(root_size, s->root_descriptor_size);
+         if (s)
+            root_size = hk_shader_root_size(s);
       } else if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
          root_size = MIN2(root_size, hk_gfx_root_descriptor_size(cmd));
       }

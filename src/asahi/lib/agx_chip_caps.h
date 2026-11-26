@@ -87,9 +87,9 @@ enum agx_chip_cap {
 
    /* Register allocation tie-breaks co-read GPR pairs across the three 32-bit
     * register banks ((reg / 2) % 3) and coalesces single-use loop RMW
-    * accumulator chains on non-preamble shaders. Enabled on G17P (HAL200); off
-    * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
-    * hardware A/B and CTS rows are collected. */
+    * accumulator chains on non-preamble shaders. Measured and qualified on
+    * G17P (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G18G,
+    * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 
    /* Private Gen10 colour and depth compression. In Gallium: single-level,
@@ -193,8 +193,9 @@ enum agx_chip_cap {
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
     AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
-    AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY)
+    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |                  \
+    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
+    AGX_CAP_CACHED_CMD_MEMORY)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.

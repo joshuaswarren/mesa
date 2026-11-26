@@ -478,23 +478,20 @@ test_consecutive_stamps_coalesce(void)
             stamp_all(cmd, i);
          T("first stamp ends the dispatch", is_end(d, 0));
 
-         /* With exact priors a stamp on a compute command is ordered
-          * through its compute queue alone (stamp_wait()), so the second
-          * stamp takes a carrier, which the rest copy. */
-         const bool own = cdm_stamp_queue_ordered(chips[c], exact);
-         struct hk_cs *src = own ? last_cs(cmd) : d;
-         const unsigned copies = own ? 3 : 4;
-         T("a run of stamps records at most one carrier",
-           list_length(&cmd->control_streams) == (own ? 2 : 1) &&
-           stamped_streams(cmd) == (own ? 2 : 1));
-         T("the rest are pending copies of the run's last command",
-           cmd->sync.stamp_copy_count == copies &&
-           cmd->sync.stamp_copy_after[HK_SYNC_CDM] == src &&
+         /* Both exact-prior queue-ordered compute stamps and legacy prefix
+          * waits coalesce all five consecutive stamps onto the dispatch with
+          * no extra carrier stream. */
+         T("a run of stamps records no extra carrier",
+           list_length(&cmd->control_streams) == 1 &&
+           stamped_streams(cmd) == 1);
+         T("the rest are pending copies of the dispatch",
+           cmd->sync.stamp_copy_count == 4 &&
+           cmd->sync.stamp_copy_after[HK_SYNC_CDM] == d &&
            !cmd->sync.stamp_copy_after[HK_SYNC_VDM] && !record_count);
          bool sources = true;
-         for (unsigned i = 0; i < copies; ++i) {
-            sources &= copy_is(&cmd->sync.stamp_copies[i], 5 - copies + i,
-                               src->timestamp.end);
+         for (unsigned i = 0; i < 4; ++i) {
+            sources &= copy_is(&cmd->sync.stamp_copies[i], 1 + i,
+                               d->timestamp.end);
          }
          T("each copy reads the stamp it repeats", sources);
 
@@ -502,9 +499,9 @@ test_consecutive_stamps_coalesce(void)
          struct hk_cs *f = last_cs(cmd);
          T("flush launches every copy once",
            record_count == 1 && records[0].cs == f &&
-           records[0].count == copies && !cmd->sync.stamp_copy_count);
+           records[0].count == 4 && !cmd->sync.stamp_copy_count);
          T("flush stream follows the stamp it reads",
-           f->sync.dep[HK_SYNC_CDM].cut == src &&
+           f->sync.dep[HK_SYNC_CDM].cut == d &&
            (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
          T("flush stream is ended", !cmd->current_cs.cs);
 
@@ -664,8 +661,10 @@ test_batched_copies(void)
 static void
 test_in_pass_copies(void)
 {
+   const unsigned counts[] = {1, HK_SYNC_STAMP_COPIES + 8};
    for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
-      for (unsigned n = 1; n <= 40; n += 39) {
+      for (unsigned ci = 0; ci < ARRAY_SIZE(counts); ++ci) {
+         const unsigned n = counts[ci];
          record_count = 0;
          struct hk_cmd_buffer *cmd = new_cmd(chips[c], false);
          struct hk_cs *r = begin_render(cmd);
@@ -875,6 +874,66 @@ test_copy_consumers_wait(void)
    }
 }
 
+/* An end timestamp attached to a render pass-merge candidate (or a covered
+ * copy of it) keeps pass_merge.sync_epoch current so the next compatible
+ * render pass instance can still merge into the same render stream, and a
+ * merged pass that already carries an end stamp never lets an in-pass
+ * TOP_OF_PIPE stamp take start on a start-stamp-ordered chip. */
+static void
+test_pass_merge_end_stamp(void)
+{
+   const enum agx_chip merge_chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   for (unsigned c = 0; c < ARRAY_SIZE(merge_chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         record_count = 0;
+         struct hk_cmd_buffer *cmd = new_cmd(merge_chips[c], exact);
+         struct hk_cs *r = render(cmd);
+
+         cmd->pass_merge.valid = true;
+         cmd->pass_merge.cs = r;
+         cmd->pass_merge.next_seq = cmd->sync.next_seq;
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+
+         stamp_all(cmd, 0);
+         T("post-pass end stamp preserves pass_merge epoch",
+           is_end(r, 0) && list_length(&cmd->control_streams) == 1 &&
+           cmd->pass_merge.sync_epoch == cmd->sync.epoch);
+
+         stamp_all(cmd, 1);
+         T("covered copy after end stamp preserves pass_merge epoch",
+           list_length(&cmd->control_streams) == 1 &&
+           cmd->sync.stamp_copy_count == 1 &&
+           copy_is(&cmd->sync.stamp_copies[0], 1, query(0)) &&
+           cmd->pass_merge.sync_epoch == cmd->sync.epoch);
+
+         /* Merge the next pass instance onto the same render stream. */
+         cmd->pass_merge.valid = false;
+         cmd->current_cs.gfx = r;
+         hk_sync_merge_rendering(cmd, r);
+         stamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 2);
+         T("in-pass TOP_OF_PIPE on end-stamped merged pass never takes start",
+           !r->timestamp.start.handle && is_end(r, 0) &&
+           cmd->sync.stamp_copy_count == 2 &&
+           copy_is(&cmd->sync.stamp_copies[1], 2, query(0)));
+         stamp_all(cmd, 3);
+         T("second pass end stamp queues as a copy of the merged end stamp",
+           cmd->sync.stamp_copy_count == 3 &&
+           copy_is(&cmd->sync.stamp_copies[2], 3, query(0)) &&
+           list_length(&cmd->control_streams) == 1 && !record_count);
+         end_render(cmd);
+
+         hk_sync_flush_stamp_copies(cmd);
+         T("all merged pass copies flush in one timestamp-only stream",
+           record_count == 1 && records[0].count == 3 &&
+           records[0].cs->sync.dep[HK_SYNC_VDM].cut == r &&
+           (records[0].cs->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+         T("merged end-stamped pass resolves",
+           submit(new_queue(exact), &cmd, 1));
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -890,6 +949,7 @@ main(void)
    test_in_pass_copies();
    test_copies_order_no_application_work();
    test_copy_consumers_wait();
+   test_pass_merge_end_stamp();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);

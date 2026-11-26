@@ -274,24 +274,28 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
 {
    /* Verify mod-3 tie-breaking, loop_phi_targets, and rmw_web stay strictly
     * gated on AGX_CAP_MOD3_REG_BANK_RA and non-preamble shaders: disabled on
-    * M5/AGX3C (G17G), on non-capable AGX3B chips (G16G), and on G17P
-    * preambles. Use the same k/pad0/pad1/m loop that G17P resolves to 0
+    * AGX3D (G18G), on non-capable AGX3B chips (G16G), and on G17P/M5
+    * preambles. Use the same k/pad0/pad1/m loop that G17P and M5 resolve to 0
     * conflicts and confirm it stays untouched (k=r1, m=r4) when gated off. */
-   for (unsigned mode = 0; mode < 3; ++mode) {
+   for (unsigned mode = 0; mode < 4; ++mode) {
       nir_builder nb = make_compute_shader("g17p-mod3-gating");
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
       struct agx_shader_info out = {};
       if (mode == 0) {
-         key.dev.chip = AGX_CHIP_G17G;
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = AGX_CHIP_G18G;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3D;
       } else if (mode == 1) {
          key.dev.chip = AGX_CHIP_G16G;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      } else {
+      } else if (mode == 2) {
          key.dev.chip = AGX_CHIP_G17P;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         b->shader->is_preamble = true;
+      } else {
+         key.dev.chip = AGX_CHIP_G17C;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
          b->shader->is_preamble = true;
       }
       b->shader->key = &key;
@@ -341,6 +345,77 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
          }
       }
       EXPECT_GT(mod3_conflicts, 0u);
+      EXPECT_EQ(b->shader->scratch_size_B, 0u);
+      ralloc_free(mem);
+      ralloc_free(nb.shader);
+   }
+}
+
+TEST(G17PMod3RA, M5ResolvesMod3Conflicts)
+{
+   /* Verify M5 (G17G, G17S, G17C) carries AGX_CAP_MOD3_REG_BANK_RA and
+    * resolves the same co-read loop to zero mod-3 bank conflicts without
+    * spilling. */
+   const enum agx_chip m5_chips[] = {
+      AGX_CHIP_G17G,
+      AGX_CHIP_G17S,
+      AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(m5_chips); ++i) {
+      nir_builder nb = make_compute_shader("m5-mod3-loop");
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      struct agx_shader_info out = {};
+      key.dev.chip = m5_chips[i];
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      b->shader->key = &key;
+      b->shader->out = &out;
+      b->shader->nir = nb.shader;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *loop = agx_test_block(b->shader);
+      agx_block *latch = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      loop->loop_header = true;
+      agx_block_add_successor(entry, loop);
+      agx_block_add_successor(loop, latch);
+      agx_block_add_successor(latch, loop);
+      agx_block_add_successor(loop, exit);
+
+      b->cursor = agx_after_block(entry);
+      agx_index k = agx_mov_imm(b, 32, 0x3f800000);
+      agx_index pad0 = agx_mov_imm(b, 32, 0x40000000);
+      agx_index pad1 = agx_mov_imm(b, 32, 0x40400000);
+      agx_index m = agx_mov_imm(b, 32, 0x40800000);
+
+      b->cursor = agx_after_block(loop);
+      agx_index x0 = agx_ffma(b, k, m, pad0);
+      agx_index x1 = agx_ffma(b, k, m, pad1);
+      agx_index x2 = agx_ffma(b, k, m, x0);
+      agx_index x3 = agx_ffma(b, k, m, x1);
+
+      b->cursor = agx_after_block(exit);
+      agx_unit_test(b, x2);
+      agx_unit_test(b, x3);
+
+      agx_compute_liveness(b->shader);
+      agx_ra(b->shader);
+
+      unsigned mod3_conflicts = 0;
+      agx_foreach_instr_in_block(loop, I) {
+         if (I->op != AGX_OPCODE_FFMA)
+            continue;
+         if (I->src[0].type == AGX_INDEX_REGISTER &&
+             I->src[1].type == AGX_INDEX_REGISTER) {
+            unsigned r0 = I->src[0].value >> 1;
+            unsigned r1 = I->src[1].value >> 1;
+            if (r0 != r1 && (r0 % 3u) == (r1 % 3u))
+               mod3_conflicts++;
+         }
+      }
+      EXPECT_EQ(mod3_conflicts, 0u);
       EXPECT_EQ(b->shader->scratch_size_B, 0u);
       ralloc_free(mem);
       ralloc_free(nb.shader);

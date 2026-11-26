@@ -1203,6 +1203,9 @@ struct agx_context {
 
    uint32_t syncobj;
    uint32_t dummy_syncobj;
+   /* Private output of the last successful submit, owned until a GL fence
+    * takes it or another submission replaces it. */
+   uint32_t last_submit_fence;
    int in_sync_fd;
    uint32_t in_sync_obj;
    uint64_t flush_last_seqid;
@@ -1365,10 +1368,10 @@ void agx_g17g_layered_clear(struct agx_context *ctx, unsigned buffers,
                             uint8_t stencil_clear_mask,
                             const union pipe_color_union *color,
                             double depth, unsigned stencil);
-bool agx_g17g_level_renderable(struct agx_context *ctx,
-                               struct pipe_resource *prsc,
-                               enum pipe_format format, unsigned level,
-                               unsigned layer);
+bool agx_level_renderable(struct agx_context *ctx,
+                          struct pipe_resource *prsc,
+                          enum pipe_format format, unsigned level,
+                          unsigned layer);
 void agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
                               uint32_t color_clear_mask,
                               uint8_t stencil_clear_mask,

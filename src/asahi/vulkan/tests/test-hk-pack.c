@@ -1942,6 +1942,47 @@ test_liveness_tracker(void)
      !hk_pack_liveness_covers(&st, &overflow_iv));
 }
 
+static void
+test_loop_work_scaling(void)
+{
+   static const struct {
+      uint64_t instrs, work;
+      uint32_t divisor;
+      bool fits;
+      uint64_t scaled;
+   } cases[] = {
+      {1, 1, 3, true, 1},
+      {UINT32_MAX, UINT32_MAX, UINT32_MAX, true, UINT64_C(0x1fffffffe)},
+      {UINT64_C(1) << 32, UINT64_C(1) << 32, 3, true,
+       UINT64_C(0xaaaaaaaaaaaaaaab)},
+      {UINT64_MAX, 1, 2, true, UINT64_MAX},
+      {UINT64_MAX, 1, 1, false, 0},
+      {UINT64_MAX, UINT64_MAX, UINT32_MAX, false, 0},
+      /* The doubling wraps and rounding carries into the high limb. */
+      {UINT64_MAX, (UINT64_C(1) << 63) + 1, 3, true,
+       UINT64_C(0x5555555555555555)},
+      /* Rounding also wraps if the doubled numerator ends at 2^128 - 4. */
+      {UINT64_MAX - 1, (UINT64_C(1) << 63) + 1, 5, true, 0},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      const uint64_t instrs = cases[i].instrs;
+      const uint64_t work = cases[i].work;
+      const uint32_t divisor = cases[i].divisor;
+      uint64_t scaled = 0;
+      const bool fits = hk_pack_scale_instrs_portable(instrs, work, divisor,
+                                                     &scaled);
+      T("portable loop work scaling fits and rounds correctly",
+        fits == cases[i].fits && (!fits || scaled == cases[i].scaled));
+#if defined(__SIZEOF_INT128__)
+      const __uint128_t native =
+         ((__uint128_t)2u * instrs * work + divisor - 1u) / divisor;
+      T("portable loop work scaling matches native 128-bit arithmetic",
+        fits == (native <= UINT64_MAX) && (!fits || scaled == native));
+#endif
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1949,6 +1990,7 @@ main(int argc, char **argv)
    test_context = ralloc_context(NULL);
    if (!test_context)
       return EXIT_FAILURE;
+   test_loop_work_scaling();
    if (negctl) {
       test_packet_reuse(true);
       test_fused_packet_reuse(true);

@@ -489,6 +489,27 @@ hk_root_matches_push(const struct hk_root_descriptor_table *a, size_t a_size,
                                hk_root_descriptor_offset(dynamic_buffers));
 }
 
+/* Whether two roots agree on every dynamic_buffers[] slot named in mask. */
+static inline bool
+hk_root_matches_dynbuf_mask(const struct hk_root_descriptor_table *a,
+                            size_t a_size,
+                            const struct hk_root_descriptor_table *b,
+                            size_t b_size, uint64_t mask)
+{
+   const uint8_t *ab = (const uint8_t *)a;
+   const uint8_t *bb = (const uint8_t *)b;
+   const size_t a_lim = MIN2(a_size, sizeof(*a));
+   const size_t b_lim = MIN2(b_size, sizeof(*b));
+   const size_t base = hk_root_descriptor_offset(dynamic_buffers);
+   const size_t stride = sizeof(a->dynamic_buffers[0]);
+   u_foreach_bit64(slot, mask) {
+      const size_t start = base + slot * stride;
+      if (!hk_root_span_matches(ab, a_lim, bb, b_lim, start, start + stride))
+         return false;
+   }
+   return true;
+}
+
 /* Build the same visible-byte sequence as hk_root_matches_for_fragment().
  * Keeping this derived from the shared span list includes future root fields
  * and padding without duplicating the root ABI. Push constants sit alongside
@@ -1298,11 +1319,19 @@ hk_root_fragment_snapshot_publish(struct hk_graphics_state *gfx,
 
 /* Select the same immutable root as the fresh byte comparison. Hidden reads
  * always use the current root; snapshots and the positive identity memo only
- * accelerate the equality check for shaders that cannot observe those bytes. */
+ * accelerate the equality check for shaders that cannot observe those bytes.
+ *
+ * dynbuf_reads names the dynamic_buffers[] slots the shader reads at constant
+ * offsets (hk_shader_info::agx3_dynbuf_reads). Those slots are compared
+ * directly in the CPU mappings, so that only happens when the caller compares
+ * roots there (!use_shadow, CPU-cached roots): the snapshots leave the
+ * dynamic buffers out, and there such a shader keeps following the current
+ * root. The slots are checked on every call, ahead of the identity memo,
+ * because the memo does not cover them. */
 static inline uint64_t
 hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
-                             uint32_t required_size, bool use_memo,
-                             bool use_shadow)
+                             uint64_t dynbuf_reads, uint32_t required_size,
+                             bool use_memo, bool use_shadow)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                           HK_ROOT_READS_DYNAMIC_BUFFERS;
@@ -1318,7 +1347,12 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
                        gfx->fs_root_fragment_snapshot_cpu == gfx->fs_root_cpu;
 
    if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
-       prev_size >= req && !(root_reads & hidden)) {
+       prev_size >= req && !(root_reads & hidden) &&
+       (!dynbuf_reads ||
+        (!use_shadow &&
+         hk_root_matches_dynbuf_mask(gfx->fs_root_cpu, prev_size,
+                                     gfx->root_cpu, cur_size,
+                                     dynbuf_reads)))) {
       const bool memo_bytes = use_memo && gfx->fs_root_checked_root &&
                               gfx->fs_root_checked_root == gfx->root;
       if (memo_bytes && (!reads_push || gfx->fs_root_checked_push_match))
@@ -3153,6 +3187,16 @@ hk_bound_fs(struct hk_cmd_buffer *cmd)
                         cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
+/* The root prefix a launch of s reads from: its trimmed size, or the whole
+ * table when it was not trimmed. Every root uploaded for s holds at least
+ * this much. */
+static inline uint32_t
+hk_shader_root_size(const struct hk_shader *s)
+{
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   return s->root_descriptor_size ? MIN2(s->root_descriptor_size, full) : full;
+}
+
 static inline size_t
 hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
 {
@@ -3506,6 +3550,14 @@ hk_stat_enabled(uint64_t addr)
 {
    return addr != AGX_SCRATCH_PAGE_ADDRESS;
 }
+
+/* A shader part stored in the disk cache (hk_cmd_draw.c) is its
+ * agx_shader_info followed by the binary. The cache does not authenticate
+ * what it returns, so a record whose info does not fit its binary or binding
+ * array (agx_shader_part_info_valid()) yields NULL: a miss, and the part is
+ * rebuilt. The part and its binary are owned by mem_ctx and malloc. */
+struct agx_shader_part *hk_part_from_blob(const uint8_t *data, size_t size,
+                                          void *mem_ctx);
 
 /* AGX3 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
  * while an ended instance is still continuable decides whether the next one

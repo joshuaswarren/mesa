@@ -22,6 +22,7 @@
  */
 
 #include "nir_serialize.h"
+#include <setjmp.h>
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "util/u_printf.h"
@@ -30,6 +31,15 @@
 
 #define NIR_SERIALIZE_FUNC_HAS_IMPL ((void *)(intptr_t)1)
 #define MAX_OBJECT_IDS              (1 << 20)
+
+/* setjmp/longjmp is broken on MinGW, see vtn_private.h. */
+#if defined(__MINGW32__) && !defined(_UCRT)
+#define read_setjmp  __builtin_setjmp
+#define read_longjmp __builtin_longjmp
+#else
+#define read_setjmp  setjmp
+#define read_longjmp longjmp
+#endif
 
 typedef struct {
    size_t blob_offset;
@@ -93,6 +103,11 @@ typedef struct {
    struct nir_variable_data last_var_data;
 
    struct hash_table strings;
+
+   /* Where read_fail() returns to. Everything read so far is allocated
+    * on nir, so the caller only has to free that and idx_table.
+    */
+   jmp_buf fail_jump;
 } read_ctx;
 
 static void
@@ -111,17 +126,35 @@ write_lookup_object(write_ctx *ctx, const void *obj)
    return (uint32_t)(uintptr_t)entry->data;
 }
 
+/* The blob is malformed: stop reading it. */
+static void NORETURN
+read_fail(read_ctx *ctx)
+{
+   read_longjmp(ctx->fail_jump, 1);
+}
+
 static void
 read_add_object(read_ctx *ctx, void *obj)
 {
-   assert(ctx->next_idx < ctx->idx_table_len);
+   /* Once the reader has overrun, every read returns zero, which would make
+    * later references resolve to the wrong objects.
+    */
+   if (ctx->blob->overrun || ctx->next_idx >= ctx->idx_table_len)
+      read_fail(ctx);
+
    ctx->idx_table[ctx->next_idx++] = obj;
 }
 
 static void *
 read_lookup_object(read_ctx *ctx, uint32_t idx)
 {
-   assert(idx < ctx->idx_table_len);
+   /* The writer only refers to objects it has already written. Phi sources
+    * are the exception, and they are looked up at the end of the
+    * function_impl, once everything they can refer to has been read.
+    */
+   if (ctx->blob->overrun || idx >= ctx->next_idx)
+      read_fail(ctx);
+
    return ctx->idx_table[idx];
 }
 
@@ -2288,16 +2321,80 @@ nir_serialize(struct blob *blob, const nir_shader *nir, bool strip)
    serialize_internal(blob, nir, strip, true);
 }
 
+static bool
+read_object_table(read_ctx *ctx, struct blob_reader *blob)
+{
+   ctx->blob = blob;
+   list_inithead(&ctx->phi_srcs);
+
+   /* The writer never assigns more than MAX_OBJECT_IDS indices.
+    * read_add_object() rejects a blob that adds more objects than this.
+    */
+   ctx->idx_table_len = blob_read_uint32(blob);
+   if (blob->overrun || ctx->idx_table_len > MAX_OBJECT_IDS)
+      return false;
+
+   ctx->idx_table = calloc(MAX2(ctx->idx_table_len, 1), sizeof(uintptr_t));
+   return ctx->idx_table != NULL;
+}
+
+/* Reads everything after the shader header into ctx->nir. Returns false if
+ * the blob is malformed.
+ */
+static bool
+read_shader_body(read_ctx *ctx)
+{
+   if (read_setjmp(ctx->fail_jump))
+      return false;
+
+   nir_shader *nir = ctx->nir;
+   struct blob_reader *blob = ctx->blob;
+
+   read_var_list(ctx, &nir->variables);
+
+   nir->num_inputs = blob_read_uint32(blob);
+   nir->num_uniforms = blob_read_uint32(blob);
+   nir->num_outputs = blob_read_uint32(blob);
+   nir->scratch_size = blob_read_uint32(blob);
+
+   unsigned num_functions = blob_read_uint32(blob);
+   for (unsigned i = 0; i < num_functions; i++)
+      read_function(ctx);
+
+   nir_foreach_function(fxn, nir) {
+      if (fxn->impl == NIR_SERIALIZE_FUNC_HAS_IMPL)
+         nir_function_set_impl(fxn, read_function_impl(ctx));
+   }
+
+   nir->constant_data_size = blob_read_uint32(blob);
+   if (nir->constant_data_size > 0) {
+      nir->constant_data = ralloc_size(nir, nir->constant_data_size);
+      blob_copy_bytes(blob, nir->constant_data, nir->constant_data_size);
+   }
+
+   nir->xfb_info = read_xfb_info(ctx);
+
+   if (nir->info.uses_printf) {
+      nir->printf_info =
+         u_printf_deserialize_info(nir, blob, &nir->printf_info_count);
+   }
+
+   return !blob->overrun;
+}
+
+/**
+ * Deserialize NIR written by nir_serialize().
+ *
+ * Returns NULL if the blob is malformed.
+ */
 nir_shader *
 nir_deserialize(void *mem_ctx,
                 const struct nir_shader_compiler_options *options,
                 struct blob_reader *blob)
 {
    read_ctx ctx = { 0 };
-   ctx.blob = blob;
-   list_inithead(&ctx.phi_srcs);
-   ctx.idx_table_len = blob_read_uint32(blob);
-   ctx.idx_table = calloc(ctx.idx_table_len, sizeof(uintptr_t));
+   if (!read_object_table(&ctx, blob))
+      return NULL;
 
    enum nir_serialize_shader_flags flags = blob_read_uint32(blob);
    char *name = (flags & NIR_SERIALIZE_SHADER_NAME) ? blob_read_string(blob) : NULL;
@@ -2306,6 +2403,10 @@ nir_deserialize(void *mem_ctx,
 
    struct shader_info info;
    blob_copy_bytes(blob, (uint8_t *)&info, sizeof(info));
+   if (blob->overrun) {
+      free(ctx.idx_table);
+      return NULL;
+   }
 
    ctx.nir = nir_shader_create(mem_ctx, info.stage, options);
 
@@ -2319,63 +2420,58 @@ nir_deserialize(void *mem_ctx,
 
    ctx.nir->info = info;
 
-   read_var_list(&ctx, &ctx.nir->variables);
-
-   ctx.nir->num_inputs = blob_read_uint32(blob);
-   ctx.nir->num_uniforms = blob_read_uint32(blob);
-   ctx.nir->num_outputs = blob_read_uint32(blob);
-   ctx.nir->scratch_size = blob_read_uint32(blob);
-
-   unsigned num_functions = blob_read_uint32(blob);
-   for (unsigned i = 0; i < num_functions; i++)
-      read_function(&ctx);
-
-   nir_foreach_function(fxn, ctx.nir) {
-      if (fxn->impl == NIR_SERIALIZE_FUNC_HAS_IMPL)
-         nir_function_set_impl(fxn, read_function_impl(&ctx));
-   }
-
-   ctx.nir->constant_data_size = blob_read_uint32(blob);
-   if (ctx.nir->constant_data_size > 0) {
-      ctx.nir->constant_data =
-         ralloc_size(ctx.nir, ctx.nir->constant_data_size);
-      blob_copy_bytes(blob, ctx.nir->constant_data,
-                      ctx.nir->constant_data_size);
-   }
-
-   ctx.nir->xfb_info = read_xfb_info(&ctx);
-
-   if (ctx.nir->info.uses_printf) {
-      ctx.nir->printf_info =
-         u_printf_deserialize_info(ctx.nir, blob,
-                                   &ctx.nir->printf_info_count);
-   }
+   bool ok = read_shader_body(&ctx);
 
    free(ctx.idx_table);
    _mesa_hash_table_fini(&ctx.strings, NULL);
+
+   if (!ok) {
+      ralloc_free(ctx.nir);
+      return NULL;
+   }
 
    nir_validate_shader(ctx.nir, "after deserialize");
 
    return ctx.nir;
 }
 
+static nir_function *
+read_single_function(read_ctx *ctx)
+{
+   if (read_setjmp(ctx->fail_jump))
+      return NULL;
+
+   nir_function *fxn = read_function(ctx);
+   nir_function_set_impl(fxn, read_function_impl(ctx));
+
+   return ctx->blob->overrun ? NULL : fxn;
+}
+
+/**
+ * Deserialize a function written by nir_serialize_function().
+ *
+ * Returns NULL if the blob is malformed.
+ */
 nir_function *
 nir_deserialize_function(void *mem_ctx,
                          const struct nir_shader_compiler_options *options,
                          struct blob_reader *blob)
 {
    read_ctx ctx = { 0 };
-   ctx.blob = blob;
-   list_inithead(&ctx.phi_srcs);
-   ctx.idx_table_len = blob_read_uint32(blob);
-   ctx.idx_table = calloc(ctx.idx_table_len, sizeof(uintptr_t));
+   if (!read_object_table(&ctx, blob))
+      return NULL;
 
    ctx.nir = nir_shader_create(mem_ctx, 0 /* stage */, options);
 
-   nir_function *fxn = read_function(&ctx);
-   nir_function_set_impl(fxn, read_function_impl(&ctx));
+   nir_function *fxn = read_single_function(&ctx);
 
    free(ctx.idx_table);
+
+   if (!fxn) {
+      ralloc_free(ctx.nir);
+      return NULL;
+   }
+
    nir_validate_shader(ctx.nir, "after deserialize");
    return fxn;
 }

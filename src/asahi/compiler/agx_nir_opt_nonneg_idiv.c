@@ -30,12 +30,6 @@
  *
  * Every identity above is bit-exact over all 32-bit signed inputs with b != 0,
  * including INT32_MIN (where two's-complement iabs(INT32_MIN) == 0x80000000u).
- *
- * agx_nir_opt_uniform_idiv later lowers a division by a uniform divisor with
- * magic multipliers: 5 ALU ops for udiv, 7 for idiv. A one-sided rewrite of
- * such a division would pay its iabs and sign fixup on top of the unsigned
- * sequence, so it stays signed. Rewrites that leave a bare udiv/umod (both
- * operands nonnegative, or irem with a nonnegative dividend) still apply.
  */
 
 #include "agx_nir.h"
@@ -46,7 +40,6 @@
 struct nonneg_ctx {
    nir_shader *shader;
    struct hash_table *range_ht;
-   struct hash_table *uniform_ht;
 };
 
 static bool
@@ -297,10 +290,6 @@ opt_nonneg_idiv_instr(nir_builder *b, nir_alu_instr *alu, void *data)
    if (!nonneg_a && nir_scalar_is_const(sb))
       return false;
 
-   const bool bare_unsigned = nonneg_b ? nonneg_a : op == nir_op_irem;
-   if (!bare_unsigned && agx_nir_uniform_idiv_applies(alu, ctx->uniform_ht))
-      return false;
-
    b->cursor = nir_before_instr(&alu->instr);
    nir_def *a = nir_ssa_for_alu_src(b, alu, 0);
    nir_def *d = nir_ssa_for_alu_src(b, alu, 1);
@@ -349,13 +338,11 @@ agx_nir_opt_nonneg_idiv(nir_shader *shader)
    struct nonneg_ctx ctx = {
       .shader = shader,
       .range_ht = _mesa_pointer_hash_table_create(NULL),
-      .uniform_ht = _mesa_pointer_hash_table_create(NULL),
    };
 
    bool progress = nir_shader_alu_pass(shader, opt_nonneg_idiv_instr,
                                        nir_metadata_control_flow, &ctx);
 
    _mesa_hash_table_destroy(ctx.range_ht, NULL);
-   _mesa_hash_table_destroy(ctx.uniform_ht, NULL);
    return progress;
 }

@@ -187,6 +187,9 @@ struct hk_shader_info {
    bool agx3_gen1_fragment_rq;
    /* HK_ROOT_READS_* classes of root bytes the shader may read. */
    uint8_t agx3_root_reads;
+   /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
+    * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
+   uint64_t agx3_dynbuf_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -257,6 +260,7 @@ struct hk_local_read_shader_meta {
    struct agx_fs_epilog_link_info epilog_key;
    uint8_t set_count;
    uint8_t agx3_root_reads;
+   uint64_t agx3_dynbuf_reads;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
@@ -617,6 +621,12 @@ struct hk_api_shader {
 
    struct hk_shader variants[];
 };
+
+/* Deserialize NIR that a shader keeps in a blob of its own (from the shader
+ * binary or the cache) to build from later. NULL unless the blob holds exactly
+ * one shader of `stage` with an entrypoint. */
+nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
+                                      size_t size, mesa_shader_stage stage);
 
 /* The custom-border-emulating twin of a shader with a border source, built
  * on first use. Thread-safe; NULL if it cannot be built. */

@@ -1,0 +1,12 @@
+#version 450
+/* One descriptor set and a push constant, which the launch may load from the
+ * root past the set pointers. */
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Data { uint v[]; } data;
+layout(push_constant) uniform PC { uint scale; uint bias; } pc;
+
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   data.v[i] = data.v[i] * pc.scale + pc.bias;
+}

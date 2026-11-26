@@ -7668,9 +7668,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* AGX3C's tied min/max consumes full register operands in both
-       * positions. Keep constants tied after compact-constant folding. */
+       * positions. Keep constants tied after compact-constant folding.
+       * Check the opcode and operand counts before touching dest[0]: this
+       * loop also visits instructions without a destination, such as
+       * BEGIN_CF. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
+          I->op == AGX_OPCODE_FCMPSEL && I->nr_dests == 1 &&
+          I->nr_srcs == 4 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
                 (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
@@ -7854,13 +7859,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
 
             /* A tied minimum/maximum selects the same minifloat it compares.
              * The select slot reads a bit pattern, so keep the tie through
-             * the register instead of leaving the minifloat there. */
-            const agx_index sel = I->src[s + 2];
+             * the register instead of leaving the minifloat there. FCMP has
+             * no select slots, so only look at them on FCMPSEL. */
             if (I->op == AGX_OPCODE_FCMPSEL &&
-                I->dest[0].size == AGX_SIZE_32 &&
-                sel.type == AGX_INDEX_IMMEDIATE && sel.value == src.value &&
-                sel.abs == src.abs && sel.neg == src.neg)
-               I->src[s + 2] = I->src[s];
+                I->dest[0].size == AGX_SIZE_32) {
+               const agx_index sel = I->src[s + 2];
+               if (sel.type == AGX_INDEX_IMMEDIATE &&
+                   sel.value == src.value && sel.abs == src.abs &&
+                   sel.neg == src.neg)
+                  I->src[s + 2] = I->src[s];
+            }
          }
       }
 
@@ -8179,6 +8187,12 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             I->src[0] = I->src[1];
             I->src[1] = tmp;
          }
+
+         /* The add was allocated with two sources. Give the FMA a source
+          * array with room for its addend before writing src[2]. */
+         agx_index *src = ralloc_array(ctx, agx_index, 3);
+         memcpy(src, I->src, 2 * sizeof(*src));
+         I->src = src;
 
          const bool product_neg = I->src[0].neg;
          I->src[0].neg = false;
@@ -10139,6 +10153,7 @@ emit_if(agx_context *ctx, nir_if *nif)
                                 NULL /* filled in later */);
    const bool divergent = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
                           nir_src_is_divergent(&nif->condition);
+   if_->uniform_cond = !nir_src_is_divergent(&nif->condition);
    ctx->loop_nesting++;
    ctx->total_nesting++;
    ctx->divergent_nesting += divergent;
@@ -10161,7 +10176,9 @@ emit_if(agx_context *ctx, nir_if *nif)
     * If it fails, we fall through to the logical end of the last else block.
     */
    _b.cursor = agx_before_block(else_block);
-   agx_else_fcmp(&_b, agx_zero(), agx_zero(), 1, AGX_FCOND_EQ, false, end_else);
+   agx_instr *else_ = agx_else_fcmp(&_b, agx_zero(), agx_zero(), 1,
+                                    AGX_FCOND_EQ, false, end_else);
+   else_->uniform_cond = if_->uniform_cond;
 
    ctx->after_block = agx_create_block(ctx);
 
@@ -11551,6 +11568,266 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+static bool
+agx_alu_constructs_vector(const nir_alu_instr *alu)
+{
+   if (alu->def.num_components > 1)
+      return true;
+
+   switch (alu->op) {
+   case nir_op_pack_32_2x16_split:
+   case nir_op_pack_64_2x32_split:
+   case nir_op_pack_32_4x8_split:
+   case nir_op_pack_half_2x16_split:
+   case nir_op_pack_half_2x16_rtz_split:
+   case nir_op_pack_32_2x16:
+   case nir_op_pack_64_2x32:
+   case nir_op_pack_32_4x8:
+   case nir_op_pack_64_4x16:
+   case nir_op_pack_half_2x16:
+   case nir_op_pack_unorm_2x16:
+   case nir_op_pack_snorm_2x16:
+   case nir_op_pack_unorm_4x8:
+   case nir_op_pack_snorm_4x8:
+   case nir_op_pack_uint_2x16:
+   case nir_op_pack_sint_2x16:
+   case nir_op_pack_uvec2_to_uint:
+   case nir_op_pack_uvec4_to_uint:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_def_only_scalar_alu_uses(nir_def *def, unsigned depth)
+{
+   if (depth >= 4)
+      return false;
+
+   nir_foreach_use_including_if(use_src, def) {
+      if (nir_src_is_if(use_src))
+         return false;
+
+      nir_instr *use_instr = nir_src_use_instr(use_src);
+      if (use_instr->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *alu = nir_instr_as_alu(use_instr);
+      if (agx_alu_constructs_vector(alu))
+         return false;
+
+      /* Scalar movs before copy-prop may forward a load channel into a vector
+       * constructor, phi, or intrinsic where register affinity still matters. */
+      if (alu->op == nir_op_mov &&
+          !agx_def_only_scalar_alu_uses(&alu->def, depth + 1))
+         return false;
+   }
+
+   return true;
+}
+
+static bool
+agx_intrinsic_is_memory_load(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_constant:
+   case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_agx:
+   case nir_intrinsic_load_constant_agx:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_memory_load_format_shrinkable(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_agx &&
+       intr->intrinsic != nir_intrinsic_load_constant_agx)
+      return true;
+
+   /* Keep packed subword loads and W8-word unpacks at their encoded width. */
+   if (nir_intrinsic_base(intr) &
+       (AGX_NIR_MEMORY_PACKED_COUNT_MASK | AGX_NIR_MEMORY_UNPACK_W8_WORD))
+      return false;
+
+   enum pipe_format fmt = nir_intrinsic_format(intr);
+   return fmt == PIPE_FORMAT_R8_UINT || fmt == PIPE_FORMAT_R16_UINT ||
+          fmt == PIPE_FORMAT_R32_UINT;
+}
+
+static bool
+agx_memory_loads_match(const nir_intrinsic_instr *a,
+                       const nir_intrinsic_instr *b)
+{
+   if (a->intrinsic != b->intrinsic || a->def.bit_size != b->def.bit_size)
+      return false;
+
+   unsigned num_srcs = nir_intrinsic_infos[a->intrinsic].num_srcs;
+   assert(num_srcs == nir_intrinsic_infos[b->intrinsic].num_srcs);
+   for (unsigned i = 0; i < num_srcs; ++i) {
+      if (nir_srcs_equal(a->src[i], b->src[i]))
+         continue;
+      if (!nir_src_is_const(a->src[i]) || !nir_src_is_const(b->src[i]) ||
+          nir_src_bit_size(a->src[i]) != nir_src_bit_size(b->src[i]) ||
+          nir_src_num_components(a->src[i]) != 1 ||
+          nir_src_num_components(b->src[i]) != 1 ||
+          nir_src_as_uint(a->src[i]) != nir_src_as_uint(b->src[i]))
+         return false;
+   }
+
+   if (nir_intrinsic_has_base(a) != nir_intrinsic_has_base(b) ||
+       (nir_intrinsic_has_base(a) &&
+        nir_intrinsic_base(a) != nir_intrinsic_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_format(a) != nir_intrinsic_has_format(b) ||
+       (nir_intrinsic_has_format(a) &&
+        nir_intrinsic_format(a) != nir_intrinsic_format(b)))
+      return false;
+
+   if (nir_intrinsic_has_sign_extend(a) != nir_intrinsic_has_sign_extend(b) ||
+       (nir_intrinsic_has_sign_extend(a) &&
+        nir_intrinsic_sign_extend(a) != nir_intrinsic_sign_extend(b)))
+      return false;
+
+   if (nir_intrinsic_has_range_base(a) != nir_intrinsic_has_range_base(b) ||
+       (nir_intrinsic_has_range_base(a) &&
+        nir_intrinsic_range_base(a) != nir_intrinsic_range_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_range(a) != nir_intrinsic_has_range(b) ||
+       (nir_intrinsic_has_range(a) &&
+        nir_intrinsic_range(a) != nir_intrinsic_range(b)))
+      return false;
+
+   return true;
+}
+
+static unsigned
+agx_shrink_memory_load_target_comps(nir_intrinsic_instr *intr)
+{
+   unsigned orig = intr->def.num_components;
+   if (orig <= 1 || !agx_memory_load_format_shrinkable(intr))
+      return orig;
+
+   /* Keep 4-component buffer descriptors intact for preamble speculation and
+    * never drop volatile memory reads. */
+   if (nir_intrinsic_has_access(intr) &&
+       (nir_intrinsic_access(intr) &
+        (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE)))
+      return orig;
+
+   /* Leave non-ALU uses (intrinsics, phis, texture ops, ifs) and vector
+    * constructors/packers untouched so vector register affinity stays intact. */
+   if (!agx_def_only_scalar_alu_uses(&intr->def, 0))
+      return orig;
+
+   unsigned mask = nir_def_components_read(&intr->def);
+   if (!mask)
+      return orig;
+
+   unsigned comps = util_last_bit(mask);
+   unsigned rounded = comps > 4 ? util_next_power_of_two(comps) : comps;
+   if (rounded >= orig)
+      return orig;
+
+   /* Divergent loads stay in GPRs whose register allocation rounds vector
+    * width up to a power of two. Skip shrinking e.g. vec4 -> vec3 when it
+    * saves no GPRs, while keeping uniform vec4 -> vec3 shrinking for
+    * preamble uniform slots and divergent vec4 -> vec1/vec2 shrinking. */
+   if (intr->def.divergent &&
+       util_next_power_of_two(rounded) >= util_next_power_of_two(orig))
+      return orig;
+
+   return rounded;
+}
+
+struct agx_shrink_load_cand {
+   nir_intrinsic_instr *intr;
+   unsigned candidate_comps;
+};
+
+static bool
+agx_nir_shrink_memory_loads_impl(nir_function_impl *impl)
+{
+   struct util_dynarray cands;
+   util_dynarray_init(&cands, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!agx_intrinsic_is_memory_load(intr) ||
+             intr->def.num_components <= 1)
+            continue;
+
+         struct agx_shrink_load_cand cand = {
+            .intr = intr,
+            .candidate_comps = agx_shrink_memory_load_target_comps(intr),
+         };
+         util_dynarray_append(&cands, cand);
+      }
+   }
+
+   bool progress = false;
+   unsigned count =
+      util_dynarray_num_elements(&cands, struct agx_shrink_load_cand);
+   struct agx_shrink_load_cand *items =
+      (struct agx_shrink_load_cand *)cands.data;
+
+   for (unsigned i = 0; i < count; ++i) {
+      unsigned target = items[i].candidate_comps;
+      nir_intrinsic_instr *intr = items[i].intr;
+      if (target >= intr->def.num_components)
+         continue;
+
+      /* Keep matching sibling loads at the same component count so post-LICM
+       * CSE and select_load continue to merge identical loads across blocks. */
+      for (unsigned j = 0; j < count; ++j) {
+         if (i == j)
+            continue;
+         if (items[j].candidate_comps > target &&
+             agx_memory_loads_match(intr, items[j].intr)) {
+            target = items[j].candidate_comps;
+            if (target >= intr->def.num_components)
+               break;
+         }
+      }
+
+      if (target < intr->def.num_components) {
+         intr->def.num_components = target;
+         intr->num_components = target;
+         progress = true;
+      }
+   }
+
+   util_dynarray_fini(&cands);
+
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
+bool
+agx_nir_shrink_memory_loads(nir_shader *nir)
+{
+   nir_divergence_analysis(nir);
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      progress |= agx_nir_shrink_memory_loads_impl(impl);
+   }
+
+   return progress;
+}
+
 /* Whether a compile with a preamble size forms its preamble. Internal shaders
  * always do: hk's meta copies depend on it for correctness with imgwblk
  * intrinsics.
@@ -12020,10 +12297,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * varying, which overflowed the AGX3B register file and spilled.
     */
    NIR_PASS(addr_progress, nir, agx_nir_opt_select_load);
-   if (addr_progress || pre_alg_progress) {
-      NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, nir_opt_dce);
-   }
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   /* Trim unused trailing vector load channels after address lowering,
+    * select_load, and CSE so identical-address loads merge before trimming and
+    * uniform vec4->vec3 / divergent power-of-two shrinking saves uniform slots
+    * or GPRs without breaking vector register affinity. */
+   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
 
    NIR_PASS(sub_progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
    if (g18_scans)
@@ -16134,10 +16415,10 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 
 /*
  * Lower 32-bit integer division. When the compile forms a preamble, a division
- * by a uniform value uses magic multipliers (agx_nir_opt_uniform_idiv), whose
- * calculation the preamble then runs once. Without a preamble that calculation
- * would run in every invocation and cost more than nir_lower_idiv's
- * reciprocal, so everything takes nir_lower_idiv.
+ * by a uniform value uses an exact reciprocal (agx_nir_opt_uniform_idiv),
+ * which the preamble then computes once. Without a preamble that calculation
+ * would run in every invocation and save nothing over nir_lower_idiv, so
+ * everything takes nir_lower_idiv.
  */
 bool
 agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)

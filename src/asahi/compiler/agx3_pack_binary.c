@@ -298,6 +298,11 @@ agx3_reads_quad_lanes(const agx_instr *I)
 static bool
 agx3_append(struct util_dynarray *emission, const uint8_t *bytes, uint8_t len)
 {
+   /* Some encoders emit nothing (a barrier the hardware does not need).
+    * util_dynarray_grow_bytes() divides by the element size. */
+   if (len == 0)
+      return true;
+
    memcpy(util_dynarray_grow_bytes(emission, 1, len), bytes, len);
    return true;
 }
@@ -3307,6 +3312,12 @@ agx3_g17g_runtime_gather(const agx_instr *I)
 static bool
 agx3_g18g_indirect_gather(const agx_instr *I)
 {
+   /* Callers ask about every instruction. Check the shape before reading
+    * the descriptor operands. */
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1)
+      return false;
+
    const bool cube = I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY;
    const bool tex_imm = I->src[3].type == AGX_INDEX_IMMEDIATE;
    const bool smp_imm = I->src[4].type == AGX_INDEX_IMMEDIATE;
@@ -3393,6 +3404,10 @@ agx3_g18g_binding_sample(const agx_instr *I)
     * descriptor pairs for full-vector cube colour and scalar depth compares,
     * with explicit levels or implicit fragment LOD. Native816 adds fragment
     * register bias for the same descriptor pairs and masks. */
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1)
+      return false;
+
    const bool cube = I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY;
    const bool comparison_dim = I->dim == AGX_DIM_2D ||
                                I->dim == AGX_DIM_2D_ARRAY || cube;
@@ -8439,8 +8454,13 @@ agx3_retire_select_waits(struct util_dynarray *emission,
                          enum agx_isa_encoding enc, const agx_instr *I,
                          uint16_t mask)
 {
-   for (unsigned s = 0; s < I->nr_srcs; ++s) {
-      const agx_index operand = I->src[s];
+   /* The mask covers every pending write of the destination this select
+    * overwrites, so with no register source (a constant-program select of
+    * uniforms and immediates) the identity reads the destination once those
+    * writes retire and writes the same value back. */
+   for (unsigned s = 0; s < I->nr_srcs + I->nr_dests; ++s) {
+      const agx_index operand = s < I->nr_srcs ? I->src[s]
+                                              : I->dest[s - I->nr_srcs];
       if (!agx3_src_is_register(operand) || operand.memory ||
           agx_channels(operand) != 1 ||
           (operand.size != AGX_SIZE_16 && operand.size != AGX_SIZE_32))

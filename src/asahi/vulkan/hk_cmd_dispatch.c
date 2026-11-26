@@ -999,7 +999,7 @@ hk_g17p_internal_graphics_uniform_ranges(
    if (s->info.agx3_uses_root || s->info.set_count) {
       if (count >= HK_G17P_COMPUTE_MAX_RANGES ||
           !hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr,
-                                   &ranges[count]))
+                                   hk_shader_root_size(s), &ranges[count]))
          return false;
       count++;
    }
@@ -1063,7 +1063,8 @@ hk_g17p_compute_uniform_ranges(
       (s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
        s->info.agx3_indexed_storage_valid) ? AGX_G17P_STORAGE_ROOT_HALFS :
       texture_pointers ? AGX_G17P_TXF_ROOT_HALFS : 0;
-   if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr, &ranges[0]))
+   if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr,
+                                hk_shader_root_size(s), &ranges[0]))
       return false;
 
    size_t count = 1;
@@ -3349,7 +3350,7 @@ hk_fused_compute_uniform_ranges(
 
    const unsigned root_uniform = s->info.agx3_root_uniform;
    if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, p->root_va,
-                                &ranges[0]))
+                                hk_shader_root_size(s), &ranges[0]))
       return false;
 
    size_t count = 1;

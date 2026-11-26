@@ -4078,7 +4078,9 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
                                            render->tilebuffer.sample_size_B);
 
    /* The instance is one ordinary render stream with draws, with no
-    * pre/post-graphics streams, heap use or timestamps attached. */
+    * pre/post-graphics streams, heap use or start timestamps attached. An end
+    * timestamp stays on the merged stream and latches when the merged pass
+    * finishes, which still satisfies Vulkan's after-all-prior-commands rule. */
    const char *why = !agx_chip_native_or_m5(dev->dev.chip) ? "chip"
                      : cmd->in_meta                          ? "meta"
                      : cs->stats.cmds == 0                   ? "no draws"
@@ -4087,17 +4089,15 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
                      : cmd->current_cs.post_gfx              ? "post-graphics"
                      : cmd->state.oq_pending_render          ? "occlusion query"
                      : cmd->uses_heap                        ? "heap"
-                     : cs->timestamp.start.handle ||
-                             cs->timestamp.end.handle
-                        ? "timestamp"
-                        : NULL;
+                     : cs->timestamp.start.handle            ? "start timestamp"
+                                                             : NULL;
    if (why) {
       if (msaa_enabled)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
             cmd->uses_heap, cs->stats.cmds,
-            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0);
+            cs->timestamp.start.handle != 0);
       return why;
    }
 
@@ -4554,7 +4554,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             (m->open_cs && m->open_cs->current != m->open_cs_current))
       why = "compute";
    else if (cs->current != m->after_current || cs->end != m->end ||
-            cs->timestamp.start.handle || cs->timestamp.end.handle)
+            cs->timestamp.start.handle)
       why = "stream";
    else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
                            VK_RENDERING_RESUMING_BIT |
@@ -7526,15 +7526,16 @@ hk_prolog_epilog_disk_key(struct hk_device *dev, const struct hk_internal_key *k
    return true;
 }
 
-/* A stored part is its agx_shader_info followed by the binary. */
-static struct agx_shader_part *
+struct agx_shader_part *
 hk_part_from_blob(const uint8_t *data, size_t size, void *mem_ctx)
 {
    struct agx_shader_part *part = NULL;
    struct agx_shader_info info;
    if (size >= sizeof(info)) {
       memcpy(&info, data, sizeof(info));
-      if (size == sizeof(info) + info.binary_size && info.binary_size) {
+      /* Subtract: the sum could wrap where size_t is 32 bits. */
+      if (info.binary_size == size - sizeof(info) && info.binary_size &&
+          agx_shader_part_info_valid(&info)) {
          part = rzalloc(mem_ctx, struct agx_shader_part);
          void *binary = part ? malloc(info.binary_size) : NULL;
          if (binary) {
@@ -8262,10 +8263,10 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       }
    }
 
-   struct blob_reader reader;
-   blob_reader_init(&reader, shader->g17p_mono_nir, shader->g17p_mono_nir_size);
-   nir = nir_deserialize(mem, &agx_nir_options, &reader);
-   if (!nir || reader.overrun)
+   nir = hk_deserialize_nested_nir(mem, shader->g17p_mono_nir,
+                                   shader->g17p_mono_nir_size,
+                                   MESA_SHADER_FRAGMENT);
+   if (!nir)
       HK_MONO_FAIL("nir");
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -8657,11 +8658,10 @@ hk_g17p_local_read_inline_epilog_part(
       }
    }
 
-   struct blob_reader reader;
-   blob_reader_init(&reader, shader->local_read_nir,
-                    shader->local_read_nir_size);
-   nir = nir_deserialize(mem, &agx_nir_options, &reader);
-   if (!nir || reader.overrun)
+   nir = hk_deserialize_nested_nir(mem, shader->local_read_nir,
+                                   shader->local_read_nir_size,
+                                   MESA_SHADER_FRAGMENT);
+   if (!nir)
       HK_LR_FAIL("nir");
 
    struct agx_fs_epilog_key lr_ekey = *ekey;
@@ -11878,20 +11878,42 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
 
       if (changed) {
-         struct agx_ptr upload =
-            hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
-         if (!upload.cpu)
-            return;
-         memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
-
+         const unsigned all_records =
+            BITFIELD_MASK(AGX_PPP_HAL300_GRAPHICS_RECORDS);
          uint8_t *start = *out;
-         u_foreach_bit(i, changed) {
-            if (!hk_ppp_emit_state(dev->dev.chip, out,
-                                   upload.gpu + state.offsets[i],
-                                   state.lengths[i])) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_FEATURE_NOT_PRESENT);
+         if (changed == all_records) {
+            struct agx_ptr upload =
+               hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
+            if (!upload.cpu)
                return;
+            memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
+            for (unsigned i = 0; i < AGX_PPP_HAL300_GRAPHICS_RECORDS; ++i) {
+               if (!hk_ppp_emit_state(dev->dev.chip, out,
+                                      upload.gpu + state.offsets[i],
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+            }
+         } else {
+            uint32_t total = 0;
+            u_foreach_bit(i, changed)
+               total += state.lengths[i];
+            struct agx_ptr upload = hk_pool_vdm_alloc(cmd, total, 64);
+            if (!upload.cpu)
+               return;
+            uint32_t off = 0;
+            u_foreach_bit(i, changed) {
+               memcpy((uint8_t *)upload.cpu + off,
+                      state.bytes + state.offsets[i], state.lengths[i]);
+               if (!hk_ppp_emit_state(dev->dev.chip, out, upload.gpu + off,
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+               off += state.lengths[i];
             }
          }
          if (unlikely(dev->frame_anatomy))
@@ -14696,7 +14718,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             const bool use_shadow =
                verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
             const uint64_t fs_root = hk_agx3_fragment_root_select(
-               gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
+               gfx, fs_src->info.agx3_root_reads,
+               fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
                true, use_shadow);
             if (fs_root != prev_fs_root) {
                const uint64_t fragment_program =
