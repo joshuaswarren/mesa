@@ -176,7 +176,7 @@ struct hk_stamp_copy {
 };
 
 /* Copies one recording waits with before it records them in one launch. */
-#define HK_SYNC_STAMP_COPIES 32
+#define HK_SYNC_STAMP_COPIES 64
 
 /*
  * Tile hazards. A render pass instance's load, store and resolve operations

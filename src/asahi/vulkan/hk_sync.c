@@ -1694,6 +1694,16 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
  * earlier stamp, since the earlier write is in its scope. A pending
  * top-of-pipe stamp is therefore resolved before any dependent stamp.
  */
+/* Whether a timestamp on a compute command is ordered against earlier compute
+ * commands by the logical compute subqueue alone: exact-prior barriers on
+ * native AGX3 and M5 parts. */
+static inline bool
+cdm_stamp_queue_ordered(const struct hk_device *dev)
+{
+   return agx_chip_native_or_m5(dev->dev.chip) &&
+          (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS);
+}
+
 /* An end stamp is written when a command completes, so ordering it after
  * earlier work orders that command's completion: for a render, its fragment
  * half alone. */
@@ -1703,8 +1713,7 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    if (cs->type == HK_CS_CDM) {
       const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_chip_native_or_m5(dev->dev.chip) &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
+      if (cdm_stamp_queue_ordered(dev)) {
          /* With exact-prior barriers on non-serialized AGX3 queues (native
           * AGX3 and M5), the logical compute queue already orders GPU commands
           * by their mandatory kick parents. Adding the timestamp's same-CDM
@@ -1794,7 +1803,19 @@ stamp_covered(struct hk_cmd_buffer *cmd, struct hk_cs *tail,
    const bool carried =
       !(full_kinds(HK_SYNC_STAMP) & ~stream_carry(tail));
 
+   /* On exact-prior native AGX3/M5 queues, stamp_wait() leaves a compute
+    * stream's same-subqueue CDM wait unset because the logical compute queue
+    * already orders GPU execution after every earlier CDM command. tail is the
+    * latest stream in the command buffer, so its end stamp already covers the
+    * compute subqueue; VDM dependencies are still checked in full. */
+   const bool cdm_ordered =
+      tail->type == HK_CS_CDM &&
+      cdm_stamp_queue_ordered(hk_cmd_buffer_device(cmd));
+
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if (sq == HK_SYNC_CDM && cdm_ordered)
+         continue;
+
       const struct hk_sync_dep *have = &tail->sync.dep[sq];
       dep_max(&need[sq], &dep[sq]);
 
@@ -1957,7 +1978,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
        * (start_stamps_ordered()), fragment end otherwise; a second end
        * stamp is copied from the first after the render. */
       if (!src_kinds && !gfx->timestamp.start.handle &&
-          start_stamps_ordered(cmd)) {
+          !gfx->timestamp.end.handle && start_stamps_ordered(cmd)) {
          gfx->timestamp.start = req;
          return;
       }
@@ -2040,6 +2061,13 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       if (tail == cmd->current_cs.cs) {
          stamp_carrier_launch(cmd);
          hk_cmd_buffer_end_compute(cmd);
+      } else if (unlikely(cmd->pass_merge.valid) &&
+                 cmd->pass_merge.cs == tail && last_stream(cmd) == tail &&
+                 cmd->sync.next_seq == cmd->pass_merge.next_seq) {
+         /* Attaching an end timestamp to the open pass-merge candidate
+          * preserves candidacy: a merged render latches it when the merged
+          * pass finishes, still after every prior command. */
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
       }
       return;
    }
@@ -2055,6 +2083,10 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
          .src = tail->timestamp.end,
       };
       st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], tail);
+      if (unlikely(cmd->pass_merge.valid) && cmd->pass_merge.cs == tail &&
+          last_stream(cmd) == tail &&
+          cmd->sync.next_seq == cmd->pass_merge.next_seq)
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
       return;
    }
 
