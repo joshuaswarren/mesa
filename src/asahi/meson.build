@@ -123,6 +123,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Ray tracing pipeline binaries: an exported binary creates the pipeline
+  # again; one whose shader groups were edited and resealed is refused.
+  # G17P with a kernel that admits render ray queries has ray tracing
+  # pipelines and loads their binaries natively.
+  test(
+    'hk-g17p-rt-binary-groups',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_rt_binary_groups,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_RENDER_RAY_QUERY=1',
+      'MESA_SHADER_CACHE_DISABLE=true',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # HAL200 2x/4x depth compression with zink's feedback-loop usage and
   # sample-location flag, through vkCreateImage and the host-copy query.
   foreach chip : ['g17p', 'g16g']

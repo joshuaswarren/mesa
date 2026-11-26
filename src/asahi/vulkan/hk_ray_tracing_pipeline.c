@@ -3663,14 +3663,9 @@ hk_init_ray_tracing_groups(
       /* Library stages are appended to the local stage array before group
        * initialization. Newly declared groups may reference any stage in
        * that combined array, including a shader-only library's stages. */
-      const struct hk_ray_tracing_group *g = pipeline->groups + i;
       const uint32_t total_stage_count = pipeline->stage_count;
-      if ((g->recursive_index != VK_SHADER_UNUSED_KHR &&
-           g->recursive_index >= total_stage_count) ||
-          (g->ahit_index != VK_SHADER_UNUSED_KHR &&
-           g->ahit_index >= total_stage_count) ||
-          (g->isec_index != VK_SHADER_UNUSED_KHR &&
-           g->isec_index >= total_stage_count)) {
+      if (!hk_rt_group_indices_valid(pipeline->groups + i,
+                                     total_stage_count)) {
          return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                           "ray tracing group %u names a shader index past "
                           "combined stageCount %u",
@@ -4385,6 +4380,27 @@ hk_GetPipelineKeyKHR(VkDevice device, const VkPipelineCreateInfoKHR *info,
    return VK_SUCCESS;
 }
 
+/* The groups of a loaded pipeline are the stored data's, not groups built
+ * from create info: hold them to the index bounds creation applies, and to
+ * shaders of the stages their slots take. */
+static bool
+hk_rt_loaded_groups_valid(const struct hk_ray_tracing_pipeline *pipeline)
+{
+   VkShaderStageFlagBits *stages =
+      malloc(MAX2(pipeline->stage_count, 1) * sizeof(*stages));
+   if (!stages)
+      return false;
+   for (uint32_t i = 0; i < pipeline->stage_count; ++i)
+      stages[i] = mesa_to_vk_shader_stage(pipeline->stages[i]->nir->info.stage);
+
+   bool valid = true;
+   for (uint32_t i = 0; valid && i < pipeline->group_count; ++i)
+      valid = hk_rt_group_stages_valid(&pipeline->groups[i],
+                                       pipeline->stage_count, stages);
+   free(stages);
+   return valid;
+}
+
 /* Fill a newly allocated pipeline from hk_rt_binary_serialize() data. On
  * failure the pipeline holds partial state and must be destroyed. */
 static VkResult
@@ -4453,6 +4469,8 @@ hk_rt_binary_load(struct hk_device *dev, struct hk_ray_tracing_pipeline *pipelin
          goto done;
       }
    }
+   if (!hk_rt_loaded_groups_valid(pipeline))
+      goto done;
    if (executable == HK_RT_BINARY_MEGAKERNEL) {
       struct vk_shader *shader = NULL;
       result = dev->vk.shader_ops->deserialize(
