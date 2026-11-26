@@ -2335,7 +2335,6 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Successful enqueue retains the fences in the kernel. */
    if (compute_syncobj)
       drmSyncobjDestroy(dev->fd, compute_syncobj);
-   drmSyncobjDestroy(dev->fd, submit_syncobj);
 
    /* Add the screen point held back above. Failing that, finish the batch on
     * the CPU and keep the older point: later work is ordered after it anyway. */
@@ -2468,6 +2467,9 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
    /* Record the last syncobj for fence creation */
    ctx->syncobj = batch->syncobj;
+   if (ctx->last_submit_fence)
+      drmSyncobjDestroy(dev->fd, ctx->last_submit_fence);
+   ctx->last_submit_fence = submit_syncobj;
 
    /* Update the last seqid in the context (must only happen if the submit
     * succeeded, otherwise the timeline point would not be valid).
