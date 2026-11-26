@@ -7149,7 +7149,8 @@ hk_part_from_blob(const uint8_t *data, size_t size, void *mem_ctx)
    struct agx_shader_info info;
    if (size >= sizeof(info)) {
       memcpy(&info, data, sizeof(info));
-      if (size == sizeof(info) + info.binary_size && info.binary_size &&
+      /* Subtract: the sum could wrap where size_t is 32 bits. */
+      if (info.binary_size == size - sizeof(info) && info.binary_size &&
           agx_shader_part_info_valid(&info)) {
          part = rzalloc(mem_ctx, struct agx_shader_part);
          void *binary = part ? malloc(info.binary_size) : NULL;

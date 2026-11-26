@@ -93,6 +93,23 @@ main(void)
    CHECK(!hk_part_from_blob(data, size - 1, ctx));
    CHECK(!hk_part_from_blob(data, sizeof(valid) - 1, ctx));
    free(data);
+
+   /* A stored length that does not match the record is a miss, including
+    * lengths whose sum with the info header wraps a 32-bit size_t. */
+   const uint32_t bad_lengths[] = {
+      0, BINARY_SIZE - 1, BINARY_SIZE + 1, UINT32_MAX,
+      (uint32_t)(UINT32_MAX - sizeof(valid) + 1 + BINARY_SIZE),
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(bad_lengths); ++i) {
+      struct agx_shader_info t = valid;
+      t.binary_size = bad_lengths[i];
+      uint8_t *rec = malloc(sizeof(t) + BINARY_SIZE);
+      CHECK(rec);
+      memcpy(rec, &t, sizeof(t));
+      memcpy(rec + sizeof(t), binary, BINARY_SIZE);
+      CHECK(!hk_part_from_blob(rec, sizeof(t) + BINARY_SIZE, ctx));
+      free(rec);
+   }
    ralloc_free(ctx);
 
    struct agx_shader_info t;
