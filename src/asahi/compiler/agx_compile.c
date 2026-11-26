@@ -2116,6 +2116,39 @@ agx_emit_local_load_pixel(agx_builder *b, agx_index dest,
    agx_emit_cached_split(b, dest, nr_comps);
 }
 
+/*
+ * Decode a raw 32-bit tilebuffer word that the shader already read into the
+ * channels a load_local_pixel_agx of an 8-bit normalized format returns. The
+ * packed tile read and a raw read of the same pixel bytes deliver the bytes in
+ * the same order, two channels to each 16-bit half, so the halves of the word
+ * feed the same `normflt` unpack as agx_unpack_normalized_agx3().
+ */
+static void
+agx_emit_unpack_local_pixel(agx_builder *b, agx_index dest,
+                            nir_intrinsic_instr *instr)
+{
+   const unsigned nr_comps = instr->def.num_components;
+   const enum agx_format format =
+      agx_format_for_pipe(nir_intrinsic_format(instr));
+
+   assert(agx_isa_is_agx3(b->shader->key->dev.encoding));
+   assert(format == AGX_FORMAT_U8NORM || format == AGX_FORMAT_S8NORM ||
+          format == AGX_FORMAT_SRGBA8);
+   assert(nr_comps >= 1 && nr_comps <= 4);
+   assert(instr->src[0].ssa->num_components == 1 &&
+          instr->src[0].ssa->bit_size == 32);
+
+   agx_index word = agx_src_index(&instr->src[0]);
+   agx_index halves[4] = {agx_null()};
+   for (unsigned i = 0; i < DIV_ROUND_UP(nr_comps, 2); ++i) {
+      halves[i] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_subdivide_to(b, halves[i], word, i);
+   }
+
+   agx_unpack_normalized_halves_agx3(b, dest, halves, format, nr_comps,
+                                     nir_def_components_read(&instr->def));
+}
+
 static bool
 nir_is_coherent(nir_intrinsic_instr *instr)
 {
@@ -3711,6 +3744,10 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_local_pixel_agx:
       assert(stage == MESA_SHADER_FRAGMENT);
       agx_emit_local_load_pixel(b, dst, instr);
+      return NULL;
+
+   case nir_intrinsic_unpack_local_pixel_agx:
+      agx_emit_unpack_local_pixel(b, dst, instr);
       return NULL;
 
    case nir_intrinsic_load_pixel_coord:

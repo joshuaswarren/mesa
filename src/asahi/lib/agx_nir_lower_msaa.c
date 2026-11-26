@@ -760,6 +760,29 @@ g17p_equiv_probe_can_unpack_v0(const struct g17p_equiv_probe *p)
           (p->bit_size == 16 || p->bit_size == 32);
 }
 
+/* A 32-bit raw probe of four 8-bit normalized lanes holds the packed bytes a
+ * tile read of the body's format returns, so sample 0's body read is decoded
+ * from the probe word (agx_emit_unpack_local_pixel) instead of reloading the
+ * tilebuffer on the fast path. */
+static bool
+g17p_equiv_probe_can_decode_v0(const struct g17p_equiv_probe *p)
+{
+   const enum ail_isa_format format = (enum ail_isa_format)p->format;
+   return p->raw_format == PIPE_FORMAT_R32_UINT && p->raw_bit_size == 32 &&
+          p->raw_components == 1 && p->num_components == 4 &&
+          (format == AIL_ISA_FORMAT_U8NORM || format == AIL_ISA_FORMAT_S8NORM ||
+           format == AIL_ISA_FORMAT_SRGBA8) &&
+          (p->bit_size == 16 || p->bit_size == 32);
+}
+
+static bool
+g17p_equiv_probe_reuses_v0(const struct g17p_equiv_probe *p)
+{
+   return g17p_equiv_probe_is_body_read(p) ||
+          g17p_equiv_probe_can_unpack_v0(p) ||
+          g17p_equiv_probe_can_decode_v0(p);
+}
+
 static bool
 g17p_equiv_is_all_samples_iand(const nir_alu_instr *alu,
                                const nir_def *active_def)
@@ -876,7 +899,13 @@ specialize_g17p_equiv_copy(nir_function_impl *impl, nir_cf_list *copy,
                if (k >= 0 && reuse_v0[k]) {
                   nir_def *val = reuse_v0[k];
                   const struct g17p_equiv_probe *p = &probes[k];
-                  if (!g17p_equiv_probe_is_body_read(p)) {
+                  if (g17p_equiv_probe_can_decode_v0(p)) {
+                     nir_builder b = nir_builder_create(impl);
+                     b.cursor = nir_before_instr(instr);
+                     val = nir_unpack_local_pixel_agx(
+                        &b, p->num_components, p->bit_size, val,
+                        .format = p->format);
+                  } else if (!g17p_equiv_probe_is_body_read(p)) {
                      assert(g17p_equiv_probe_can_unpack_v0(p));
                      nir_builder b = nir_builder_create(impl);
                      b.cursor = nir_before_instr(instr);
@@ -1062,8 +1091,9 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
     * own. For wider MRT local-read shaders, keeping all probed payloads live
     * across the branch inflates register pressure; drop the probe values after
     * the ballot and reload sample 0 in the shading body instead. A probe that
-    * reads the raw lanes of a decoded normalized format is never reused: the
-    * body still decodes its own reload. Narrow the remaining 8-bit
+    * reads the raw word of four 8-bit normalized lanes is decoded in place of
+    * the reload; other raw reads of decoded formats are never reused and the
+    * body decodes its own reload. Narrow the remaining 8-bit
     * unorm/snorm probes (one or three lanes) to f16 when they are not reused
     * (injective for all 256 values), so the probe preamble uses half the
     * registers while the shading body still loads exact f32 values. */
@@ -1110,8 +1140,7 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
          v0[k] = nir_channels(&b, chunk_v0[chunk_of[k]],
                               BITFIELD_MASK(probes[k].raw_components)
                                  << first);
-         reuse[k] = reuse_small && (body_read ||
-                                    g17p_equiv_probe_can_unpack_v0(&probes[k]))
+         reuse[k] = reuse_small && g17p_equiv_probe_reuses_v0(&probes[k])
                        ? v0[k]
                        : NULL;
          any_reuse |= reuse[k] != NULL;
@@ -1129,8 +1158,7 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
          &b, probes[k].raw_components, probe_bits, sample_masks[0],
          .base = probes[k].base, .format = probes[k].raw_format,
          .target = probes[k].target);
-      reuse[k] = reuse_small && (body_read ||
-                                 g17p_equiv_probe_can_unpack_v0(&probes[k]))
+      reuse[k] = reuse_small && g17p_equiv_probe_reuses_v0(&probes[k])
                     ? v0[k]
                     : NULL;
       any_reuse |= reuse[k] != NULL;

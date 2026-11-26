@@ -804,7 +804,8 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
       b.shader->info.fs.uses_sample_shading = false;
       nir_validate_shader(b.shader, "local-read sample equiv");
 
-      unsigned ballots = 0, loads = 0, raw_probes = 0, stores = 0;
+      unsigned ballots = 0, loads = 0, raw_probes = 0, stores = 0,
+               decodes = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -812,6 +813,10 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             const nir_intrinsic_op op = intr->intrinsic;
             ballots += op == nir_intrinsic_ballot;
+            if (op == nir_intrinsic_unpack_local_pixel_agx) {
+               EXPECT_EQ(intr->def.bit_size, 16u);
+               decodes++;
+            }
             if (op == nir_intrinsic_load_local_pixel_agx) {
                loads++;
                raw_probes +=
@@ -822,11 +827,13 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
          }
       }
       EXPECT_EQ(ballots, 1u);
-      /* The RGBA8 target is probed as one raw 32-bit word per sample, which
-       * the body cannot reuse: 4 probe loads + 1 sample-0 load in the fast
-       * path + 4 in the slow path. */
+      /* The RGBA8 target is probed as one raw 32-bit word per sample. The
+       * fast path and slow sample 0 decode sample 0's word into the 16-bit
+       * body read instead of reloading it: 4 probe loads + 3 slow-path loads
+       * for samples 1..3. */
       EXPECT_EQ(raw_probes, 4u);
-      EXPECT_EQ(loads, 9u);
+      EXPECT_EQ(loads, 7u);
+      EXPECT_EQ(decodes, 2u);
       /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
       EXPECT_EQ(stores, 5u);
 
@@ -943,7 +950,7 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
 
       unsigned ballots = 0, loads = 0, stores = 0, raw32_probes = 0,
                raw32_vec2_probes = 0, raw32_vec4_probes = 0, raw16_probes = 0,
-               active_reads = 0, sample_mask_reads = 0, ieqs = 0;
+               active_reads = 0, sample_mask_reads = 0, ieqs = 0, decodes = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_alu) {
@@ -958,6 +965,7 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
             ballots += op == nir_intrinsic_ballot;
             active_reads += op == nir_intrinsic_load_active_samples_agx;
             sample_mask_reads += op == nir_intrinsic_load_sample_mask;
+            decodes += op == nir_intrinsic_unpack_local_pixel_agx;
             if (op == nir_intrinsic_load_local_pixel_agx) {
                loads++;
                const enum pipe_format fmt = nir_intrinsic_format(intr);
@@ -984,9 +992,11 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
       /* 8 probe loads: targets 0-2 fill bytes 0-15 and are compared with one
        * 4x32-bit read per sample (4), target 3 with its own 1x32-bit read (4).
        * Sample 0's words of the 4x16-bit target 1 unpack directly into the
-       * body, eliminating the fast-path and sample-0 slow-path reloads of
-       * target 1: 8 + 3 + 15 = 26 total loads. */
-      EXPECT_EQ(loads, 26u);
+       * body and those of the three RGBA8 targets are decoded, so neither
+       * the fast path nor slow sample 0 reloads anything: 8 + 0 + 12 = 20
+       * total loads, and 3 + 3 decoded reads. */
+      EXPECT_EQ(loads, 20u);
+      EXPECT_EQ(decodes, 6u);
       EXPECT_EQ(raw32_vec4_probes, 4u);
       EXPECT_EQ(raw32_probes, 4u);
       EXPECT_EQ(raw32_vec2_probes, 0u);
@@ -1070,12 +1080,13 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4Half16EquivCompiles)
       nir_validate_shader(b.shader, "deferred 4-MRT r16u local-read equiv");
 
       unsigned loads = 0, raw32_vec2_probes = 0, raw32_vec4_probes = 0,
-               r16_reloads = 0;
+               r16_reloads = 0, decodes = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            decodes += intr->intrinsic == nir_intrinsic_unpack_local_pixel_agx;
             if (intr->intrinsic != nir_intrinsic_load_local_pixel_agx)
                continue;
             loads++;
@@ -1093,9 +1104,11 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4Half16EquivCompiles)
       }
       /* Targets 1, 2 and 3 fill bytes 8-23 and are probed with one 4x32-bit
        * read per sample, target 4 with its own 1x32-bit read: 8 probe loads.
-       * Fast path & slow sample 0 reuse target 1's words via unpack_32_2x16,
-       * leaving only slow samples 1..3 as R16_UINT loads: 8 + 3 + 15 = 26. */
-      EXPECT_EQ(loads, 26u);
+       * Fast path & slow sample 0 reuse target 1's words via unpack_32_2x16
+       * and decode those of the three RGBA8 targets, leaving only slow
+       * samples 1..3 as loads (R16_UINT for target 1): 8 + 0 + 12 = 20. */
+      EXPECT_EQ(loads, 20u);
+      EXPECT_EQ(decodes, 6u);
       EXPECT_EQ(raw32_vec4_probes, 4u);
       EXPECT_EQ(raw32_vec2_probes, 0u);
       EXPECT_EQ(r16_reloads, 3u);
@@ -1191,12 +1204,19 @@ TEST(G17PMsaaEpilog, LocalReadEquivMergesAdjacentProbesIntoTwoOrFourWords)
       b.shader->info.fs.uses_sample_shading = false;
       nir_validate_shader(b.shader, "three adjacent rgba8 equiv");
 
-      unsigned loads = 0, raw32 = 0, raw32_vec2 = 0, raw32_wider = 0;
+      unsigned loads = 0, raw32 = 0, raw32_vec2 = 0, raw32_wider = 0,
+               decodes = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_unpack_local_pixel_agx) {
+               EXPECT_EQ(intr->src[0].ssa->num_components, 1u);
+               EXPECT_EQ(intr->src[0].ssa->bit_size, 32u);
+               EXPECT_EQ(nir_intrinsic_format(intr), PIPE_FORMAT_R8_UNORM);
+               decodes++;
+            }
             if (intr->intrinsic != nir_intrinsic_load_local_pixel_agx)
                continue;
             loads++;
@@ -1209,12 +1229,14 @@ TEST(G17PMsaaEpilog, LocalReadEquivMergesAdjacentProbesIntoTwoOrFourWords)
                EXPECT_EQ(nir_intrinsic_base(intr), 0);
          }
       }
-      /* 8 probe loads, then the fast path's 3 and the slow path's 12 body
-       * reads of the decoded targets: 23. */
+      /* 8 probe loads; the fast path and slow sample 0 decode the probe
+       * words of the three targets (3 + 3), and slow samples 1..3 read their
+       * own (9): 17 loads. */
       EXPECT_EQ(raw32_vec2, 4u);
       EXPECT_EQ(raw32, 4u);
       EXPECT_EQ(raw32_wider, 0u);
-      EXPECT_EQ(loads, 23u);
+      EXPECT_EQ(loads, 17u);
+      EXPECT_EQ(decodes, 6u);
 
       agx_preprocess_nir(b.shader);
 
