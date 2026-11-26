@@ -2081,6 +2081,23 @@ agx_ilp_schedule(agx_context *ctx)
    const unsigned budget = dynamic ? agx3_register_budget(ctx) : 0;
    const signed device_load_cap =
       shared_compute_loads ? agx_ilp_m5_device_load_cap(program_peak) : 0;
+   /* Wider windows for two-level indirect load chains stay inside the
+    * program's occupancy step, and that step ends where the register file
+    * the allocator can use ends: AGX3B's file ends at half 191, inside the
+    * table's 512-thread step, so a program already at the top of the file
+    * has no step left to grow into, and growing it only spills. */
+   signed chained_step_cap = 0;
+   if (shared_compute_loads) {
+      const signed file_halves = is_agx3 ? (signed)agx3_register_budget(ctx)
+                                         : AGX_ILP_M5_MAX_HALVES;
+      if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= file_halves) {
+         chained_step_cap =
+            MIN2((signed)agx_occupancy_for_register_count(
+                    program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers,
+                 file_halves) -
+            AGX_ILP_M5_OCCUPANCY_MARGIN;
+      }
+   }
 
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
@@ -2168,19 +2185,11 @@ agx_ilp_schedule(agx_context *ctx)
                   ? ilp_dynamic_growth(program_peak, peak, budget,
                                        AGX_ILP_FS_SAMPLE_HALVES)
                   : MAX2(load_cap - peak, 0);
-               const signed occ_step_cap =
-                  (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <=
-                   AGX_ILP_M5_MAX_HALVES)
-                     ? agx_occupancy_for_register_count(
-                          program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN)
-                             .max_registers -
-                          AGX_ILP_M5_OCCUPANCY_MARGIN
-                     : 0;
                const bool wide_flat =
                   ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
                   device_loads == loads && loads > 4 && device_load_cap > peak;
                const signed step_cap = small_loop_loads || !chained
-                                          ? device_load_cap : occ_step_cap;
+                                          ? device_load_cap : chained_step_cap;
                /* Each window first tries interleaving independent ALU chains
                 * while loads are in flight, then the source order. */
                bool scheduled = false;
