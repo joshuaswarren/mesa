@@ -786,15 +786,13 @@ agx_emit_load_vary_agx3(agx_builder *b, agx_index dest, agx_index cf,
       return false;
    }
 
-   /* G17P uses the native projective RHW/RCP/MUL sequence for centre, sample
-    * and centroid inputs alike. G17G's Gallium fragment path keeps the
-    * generic sequence: the native f32mul has no 16-bit destination form,
-    * which fp16 varyings need, and the generic sequence is what the G17G GL
-    * line was validated with. */
+   /* AGX3B and AGX3C (G17G/G17S/G17C) use the native projective RHW/RCP/MUL
+    * sequence for centre, sample and centroid inputs alike. Narrowing to 16-bit
+    * happens after agx_persp_mul_agx3() below, and the optimizer keeps the
+    * destination 32-bit. */
    const bool native_projective =
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
-      (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       b->shader->key->dev.chip != AGX_CHIP_G17G);
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    agx_index reciprocal_w = agx_null();
    if (perspective) {
       agx_index rhw_cf = agx_get_cf(b->shader, VARYING_SLOT_POS, 3);
