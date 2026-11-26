@@ -57,6 +57,29 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  # Shader-object binaries: an exported binary imports and exports again
+  # unchanged; one whose root prefix or root metadata was edited and resealed
+  # is refused. M5 and G17P binaries carry the trimmed root prefix.
+  foreach chip : [['g17s', ['--expect-root-size']],
+                  ['g17p', ['--expect-root-size']], ['g13g', []]]
+    test(
+      'hk-' + chip[0] + '-shader-binary-root',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_shader_binary_root,
+      ] + chip[1],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip[0],
+        'MESA_SHADER_CACHE_DISABLE=true',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
   # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
   # state changes (scissor, viewport, cull mode, depth op, color blend).
   test(
