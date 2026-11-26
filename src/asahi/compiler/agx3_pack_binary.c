@@ -5424,6 +5424,131 @@ agx3_emit_tile(struct util_dynarray *emission, enum agx_isa_encoding enc,
 }
 
 /*
+ * A compute shader's imageblock store: the fragment tile store's operands,
+ * but the pixel is an explicit 16-bit coordinate pair (x, then y in the next
+ * half) and the sample is the whole pixel. `last` marks the program's last
+ * imageblock store, which ends its imageblock write transaction.
+ */
+static bool
+agx3_emit_compute_tile_store(struct util_dynarray *emission,
+                             enum agx_isa_encoding enc, const agx_instr *I,
+                             uint16_t wait_mask, bool last)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B || I->op != AGX_OPCODE_ST_TILE ||
+       I->nr_dests != 0 || I->nr_srcs != 3 || !I->explicit_coords ||
+       I->pixel_offset > UINT8_MAX)
+      return false;
+
+   const agx_index value = I->src[0];
+   const agx_index sample = I->src[1];
+   const agx_index coords = I->src[2];
+   const int width = agx3_tile_format_width(I->format);
+   if (width < 0 || !agx3_tile_value_ok(value, I->mask, width) ||
+       sample.type != AGX_INDEX_IMMEDIATE || !(sample.value & 1) ||
+       !agx3_src_is_register(coords) || coords.memory || coords.abs ||
+       coords.neg || coords.size != AGX_SIZE_16 || agx_channels(coords) != 2 ||
+       (coords.value & 1))
+      return false;
+
+   /* The store carries no wait of its own: retire the producers it reads,
+    * such as the load of a texel stored unchanged. */
+   if (wait_mask && !agx3_retire_slots_noop(emission, enc, wait_mask))
+      return false;
+
+   uint8_t bytes[AGX3_TILE_MAX_LENGTH], length = 0;
+   return agx3_tile_store_explicit(enc, value.value,
+                                   (enum agx3_tile_width)width, I->mask,
+                                   I->pixel_offset, coords.value, last, bytes,
+                                   &length) &&
+          agx3_append(emission, bytes, length);
+}
+
+/*
+ * A compute shader's block store of its workgroup's 2D imageblock tile
+ * through a heap PBE: the descriptor set's uniform halves are the heap and
+ * the index is the PBE record (hk_g17p_lower_storage_records()), as for a
+ * bindless image write. The tile origin and the packed offset stage at
+ * halves 0..5 of the staging bank, which the store holds on slot 1 until it
+ * completes.
+ */
+static bool
+agx3_emit_compute_block_store(struct util_dynarray *emission,
+                              enum agx_isa_encoding enc, const agx_instr *I,
+                              uint16_t wait_mask,
+                              struct agx3_staging_banks *banks,
+                              uint16_t *outstanding)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_BLOCK_IMAGE_STORE || I->nr_dests != 0 ||
+       I->nr_srcs != 4 || I->dim != AGX_DIM_2D || !I->explicit_coords)
+      return false;
+
+   const agx_index base = I->src[0], index = I->src[1];
+   const agx_index offset = I->src[2], coords = I->src[3];
+   const bool f16 = I->format == AGX_FORMAT_F16;
+   const int width = agx3_tile_format_width(I->format);
+   const int lane_class = width < 0 ? -1 :
+      agx3_block_store_lane_class((enum agx3_tile_width)width, f16);
+   const bool heap =
+      base.type == AGX_INDEX_UNIFORM && base.size == AGX_SIZE_64 &&
+      agx_channels(base) == 1 && !(base.value & 3) && base.value <= 508 &&
+      !base.memory && !base.abs && !base.neg;
+   const bool register_index =
+      agx3_tex_plain_reg(index) && index.size == AGX_SIZE_32 &&
+      agx_channels(index) == 1 && !(index.value & 1) && index.value < 192;
+   const bool immediate_index = index.type == AGX_INDEX_IMMEDIATE &&
+                                !index.memory && !index.abs && !index.neg;
+   const bool uniform_index = index.type == AGX_INDEX_UNIFORM &&
+                              index.size == AGX_SIZE_32 &&
+                              agx_channels(index) == 1 && index.value < 512 &&
+                              !index.memory && !index.abs && !index.neg;
+   if (lane_class < 0 || !heap ||
+       (!register_index && !immediate_index && !uniform_index) ||
+       !agx3_tex_imm(offset, 0) || !agx3_tex_plain_reg(coords) ||
+       coords.size != AGX_SIZE_32 || agx_channels(coords) != 2 ||
+       (coords.value & 1) || coords.value + 2 >= 192)
+      return false;
+
+   /* The tile origin, the index and the staging halves must be free: retire
+    * the producers the store reads and whatever still holds halves 0..5 or
+    * slot 1. */
+   agx3_staging_release(banks, *outstanding);
+   const uint16_t retire =
+      wait_mask |
+      agx3_staging_conflicts(banks, 0, AGX3_BLOCK_STORE_STAGING_HALFS) |
+      (*outstanding & 1u);
+   if (retire) {
+      if (!agx3_retire_slots_noop(emission, enc, retire))
+         return false;
+      *outstanding &= (uint16_t)~retire;
+      agx3_staging_forget(banks, retire);
+   }
+
+   const bool kill = coords.kill || coords.discard;
+   const struct agx3_block_store_desc d = {
+      .x = coords.value,
+      .y = coords.value + 2,
+      .x_kill = kill,
+      .y_kill = kill,
+      .lane_class = lane_class,
+      .base_uniform = base.value,
+      .index_kind = register_index  ? AGX3_BLOCK_STORE_INDEX_REGISTER :
+                    immediate_index ? AGX3_BLOCK_STORE_INDEX_IMMEDIATE :
+                                      AGX3_BLOCK_STORE_INDEX_UNIFORM,
+      .index = index.value,
+      .index_kill = register_index && (index.kill || index.discard),
+   };
+   uint8_t bytes[AGX3_BLOCK_STORE_MAX_LENGTH];
+   size_t length = 0;
+   if (!agx3_block_store_compute(enc, &d, bytes, &length) ||
+       !agx3_append(emission, bytes, length) ||
+       !agx3_staging_hold(banks, 0, AGX3_BLOCK_STORE_STAGING_HALFS, 1))
+      return false;
+   *outstanding |= 1u;
+   return true;
+}
+
+/*
  * Fragment ops that stay refused, and why. Each is a missing *witness*, not
  * missing routing, so grounding one is a corpus session rather than a patch:
  *
@@ -7724,7 +7849,7 @@ agx3_emit_scoped_barrier(struct util_dynarray *emission,
 {
    if (I->op != AGX_OPCODE_SCOPED_BARRIER_AGX3 ||
        I->nr_dests != 0 || I->nr_srcs != 0 ||
-       I->imm > AGX3_BARRIER_SCOPE_THREADGROUP_FENCE)
+       I->imm > AGX3_BARRIER_SCOPE_IMAGEBLOCK)
       return false;
 
    struct agx3_encoded_scoped_barrier encoded;
@@ -15807,6 +15932,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
+         if (I->op == AGX_OPCODE_BLOCK_IMAGE_STORE &&
+             ctx->stage == MESA_SHADER_COMPUTE) {
+            if (!agx3_emit_compute_block_store(emission, enc, I, wait,
+                                               &staging_banks, &outstanding))
+               AGX3_REFUSE(I);
+            image_write_slots &= outstanding;
+            image_write_slots |= 1u;
+            ctx->agx3_staging_halfs =
+               MAX2(ctx->agx3_staging_halfs, MAX2(staging_banks.end, 16));
+            continue;
+         }
+
          if (I->op == AGX_OPCODE_IMAGE_WRITE) {
             uint8_t write_slot;
             if (!agx3_emit_storage_image_write(emission, enc,
@@ -16483,6 +16620,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             } else {
                assert(tile_stores_left > 0);
                last = --tile_stores_left == 0;
+            }
+            if (I->op == AGX_OPCODE_ST_TILE && I->explicit_coords &&
+                ctx->stage == MESA_SHADER_COMPUTE) {
+               if (!agx3_emit_compute_tile_store(emission, enc, I, wait, last))
+                  AGX3_REFUSE(I);
+               continue;
             }
             if (g17p_mrt.valid && g17p_mrt.local_read_phase_split) {
                uint8_t bytes[AGX3_PIXEL_MAX_LENGTH];

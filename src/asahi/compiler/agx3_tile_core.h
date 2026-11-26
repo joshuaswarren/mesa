@@ -138,6 +138,58 @@ bool agx3_tile_load_g18_mixed(enum agx_isa_encoding enc, uint16_t dest,
                               bool last, uint8_t out[AGX3_TILE_MAX_LENGTH],
                               uint8_t *len);
 
+/*
+ * Compute imageblock store (st_tile with explicit coordinates), AGX3B.
+ *
+ * A compute `lstcol` names the pixel instead of taking the fragment's: x is
+ * the 16-bit half `coords` and y the half after it. `data`, `width`,
+ * `chan_mask` and `tile_off` mean what they mean for the fragment store; the
+ * sample operand is the whole-pixel immediate. `last` marks the program's
+ * last imageblock store. The shapes are the ones compiled from our own
+ * imageblock compute kernels (8-bit lanes x1 or x4, one 32-bit lane).
+ */
+bool agx3_tile_store_explicit(enum agx_isa_encoding enc, uint16_t data,
+                              enum agx3_tile_width width, uint8_t chan_mask,
+                              uint16_t tile_off, uint16_t coords, bool last,
+                              uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len);
+
+/* The lane class a compute block store names for an imageblock format, or -1:
+ * 8-bit lanes, 16-bit float lanes and raw 32-bit words. */
+int agx3_block_store_lane_class(enum agx3_tile_width width, bool f16);
+
+enum agx3_block_store_index {
+   AGX3_BLOCK_STORE_INDEX_IMMEDIATE,
+   AGX3_BLOCK_STORE_INDEX_UNIFORM,
+   AGX3_BLOCK_STORE_INDEX_REGISTER,
+};
+
+/*
+ * Compute block store of the workgroup's 2D imageblock tile (AGX3B).
+ *
+ * The tile's origin is staged as two 32-bit words, x from register half `x`
+ * and y from `y`, at staging halves 0 and 2, with the packed imageblock
+ * offset (zero) and layer (zero) at 4; the store then writes the tile through
+ * the PBE descriptor `index` of the descriptor heap whose 64-bit base is
+ * uniform half `base_uniform`.
+ */
+struct agx3_block_store_desc {
+   uint16_t x, y;
+   bool x_kill, y_kill;
+   int lane_class;
+   uint16_t base_uniform;
+   enum agx3_block_store_index index_kind;
+   uint16_t index;
+   bool index_kill;
+};
+
+#define AGX3_BLOCK_STORE_MAX_LENGTH 64u
+#define AGX3_BLOCK_STORE_STAGING_HALFS 6u
+
+bool agx3_block_store_compute(enum agx_isa_encoding enc,
+                              const struct agx3_block_store_desc *d,
+                              uint8_t out[AGX3_BLOCK_STORE_MAX_LENGTH],
+                              size_t *len);
+
 #ifdef __cplusplus
 }
 #endif

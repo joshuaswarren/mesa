@@ -1477,7 +1477,15 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
    agx_index coords = explicit ? agx_src_index(&instr->src[2]) : agx_null();
 
    b->shader->out->tag_write_disable = false;
-   agx_index sample = agx_src_index(&instr->src[1]);
+   /* An AGX3B compute imageblock store takes its sample mask as an
+    * immediate, the whole pixel. */
+   const bool compute_explicit =
+      explicit && b->shader->stage == MESA_SHADER_COMPUTE &&
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      nir_src_is_const(instr->src[1]);
+   agx_index sample = compute_explicit
+                         ? agx_immediate(nir_src_as_uint(instr->src[1]))
+                         : agx_src_index(&instr->src[1]);
    if (b->shader->key->dev.emit_agx3d &&
        b->shader->key->fs.nr_samples == 1 && !explicit &&
        !nir_src_is_const(instr->src[1]) &&
@@ -2594,7 +2602,16 @@ agx_tex_dim(enum glsl_sampler_dim dim, bool array)
 static agx_instr *
 agx_emit_block_image_store(agx_builder *b, nir_intrinsic_instr *instr)
 {
-   agx_index offset = agx_src_index(&instr->src[1]);
+   /* An AGX3B compute block store takes a constant imageblock offset as an
+    * immediate. End-of-tile programs keep their offset register. */
+   const bool compute_bindless =
+      instr->intrinsic == nir_intrinsic_bindless_image_store_block_agx &&
+      b->shader->stage == MESA_SHADER_COMPUTE &&
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      nir_src_is_const(instr->src[1]);
+   agx_index offset = compute_bindless
+                         ? agx_immediate(nir_src_as_uint(instr->src[1]))
+                         : agx_src_index(&instr->src[1]);
    agx_index coords = agx_src_index(&instr->src[2]);
    enum agx_format format = agx_format_for_pipe(nir_intrinsic_format(instr));
 
@@ -4517,7 +4534,16 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          if (nir_intrinsic_execution_scope(instr) >= SCOPE_WORKGROUP &&
              !emitted) {
             assert(mesa_shader_stage_is_compute(b->shader->nir->info.stage));
-            agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_EXECUTION);
+            /* In a kernel with an imageblock, the workgroup barrier is the
+             * one that makes its imageblock stores visible to a block
+             * store. */
+            const bool imageblock =
+               b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+               b->shader->nir->info.stage == MESA_SHADER_COMPUTE &&
+               b->shader->nir->info.cs.image_block_size_per_thread_agx;
+            agx_scoped_barrier_agx3(b, imageblock
+                                          ? AGX3_BARRIER_SCOPE_IMAGEBLOCK
+                                          : AGX3_BARRIER_SCOPE_EXECUTION);
          }
 
          return NULL;

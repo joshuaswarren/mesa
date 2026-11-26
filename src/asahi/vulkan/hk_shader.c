@@ -4395,15 +4395,16 @@ hk_g17p_pbe_record(nir_builder *b, nir_scalar s)
 }
 
 /* Honeykrisp names a storage image by the byte offset of its PBE in the
- * descriptor set. G17P's imgwci instead takes a PBE heap from a uniform and
- * the index of a PBE record in that heap, so the set itself is the heap and
- * the store carries its record index.
+ * descriptor set. G17P's imgwci and imgwblk instead take a PBE heap from a
+ * uniform and the index of a PBE record in that heap, so the set itself is
+ * the heap and the store carries its record index.
  */
 static bool
 hk_g17p_lower_storage_records(nir_builder *b, nir_intrinsic_instr *intr,
                               UNUSED void *data)
 {
-   if (intr->intrinsic != nir_intrinsic_bindless_image_store)
+   if (intr->intrinsic != nir_intrinsic_bindless_image_store &&
+       intr->intrinsic != nir_intrinsic_bindless_image_store_block_agx)
       return false;
 
    nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
