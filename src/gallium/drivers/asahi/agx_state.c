@@ -22,6 +22,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx3_code_container_core.h"
 #include "asahi/lib/agx3_g17p_grid_helper_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_g17p_draw_state_upload.h"
 #include "asahi/lib/agx_helpers.h"
 #include "asahi/lib/agx_m5_va.h"
@@ -2970,7 +2971,8 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
         * and geometry stages run on the GPU too (hk refuses their
         * preambles on M5 as well). */
        .no_preamble = agx_chip_agx3_path(dev->chip),
-      .g18_native_mixed = g18_native_mixed && dev->chip == AGX_CHIP_G18G,
+      .g18_native_mixed = g18_native_mixed &&
+         agx_chip_has_cap(dev->chip, AGX_CAP_NATIVE_MIXED_EPILOG),
    };
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -4899,8 +4901,7 @@ agx_fill_precompile_keys(const struct agx_device *dev,
          key.fs.zero_lod_bias = so->info.lod_bias_samplers;
          /* Match agx_update_fs()'s single-sample key so the precompiled
           * variant hits on the first 1x draw instead of recompiling. */
-         if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-             dev->chip == AGX_CHIP_G18G || so->info.needs_sample_count ||
+         if (agx_chip_agx3_path(dev->chip) || so->info.needs_sample_count ||
              so->info.uses_sample_shading)
             key.fs.nr_samples = 1;
       }
@@ -5987,8 +5988,7 @@ agx_update_gs(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct agx_device *dev = agx_device(ctx->base.screen);
    struct agx_uncompiled_shader *fs = ctx->stage[MESA_SHADER_FRAGMENT].shader;
    struct asahi_gs_shader_key key = {0};
-   if (dev->chip == AGX_CHIP_G18G || agx_chip_native_hal200(dev->chip) ||
-       agx_chip_g17_m5(dev->chip)) {
+   if (agx_chip_native_hal200(dev->chip) || agx_chip_hal300_path(dev->chip)) {
       key.link_uvs = true;
       if (fs) {
          key.flat_varyings = fs->info.inputs_flat_shaded;
@@ -6279,7 +6279,7 @@ agx_update_fs(struct agx_batch *batch)
    /* Run 1139: the epilog builds the same index-order layout and stores
     * exactly what Apple's mixed-format fragments store. */
    link_key.epilog.fs.g18_native_mixed =
-      dev->chip == AGX_CHIP_G18G &&
+      agx_chip_has_cap(dev->chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
       agx_g18g_native_mixed_mask(&batch->tilebuffer_layout) != 0;
 
    memcpy(&link_key.epilog.fs.blend, &ctx->blend->key,
