@@ -1373,10 +1373,6 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
-   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
-    * Lives on the command buffer so it survives CS splits and
-    * merge_control_streams. */
-   bool cdm_barrier_pending;
 };
 
 /*
