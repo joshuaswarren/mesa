@@ -5890,6 +5890,175 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
                   att->clear_colour, &range, false /* partially clear 3D */);
 }
 
+static bool
+hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
+                        VkImageAspectFlags aspects, const VkClearValue *value,
+                        uint32_t range_count,
+                        const VkImageSubresourceRange *ranges, bool from_gfx,
+                        const struct hk_sync_dep *gfx_dep);
+
+static bool
+hk_deferred_clear_eligible(struct hk_cmd_buffer *cmd,
+                           const struct hk_image *image,
+                           VkImageAspectFlags aspects, uint32_t range_count,
+                           const VkImageSubresourceRange *ranges);
+
+/* Try to fold an empty clear-only render pass into deferred whole-image clears
+ * so a following pass that loads (or re-clears) the attachment absorbs the
+ * clear directly as a tilebuffer load-op clear without an extra compute fill
+ * job or memory round-trip. Only folds when every cleared attachment in the
+ * pass is eligible; otherwise returns false so the caller emits compute fills. */
+static bool
+hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (!agx_chip_native_or_m5(dev->dev.chip) || cmd->in_meta ||
+       render->view_mask || render->layer_count != 1 ||
+       (render->flags &
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT |
+         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) ||
+       hk_sync_xfer_pending(&cmd->sync))
+      return false;
+
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
+         return false;
+   }
+   if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE ||
+       render->stencil_att.resolve_mode != VK_RESOLVE_MODE_NONE)
+      return false;
+
+   struct empty_clear_cand {
+      struct hk_image *image;
+      VkImageAspectFlags aspects;
+      VkClearValue value;
+   } cands[HK_MAX_RTS + 1];
+   unsigned cand_count = 0;
+
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      if (!att->clear || !att->iview)
+         continue;
+      if (att->store_op != VK_ATTACHMENT_STORE_OP_STORE)
+         return false;
+
+      struct hk_image_view *view = att->iview;
+      struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+      const VkImageSubresourceRange range = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel = view->vk.base_mip_level,
+         .levelCount = view->vk.level_count,
+         .baseArrayLayer = view->vk.base_array_layer,
+         .layerCount = view->vk.layer_count,
+      };
+      if (view->vk.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+          image->vk.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+          view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
+          att->vk_format != image->vk.format ||
+          (image->vk.create_flags &
+           (VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) ||
+          render->area.offset.x != 0 || render->area.offset.y != 0 ||
+          render->area.extent.width != image->vk.extent.width ||
+          render->area.extent.height != image->vk.extent.height ||
+          !hk_deferred_clear_eligible(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, 1,
+                                      &range))
+         return false;
+
+      VkClearValue val = {0};
+      memcpy(val.color.uint32, att->clear_colour, sizeof(val.color.uint32));
+      cands[cand_count++] = (struct empty_clear_cand){
+         .image = image,
+         .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+         .value = val,
+      };
+   }
+
+   const bool has_z = render->depth_att.clear && render->depth_att.iview;
+   const bool has_s = render->stencil_att.clear && render->stencil_att.iview;
+   if (has_z || has_s) {
+      if ((has_z && render->depth_att.store_op != VK_ATTACHMENT_STORE_OP_STORE) ||
+          (has_s &&
+           render->stencil_att.store_op != VK_ATTACHMENT_STORE_OP_STORE))
+         return false;
+
+      struct hk_image_view *z_view = has_z ? render->depth_att.iview : NULL;
+      struct hk_image_view *s_view = has_s ? render->stencil_att.iview : NULL;
+      struct hk_image *z_img =
+         z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
+      struct hk_image *s_img =
+         s_view ? container_of(s_view->vk.image, struct hk_image, vk) : NULL;
+      if (has_z && has_s && z_img != s_img)
+         return false;
+
+      struct hk_image *image = z_img ? z_img : s_img;
+      struct hk_image_view *view = z_view ? z_view : s_view;
+      const VkImageAspectFlags aspects =
+         (has_z ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+         (has_s ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+      const VkImageSubresourceRange range = {
+         .aspectMask = aspects,
+         .baseMipLevel = view->vk.base_mip_level,
+         .levelCount = view->vk.level_count,
+         .baseArrayLayer = view->vk.base_array_layer,
+         .layerCount = view->vk.layer_count,
+      };
+      if (view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
+          (has_z && has_s &&
+           (z_view->vk.base_mip_level != s_view->vk.base_mip_level ||
+            z_view->vk.level_count != s_view->vk.level_count ||
+            z_view->vk.base_array_layer != s_view->vk.base_array_layer ||
+            z_view->vk.layer_count != s_view->vk.layer_count)) ||
+          (image->vk.create_flags &
+           (VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) ||
+          render->area.offset.x != 0 || render->area.offset.y != 0 ||
+          render->area.extent.width != image->vk.extent.width ||
+          render->area.extent.height != image->vk.extent.height ||
+          !hk_deferred_clear_eligible(cmd, image, aspects, 1, &range))
+         return false;
+
+      VkClearValue val = {0};
+      if (has_z)
+         val.depthStencil.depth = uif(render->depth_att.clear_colour[0]);
+      if (has_s)
+         val.depthStencil.stencil = render->stencil_att.clear_colour[1];
+      cands[cand_count++] = (struct empty_clear_cand){
+         .image = image,
+         .aspects = aspects,
+         .value = val,
+      };
+   }
+
+   if (cand_count == 0 ||
+       cmd->state.deferred_clear_count + cand_count > HK_MAX_DEFERRED_CLEARS)
+      return false;
+
+   for (unsigned i = 0; i < cand_count; ++i) {
+      for (unsigned j = i + 1; j < cand_count; ++j) {
+         if (cands[i].image == cands[j].image)
+            return false;
+      }
+   }
+
+   struct hk_sync_dep saved_dep[HK_SYNC_NUM_SQ];
+   memcpy(saved_dep, cs->sync.dep, sizeof(saved_dep));
+
+   for (unsigned i = 0; i < cand_count; ++i) {
+      const VkImageSubresourceRange range = {
+         .aspectMask = cands[i].aspects,
+         .levelCount = 1,
+         .layerCount = 1,
+      };
+      bool ok = hk_defer_clear_internal(cmd, cands[i].image, cands[i].aspects,
+                                        &cands[i].value, 1, &range, true,
+                                        saved_dep);
+      assert(ok);
+   }
+
+   return true;
+}
+
 bool
 hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 {
@@ -5987,6 +6156,16 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    if (unlikely(cmd->state.oq_pending_render == cs))
       hk_flush_oq_pending(cmd);
 
+   /* Fold whole-image single-sample clear-only render passes into deferred
+    * clears so a following pass that loads (or re-clears) the attachment
+    * absorbs the clear directly without an extra compute fill kick. */
+   if (hk_try_defer_empty_render_clears(cmd, cs)) {
+      hk_sync_forget_stream(cmd, cs);
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+      return true;
+   }
+
    /* The clears stand in for the render: they are graphics work for every
     * later dependency, and they were recorded under the same requirements
     * the render was created under. */
@@ -6065,10 +6244,11 @@ hk_deferred_clear_image_whole(const struct hk_image *image,
    return true;
 }
 
-bool
-hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
-               VkImageAspectFlags aspects, const VkClearValue *value,
-               uint32_t range_count, const VkImageSubresourceRange *ranges)
+static bool
+hk_deferred_clear_eligible(struct hk_cmd_buffer *cmd,
+                           const struct hk_image *image,
+                           VkImageAspectFlags aspects, uint32_t range_count,
+                           const VkImageSubresourceRange *ranges)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_physical_device *pdev = hk_device_physical(dev);
@@ -6077,26 +6257,34 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
          ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
          : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
-       cmd->in_meta ||
-       cmd->vk.pool->queue_family_index >= pdev->queue_family_count ||
-       !(pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &
-         VK_QUEUE_GRAPHICS_BIT) ||
-       !(image->vk.usage & attachment) ||
-       aspects != (image->vk.aspects &
-                   (aspects == VK_IMAGE_ASPECT_COLOR_BIT
-                       ? VK_IMAGE_ASPECT_COLOR_BIT
-                       : (VK_IMAGE_ASPECT_DEPTH_BIT |
-                          VK_IMAGE_ASPECT_STENCIL_BIT))) ||
-       !hk_deferred_clear_image_whole(image, range_count, ranges, aspects))
+   return agx_chip_native_or_m5(dev->dev.chip) && !cmd->in_meta &&
+          cmd->vk.pool->queue_family_index < pdev->queue_family_count &&
+          (pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &
+           VK_QUEUE_GRAPHICS_BIT) &&
+          (image->vk.usage & attachment) &&
+          aspects == (image->vk.aspects &
+                      (aspects == VK_IMAGE_ASPECT_COLOR_BIT
+                          ? VK_IMAGE_ASPECT_COLOR_BIT
+                          : (VK_IMAGE_ASPECT_DEPTH_BIT |
+                             VK_IMAGE_ASPECT_STENCIL_BIT))) &&
+          hk_deferred_clear_image_whole(image, range_count, ranges, aspects);
+}
+
+static bool
+hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
+                        VkImageAspectFlags aspects, const VkClearValue *value,
+                        uint32_t range_count,
+                        const VkImageSubresourceRange *ranges, bool from_gfx,
+                        const struct hk_sync_dep *gfx_dep)
+{
+   if (!hk_deferred_clear_eligible(cmd, image, aspects, range_count, ranges))
       return false;
 
    /* The deferred clear overwrites the whole image, whether it becomes a
-    * load-op clear or a fill: a pending store of it is dead. */
+    * load-op clear or a fill: a pending store of those aspects is dead. */
    if (cmd->state.pending_z_store.cs &&
-       cmd->state.pending_z_store.image == image &&
-       (aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-      hk_kill_pending_z_store(cmd);
+       cmd->state.pending_z_store.image == image)
+      hk_kill_pending_z_store_aspects(cmd, aspects);
 
    /* A later clear of the same image replaces the earlier one. */
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
@@ -6104,6 +6292,11 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
       if (e->image == image) {
          e->aspects = aspects;
          e->value = *value;
+         e->from_gfx = from_gfx;
+         if (from_gfx && gfx_dep)
+            memcpy(e->gfx_dep, gfx_dep, sizeof(e->gfx_dep));
+         else
+            memset(e->gfx_dep, 0, sizeof(e->gfx_dep));
          return true;
       }
    }
@@ -6111,13 +6304,26 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
    if (cmd->state.deferred_clear_count == HK_MAX_DEFERRED_CLEARS)
       hk_flush_deferred_clears(cmd);
 
-   cmd->state.deferred_clear[cmd->state.deferred_clear_count++] =
-      (struct hk_deferred_clear){
-         .image = image,
-         .aspects = aspects,
-         .value = *value,
-      };
+   struct hk_deferred_clear *slot =
+      &cmd->state.deferred_clear[cmd->state.deferred_clear_count++];
+   *slot = (struct hk_deferred_clear){
+      .image = image,
+      .aspects = aspects,
+      .value = *value,
+      .from_gfx = from_gfx,
+   };
+   if (from_gfx && gfx_dep)
+      memcpy(slot->gfx_dep, gfx_dep, sizeof(slot->gfx_dep));
    return true;
+}
+
+bool
+hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
+               VkImageAspectFlags aspects, const VkClearValue *value,
+               uint32_t range_count, const VkImageSubresourceRange *ranges)
+{
+   return hk_defer_clear_internal(cmd, image, aspects, value, range_count,
+                                  ranges, false, NULL);
 }
 
 /* A buffer command (copy, fill, update) cannot access an image except
@@ -6174,15 +6380,17 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.deferred_clear_flushing = true;
+   bool any_xfer = false, any_gfx = false;
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       const struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
       if (unlikely(dev->frame_anatomy)) {
          hk_frame_anatomy_note(
-            dev, "deferred-clear fill by %s: %ux%u %s aspects=0x%x compressed=%u",
+            dev,
+            "deferred-clear fill by %s: %ux%u %s aspects=0x%x compressed=%u gfx=%u",
             why, e->image->vk.extent.width, e->image->vk.extent.height,
             util_format_short_name(
                hk_format_to_pipe_format(e->image->vk.format)),
-            e->aspects, e->image->planes[0].layout.compressed);
+            e->aspects, e->image->planes[0].layout.compressed, e->from_gfx);
       }
       const VkImageSubresourceRange range = {
          .aspectMask = e->aspects,
@@ -6198,9 +6406,22 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
          colour[2] = colour[3] = 0;
       }
 
-      hk_sync_xfer_begin(cmd);
-      hk_clear_image(cmd, e->image, PIPE_FORMAT_NONE, colour, &range, true);
-      hk_sync_xfer_end(cmd);
+      if (e->from_gfx) {
+         hk_cmd_buffer_end_compute(cmd);
+         cmd->sync.kind_override = HK_SYNC_GFX;
+         hk_clear_image(cmd, e->image, PIPE_FORMAT_NONE, colour, &range, true);
+         if (cmd->current_cs.cs) {
+            hk_sync_apply_dep(cmd, cmd->current_cs.cs, e->gfx_dep);
+            hk_cmd_buffer_end_compute(cmd);
+         }
+         cmd->sync.kind_override = 0;
+         any_gfx = true;
+      } else {
+         hk_sync_xfer_begin(cmd);
+         hk_clear_image(cmd, e->image, PIPE_FORMAT_NONE, colour, &range, true);
+         hk_sync_xfer_end(cmd);
+         any_xfer = true;
+      }
    }
    cmd->state.deferred_clear_count = 0;
 
@@ -6215,7 +6436,10 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
    }
    if (cs && !alias_scope)
       hk_cdm_note_alias_site(cmd, cs);
-   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
+   if (any_xfer)
+      hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
+   if (any_gfx)
+      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_ALL);
    cmd->state.deferred_clear_flushing = false;
 }
 
@@ -6269,13 +6493,18 @@ hk_deferred_clear_layout_use(VkImageLayout layout, VkImageAspectFlags aspect)
 }
 
 /* The deferred clear of the image an attachment views, if the attachment can
- * take it as its load-op clear (see above); *fill is set when the clear must
- * also be recorded as a fill before the pass. */
+ * take it as its load-op clear (or overwrite it cleanly with its own
+ * LOAD_OP_CLEAR in a strict attachment layout); *fill is set when the clear
+ * must also be recorded as a fill before the pass, and *overwrite is set when
+ * the attachment already specifies LOAD_OP_CLEAR so its own clear value must
+ * be preserved while dropping the dead earlier clear. */
 static struct hk_deferred_clear *
 hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                       const VkRenderingAttachmentInfo *att,
-                      VkImageAspectFlags aspect, bool *fill)
+                      VkImageAspectFlags aspect, bool *fill, bool *overwrite)
 {
+   *fill = false;
+   *overwrite = false;
    if (!att || !att->imageView)
       return NULL;
 
@@ -6298,9 +6527,12 @@ hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          e = &cmd->state.deferred_clear[i];
    }
 
+   const bool load_overwrite =
+      att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+      use == HK_DEFERRED_CLEAR_LOAD;
    if (!e || !(e->aspects & aspect) ||
        (att->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD &&
-        att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE) ||
+        att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE && !load_overwrite) ||
        (att->storeOp != VK_ATTACHMENT_STORE_OP_STORE &&
         att->storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) ||
        view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
@@ -6313,11 +6545,13 @@ hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       return NULL;
 
    *fill = use == HK_DEFERRED_CLEAR_LOAD_AND_FILL;
+   *overwrite = load_overwrite;
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
-      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
-                            "deferred-clear taken: %ux%u layout=%u fill=%u",
-                            image->vk.extent.width, image->vk.extent.height,
-                            att->imageLayout, *fill);
+      hk_frame_anatomy_note(
+         hk_cmd_buffer_device(cmd),
+         "deferred-clear %s: %ux%u layout=%u fill=%u",
+         load_overwrite ? "overwritten" : "taken", image->vk.extent.width,
+         image->vk.extent.height, att->imageLayout, *fill);
    }
    return e;
 }
@@ -6336,15 +6570,19 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 
    struct hk_deferred_clear *col[HK_MAX_RTS] = {NULL};
    bool col_fill[HK_MAX_RTS] = {false}, z_fill = false, s_fill = false;
+   bool col_overwrite[HK_MAX_RTS] = {false}, z_overwrite = false,
+        s_overwrite = false;
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       col[i] = hk_deferred_clear_for(cmd, info, &info->pColorAttachments[i],
-                                     VK_IMAGE_ASPECT_COLOR_BIT, &col_fill[i]);
+                                     VK_IMAGE_ASPECT_COLOR_BIT, &col_fill[i],
+                                     &col_overwrite[i]);
    }
    struct hk_deferred_clear *z = hk_deferred_clear_for(
-      cmd, info, info->pDepthAttachment, VK_IMAGE_ASPECT_DEPTH_BIT, &z_fill);
+      cmd, info, info->pDepthAttachment, VK_IMAGE_ASPECT_DEPTH_BIT, &z_fill,
+      &z_overwrite);
    struct hk_deferred_clear *s = hk_deferred_clear_for(
-      cmd, info, info->pStencilAttachment, VK_IMAGE_ASPECT_STENCIL_BIT,
-      &s_fill);
+      cmd, info, info->pStencilAttachment, VK_IMAGE_ASPECT_STENCIL_BIT, &s_fill,
+      &s_overwrite);
 
    /* A depth/stencil clear is taken only if every aspect it cleared is. */
    struct hk_deferred_clear *zs[2] = {z, s};
@@ -6368,19 +6606,19 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    *copy = *info;
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       color[i] = info->pColorAttachments[i];
-      if (col[i]) {
+      if (col[i] && !col_overwrite[i]) {
          color[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
          color[i].clearValue = col[i]->value;
       }
    }
    copy->pColorAttachments = color;
-   if (z) {
+   if (z && !z_overwrite) {
       *depth = *info->pDepthAttachment;
       depth->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
       depth->clearValue = z->value;
       copy->pDepthAttachment = depth;
    }
-   if (s) {
+   if (s && !s_overwrite) {
       *stencil = *info->pStencilAttachment;
       stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
       stencil->clearValue = s->value;
