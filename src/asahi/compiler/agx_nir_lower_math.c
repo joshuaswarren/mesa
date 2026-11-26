@@ -82,8 +82,8 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
    if (alu->def.bit_size == 64)
       return false;
 
-   /* Driver-internal shaders and app ops marked fully exact get correctly
-    * rounded math. Everything else keeps the Khronos-fast path: an app frcp
+   /* Driver-internal shaders get correctly rounded math. Everything else
+    * keeps the Khronos-fast path: an app frcp
     * keeps its <= 1 ULP hardware result and an app fdiv becomes a * frcp(d),
     * as .lower_fdiv always produced -- the 2.5 ULP every Khronos API allows
     * even for `precise` NoContraction division, which DXVK puts on every op.
@@ -119,7 +119,7 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
        * vec constant like (1.0, 2.0) only qualifies for component 0.
        */
       nir_const_value *cv = nir_src_as_const_value(alu->src[0].src);
-      bool all_one = cv != NULL;
+      bool all_one = cv != NULL && alu->def.bit_size == 32;
       for (unsigned i = 0; all_one && i < alu->def.num_components; ++i)
          all_one = cv[alu->src[0].swizzle[i]].f32 == 1.0f;
       if (exact && alu->def.bit_size == 32 && all_one)
@@ -679,8 +679,8 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    if (instr->pass_flags)
       return nir_mov_alu(b, alu->src[0], 1);
 
-   /* Application shaders keep the stock approximation unless the flag is
-    * set; agx_lower_sincos lowers those ops after this pass. */
+   /* Application shaders keep the stock approximation; agx_lower_sincos
+    * lowers those ops after this pass. */
    if (!wants_exact_fp32(b->shader))
       return NULL;
 
@@ -890,8 +890,8 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    /* The partner's tail reuses the shared k (one more quadrant), sn and cs.
     * Without a hoist it must sit in the join block after everything emitted
     * above, or in a later element of that block's cf list, where the shared
-    * values dominate. Rewriting its uses lets the flag check above skip its
-    * own pass.
+    * values dominate. Rewriting its uses lets the early return above skip
+    * its own pass.
     */
    nir_instr *boundary = nir_def_instr(v);
    nir_def *vp32 = NULL, *vp16 = NULL;
@@ -970,8 +970,8 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 bool
 agx_nir_lower_sincos(nir_shader *s)
 {
-   /* Application shaders hand every fsin/fcos to the stock pass unless the
-    * flag opts the whole shader in. */
+   /* Application shaders hand every fsin/fcos to the stock pass; internal
+    * shaders take the exact forms here. */
    if (!wants_exact_fp32(s))
       return false;
 
