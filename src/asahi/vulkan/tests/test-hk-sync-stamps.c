@@ -1134,6 +1134,51 @@ test_leading_stamp_rides_first_stream(void)
            submit(new_queue(exact), mn, 2));
          T("leading ALL_COMMANDS carrier follows the earlier render",
            nk->sync.barrier[HK_SYNC_VDM] == mr->sync.index);
+
+         /* A second stamp before any stream is a copy of the leading one:
+          * the render carries the leading stamp after the wider of their
+          * first scopes, and the copy launches after the render. */
+         struct hk_cmd_buffer *p = new_cmd(chips[c], exact);
+         struct hk_cs *pd = dispatch(p);
+         struct hk_cmd_buffer *two = new_cmd(chips[c], exact);
+         hk_sync_barrier(two, HK_SYNC_XFER, HK_SYNC_XFER);
+         stamp(two, VK_PIPELINE_STAGE_2_NONE, 8);
+         stamp_all(two, 9);
+         T("second leading stamp is a copy of the first",
+           list_is_empty(&two->control_streams) && two->sync.lead_ts.handle &&
+           two->sync.stamp_copy_count == 1 &&
+           copy_is(&two->sync.stamp_copies[0], 9, query(8)));
+         struct hk_cs *rp = render(two);
+         T("render carries the leading stamp and its copies follow it",
+           same_req(rp->timestamp.vtx_end, query(8)) &&
+           list_is_singular(&two->control_streams) &&
+           two->sync.stamp_copy_after[HK_SYNC_VDM] == rp);
+         record_count = 0;
+         hk_sync_flush_stamp_copies(two);
+         T("copy of the leading stamp launches after the render",
+           record_count == 1 && records[0].count == 1 &&
+           records[0].cs->sync.dep[HK_SYNC_VDM].cut == rp);
+         struct hk_cmd_buffer *ptwo[] = {p, two};
+         T("two leading stamps resolve", submit(new_queue(exact), ptwo, 2));
+         T("render of two leading stamps waits for the wider first scope",
+           vertex_barrier(rp, HK_SYNC_CDM) == pd->sync.index);
+
+         /* No stream at all, flushed as vkEndCommandBuffer does (copies
+          * first): the leading stamp's command, then the copy after it. */
+         struct hk_cmd_buffer *q2 = new_cmd(chips[c], exact);
+         hk_sync_barrier(q2, HK_SYNC_XFER, HK_SYNC_XFER);
+         stamp_all(q2, 10);
+         stamp_all(q2, 11);
+         record_count = 0;
+         hk_sync_flush_stamp_copies(q2);
+         hk_sync_flush_pending_timestamp(q2);
+         struct hk_cs *qk = list_first_entry(&q2->control_streams,
+                                             struct hk_cs, node);
+         T("leading stamps with no stream: a carrier, then the copy after it",
+           list_length(&q2->control_streams) == 2 && is_end(qk, 10) &&
+           record_count == 1 && records[0].cs != qk &&
+           records[0].cs->sync.dep[HK_SYNC_CDM].cut == qk &&
+           copy_is(&records[0].copies[0], 11, query(10)));
       }
    }
 }

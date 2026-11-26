@@ -1194,6 +1194,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          stamp_wait(cmd, cs, dep);
       }
       st->lead_ts = (struct agx_timestamp_req){0};
+      /* Later stamps recorded before this stream are copies of it. */
+      if (st->stamp_copy_count) {
+         const unsigned sq = hk_sync_sq(cs);
+         st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], cs);
+      }
    }
 }
 
@@ -1945,12 +1950,19 @@ stamp_copies_follow(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    return true;
 }
 
+static void flush_lead_timestamp(struct hk_cmd_buffer *cmd);
+
 void
 hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
    if (!st->stamp_copy_count)
       return;
+
+   /* Copies of a leading stamp that no stream took yet read it after the
+    * command it then gets of its own. */
+   if (st->lead_ts.handle)
+      flush_lead_timestamp(cmd);
 
    /* And the copies write timestamp queries: after their resets. */
    struct hk_sync_dep after[HK_SYNC_NUM_SQ];
@@ -2007,6 +2019,10 @@ flush_lead_timestamp(struct hk_cmd_buffer *cmd)
    if (!cs)
       return;
    cs->timestamp.end = req;
+   if (st->stamp_copy_count) {
+      st->stamp_copy_after[HK_SYNC_CDM] =
+         hk_sync_later(st->stamp_copy_after[HK_SYNC_CDM], cs);
+   }
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
 }
@@ -2151,6 +2167,22 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
          st->pending_start_ts_unordered = true;
          return;
       }
+   }
+
+   /* Another stamp while the leading one still waits for the command
+    * buffer's first stream: a copy of it. The first stream carries the
+    * leading stamp after the first scopes of both, a valid later latch for
+    * the earlier one, and the copy launches after that stream
+    * (hk_sync_flush_stamp_copies()). Neither gets a command of its own. */
+   if (st->lead_ts.handle && st->stamp_copy_count < HK_SYNC_STAMP_COPIES) {
+      assert(!last_stream(cmd));
+      st->lead_scope |= src_kinds ? hk_sync_stamp_scope(src_kinds) | HK_SYNC_QRESET
+                                  : HK_SYNC_QRESET;
+      st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
+         .dst = req,
+         .src = st->lead_ts,
+      };
+      return;
    }
 
    hk_sync_flush_pending_timestamp(cmd);
