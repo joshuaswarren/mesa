@@ -15548,6 +15548,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
     * compute shaders; other generations keep it until they are measured. */
    bool skip_sched = (agx_compiler_debug & AGX_DBG_NOSCHED) ||
                      (nir->info.stage == MESA_SHADER_COMPUTE &&
+                      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
                       agx_chip_has_cap(ctx->key->dev.chip,
                                        AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED));
    if (likely(!skip_sched)) {
@@ -19593,7 +19594,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
    }
 
-   if (agx_chip_has_cap(key->dev.chip, AGX_CAP_FOLD_SHARED_OFFSETS)) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+       agx_chip_has_cap(key->dev.chip, AGX_CAP_FOLD_SHARED_OFFSETS)) {
       NIR_PASS(_, nir, agx_fold_shared_offsets);
       NIR_PASS(_, nir, nir_opt_dce);
    }
