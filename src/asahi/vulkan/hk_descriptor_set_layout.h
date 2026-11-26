@@ -63,6 +63,14 @@ struct hk_descriptor_set_layout {
     * UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING. */
    bool has_update_after_bind;
 
+   /* True if any single-element STORAGE_BUFFER binding is visible to compute
+    * shaders and needs CPU backing provenance (hk_descriptor_set::storage_backings). */
+   bool has_compute_storage_backing;
+
+   /* True if any binding carries immutable samplers that must be initialized on
+    * vkAllocateDescriptorSets(). */
+   bool has_immutable_samplers;
+
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;

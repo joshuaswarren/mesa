@@ -386,6 +386,12 @@ hk_CreateDescriptorSetLayout(VkDevice device,
 
       layout->binding[b].array_size = binding->descriptorCount;
 
+      if (!pCreateInfo->flags &&
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+          !layout->binding[b].flags && binding->descriptorCount == 1 &&
+          (binding->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT))
+         layout->has_compute_storage_backing = true;
+
       if (vk_descriptor_type_is_dynamic(binding->descriptorType)) {
          layout->binding[b].dynamic_buffer_index = dynamic_buffer_count;
          dynamic_buffer_count += binding->descriptorCount;
@@ -401,6 +407,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
                                             type_list, &stride, &alignment);
 
       if (binding_has_immutable_samplers(binding)) {
+         layout->has_immutable_samplers = true;
          layout->binding[b].immutable_samplers = samplers;
          for (uint32_t i = 0; i < binding->descriptorCount; i++)
             *samplers++ = hk_sampler_from_handle(binding->pImmutableSamplers[i]);
