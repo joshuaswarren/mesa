@@ -8601,3 +8601,38 @@ TEST(NativeForms, BoundsPassesClearMetadataAcrossPreambleAndMain)
 
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, AGX3CFfsHalfSourceZeroExtends)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+
+   agx_index src16 = agx_mov_imm(b, 16, 5);
+   agx_index dst32 = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *ffs = agx_ffs_to(b, dst32, src16);
+   agx_unit_test(b, dst32);
+
+   agx_lower_m5_alu_operands(b->shader);
+
+   ASSERT_EQ(ffs->src[0].size, AGX_SIZE_32);
+   ASSERT_EQ(ffs->src[0].type, AGX_INDEX_NORMAL);
+   agx_instr *def = NULL;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->nr_dests >= 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+          I->dest[0].value == ffs->src[0].value) {
+         def = I;
+         break;
+      }
+   }
+   ASSERT_NE(def, nullptr);
+   /* Must zero-extend via MOV (not undef-pad via COLLECT/agx_pad_to_32). */
+   EXPECT_EQ(def->op, AGX_OPCODE_MOV);
+   EXPECT_EQ(def->src[0].size, AGX_SIZE_16);
+   EXPECT_EQ(def->src[0].value, src16.value);
+   ralloc_free(mem);
+}

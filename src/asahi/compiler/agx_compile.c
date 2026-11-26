@@ -5339,7 +5339,7 @@ agx_m5_find_comparand(const struct util_dynarray *comparands, agx_index src)
  * 32-bit register, so widen the destination and narrow the exact low half. */
 /* Form a full-width product from narrow indices with two shifted adds.
  * Keep the extension modifiers on their original operands. */
-static void
+void
 agx_lower_m5_alu_operands(agx_context *ctx)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
@@ -5416,8 +5416,13 @@ agx_lower_m5_alu_operands(agx_context *ctx)
       }
 
       if (I->op == AGX_OPCODE_FFS && I->src[0].size == AGX_SIZE_16) {
+         /* agx_supports_zext folds u2u32 into FFS, so widening back to 32-bit
+          * for AGX3's 32-bit FFS encoding must zero-extend (not undef-pad with
+          * agx_pad_to_32), otherwise garbage in the upper half corrupts MSB. */
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         I->src[0] = agx_pad_to_32(&b, I->src[0]);
+         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+         agx_mov_to(&b, wide, I->src[0]);
+         I->src[0] = wide;
          continue;
       }
 
