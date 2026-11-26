@@ -857,6 +857,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    /* Values in registers on both sides of the edge, where a reload may read
     * them without extending their live ranges. Nothing else is in a register
     * along the edge, so what the start of succ does not use is free there.
+    * There is none when the entry exceeds k, which a remat-only pass allows.
     */
    unsigned entry_size = 0;
    for (unsigned j = 0; j < ss->nW_entry; ++j) {
@@ -866,8 +867,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
          BITSET_SET(edge_regs, v);
    }
 
-   assert(entry_size <= ctx->k);
-   const unsigned room = ctx->k - entry_size;
+   const unsigned room = entry_size < ctx->k ? ctx->k - entry_size : 0;
 
    agx_foreach_phi_in_block(succ, phi) {
       unsigned chased = chase_mem_index(phi->dest[0], ctx->spill_base);
@@ -1189,9 +1189,11 @@ min_algorithm(struct spill_ctx *ctx)
        * have to follow. The room left for I's destinations is free until I,
        * so an operand computed again for a repeat may use it. Reloads for an
        * export are hoisted above every export of the group, whose sources
-       * are all live there, so they do not get that room.
+       * are all live there, so they do not get that room, and there is none
+       * while W exceeds k, which a remat-only pass allows.
        */
-      const unsigned room = I->op == AGX_OPCODE_EXPORT ? 0 : ctx->k - ctx->nW;
+      const unsigned room =
+         I->op == AGX_OPCODE_EXPORT || ctx->nW >= ctx->k ? 0 : ctx->k - ctx->nW;
       bool by_repeat[AGX_MAX_NORMAL_SOURCES];
       unsigned operand[AGX_MAX_NORMAL_SOURCES];
       for (unsigned i = 0; i < nR; ++i) {
