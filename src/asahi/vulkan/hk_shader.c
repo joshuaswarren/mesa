@@ -3669,7 +3669,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lookup_ycbcr_conversion, &ycbcr_state);
    NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
             lower_ycbcr_chroma_blend, nir_metadata_none, (void *)&ycbcr_state);
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_has_packed_ycbcr(dev->dev.chip)) {
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                lower_ycbcr_plane_range, nir_metadata_control_flow,
                (void *)&ycbcr_state);

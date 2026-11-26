@@ -46,7 +46,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 {
    VkFormatFeatureFlags2 features = 0;
 
-   /* G17P reconstructs single-plane interleaved 4:2:2 in the shader rather
+   /* Native AGX3 and M5 reconstruct single-plane interleaved 4:2:2 in the shader rather
     * than in the texture unit (hk_image_view.c programs these views as plain
     * four-component words), so it can honour chroma-reconstruction features
     * that the generic path below cannot, and it used to advertise all of
@@ -72,7 +72,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
     * of code inspection alone.  COSITED_EVEN is kept because it is what this
     * driver actually implements and passes.
     */
-   if (agx_chip_native_agx3(pdev->dev.chip) &&
+   if (agx_chip_has_packed_ycbcr(pdev->dev.chip) &&
        hk_packed_ycbcr_bits(vk_format)) {
       if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR)
          return 0;
