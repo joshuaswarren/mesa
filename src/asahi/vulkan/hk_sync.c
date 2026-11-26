@@ -133,11 +133,22 @@ footprints_share_tile(const struct hk_sync_footprint *a,
           b->cy0 <= a->cy1;
 }
 
+/* Whether two footprints that share a tile share it only through a load:
+ * both cover whole tiles of every layer they name, so neither pass writes
+ * back a tile it does not own whole, and the later one reads what the
+ * earlier one stored. */
+static bool
+footprints_whole_tiles(const struct hk_sync_footprint *a,
+                       const struct hk_sync_footprint *b)
+{
+   return !a->partial && !b->partial;
+}
+
 void
 hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
                        uint32_t level, uint32_t layer0, uint32_t layer1,
                        uint32_t level_width, uint32_t level_height,
-                       VkRect2D area, bool preserve_layers)
+                       VkRect2D area, bool preserve_layers, bool preserve_load)
 {
    struct hk_sync_state *st = &cmd->sync;
    const int64_t w = level_width, h = level_height;
@@ -152,16 +163,17 @@ hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
 
    /* Retain complete writes too: a later sparse multiview pass may reload
     * and store these layers even though its API writes are disjoint. */
-   const bool preserve = preserve_layers || x0 % cell || y0 % cell ||
-                         (x1 % cell && x1 != w) ||
-                         (y1 % cell && y1 != h);
+   const bool partial = preserve_layers || x0 % cell || y0 % cell ||
+                        (x1 % cell && x1 != w) ||
+                        (y1 % cell && y1 != h);
 
    assert(st->pass_fp_count < HK_SYNC_MAX_PASS_FOOTPRINTS);
    if (st->pass_fp_count >= HK_SYNC_MAX_PASS_FOOTPRINTS)
       return;
 
    st->pass_fp[st->pass_fp_count++] = (struct hk_sync_footprint){
-      .preserve = preserve,
+      .preserve = partial || preserve_load,
+      .partial = partial,
       .image = image,
       .level = level,
       .layer0 = layer0,
@@ -173,25 +185,48 @@ hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
    };
 }
 
+bool
+hk_sync_load_hazard_frag(const struct hk_device *dev)
+{
+   return dev && dev->load_hazard_frag;
+}
+
 void
 hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   const bool frag_ok = hk_sync_load_hazard_frag(hk_cmd_buffer_device(cmd));
    struct hk_cs *wait[HK_SYNC_NUM_SQ] = {0};
+   struct hk_cs *frag = NULL;
    util_dynarray_foreach(&cmd->sync_pass_records, struct hk_sync_pass_record, rec) {
       if (!rec->last)
          continue;
       const unsigned sq = hk_sync_sq(rec->last);
       if (wait[sq] && rec->last->sync.seq <= wait[sq]->sync.seq)
          continue;
+      /* A render that shares only whole, loaded tiles with the instance
+       * needs the fragment half ordered (hk_sync_stream_created()). */
+      bool shares = false, whole = true;
       for (unsigned i = 0; i < st->pass_fp_count; ++i) {
          if (footprints_share_tile(&rec->fp, &st->pass_fp[i])) {
-            wait[sq] = rec->last;
-            break;
+            shares = true;
+            whole &= footprints_whole_tiles(&rec->fp, &st->pass_fp[i]);
          }
       }
+      if (!shares)
+         continue;
+      if (frag_ok && whole && rec->last->type == HK_CS_VDM)
+         frag = hk_sync_later(frag, rec->last);
+      else
+         wait[sq] = rec->last;
    }
    memcpy(st->pass_tile_wait, wait, sizeof(wait));
+   /* A wait of both halves on a later render covers it. */
+   st->pass_tile_wait_frag =
+      frag && (!wait[HK_SYNC_VDM] ||
+               frag->sync.seq > wait[HK_SYNC_VDM]->sync.seq)
+         ? frag
+         : NULL;
 }
 
 /* Record the footprints of the pass instance that ends, with its streams. */
@@ -215,6 +250,7 @@ pass_footprints_commit(struct hk_cmd_buffer *cmd)
 
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+   st->pass_tile_wait_frag = NULL;
    st->pass_tile_first = st->pass_tile_last = NULL;
 }
 
@@ -232,6 +268,15 @@ records_replace_stream(struct hk_cmd_buffer *cmd, struct hk_cs *from,
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       if (cmd->sync.pass_tile_wait[sq] == from)
          cmd->sync.pass_tile_wait[sq] = to;
+   }
+   /* A render replaced by compute is no longer a render: wait on it whole. */
+   if (cmd->sync.pass_tile_wait_frag == from) {
+      cmd->sync.pass_tile_wait_frag = NULL;
+      if (to) {
+         const unsigned sq = hk_sync_sq(to);
+         cmd->sync.pass_tile_wait[sq] =
+            hk_sync_later(cmd->sync.pass_tile_wait[sq], to);
+      }
    }
    if (cmd->sync.pass_tile_first == from)
       cmd->sync.pass_tile_first = to;
@@ -1082,6 +1127,14 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
             tile[sq].cut = st->pass_tile_wait[sq];
          hk_sync_stream_wait(cs, tile);
+
+         /* Except where the instance only loads whole tiles an earlier
+          * render stored: the kernel runs this render's fragment work after
+          * that one's, partial renders included, and tiling never writes a
+          * tile back (hk_sync_queue::load_hazard_frag). */
+         const struct hk_sync_dep load[HK_SYNC_NUM_SQ] = {
+            {.cut = st->pass_tile_wait_frag}, {0}};
+         stream_wait_frag(cs, load);
       }
       if (st->in_pass && (st->pass_tile_last || st->resume_pending)) {
          struct hk_sync_dep cont[HK_SYNC_NUM_SQ] = {0};
@@ -2119,6 +2172,7 @@ hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
    st->heap_pass = false;
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+   st->pass_tile_wait_frag = NULL;
    st->pass_tile_first = st->pass_tile_last = NULL;
 
    /* A resuming instance is the same render pass instance as the suspended
@@ -2194,6 +2248,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->heap_pass = false;
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+   st->pass_tile_wait_frag = NULL;
    st->pass_tile_first = st->pass_tile_last = cs;
    st->suspended_last = NULL;
 }
@@ -2445,10 +2500,27 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
    return false;
 }
 
+/* Whether a footprint of an earlier render on the render subqueue that
+ * shares a tile with fp needs only fp's fragment half ordered after it
+ * (hk_sync_queue::load_hazard_frag). */
+static bool
+load_hazard_frag(const struct hk_sync_queue *q, enum hk_sync_sq sq,
+                 const struct hk_sync_footprint *earlier,
+                 const struct hk_sync_footprint *fp)
+{
+   return q->load_hazard_frag && sq == HK_SYNC_VDM &&
+          footprints_whole_tiles(earlier, fp);
+}
+
+/* The subqueues a possibly still running earlier submission shares a tile of
+ * fp on, and in *frag_only those whose shared tiles all need only fp's
+ * fragment half ordered (load_hazard_frag()). */
 static uint8_t
 recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *fp,
-                uint64_t completed, const struct recent_tile_index *index)
+                uint64_t completed, const struct recent_tile_index *index,
+                uint8_t *frag_only)
 {
+   *frag_only = 0;
    if (!recent_may_run(q, completed))
       return false;
    if (q->precise_tile_evictions && !fp->preserve && !q->last_preserve)
@@ -2461,24 +2533,33 @@ recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *f
       ? q->evicted_preserve : q->evicted;
    if (evicted > completed)
       return BITFIELD_MASK(HK_SYNC_NUM_SQ);
-   uint8_t engines = 0;
+   uint8_t engines = 0, whole = 0;
    if (index) {
       for (uint16_t i = index->head[tile_bucket(fp)]; i != UINT16_MAX;
            i = index->next[i]) {
-         const uint8_t engine = BITFIELD_BIT(q->recent[i].sq);
-         if (!(engines & engine) &&
-             footprints_share_tile(&q->recent[i].fp, fp))
+         const struct hk_sync_recent *r = &q->recent[i];
+         const uint8_t engine = BITFIELD_BIT(r->sq);
+         if ((whole & engine) || !footprints_share_tile(&r->fp, fp))
+            continue;
+         if (load_hazard_frag(q, r->sq, &r->fp, fp))
             engines |= engine;
+         else
+            whole |= engine;
       }
-      return engines;
+   } else {
+      const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
+      for (uint32_t i = 0; i < n; ++i) {
+         const struct hk_sync_recent *r = &q->recent[i];
+         if (r->point <= completed || !footprints_share_tile(&r->fp, fp))
+            continue;
+         if (load_hazard_frag(q, r->sq, &r->fp, fp))
+            engines |= BITFIELD_BIT(r->sq);
+         else
+            whole |= BITFIELD_BIT(r->sq);
+      }
    }
-   const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
-   for (uint32_t i = 0; i < n; ++i) {
-      if (q->recent[i].point > completed &&
-          footprints_share_tile(&q->recent[i].fp, fp))
-         engines |= BITFIELD_BIT(q->recent[i].sq);
-   }
-   return engines;
+   *frag_only = engines & ~whole;
+   return engines | whole;
 }
 
 static void
@@ -2723,52 +2804,73 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
        * before this submission (before this ioctl on queues without exact
        * prior ordinals). Within the command buffer the recorded
        * dependency already orders it. The vertex half waits too, as for the
-       * in-pass hazard (hk_sync_stream_created()). */
+       * in-pass hazard (hk_sync_stream_created()), unless every such tile is
+       * a whole tile an earlier render stored and this one loads
+       * (load_hazard_frag()): then the fragment half alone (vf). */
       util_dynarray_foreach(&cmd->sync_pass_records,
                             struct hk_sync_pass_record, rec) {
          if (!rec->first || !rec->last)
             continue;
          hk_sync_value v[HK_SYNC_NUM_SQ] = {HK_SYNC_NONE, HK_SYNC_NONE};
+         hk_sync_value vf[HK_SYNC_NUM_SQ] = {HK_SYNC_NONE, HK_SYNC_NONE};
+#define SUBMITTED_CONFLICT(e)                                                  \
+   do {                                                                        \
+      if (footprints_share_tile(&(e)->fp, &rec->fp)) {                          \
+         hk_sync_value *slot =                                                 \
+            load_hazard_frag(&queue->sync, (e)->sq, &(e)->fp, &rec->fp)         \
+               ? &vf[(e)->sq]                                                  \
+               : &v[(e)->sq];                                                  \
+         *slot = value_max(*slot, (e)->index);                                 \
+      }                                                                        \
+   } while (0)
          if (indexed) {
             for (uint32_t j = submitted_head[tile_bucket(&rec->fp)];
                  j != TILE_INDEX_NONE;) {
                const struct submit_footprint *e = util_dynarray_element(
                   &submitted, struct submit_footprint, j);
-               if (e->index > v[e->sq] &&
-                   footprints_share_tile(&e->fp, &rec->fp))
-                  v[e->sq] = e->index;
+               SUBMITTED_CONFLICT(e);
                j = e->next_by_image;
             }
          } else {
-            util_dynarray_foreach(&submitted, struct submit_footprint, e) {
-               if (e->index > v[e->sq] && footprints_share_tile(&e->fp, &rec->fp))
-                  v[e->sq] = e->index;
-            }
+            util_dynarray_foreach(&submitted, struct submit_footprint, e)
+               SUBMITTED_CONFLICT(e);
          }
-         const uint8_t recent = recent_conflict(
-            &queue->sync, &rec->fp, completed, indexed ? &recent_index : NULL);
+#undef SUBMITTED_CONFLICT
+         uint8_t recent_frag;
+         const uint8_t recent =
+            recent_conflict(&queue->sync, &rec->fp, completed,
+                            indexed ? &recent_index : NULL, &recent_frag);
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
             struct hk_sync_stream *s = &rec->first->sync;
-            if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq))) {
-               if (queue->sync.exact_prior) {
-                  /* Everything before this submission, by its ordinal: a
-                   * zero barrier would name everything before the ioctl
-                   * that carries the render, which for a later ioctl of a
-                   * split submission is more than the whole render's
-                   * prefix may name. */
-                  const uint64_t start = queue->sync.submitted[sq];
+            const bool earlier = recent & BITFIELD_BIT(sq);
+            const bool earlier_ta =
+               earlier && !(recent_frag & BITFIELD_BIT(sq));
+            /* A prefix in this submission also covers every earlier one. */
+            hk_sync_value whole = value_max(v[sq], vf[sq]);
+            hk_sync_value ta = v[sq];
+            if (queue->sync.exact_prior) {
+               /* Everything before this submission, by its ordinal: a zero
+                * barrier would name everything before the ioctl that
+                * carries the render, which for a later ioctl of a split
+                * submission is more than the whole render's prefix may
+                * name. */
+               const uint64_t start = queue->sync.submitted[sq];
+               if (whole == HK_SYNC_NONE && earlier)
                   s->prior[sq] = MAX2(s->prior[sq], start);
+               if (ta == HK_SYNC_NONE && earlier_ta)
                   s->prior_ta[sq] = MAX2(s->prior_ta[sq], start);
-                  continue;
-               }
-               v[sq] = 0;
+            } else {
+               if (whole == HK_SYNC_NONE && earlier)
+                  whole = 0;
+               if (ta == HK_SYNC_NONE && earlier_ta)
+                  ta = 0;
             }
-            if (v[sq] != HK_SYNC_NONE) {
+            if (whole != HK_SYNC_NONE)
                barrier_at_least(queue, sq, &s->barrier[sq], &s->prior[sq],
-                                v[sq]);
+                                whole);
+            if (ta != HK_SYNC_NONE)
                barrier_at_least(queue, sq, &s->barrier_ta[sq],
-                                &s->prior_ta[sq], v[sq]);
-            }
+                                &s->prior_ta[sq], ta);
          }
       }
       util_dynarray_foreach(&cmd->sync_pass_records,

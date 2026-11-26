@@ -210,6 +210,10 @@ struct hk_stamp_copy {
 struct hk_sync_footprint {
    /* The hardware preserves pixels or inactive layers outside the API writes. */
    bool preserve;
+   /* It does so for the area or the layers: a partly covered tile, or layers
+    * a sparse view mask skips. A footprint that preserves only because it
+    * loads its attachment covers whole tiles of every layer it names. */
+   bool partial;
    /* Identity of the written image; compared, never dereferenced. */
    const void *image;
    uint32_t level;
@@ -449,6 +453,10 @@ struct hk_sync_state {
    struct hk_sync_footprint pass_fp[HK_SYNC_MAX_PASS_FOOTPRINTS];
    uint8_t pass_fp_count;
    struct hk_cs *pass_tile_wait[HK_SYNC_NUM_SQ];
+   /* The latest earlier render that only the fragment half waits for: it
+    * shares only whole tiles with the instance, which loads them
+    * (hk_sync_queue::load_hazard_frag). */
+   struct hk_cs *pass_tile_wait_frag;
    /* Attachment producers, including a compute replacement of a clear. */
    struct hk_cs *pass_tile_first, *pass_tile_last;
    /* The last attachment producer of a suspended pass instance, which the
@@ -505,6 +513,11 @@ struct hk_sync_queue {
    bool precise_tile_evictions;
    /* A single command buffer already owns the complete footprint list. */
    bool direct_single_footprints;
+   /* The kernel runs a render's fragment work after the previous render's on
+    * this queue, partial renders included, so a render that only loads whole
+    * tiles an earlier render stores waits for it in its fragment half alone
+    * (hk_sync.h, tile hazards). */
+   bool load_hazard_frag;
    uint64_t last_preserve, evicted_preserve;
 };
 
@@ -713,8 +726,12 @@ void hk_sync_heap_used(struct hk_cmd_buffer *cmd);
 void hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
                             uint32_t level, uint32_t layer0, uint32_t layer1,
                             uint32_t level_width, uint32_t level_height,
-                            VkRect2D area, bool preserve_layers);
+                            VkRect2D area, bool preserve_layers,
+                            bool preserve_load);
 void hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd);
+
+/* hk_device::load_hazard_frag, false without a device (unit fixtures). */
+bool hk_sync_load_hazard_frag(const struct hk_device *dev);
 void hk_sync_replace_render(struct hk_cmd_buffer *cmd, struct hk_cs *from,
                             struct hk_cs *into);
 /* Whether a submission records tile-hazard footprints, and whether the
