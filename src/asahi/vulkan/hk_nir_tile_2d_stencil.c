@@ -1496,8 +1496,8 @@ match_box_blur_u8(nir_shader *s, uint32_t set_layout_count,
       return false;
 
    plan->kind = HK_2D_STENCIL_BOX_BLUR_U8;
-   plan->tile_w = 64;
-   plan->tile_h = 16;
+   plan->tile_w = HK_BOX_BLUR_STRIP_W;
+   plan->tile_h = HK_BOX_BLUR_TILE_H;
    plan->width_pc_offset_B = w_off;
    plan->height_pc_offset_B = h_off;
    plan->stride_pc_offset_B = stride_pc;
@@ -3800,45 +3800,81 @@ store_sh_u16(nir_builder *b, nir_deref_instr *arr, nir_def *idx, nir_def *val)
    nir_store_deref(b, nir_build_deref_array(b, arr, idx), val, 0x1);
 }
 
-/* Separable 2D shared-memory R8 box blur:
- *   Tile 64x16 (1024 px/WG), WG 256x1x1 (8 simdgroups).
- *   Shared memory:
- *     sh_src: 48 rows x 25 u8x4 (= 100 bytes/row, bank-conflict-free) = 4,800 B
- *     sh_col: 16 rows x 97 u16  (odd stride, bank-conflict-free)     = 3,104 B
- *     Total: 7,904 B (< 8 KiB -> full threadgroup occupancy).
- *   Phase 0: coalesced u8x4 cooperative preload into sh_src.
- *   Phase 1: 2*W_EXT threads run vertical sliding window (8 rows/thread) -> sh_col.
- *   Phase 2: 16x16 threads run horizontal sliding window (4 px/thread) + udiv
- *            by uniform (2r+1)^2 + coalesced u8x4 interior store. */
+/* R8 box blur, one subgroup per 128-column strip:
+ *   Workgroup 256x1x1 = 8 subgroups stacked on one strip, 16 rows each
+ *   (HK_BOX_BLUR_TILE_H = 128 rows), hk_box_blur_out_w(r) output columns.
+ *   Each lane owns 4 source columns and keeps their vertical (2r+1)-row sums
+ *   in registers, sliding them one row at a time (one u8x4 row added, one
+ *   subtracted). Per row, an in-lane prefix plus a subgroup exclusive scan
+ *   gives the strip's horizontal prefix sum P; output x is
+ *   (P[x + r] - P[x - r - 1]) / (2r+1)^2. P goes through a 512-byte
+ *   subgroup-private slice of shared memory, so no workgroup barrier is
+ *   needed. Border pixels copy the source, as in the original shader.
+ */
+static void
+box_blur_load_row(nir_builder *b, nir_deref_instr *src_u8,
+                  nir_deref_instr *src_u8x4, nir_def *row, nir_def *hm1,
+                  nir_def *wm1, nir_def *stride, nir_def *col, nir_def *col_ld,
+                  nir_def *out[4])
+{
+   nir_def *rowc = nir_imin(b, nir_imax(b, row, nir_imm_int(b, 0)), hm1);
+   nir_def *roff = nir_imul(b, rowc, stride);
+
+   /* A u8x4 read of a group that crosses the right edge runs up to 3 bytes
+    * past the row: inside the next row, but past the buffer on the last row,
+    * which loads byte by byte instead. */
+   nir_def *fast, *slow;
+   nir_push_if(b, nir_ilt(b, rowc, hm1));
+   {
+      nir_def *v = load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, roff, col_ld));
+      fast = nir_u2u32(b, v);
+   }
+   nir_push_else(b, NULL);
+   {
+      nir_def *s[4];
+      for (unsigned j = 0; j < 4; j++) {
+         nir_def *cj = nir_imin(
+            b, nir_imax(b, nir_iadd_imm(b, col, j), nir_imm_int(b, 0)), wm1);
+         s[j] = nir_u2u32(b, load_ssbo_u8(b, src_u8, nir_iadd(b, roff, cj)));
+      }
+      slow = nir_vec(b, s, 4);
+   }
+   nir_pop_if(b, NULL);
+   nir_def *v = nir_if_phi(b, fast, slow);
+   for (unsigned j = 0; j < 4; j++)
+      out[j] = nir_channel(b, v, j);
+}
+
+static void
+subgroup_shared_barrier(nir_builder *b)
+{
+   nir_barrier(b, .execution_scope = SCOPE_SUBGROUP,
+               .memory_scope = SCOPE_SUBGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+}
+
 static void
 build_box_blur_u8_kernel(nir_builder *b, const struct hk_2d_stencil_plan *plan,
                          nir_address_format ssbo_addr_format)
 {
-   const unsigned WG = 256;
-   const unsigned TILE_W = 64;
-   const unsigned TILE_H = 16;
-   const unsigned MAX_H_EXT = TILE_H + 2 * HK_2D_STENCIL_MAX_RADIUS; /* 48 */
-   const unsigned SH_SRC_U4_STRIDE = 25; /* 100 B >= 64 + 32 = 96 B */
-   const unsigned SH_SRC_B_STRIDE = SH_SRC_U4_STRIDE * 4;
-   const unsigned SH_COL_STRIDE = 97; /* odd >= 96 */
+   const unsigned STRIP_W = HK_BOX_BLUR_STRIP_W;
+   const unsigned ROWS = HK_BOX_BLUR_SUBGROUP_ROWS;
 
-   b->shader->info.workgroup_size[0] = WG;
+   b->shader->info.workgroup_size[0] = HK_BOX_BLUR_SUBGROUPS * 32;
    b->shader->info.workgroup_size[1] = 1;
    b->shader->info.workgroup_size[2] = 1;
    b->shader->info.workgroup_size_variable = false;
    b->shader->info.shared_size = 0;
+   b->shader->info.api_subgroup_size = 32;
+   b->shader->info.min_subgroup_size = 32;
+   b->shader->info.max_subgroup_size = 32;
 
-   nir_variable *sh_src_var = nir_variable_create(
+   nir_variable *sh_p_var = nir_variable_create(
       b->shader, nir_var_mem_shared,
-      glsl_array_type(glsl_vector_type(GLSL_TYPE_UINT8, 4),
-                      MAX_H_EXT * SH_SRC_U4_STRIDE, 0),
-      "sh_src");
-   nir_variable *sh_col_var = nir_variable_create(
-      b->shader, nir_var_mem_shared,
-      glsl_array_type(glsl_uint16_t_type(), TILE_H * SH_COL_STRIDE, 0),
-      "sh_col");
-   nir_deref_instr *sh_src = nir_build_deref_var(b, sh_src_var);
-   nir_deref_instr *sh_col = nir_build_deref_var(b, sh_col_var);
+      glsl_array_type(glsl_uint_type(), HK_BOX_BLUR_SUBGROUPS * STRIP_W, 0),
+      "sh_prefix");
+   nir_deref_instr *sh_p = nir_build_deref_var(b, sh_p_var);
 
    nir_deref_instr *src_u8 = build_ssbo_base_deref(
       b, &plan->bufs[0], ssbo_addr_format, glsl_uint8_t_type(), 1);
@@ -3856,261 +3892,173 @@ build_box_blur_u8_kernel(nir_builder *b, const struct hk_2d_stencil_plan *plan,
    nir_def *stride = load_pc_i32(b, plan->stride_pc_offset_B);
    nir_def *radius = load_pc_i32(b, plan->radius_pc_offset_B);
 
-   nir_def *two_r = nir_ishl_imm(b, radius, 1);
-   nir_def *diam = nir_iadd_imm(b, two_r, 1);
+   nir_def *diam = nir_iadd_imm(b, nir_ishl_imm(b, radius, 1), 1);
    nir_def *area = nir_imul(b, diam, diam);
-   nir_def *w_ext = nir_iadd_imm(b, two_r, TILE_W);
-   nir_def *h_ext = nir_iadd_imm(b, two_r, TILE_H);
-   nir_def *w4 = nir_ushr_imm(b, nir_iadd_imm(b, w_ext, 3), 2);
-
-   nir_def *tid = nir_channel(b, nir_load_local_invocation_id(b), 0);
-   nir_def *wgid = nir_load_workgroup_id(b);
-   nir_def *tile_x = nir_imul_imm(b, nir_channel(b, wgid, 0), TILE_W);
-   nir_def *tile_y = nir_imul_imm(b, nir_channel(b, wgid, 1), TILE_H);
-   nir_def *x_start = nir_isub(b, tile_x, radius);
-   nir_def *y_start = nir_isub(b, tile_y, radius);
-
-   /* Phase 0: Cooperative load of `(TILE_W + 2r) x (TILE_H + 2r)` bytes. */
-   nir_def *tile_in_bounds = nir_iand(
+   nir_def *halo = nir_iand_imm(b, nir_iadd_imm(b, radius, 4), ~3);
+   nir_def *out_lanes = nir_iadd_imm(
       b,
-      nir_iand(b, nir_ige_imm(b, x_start, 0),
-               nir_ige(b, width, nir_iadd(b, x_start, nir_ishl_imm(b, w4, 2)))),
-      nir_iand(b, nir_ige_imm(b, y_start, 0),
-               nir_ige(b, height, nir_iadd(b, y_start, h_ext))));
+      nir_ushr_imm(b, nir_isub(b, nir_imm_int(b, STRIP_W - 4),
+                               nir_iadd(b, halo, radius)),
+                   2),
+      1);
+   nir_def *wm1 = nir_iadd_imm(b, width, -1);
+   nir_def *hm1 = nir_iadd_imm(b, height, -1);
 
-   nir_def *lane32 = nir_iand_imm(b, tid, 31);
-   nir_def *warp8 = nir_ushr_imm(b, tid, 5);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *sg = nir_load_subgroup_id(b);
+   nir_def *wgid = nir_load_workgroup_id(b);
+   nir_def *tile_x =
+      nir_imul(b, nir_channel(b, wgid, 0), nir_ishl_imm(b, out_lanes, 2));
+   nir_def *y0 = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wgid, 1),
+                                          HK_BOX_BLUR_TILE_H),
+                          nir_imul_imm(b, sg, ROWS));
 
-   nir_push_if(b, tile_in_bounds);
+   /* First of this lane's 4 source columns. Strips start at a multiple of
+    * 4, so a group never straddles column 0. Groups wholly outside the image
+    * read columns 0..3 or the last 4; their sums only reach border outputs,
+    * which copy the source instead. */
+   nir_def *col =
+      nir_iadd(b, nir_isub(b, tile_x, halo), nir_ishl_imm(b, lane, 2));
+   nir_def *col_ld =
+      nir_bcsel(b, nir_ige(b, col, width), nir_iadd_imm(b, width, -4),
+                nir_imax(b, col, nir_imm_int(b, 0)));
+
+   nir_def *sh_lane = nir_iadd(b, nir_imul_imm(b, sg, STRIP_W),
+                               nir_ishl_imm(b, lane, 2));
+   nir_def *sh_hi = nir_iadd(b, sh_lane, nir_iadd(b, halo, radius));
+   nir_def *sh_lo = nir_isub(b, nir_iadd(b, sh_lane, halo),
+                             nir_iadd_imm(b, radius, 1));
+   nir_def *x0 = nir_iadd(b, tile_x, nir_ishl_imm(b, lane, 2));
+   nir_def *out_lane =
+      nir_iand(b, nir_ult(b, lane, out_lanes), nir_ilt(b, x0, width));
+   nir_def *x_int = nir_iand(b, nir_ige(b, x0, radius),
+                             nir_ilt(b, nir_iadd_imm(b, x0, 3),
+                                     nir_isub(b, width, radius)));
+   nir_def *x_lim = nir_isub(b, width, radius);
+
+   nir_push_if(b, nir_ilt(b, y0, height));
    {
-      /* Fast interior path: branch-free coalesced u8x4 loads per warp. */
-      nir_push_if(b, nir_ilt(b, lane32, w4));
-      {
-         nir_variable *sy_var =
-            nir_local_variable_create(b->impl, glsl_int_type(), "sy_fast");
-         nir_store_var(b, sy_var, warp8, 0x1);
-         nir_def *gx = nir_iadd(b, x_start, nir_ishl_imm(b, lane32, 2));
-         nir_loop *rl = nir_push_loop(b);
-         rl->control = nir_loop_control_dont_unroll;
-         {
-            nir_def *sy = nir_load_var(b, sy_var);
-            nir_push_if(b, nir_ige(b, sy, h_ext));
-            nir_jump(b, nir_jump_break);
-            nir_pop_if(b, NULL);
-
-            nir_def *gy = nir_iadd(b, y_start, sy);
-            nir_def *v =
-               load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, nir_imul(b, gy, stride), gx));
-            store_sh_u8x4(
-               b, sh_src,
-               nir_iadd(b, nir_imul_imm(b, sy, SH_SRC_U4_STRIDE), lane32), v);
-
-            nir_store_var(b, sy_var, nir_iadd_imm(b, sy, 8), 0x1);
-         }
-         nir_pop_loop(b, NULL);
+      /* Vertical sums of rows y0 - r .. y0 + r (clamped rows only ever feed
+       * border outputs). */
+      nir_variable *cs_var[4];
+      for (unsigned j = 0; j < 4; j++) {
+         cs_var[j] = nir_local_variable_create(b->impl, glsl_uint_type(), "cs");
+         nir_store_var(b, cs_var[j], nir_imm_int(b, 0), 0x1);
       }
-      nir_pop_if(b, NULL);
-   }
-   nir_push_else(b, NULL);
-   {
-      /* Cold border tile path: bounded scalar byte loads. */
-      nir_variable *sy_var =
-         nir_local_variable_create(b->impl, glsl_int_type(), "sy_bord");
-      nir_store_var(b, sy_var, warp8, 0x1);
+      nir_variable *d_var =
+         nir_local_variable_create(b->impl, glsl_int_type(), "bd");
+      nir_store_var(b, d_var, nir_ineg(b, radius), 0x1);
+      nir_loop *il = nir_push_loop(b);
+      il->control = nir_loop_control_dont_unroll;
+      {
+         nir_def *d = nir_load_var(b, d_var);
+         nir_push_if(b, nir_ilt(b, radius, d));
+         nir_jump(b, nir_jump_break);
+         nir_pop_if(b, NULL);
+
+         nir_def *v[4];
+         box_blur_load_row(b, src_u8, src_u8x4, nir_iadd(b, y0, d), hm1, wm1,
+                           stride, col, col_ld, v);
+         for (unsigned j = 0; j < 4; j++)
+            nir_store_var(b, cs_var[j],
+                          nir_iadd(b, nir_load_var(b, cs_var[j]), v[j]), 0x1);
+         nir_store_var(b, d_var, nir_iadd_imm(b, d, 1), 0x1);
+      }
+      nir_pop_loop(b, NULL);
+
+      nir_variable *i_var =
+         nir_local_variable_create(b->impl, glsl_int_type(), "bi");
+      nir_store_var(b, i_var, nir_imm_int(b, 0), 0x1);
       nir_loop *rl = nir_push_loop(b);
       rl->control = nir_loop_control_dont_unroll;
       {
-         nir_def *sy = nir_load_var(b, sy_var);
-         nir_push_if(b, nir_ige(b, sy, h_ext));
+         nir_def *i = nir_load_var(b, i_var);
+         nir_def *y = nir_iadd(b, y0, i);
+         nir_push_if(b, nir_ior(b, nir_ige_imm(b, i, ROWS),
+                                nir_ige(b, y, height)));
          nir_jump(b, nir_jump_break);
          nir_pop_if(b, NULL);
 
-         nir_def *gy = nir_iadd(b, y_start, sy);
-         nir_push_if(b, nir_iand(b, nir_ige_imm(b, gy, 0),
-                                 nir_ilt(b, gy, height)));
-         {
-            nir_def *row_off = nir_imul(b, gy, stride);
-            nir_def *sh_row = nir_imul_imm(b, sy, SH_SRC_B_STRIDE);
-            nir_variable *cx_var =
-               nir_local_variable_create(b->impl, glsl_int_type(), "cx_bord");
-            nir_store_var(b, cx_var, lane32, 0x1);
-            nir_loop *cl = nir_push_loop(b);
-            cl->control = nir_loop_control_dont_unroll;
-            {
-               nir_def *cx = nir_load_var(b, cx_var);
-               nir_push_if(b, nir_ige(b, cx, w_ext));
-               nir_jump(b, nir_jump_break);
-               nir_pop_if(b, NULL);
+         /* Next row's window: add row y + r + 1, drop row y - r. Issued
+          * here so the loads overlap this row's output work. */
+         nir_def *add[4], *sub[4];
+         box_blur_load_row(b, src_u8, src_u8x4,
+                           nir_iadd(b, y, nir_iadd_imm(b, radius, 1)), hm1,
+                           wm1, stride, col, col_ld, add);
+         box_blur_load_row(b, src_u8, src_u8x4, nir_isub(b, y, radius), hm1,
+                           wm1, stride, col, col_ld, sub);
 
-               nir_def *gx = nir_iadd(b, x_start, cx);
-               nir_push_if(b, nir_iand(b, nir_ige_imm(b, gx, 0),
-                                       nir_ilt(b, gx, width)));
-               {
-                  nir_def *val = load_ssbo_u8(b, src_u8, nir_iadd(b, row_off, gx));
-                  store_sh_u8x4_byte(b, sh_src, nir_iadd(b, sh_row, cx), val);
-               }
-               nir_pop_if(b, NULL);
+         nir_def *cs[4], *p[4];
+         for (unsigned j = 0; j < 4; j++)
+            cs[j] = nir_load_var(b, cs_var[j]);
+         p[0] = cs[0];
+         for (unsigned j = 1; j < 4; j++)
+            p[j] = nir_iadd(b, p[j - 1], cs[j]);
+         nir_def *ex =
+            nir_exclusive_scan(b, p[3], .reduction_op = nir_op_iadd);
 
-               nir_store_var(b, cx_var, nir_iadd_imm(b, cx, 32), 0x1);
-            }
-            nir_pop_loop(b, NULL);
+         /* The previous row's reads of this slice are done before it is
+          * overwritten, and this row's writes land before it is read. */
+         subgroup_shared_barrier(b);
+         for (unsigned j = 0; j < 4; j++) {
+            nir_store_deref(
+               b, nir_build_deref_array(b, sh_p, nir_iadd_imm(b, sh_lane, j)),
+               nir_iadd(b, ex, p[j]), 0x1);
          }
-         nir_pop_if(b, NULL);
+         subgroup_shared_barrier(b);
 
-         nir_store_var(b, sy_var, nir_iadd_imm(b, sy, 8), 0x1);
-      }
-      nir_pop_loop(b, NULL);
-   }
-   nir_pop_if(b, NULL);
+         nir_push_if(b, out_lane);
+         {
+            nir_def *o[4];
+            for (unsigned j = 0; j < 4; j++) {
+               nir_def *hi = nir_load_deref(
+                  b, nir_build_deref_array(b, sh_p, nir_iadd_imm(b, sh_hi, j)));
+               nir_def *lo = nir_load_deref(
+                  b, nir_build_deref_array(b, sh_p, nir_iadd_imm(b, sh_lo, j)));
+               o[j] = nir_u2u8(b, nir_udiv(b, nir_isub(b, hi, lo), area));
+            }
 
-   emit_shared_barrier(b);
-
-   /* Phase 1: Vertical sliding window -> `sh_col[16][97]` (2 halves x 8 rows). */
-   nir_def *half = nir_ushr_imm(b, tid, 7);
-   nir_def *cx = nir_iand_imm(b, tid, 127);
-   nir_push_if(b, nir_ilt(b, cx, w_ext));
-   {
-      nir_def *row0 = nir_ishl_imm(b, half, 3); /* 0 or 8 */
-      nir_variable *acc_var =
-         nir_local_variable_create(b->impl, glsl_uint_type(), "vacc");
-      nir_variable *k_var =
-         nir_local_variable_create(b->impl, glsl_int_type(), "vk");
-      nir_store_var(b, acc_var, nir_imm_int(b, 0), 0x1);
-      nir_store_var(b, k_var, nir_imm_int(b, 0), 0x1);
-
-      nir_loop *vl = nir_push_loop(b);
-      vl->control = nir_loop_control_dont_unroll;
-      {
-         nir_def *k = nir_load_var(b, k_var);
-         nir_push_if(b, nir_ige(b, k, diam));
-         nir_jump(b, nir_jump_break);
-         nir_pop_if(b, NULL);
-
-         nir_def *sy = nir_iadd(b, row0, k);
-         nir_def *byte = load_sh_u8x4_byte(
-            b, sh_src, nir_iadd(b, nir_imul_imm(b, sy, SH_SRC_B_STRIDE), cx));
-         nir_store_var(b, acc_var,
-                       nir_iadd(b, nir_load_var(b, acc_var), nir_u2u32(b, byte)),
-                       0x1);
-         nir_store_var(b, k_var, nir_iadd_imm(b, k, 1), 0x1);
-      }
-      nir_pop_loop(b, NULL);
-
-      nir_def *acc = nir_load_var(b, acc_var);
-      store_sh_u16(b, sh_col,
-                   nir_iadd(b, nir_imul_imm(b, row0, SH_COL_STRIDE), cx),
-                   nir_u2u16(b, acc));
-
-      for (unsigned j = 1; j < 8; j++) {
-         nir_def *sy_add = nir_iadd_imm(b, nir_iadd(b, row0, two_r), j);
-         nir_def *sy_sub = nir_iadd_imm(b, row0, j - 1);
-         nir_def *b_add = load_sh_u8x4_byte(
-            b, sh_src,
-            nir_iadd(b, nir_imul_imm(b, sy_add, SH_SRC_B_STRIDE), cx));
-         nir_def *b_sub = load_sh_u8x4_byte(
-            b, sh_src,
-            nir_iadd(b, nir_imul_imm(b, sy_sub, SH_SRC_B_STRIDE), cx));
-         acc = nir_isub(b, nir_iadd(b, acc, nir_u2u32(b, b_add)),
-                        nir_u2u32(b, b_sub));
-         store_sh_u16(
-            b, sh_col,
-            nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, row0, j), SH_COL_STRIDE),
-                     cx),
-            nir_u2u16(b, acc));
-      }
-   }
-   nir_pop_if(b, NULL);
-
-   emit_shared_barrier(b);
-
-   /* Phase 2: Horizontal sliding window (16x16 threads, 4 px/thread) + store. */
-   nir_def *bx = nir_iand_imm(b, tid, 15);
-   nir_def *row = nir_ushr_imm(b, tid, 4);
-   nir_def *lx0 = nir_ishl_imm(b, bx, 2);
-   nir_def *x0 = nir_iadd(b, tile_x, lx0);
-   nir_def *py = nir_iadd(b, tile_y, row);
-
-   nir_push_if(b, nir_ilt(b, py, height));
-   {
-      nir_def *col_row = nir_imul_imm(b, row, SH_COL_STRIDE);
-      nir_variable *hsum_var =
-         nir_local_variable_create(b->impl, glsl_uint_type(), "hsum");
-      nir_variable *hk_var =
-         nir_local_variable_create(b->impl, glsl_int_type(), "hk");
-      nir_store_var(b, hsum_var, nir_imm_int(b, 0), 0x1);
-      nir_store_var(b, hk_var, nir_imm_int(b, 0), 0x1);
-
-      nir_loop *hl = nir_push_loop(b);
-      hl->control = nir_loop_control_dont_unroll;
-      {
-         nir_def *k = nir_load_var(b, hk_var);
-         nir_push_if(b, nir_ige(b, k, diam));
-         nir_jump(b, nir_jump_break);
-         nir_pop_if(b, NULL);
-
-         nir_def *c = load_sh_u16(
-            b, sh_col, nir_iadd(b, col_row, nir_iadd(b, lx0, k)));
-         nir_store_var(b, hsum_var,
-                       nir_iadd(b, nir_load_var(b, hsum_var), nir_u2u32(b, c)),
-                       0x1);
-         nir_store_var(b, hk_var, nir_iadd_imm(b, k, 1), 0x1);
-      }
-      nir_pop_loop(b, NULL);
-
-      nir_def *hsum = nir_load_var(b, hsum_var);
-      nir_def *out_p[4];
-      out_p[0] = nir_u2u8(b, nir_udiv(b, hsum, area));
-      for (unsigned t = 1; t < 4; t++) {
-         nir_def *c_add = load_sh_u16(
-            b, sh_col,
-            nir_iadd(b, col_row,
-                     nir_iadd_imm(b, nir_iadd(b, lx0, two_r), t)));
-         nir_def *c_sub = load_sh_u16(
-            b, sh_col, nir_iadd(b, col_row, nir_iadd_imm(b, lx0, t - 1)));
-         hsum = nir_isub(b, nir_iadd(b, hsum, nir_u2u32(b, c_add)),
-                         nir_u2u32(b, c_sub));
-         out_p[t] = nir_u2u8(b, nir_udiv(b, hsum, area));
-      }
-
-      nir_def *max_int_x = nir_isub(b, width, radius);
-      nir_def *max_int_y = nir_isub(b, height, radius);
-      nir_def *y_interior =
-         nir_iand(b, nir_ige(b, py, radius), nir_ilt(b, py, max_int_y));
-      nir_def *all_interior = nir_iand(
-         b, y_interior,
-         nir_iand(b, nir_ige(b, x0, radius),
-                  nir_ilt(b, nir_iadd_imm(b, x0, 3), max_int_x)));
-      nir_def *dst_row = nir_imul(b, py, stride);
-
-      nir_push_if(b, all_interior);
-      {
-         nir_def *packed = nir_vec(b, out_p, 4);
-         store_ssbo_u8x4(b, dst_u8x4, nir_iadd(b, dst_row, x0), packed);
-      }
-      nir_push_else(b, NULL);
-      {
-         for (unsigned t = 0; t < 4; t++) {
-            nir_def *px = nir_iadd_imm(b, x0, t);
-            nir_push_if(b, nir_ilt(b, px, width));
+            nir_def *y_int = nir_iand(b, nir_ige(b, y, radius),
+                                      nir_ilt(b, y, nir_isub(b, height, radius)));
+            nir_def *off = nir_iadd(b, nir_imul(b, y, stride), x0);
+            nir_push_if(b, nir_iand(b, y_int, x_int));
             {
-               nir_def *off = nir_iadd(b, dst_row, px);
-               nir_def *is_int = nir_iand(
-                  b, y_interior,
-                  nir_iand(b, nir_ige(b, px, radius), nir_ilt(b, px, max_int_x)));
-               nir_push_if(b, is_int);
-               {
-                  store_ssbo_u8(b, dst_u8, off, out_p[t]);
+               store_ssbo_u8x4(b, dst_u8x4, off, nir_vec(b, o, 4));
+            }
+            nir_push_else(b, NULL);
+            {
+               for (unsigned j = 0; j < 4; j++) {
+                  nir_def *px = nir_iadd_imm(b, x0, j);
+                  nir_def *offj = nir_iadd_imm(b, off, j);
+                  nir_push_if(b, nir_ilt(b, px, width));
+                  {
+                     nir_push_if(b, nir_iand(b, y_int,
+                                             nir_iand(b, nir_ige(b, px, radius),
+                                                      nir_ilt(b, px, x_lim))));
+                     {
+                        store_ssbo_u8(b, dst_u8, offj, o[j]);
+                     }
+                     nir_push_else(b, NULL);
+                     {
+                        store_ssbo_u8(b, dst_u8, offj,
+                                      load_ssbo_u8(b, src_u8, offj));
+                     }
+                     nir_pop_if(b, NULL);
+                  }
+                  nir_pop_if(b, NULL);
                }
-               nir_push_else(b, NULL);
-               {
-                  store_ssbo_u8(b, dst_u8, off, load_ssbo_u8(b, src_u8, off));
-               }
-               nir_pop_if(b, NULL);
             }
             nir_pop_if(b, NULL);
          }
+         nir_pop_if(b, NULL);
+
+         for (unsigned j = 0; j < 4; j++)
+            nir_store_var(b, cs_var[j],
+                          nir_isub(b, nir_iadd(b, cs[j], add[j]), sub[j]),
+                          0x1);
+         nir_store_var(b, i_var, nir_iadd_imm(b, i, 1), 0x1);
       }
-      nir_pop_if(b, NULL);
+      nir_pop_loop(b, NULL);
    }
    nir_pop_if(b, NULL);
 }
@@ -5156,7 +5104,12 @@ hk_2d_stencil_validate_dispatch_core(
                               img_bytes))
          return false;
 
-      *out_groups_x = DIV_ROUND_UP((uint32_t)width, (uint32_t)plan->tile_w);
+      /* The u8x4 row reads clamp to the last 4 columns. */
+      if (width < 4)
+         return false;
+
+      *out_groups_x =
+         DIV_ROUND_UP((uint32_t)width, hk_box_blur_out_w((uint32_t)radius));
       *out_groups_y = DIV_ROUND_UP((uint32_t)height, (uint32_t)plan->tile_h);
       return true;
    }

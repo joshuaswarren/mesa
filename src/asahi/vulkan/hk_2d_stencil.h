@@ -19,6 +19,32 @@ struct vk_descriptor_set_layout;
 /* Maximum supported 2D box-blur / stereo-SAD radius (16 -> up to 33x33). */
 #define HK_2D_STENCIL_MAX_RADIUS 16u
 
+/* Box blur tiling: each 32-lane subgroup owns a strip of source columns, 4
+ * per lane (one u8x4 read per row), and HK_BOX_BLUR_SUBGROUP_ROWS output
+ * rows; the 8 subgroups of a workgroup stack vertically on the same strip. A
+ * strip starts hk_box_blur_halo(r) columns left of its first output column, a
+ * multiple of 4 that is at least r + 1, and yields hk_box_blur_out_w(r) output
+ * columns: the lanes whose window still ends inside the strip.
+ */
+#define HK_BOX_BLUR_STRIP_W        (32u * 4u)
+#define HK_BOX_BLUR_SUBGROUP_ROWS  16u
+#define HK_BOX_BLUR_SUBGROUPS      8u
+#define HK_BOX_BLUR_TILE_H         (HK_BOX_BLUR_SUBGROUPS * HK_BOX_BLUR_SUBGROUP_ROWS)
+
+static inline uint32_t
+hk_box_blur_halo(uint32_t radius)
+{
+   return (radius + 4u) & ~3u;
+}
+
+static inline uint32_t
+hk_box_blur_out_w(uint32_t radius)
+{
+   return 4u * ((HK_BOX_BLUR_STRIP_W - 4u - hk_box_blur_halo(radius) - radius) /
+                   4u +
+                1u);
+}
+
 enum hk_2d_stencil_kind {
    HK_2D_STENCIL_BOX_BLUR_U8 = 0,
    HK_2D_STENCIL_STEREO_SAD_U8 = 1,

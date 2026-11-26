@@ -209,7 +209,8 @@ test_box_blur_matcher_and_builder(void)
       assert(got == expect);
       if (expect) {
          assert(plan.kind == HK_2D_STENCIL_BOX_BLUR_U8);
-         assert(plan.tile_w == 64 && plan.tile_h == 16);
+         assert(plan.tile_w == HK_BOX_BLUR_STRIP_W &&
+                plan.tile_h == HK_BOX_BLUR_TILE_H);
          assert(plan.width_pc_offset_B == 0);
          assert(plan.height_pc_offset_B == 4);
          assert(plan.stride_pc_offset_B == 8);
@@ -272,7 +273,33 @@ test_box_blur_matcher_and_builder(void)
       uint32_t gx = 0, gy = 0;
       assert(hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
                                                   60, 135, 1, &gx, &gy));
-      assert(gx == 30 && gy == 68);
+      /* r = 3: strips start 4 columns left of their outputs and yield 120
+       * columns; 128-row tiles. */
+      assert(hk_box_blur_halo(3) == 4 && hk_box_blur_out_w(3) == 120);
+      assert(gx == 16 && gy == 9);
+
+      /* Every radius: the strip starts a multiple of 4 columns and at least
+       * r + 1 columns left of its first output, the last output's window
+       * ends inside the 128-column strip, and one more output lane would
+       * not fit. */
+      for (uint32_t r = 0; r <= HK_2D_STENCIL_MAX_RADIUS; r++) {
+         const uint32_t halo = hk_box_blur_halo(r);
+         const uint32_t ow = hk_box_blur_out_w(r);
+         assert(halo % 4 == 0 && halo >= r + 1 && halo < r + 5);
+         assert(ow % 4 == 0 && ow >= 4);
+         assert(ow - 1 + halo + r <= HK_BOX_BLUR_STRIP_W - 1);
+         assert(ow + 3 + halo + r > HK_BOX_BLUR_STRIP_W - 1);
+      }
+
+      /* Narrower than one u8x4 read -> reject (the original shader runs). */
+      pc[0] = 3;
+      pc[2] = 3;
+      memcpy(desc.root.push, pc, sizeof(pc));
+      assert(!hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                   60, 135, 1, &gx, &gy));
+      pc[0] = 1920;
+      pc[2] = 1920;
+      memcpy(desc.root.push, pc, sizeof(pc));
 
       /* Aliasing active -> reject. */
       assert(!hk_2d_stencil_validate_dispatch_core(false, &desc, &plan, 0, 0, 0,
