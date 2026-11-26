@@ -1412,6 +1412,17 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  # Ray tracing pipeline binary import: round trip, and refusal of groups
+  # that name shaders past the pipeline's stages or of the wrong stage.
+  hk_vulkan_rt_binary_groups = executable(
+    'hk-vulkan-rt-binary-groups',
+    files('tests/hk_vulkan_rt_binary_groups.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src],
+    dependencies : [idep_mesautil, cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hal200_vulkan_msaa_depth_compression = executable(
     'hal200-vulkan-msaa-depth-compression',
     files('tests/hal200_vulkan_msaa_depth_compression.c'),
