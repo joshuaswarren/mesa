@@ -13720,7 +13720,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    unsigned vertex_loads_scheduled = 0;
    const bool batch_device_loads =
       enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
-      ctx->stage == MESA_SHADER_COMPUTE && ctx->nir && !ctx->nir->info.internal;
+      (ctx->stage == MESA_SHADER_COMPUTE ||
+       ctx->stage == MESA_SHADER_FRAGMENT) &&
+      ctx->nir && !ctx->nir->info.internal;
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
          if (I->op == AGX_OPCODE_STOP)
