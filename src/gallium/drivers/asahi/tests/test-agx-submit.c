@@ -38,7 +38,7 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          &syncs[submit->in_sync_count + 3];
       CHECK(anchor->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE);
       CHECK(anchor->handle == ctx->sib.anchor);
-      CHECK(anchor->timeline_value == ctx->sib.anchor_point);
+      CHECK(anchor->timeline_value == ctx->sib.anchor_point + 1);
    } else {
       CHECK(submit->out_sync_count == 1 || submit->out_sync_count == 3);
    }
@@ -214,6 +214,7 @@ static struct {
    uint32_t queue_id;
    uint64_t anchor_wait;
    uint64_t anchor_signal;
+   int fail_errno;
 } sib;
 
 static int
@@ -240,15 +241,17 @@ sibling_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          &syncs[submit->in_sync_count + submit->out_sync_count - 1];
       CHECK(anchor->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE);
       CHECK(anchor->handle == ctx->sib.anchor);
+      CHECK(anchor->timeline_value == ctx->sib.anchor_point + 1);
       CHECK(anchor->timeline_value > sib.anchor_signal);
-      sib.anchor_signal = anchor->timeline_value;
+      if (!sib.fail_errno)
+         sib.anchor_signal = anchor->timeline_value;
    }
 
    /* Compute commands of a sibling submission wait only on that queue. */
    const struct drm_asahi_cmd_header *h = (void *)(uintptr_t)submit->cmdbuf;
    if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE)
       CHECK(h->vdm_barrier == 0 && h->cdm_barrier == 0);
-   return 0;
+   return sib.fail_errno ? -sib.fail_errno : 0;
 }
 
 /* Submit one compute-only batch that dispatched `threads` threads through
@@ -341,6 +344,35 @@ run_sibling_checks(struct pipe_screen *screen)
    CHECK(ctx->memory_barrier_epoch == epoch + 1);
    submit_storage_batch(ctx, &bos[7], AGX_SIBLING_COMPUTE_MIN_THREADS, false);
    CHECK(!sib.anchor_wait);
+
+   /* A recoverable refusal after the anchor has started leaves an error fence
+    * on the old anchor; retirement waits for earlier sibling points and
+    * replaces the anchor so later submissions stay clean. Give the old anchor
+    * a sentinel handle distinct from drm-shim's constant handle 1 so the test
+    * observes the replacement. */
+   for (unsigned i = 0; i < 6; ++i)
+      submit_storage_batch(ctx, &bos[i], AGX_SIBLING_COMPUTE_MIN_THREADS, false);
+   CHECK(ctx->sib.anchored && ctx->sib.pending_point);
+   const uint32_t poisoned_anchor = 42;
+   ctx->sib.anchor = poisoned_anchor;
+   const uint64_t pending_before_refusal = ctx->sib.pending_point;
+   sib.fail_errno = 524; /* ENOTSUPP */
+   submit_storage_batch(ctx, &bos[6], AGX_SIBLING_COMPUTE_MIN_THREADS, true);
+   CHECK(sib.anchor_wait == pending_before_refusal);
+   CHECK(!ctx->any_faults && !ctx->submit_quarantined);
+   CHECK(ctx->sib.anchor && ctx->sib.anchor != poisoned_anchor);
+   CHECK(!ctx->sib.anchored);
+   CHECK(ctx->sib.anchor_point == 1 && ctx->sib.anchor_signalled == 1);
+   CHECK(!ctx->sib.pending_point);
+
+   /* Subsequent valid work starts fresh on the new anchor without waiting on
+    * the discarded handle. */
+   sib.fail_errno = 0;
+   sib.anchor_signal = 0;
+   submit_storage_batch(ctx, &bos[7], AGX_SIBLING_COMPUTE_MIN_THREADS, false);
+   CHECK(ctx->sib.anchored && !sib.anchor_wait);
+   CHECK(ctx->sib.anchor_point == 2 && sib.anchor_signal == 2);
+   CHECK(!ctx->any_faults);
 
    agx_sync_all(ctx, "sibling test retirement");
    dev->ops.submit = saved;

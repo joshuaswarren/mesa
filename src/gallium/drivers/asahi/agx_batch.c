@@ -1244,13 +1244,51 @@ agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
    return ret == 0;
 }
 
+/* A refused submission still gets an error fence on every output, including
+ * the context's cumulative sibling anchor. Replacing the anchor prevents a
+ * later submission from chaining that error into its own outputs, but earlier
+ * sibling work on the old anchor must finish first so no ordering is lost. */
+static bool
+agx_reset_sibling_anchor(struct agx_device *dev, struct agx_context *ctx)
+{
+   uint64_t wait_point = ctx->sib.anchor_point;
+   if (wait_point > 1) {
+      int ret;
+      do {
+         ret = drmSyncobjTimelineWait(dev->fd, &ctx->sib.anchor, &wait_point, 1,
+                                      INT64_MAX,
+                                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      } while (ret == -EINTR);
+      if (ret)
+         return false;
+   }
+
+   uint32_t fresh = 0;
+   uint64_t first_point = 1;
+   if (drmSyncobjCreate(dev->fd, 0, &fresh) ||
+       drmSyncobjTimelineSignal(dev->fd, &fresh, &first_point, 1)) {
+      if (fresh)
+         drmSyncobjDestroy(dev->fd, fresh);
+      return false;
+   }
+
+   drmSyncobjDestroy(dev->fd, ctx->sib.anchor);
+   ctx->sib.anchor = fresh;
+   ctx->sib.anchor_point = first_point;
+   ctx->sib.anchor_signalled = first_point;
+   ctx->sib.pending_point = 0;
+   ctx->sib.anchored = false;
+   return true;
+}
+
 static void
 agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
                          struct drm_asahi_sync *syncs,
                          struct agx_shared_bo_sync *shared_bos,
                          unsigned shared_bo_count, void *extres,
                          struct util_dynarray *cmdbuf, int error,
-                         uint32_t accepted_syncobj, uint32_t error_syncobj)
+                         uint32_t accepted_syncobj, uint32_t error_syncobj,
+                         uint64_t anchor_point)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
 
@@ -1284,6 +1322,8 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
    bool complete = refused || agx_wait_failed_submit(dev, error_syncobj, false);
    if (!refused)
       complete &= agx_wait_failed_submit(dev, accepted_syncobj, true);
+   if (complete && anchor_point && (refused || g17_refused))
+      complete = agx_reset_sibling_anchor(dev, ctx);
 
    /* Never put resources in the BO cache on an inconclusive wait. Keep the
     * entire batch, its fences, context and screen until process exit. This
@@ -1325,7 +1365,7 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
    }
 
    /* A refused batch is lost on its own; the context stays usable. */
-   if (!refused && !(g17_refused && complete)) {
+   if (!((refused || g17_refused) && complete)) {
       const bool first_fault = !ctx->any_faults;
       p_atomic_set(&ctx->any_faults, true);
       if (first_fault && ctx->reset.reset)
@@ -1347,7 +1387,7 @@ agx_batch_retire_faulted(struct agx_context *ctx, struct agx_batch *batch)
 
    assert(ctx->any_faults);
    agx_retire_failed_submit(ctx, batch, NULL, NULL, 0, NULL, &cmdbuf, EIO, 0,
-                            0);
+                            0, 0);
 }
 
 static void
@@ -1574,6 +1614,8 @@ agx_batch_sibling_queue(struct agx_device *dev, struct agx_context *ctx,
          /* Out of kernel queues: keep the siblings already created. */
          ctx->sib.count = target;
          ctx->sib.next = 0;
+         if (target == 1 && !ctx->sib.pending_point)
+            ctx->sib.anchored = false;
          return 0;
       }
 
@@ -1753,7 +1795,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
    if (!syncs || !shared_bos || ctx->any_faults) {
       agx_retire_failed_submit(ctx, batch, syncs, shared_bos, 0, NULL,
-                               &cmdbuf, ctx->any_faults ? EIO : ENOMEM, 0, 0);
+                               &cmdbuf, ctx->any_faults ? EIO : ENOMEM, 0, 0,
+                               0);
       return;
    }
 
@@ -1831,7 +1874,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             u_rwlock_rdunlock(&screen->destroy_lock);
             agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                      shared_bo_count, virt.extres, &cmdbuf,
-                                     sync_errno, 0, 0);
+                                     sync_errno, 0, 0, 0);
             return;
          }
 
@@ -1871,7 +1914,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       if (!virt.extres) {
          u_rwlock_rdunlock(&screen->destroy_lock);
          agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
-                                  shared_bo_count, NULL, &cmdbuf, ENOMEM, 0, 0);
+                                  shared_bo_count, NULL, &cmdbuf, ENOMEM, 0, 0,
+                                  0);
          return;
       }
 
@@ -1897,7 +1941,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       u_rwlock_rdunlock(&screen->destroy_lock);
       agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                shared_bo_count, virt.extres, &cmdbuf,
-                               sync_errno, 0, 0);
+                               sync_errno, 0, 0, 0);
       return;
    }
    agx_add_sync(syncs, &in_sync_count, explicit_syncobj);
@@ -1987,7 +2031,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       u_rwlock_rdunlock(&screen->destroy_lock);
       agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                shared_bo_count, virt.extres, &cmdbuf,
-                               error, 0, 0);
+                               error, 0, 0, 0);
       return;
    }
    if (unlikely(dev->debug & AGX_DBG_PERF)) {
@@ -2046,7 +2090,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          u_rwlock_rdunlock(&screen->destroy_lock);
          agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                   shared_bo_count, virt.extres, &cmdbuf,
-                                  compute_errno, 0, compute_syncobj);
+                                  compute_errno, 0, compute_syncobj, 0);
          return;
       }
 
@@ -2083,11 +2127,11 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* With sibling queues, completion follows submission order through the
     * context's cumulative anchor: every output of this submission also
     * covers all earlier submissions of the context, whichever kernel queue
-    * ran them. The point is spent even if the submission fails. */
+    * ran them. Advance ctx->sib.anchor_point only once the submit succeeds. */
    unsigned out_sync_count = late_point ? 2 : 3;
    uint64_t anchor_point = 0;
    if (ctx->sib.anchored) {
-      anchor_point = ++ctx->sib.anchor_point;
+      anchor_point = ctx->sib.anchor_point + 1;
       out_syncs[out_sync_count++] = (struct drm_asahi_sync){
          .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE,
          .handle = ctx->sib.anchor,
@@ -2198,7 +2242,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                      shared_bo_count, virt.extres, &cmdbuf,
                                      chunk_errno, first ? compute_syncobj : 0,
-                                     first ? 0 : compute_syncobj);
+                                     first ? 0 : compute_syncobj, 0);
             return;
          }
          first += n;
@@ -2254,7 +2298,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
-                                        error, 0, 0);
+                                        error, 0, 0, 0);
                return;
             }
             in_sync_count = 0;
@@ -2270,7 +2314,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
-                                        error, 0, 0);
+                                        error, 0, 0, 0);
                return;
             }
             if (empty)
@@ -2306,7 +2350,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
-                                        prepass_errno, 0, 0);
+                                        prepass_errno, 0, 0, 0);
                return;
             }
          }
@@ -2327,7 +2371,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
-                                        error, 0, 0);
+                                        error, 0, 0, 0);
                return;
             }
             struct drm_asahi_cmd_compute one = *compute;
@@ -2512,13 +2556,17 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
       agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                shared_bo_count, virt.extres, &cmdbuf,
-                               submit_errno, compute_syncobj, submit_syncobj);
+                               submit_errno, compute_syncobj, submit_syncobj,
+                               anchor_point);
       return;
    }
 
    /* Successful enqueue retains the fences in the kernel. */
    if (compute_syncobj)
       drmSyncobjDestroy(dev->fd, compute_syncobj);
+
+   if (anchor_point)
+      ctx->sib.anchor_point = anchor_point;
 
    /* Work on the context's own queue after this batch is ordered after it,
     * and through it after the sibling work it waited for. */
