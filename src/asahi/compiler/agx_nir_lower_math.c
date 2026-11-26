@@ -95,7 +95,15 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
       const uint32_t saved_ctrl = b->fp_math_ctrl;
       if (exact)
          b->fp_math_ctrl = nir_fp_no_fast_math;
-      if (exact && alu->def.bit_size == 32)
+
+      /* 1.0f / d is RN(1/d): the Markstein sequence degenerates to the rcp
+       * refinement, so skip the quotient steps. Reciprocal-frequency table
+       * lookups hit this constantly.
+       */
+      nir_const_value *cv = nir_src_as_const_value(alu->src[0].src);
+      if (exact && alu->def.bit_size == 32 && cv && cv[0].f32 == 1.0f)
+         res = rcp_rn(b, d);
+      else if (exact && alu->def.bit_size == 32)
          res = div_rn(b, a, d);
       else
          res = nir_fmul(b, a, nir_frcp(b, d));
