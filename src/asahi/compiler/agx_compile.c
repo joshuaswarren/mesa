@@ -64,6 +64,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
+   {"exactmath", AGX_DBG_EXACTMATH, "Correctly rounded fp32 math on application shaders"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */

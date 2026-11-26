@@ -9,6 +9,8 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_builtin_builder.h"
+#include "agx_compiler.h"
+#include "agx_debug.h"
 #include "agx_nir.h"
 
 /*
@@ -57,21 +59,18 @@ div_rn(nir_builder *b, nir_def *a, nir_def *d)
    return nir_bcsel(b, keep, q, q_2);
 }
 
-/* Driver-internal shaders take the correctly rounded forms throughout. On
- * application shaders only ops the app marked fully exact opt in: the
- * complete nir_fp_exact mask, which a strict SPIR-V FPFastMathDefault, a
- * CL kernel's ContractionOff, or an op carrying all of NoContraction,
- * NoReassociation and NoTransform produce. A lone NoContraction bit stays
- * on the fast path: DXVK stamps it on every op, so it cannot be the switch.
- * Application compute keeps the same lowerings it always had -- the exact
- * forms cost ~1-3% on a decode-heavy compute workload for results that are
- * bit-identical anyway.
+/* Driver-internal shaders take the correctly rounded forms throughout.
+ * Application shaders keep the stock lowerings they always had unless the
+ * exactmath debug flag is set: the forms cost ~1-3% on a decode-heavy
+ * compute workload for results that are bit-identical anyway, so nothing
+ * the app merely declares (float controls, NoContraction -- DXVK stamps it
+ * on every op and SPIR-V maps it to full nir_fp_exact) can be the switch.
  */
 static bool
-wants_exact_fp32(const nir_shader *s, const nir_alu_instr *alu)
+wants_exact_fp32(const nir_shader *s)
 {
    return s->info.internal ||
-          (alu->fp_math_ctrl & nir_fp_exact) == nir_fp_exact;
+          (agx_compiler_debug & AGX_DBG_EXACTMATH);
 }
 
 static bool
@@ -91,7 +90,7 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
     * as .lower_fdiv always produced -- the 2.5 ULP every Khronos API allows
     * even for `precise` NoContraction division, which DXVK puts on every op.
     */
-   const bool exact = wants_exact_fp32(b->shader, alu);
+   const bool exact = wants_exact_fp32(b->shader);
 
    nir_def *res;
    if (alu->op == nir_op_frcp) {
@@ -376,12 +375,11 @@ lower_log(nir_builder *b, nir_alu_instr *alu, void *_)
    else
       return false;
 
-   /* Either op may carry the exact mark: the flog2 the frontend emitted or
-    * the *ln2 multiply built around it. */
-   nir_scalar log = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), li);
-   if (!wants_exact_fp32(b->shader, alu) &&
-       !wants_exact_fp32(b->shader, nir_instr_as_alu(nir_def_instr(log.def))))
+   /* The exact gate is shader-level: check it once before chasing. */
+   if (!wants_exact_fp32(b->shader))
       return false;
+
+   nir_scalar log = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), li);
 
    nir_scalar xs = nir_scalar_chase_alu_src(log, 0);
 
@@ -404,7 +402,7 @@ static bool
 lower_log2(nir_builder *b, nir_alu_instr *alu, void *_)
 {
    if (alu->op != nir_op_flog2 || alu->def.bit_size != 32 ||
-       !wants_exact_fp32(b->shader, alu))
+       !wants_exact_fp32(b->shader))
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);
@@ -679,10 +677,10 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    if (instr->pass_flags)
       return nir_mov_alu(b, alu->src[0], 1);
 
-   /* Application shaders keep the stock approximation for every op not
-    * marked fully exact; agx_lower_sincos lowers those after this pass. */
-   if (!wants_exact_fp32(b->shader, alu))
-      return false;
+   /* Application shaders keep the stock approximation unless the flag is
+    * set; agx_lower_sincos lowers those ops after this pass. */
+   if (!wants_exact_fp32(b->shader))
+      return NULL;
 
    /* sin(x) and cos(x) differ only in the quadrant select: the reduction and
     * both polynomials are identical, so a sin/cos pair on one argument (the
@@ -705,7 +703,7 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
       nir_alu_instr *p = nir_instr_as_alu(ins);
       if (p->op != partner_op || p->def.bit_size > 32 ||
           p->def.num_components != alu->def.num_components ||
-          use != &p->src[0].src || !wants_exact_fp32(b->shader, p))
+          use != &p->src[0].src)
          continue;
       bool swz = true;
       for (unsigned i = 0; i < alu->def.num_components; ++i)
@@ -970,16 +968,17 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 bool
 agx_nir_lower_sincos(nir_shader *s)
 {
-   /* Skip the pair setup entirely on shaders with no trig this pass owns:
-    * application shaders hand their unmarked fsin/fcos to the stock pass. */
+   /* Application shaders hand every fsin/fcos to the stock pass unless the
+    * flag opts the whole shader in. */
+   if (!wants_exact_fp32(s))
+      return false;
+
+   /* Skip the pair setup entirely on shaders with no trig. */
    bool has_sincos = false;
    nir_foreach_function_impl(impl, s) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_alu)
-               continue;
-            has_sincos |= sincos_filter(instr, NULL) &&
-                          wants_exact_fp32(s, nir_instr_as_alu(instr));
+            has_sincos |= sincos_filter(instr, NULL);
          }
       }
    }

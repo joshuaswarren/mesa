@@ -6,6 +6,8 @@
 #include "nir_builder.h"
 
 extern "C" {
+#include "agx_compiler.h"
+#include "agx_debug.h"
 #include "agx_nir.h"
 }
 
@@ -301,12 +303,15 @@ TEST_F(LowerMathTest, SinCosThenElseArmsShareAboveIf)
    nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
 }
 
-/* The opt-in gate: on application shaders only ops carrying the full
- * nir_fp_exact mask take the correctly rounded forms. These tests build on
- * the fixture's compute shader with internal cleared. */
+/* The switch is shader-level: driver-internal shaders and the exactmath
+ * debug flag take the exact forms; nothing the app declares per-op can
+ * reach them. These tests build on the fixture's compute shader with
+ * internal cleared. */
 
-TEST_F(LowerMathTest, AppShaderMarkedOpsOptInUnmarkedStayFast)
+TEST_F(LowerMathTest, AppShaderMarkedOpsStayFast)
 {
+   /* SPIR-V maps NoContraction to the full nir_fp_exact mask and DXVK
+    * stamps it on every op, so op marks must not open the gate. */
    b.shader->info.internal = false;
    nir_def *a = nir_undef(&b, 1, 32);
    nir_def *d = nir_undef(&b, 1, 32);
@@ -316,31 +321,9 @@ TEST_F(LowerMathTest, AppShaderMarkedOpsOptInUnmarkedStayFast)
 
    ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
 
-   /* Unmarked: a * frcp(d). Marked: the Markstein sequence. */
    EXPECT_EQ(count_alu(nir_op_fdiv), 0u);
    EXPECT_EQ(count_alu(nir_op_frcp), 2u);
    EXPECT_EQ(count_alu(nir_op_fmul), 2u);
-   EXPECT_EQ(count_alu(nir_op_ffma), 4u);
-   EXPECT_EQ(count_alu(nir_op_fneg), 2u);
-   EXPECT_EQ(count_alu(nir_op_bcsel), 2u);
-   EXPECT_EQ(count_alu(nir_op_fneu), 2u);
-   EXPECT_EQ(count_alu(nir_op_feq), 1u);
-}
-
-TEST_F(LowerMathTest, AppShaderNoContractionAloneStaysFast)
-{
-   /* DXVK stamps NoContraction on every op; a single bit is not the
-    * opt-in. */
-   b.shader->info.internal = false;
-   nir_def *a = nir_undef(&b, 1, 32);
-   nir_def *d = nir_undef(&b, 1, 32);
-   nir_def *q = nir_fdiv(&b, a, d);
-   nir_instr_as_alu(nir_def_instr(q))->fp_math_ctrl |= nir_fp_no_contract;
-
-   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
-
-   EXPECT_EQ(count_alu(nir_op_frcp), 1u);
-   EXPECT_EQ(count_alu(nir_op_fmul), 1u);
    EXPECT_EQ(count_alu(nir_op_ffma), 0u);
 }
 
@@ -355,16 +338,25 @@ TEST_F(LowerMathTest, AppShaderUnmarkedTrigStaysStock)
    EXPECT_EQ(count_alu(nir_op_fsin), 1u);
 }
 
-TEST_F(LowerMathTest, AppShaderMarkedSinOptsIn)
+TEST_F(LowerMathTest, ExactmathFlagOptsIn)
 {
+   /* With the flag set an ordinary application shader takes the exact
+    * forms: Markstein for the divide, one reduction for the sin. */
    b.shader->info.internal = false;
+   agx_compiler_debug |= AGX_DBG_EXACTMATH;
+   nir_def *a = nir_undef(&b, 1, 32);
+   nir_def *d = nir_undef(&b, 1, 32);
+   nir_fdiv(&b, a, d);
    nir_def *x = nir_undef(&b, 1, 32);
-   nir_def *s = nir_fsin(&b, x);
-   nir_instr_as_alu(nir_def_instr(s))->fp_math_ctrl |= nir_fp_exact;
+   nir_fsin(&b, x);
 
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
    ASSERT_TRUE(agx_nir_lower_sincos(b.shader));
+   agx_compiler_debug &= ~AGX_DBG_EXACTMATH;
 
+   EXPECT_EQ(count_alu(nir_op_fdiv), 0u);
+   EXPECT_EQ(count_alu(nir_op_frcp), 1u);
    EXPECT_EQ(count_alu(nir_op_fsin), 0u);
    EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
-   nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
+   nir_validate_shader(b.shader, "after exactmath lowering");
 }
