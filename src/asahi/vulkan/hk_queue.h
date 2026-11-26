@@ -14,6 +14,7 @@
 
 struct hk_device;
 struct hk_packed_submit;
+struct hk_render_packet;
 
 /* Queues advertised per family when the kernel reports independent queues
  * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
@@ -131,6 +132,16 @@ struct hk_queue {
       struct hk_packed_submit *packets;
       unsigned packets_cap;
    } pack;
+
+   /* Reusable scratch and packets for submit-time render packing
+    * (hk_render_pack_runs()). */
+   struct {
+      struct util_dynarray commands;
+      struct util_dynarray runs;
+      struct util_dynarray targets;
+      struct hk_render_packet *packets;
+      unsigned packets_cap;
+   } rpack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
