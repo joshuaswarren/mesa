@@ -8185,6 +8185,12 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             I->src[1] = tmp;
          }
 
+         /* The add was allocated with two sources. Give the FMA a source
+          * array with room for its addend before writing src[2]. */
+         agx_index *src = ralloc_array(ctx, agx_index, 3);
+         memcpy(src, I->src, 2 * sizeof(*src));
+         I->src = src;
+
          const bool product_neg = I->src[0].neg;
          I->src[0].neg = false;
          I->op = AGX_OPCODE_HFMA;

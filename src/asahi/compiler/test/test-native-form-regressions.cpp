@@ -8284,6 +8284,72 @@ TEST(NativeForms, Agx3MaterializeConstantsSkipsDestinationlessInstructions)
    }
 }
 
+/* A half add with a negated register source becomes fma(a, 1.0h, -b). The
+ * add was allocated with two sources and the FMA has three, so the pass must
+ * give the instruction a larger source array before it writes the addend.
+ * Writing src[2] in the original array goes past the end of the instruction;
+ * today that lands in the bytes ralloc rounds the block up to, so a sanitizer
+ * does not see it. Check the array itself instead. */
+TEST(NativeForms, Agx3SignedHalfAddBecomesThreeSourceFma)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      for (unsigned negated = 0; negated < 3; ++negated) {
+         SCOPED_TRACE(negated);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.chip = target.chip;
+         b->shader->key = &key;
+
+         /* negated: 0 = a - b, 1 = -a + b, 2 = -a - b */
+         agx_index a = agx_preload(b, agx_register(0, AGX_SIZE_16));
+         agx_index c = agx_preload(b, agx_register(1, AGX_SIZE_16));
+         agx_index s0 = negated ? agx_neg(a) : a;
+         agx_index s1 = negated != 1 ? agx_neg(c) : c;
+         agx_instr *add =
+            agx_hadd_to(b, agx_temp(b->shader, AGX_SIZE_16), s0, s1);
+         agx_unit_test(b, add->dest[0]);
+
+         agx_materialize_agx3_alu_constants(b->shader);
+
+         ASSERT_EQ(add->op, AGX_OPCODE_HFMA);
+         ASSERT_EQ(add->nr_srcs, 3u);
+         /* Not the two-entry array allocated with the add. */
+         EXPECT_NE(add->src, add->dest + add->nr_dests);
+
+         /* For -a + b the operands swap so that b is the multiplicand. */
+         const agx_index product = negated == 1 ? c : a;
+         const agx_index addend = negated == 1 ? a : c;
+         EXPECT_TRUE(agx_is_equiv(add->src[0], product));
+         EXPECT_FALSE(add->src[0].neg);
+         EXPECT_EQ(add->src[1].neg, negated == 2);
+         EXPECT_TRUE(agx_is_equiv(add->src[2], addend));
+         EXPECT_TRUE(add->src[2].neg);
+
+         const agx_instr *one = NULL;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+                agx_is_equiv(I->dest[0], add->src[1]))
+               one = I;
+         }
+         ASSERT_NE(one, nullptr);
+         EXPECT_EQ(one->imm, 0x3c00u);
+         ralloc_free(mem);
+      }
+   }
+}
+
 TEST(NativeForms, Agx3bUsatSub32NativeAnd16Lowered)
 {
    /* 32-bit usub_sat compiles to a native saturating IADD on AGX3B, while
