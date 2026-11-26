@@ -65,6 +65,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
    {"compsched", AGX_DBG_COMPSCHED,  "Run the register-pressure scheduler on compute shaders"},
+   {"nolocalfold",AGX_DBG_NOLOCALFOLD,"Do not fold shared-access constants into the index immediate"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -2941,6 +2942,11 @@ agx_emit_local_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *instr)
    /* Shared offsets are relative to the workgroup allocation. */
    agx_index base = agx3 ? agx_local_immediate_base(b, instr) : address;
    agx_index index = agx3 ? address : agx_zero();
+   if (!agx3 && nir_intrinsic_base(instr)) {
+      unsigned unit = 4 * (instr->def.bit_size / 8);
+      assert(nir_intrinsic_base(instr) % unit == 0);
+      index = agx_immediate(nir_intrinsic_base(instr) / unit);
+   }
    assert(address.size == AGX_SIZE_16);
 
    enum agx_format format = format_for_bitsize(instr->def.bit_size);
@@ -2974,6 +2980,11 @@ agx_emit_local_store(agx_builder *b, nir_intrinsic_instr *instr)
    const bool agx3 = b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
    agx_index base = agx3 ? agx_local_immediate_base(b, instr) : address;
    agx_index index = agx3 ? address : agx_zero();
+   if (!agx3 && nir_intrinsic_base(instr)) {
+      unsigned unit = 4 * (nir_src_bit_size(instr->src[0]) / 8);
+      assert(nir_intrinsic_base(instr) % unit == 0);
+      index = agx_immediate(nir_intrinsic_base(instr) / unit);
+   }
    assert(address.size == AGX_SIZE_16);
 
    enum agx_format format = format_for_bitsize(nir_src_bit_size(instr->src[0]));
@@ -11155,6 +11166,190 @@ agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
       return false;
 
    return true;
+}
+
+/* Peel a constant addend out of a 16-bit shared address (through the u2u16
+ * narrowing and nested iadds). The lload/lstore index immediate adds 4 elements
+ * of the access type per unit (measured on G13G), so the multiple-of-unit part
+ * of the constant moves into nir_intrinsic_base (bytes) and the remainder stays
+ * in the address. */
+static nir_scalar
+agx_peel_const(nir_scalar s, int64_t *c)
+{
+   if (!nir_scalar_is_alu(s))
+      return s;
+   nir_op op = nir_scalar_alu_op(s);
+   if (op == nir_op_u2u16 || op == nir_op_u2u32) {
+      /* A u2u16 truncation and the widening back both leave the address
+       * mod-2^16 addressable; accumulate constants mod 2^16 below. */
+      return agx_peel_const(nir_scalar_chase_alu_src(s, 0), c);
+   }
+   if (op == nir_op_iadd) {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar bb = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(bb)) {
+         *c = (*c + (int64_t)nir_scalar_as_uint(bb)) & 0xffff;
+         return agx_peel_const(a, c);
+      }
+      if (nir_scalar_is_const(a)) {
+         *c = (*c + (int64_t)nir_scalar_as_uint(a)) & 0xffff;
+         return agx_peel_const(bb, c);
+      }
+   }
+   return s;
+}
+
+/* The peeled scalar as a single-component address def. */
+static nir_def *
+agx_scalar_def(nir_builder *b, nir_scalar s)
+{
+   if (s.def->num_components == 1)
+      return s.def;
+   return nir_channel(b, s.def, s.comp);
+}
+
+struct fold_cand {
+   nir_intrinsic_instr *intr;
+   unsigned oi;
+   nir_scalar stripped; /* address with constant addends removed */
+   nir_scalar key;      /* grouping key: the value under the u2u16 narrowing */
+   int64_t c;           /* constant addend (bytes) */
+   int64_t unit;        /* bytes per index unit for this access */
+};
+
+/* Group the shared accesses of one block that differ only by constants.
+ * Shared addressing wraps mod 2^16, so peeled constants and member deltas
+ * are 16-bit: the member with the lowest real address anchors a shared
+ * base, and every other member's delta lands in the lload/lstore index
+ * immediate (4 elements of the access type per unit) with any remainder
+ * kept in the address. The index immediate add does not wrap, so the fold
+ * is sound only when the anchor plus delta cannot exceed 2^16: with
+ * shared_size <= 32 KiB every in-bounds address is below 2^15, the signed
+ * 16-bit delta between two real addresses is exact, and base + delta stays
+ * under 2^16. */
+static bool
+agx_fold_shared_block(nir_builder *b, nir_block *block)
+{
+   struct fold_cand cands[512];
+   unsigned n = 0;
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic || n == ARRAY_SIZE(cands))
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      unsigned oi;
+      if (intr->intrinsic == nir_intrinsic_load_shared)
+         oi = 0;
+      else if (intr->intrinsic == nir_intrinsic_store_shared)
+         oi = 1;
+      else
+         continue;
+      if (nir_intrinsic_base(intr) != 0)
+         continue;
+      nir_def *addr = intr->src[oi].ssa;
+      if (addr->bit_size != 16)
+         continue;
+      int64_t c = 0;
+      nir_scalar stripped = agx_peel_const(nir_scalar_resolved(addr, 0), &c);
+      unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
+                         ? intr->def.bit_size
+                         : nir_src_bit_size(intr->src[0]);
+      nir_scalar key = stripped;
+      if (nir_scalar_is_alu(stripped) &&
+          nir_scalar_alu_op(stripped) == nir_op_u2u16)
+         key = nir_scalar_chase_alu_src(stripped, 0);
+      cands[n++] = (struct fold_cand){intr, oi, stripped, key, c,
+                                      4 * (int64_t)(bits / 8)};
+   }
+   bool progress = false;
+   for (unsigned i = 0; i < n; i++) {
+      if (!cands[i].intr)
+         continue;
+      /* collect the group sharing this stripped address */
+      unsigned members[512];
+      unsigned m = 0;
+      for (unsigned j = i; j < n; j++) {
+         if (cands[j].intr && cands[j].key.def == cands[i].key.def &&
+             cands[j].key.comp == cands[i].key.comp)
+            members[m++] = j;
+      }
+      if (m < 2) {
+         cands[i].intr = NULL;
+         continue;
+      }
+      /* Signed 16-bit deltas relative to the first member; the lowest
+       * member's real address anchors the shared base. A member folds
+       * only when its delta covers a whole index unit; when none does,
+       * the rewrite would only replace each address with an equivalent
+       * one, so the group is left alone. */
+      int64_t min_delta = 0;
+      for (unsigned k = 1; k < m; k++) {
+         int64_t delta =
+            (int16_t)(uint16_t)(cands[members[k]].c - cands[i].c);
+         min_delta = MIN2(min_delta, delta);
+      }
+      bool any_fold = false;
+      for (unsigned k = 0; k < m; k++) {
+         struct fold_cand *cd = &cands[members[k]];
+         int64_t d =
+            (int16_t)(uint16_t)(cd->c - cands[i].c) - min_delta;
+         if (d >= cd->unit)
+            any_fold = true;
+      }
+      if (!any_fold) {
+         for (unsigned k = 0; k < m; k++)
+            cands[members[k]].intr = NULL;
+         continue;
+      }
+      struct fold_cand *first = &cands[members[0]];
+      b->cursor = nir_before_instr(&first->intr->instr);
+      nir_def *base = agx_scalar_def(b, cands[i].stripped);
+      if (base->bit_size != 16)
+         base = nir_u2u16(b, base);
+      uint32_t cbase = (uint16_t)(cands[i].c + min_delta);
+      if (cbase)
+         base = nir_iadd_imm(b, base, cbase);
+      for (unsigned k = 0; k < m; k++) {
+         struct fold_cand *cd = &cands[members[k]];
+         int64_t delta =
+            (int16_t)(uint16_t)(cd->c - cands[i].c);
+         int64_t d = delta - min_delta;
+         int64_t fold = (d / cd->unit) * cd->unit;
+         int64_t rest = d - fold;
+         if (fold / cd->unit >= 0x10000) {
+            cd->intr = NULL;
+            continue;
+         }
+         nir_def *na = base;
+         if (rest) {
+            b->cursor = nir_before_instr(&cd->intr->instr);
+            na = nir_iadd_imm(b, base, rest);
+         }
+         nir_intrinsic_set_base(cd->intr, (int)fold);
+         nir_src_rewrite(&cd->intr->src[cd->oi], na);
+         progress = true;
+         cd->intr = NULL;
+      }
+   }
+   return progress;
+}
+
+static bool
+agx_fold_shared_offsets(nir_shader *nir)
+{
+   /* The fold's in-bounds proof needs every real address below 2^15; a
+    * larger shared window can address past it. */
+   if (nir->info.shared_size == 0 || nir->info.shared_size > 32768)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         progress |= agx_fold_shared_block(&b, block);
+      }
+      nir_progress(progress, impl, nir_metadata_none);
+   }
+   return progress;
 }
 
 static bool
@@ -19397,6 +19592,11 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
         !key->secondary)) {
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
+   }
+
+   if (!(agx_compiler_debug & AGX_DBG_NOLOCALFOLD)) {
+      NIR_PASS(_, nir, agx_fold_shared_offsets);
+      NIR_PASS(_, nir, nir_opt_dce);
    }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))

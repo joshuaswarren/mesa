@@ -713,7 +713,8 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          I->src[s] = agx_immediate_f(f);
       } else if (value == def->imm) {
          I->src[s] = agx_immediate(value);
-      } else if (value_u16 == def->imm && agx_allows_16bit_immediate(I)) {
+      } else if (value_u16 == def->imm &&
+                 agx_allows_16bit_immediate(I, ctx->key->dev.encoding)) {
          I->src[s] = agx_abs(agx_immediate(value_u16));
       } else if ((I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) &&
                  s == agx_negate_src_index(I)) {

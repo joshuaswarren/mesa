@@ -3941,7 +3941,8 @@ TEST_F(AGX3PackBinary, LocalAtomicReturnedImmediateAddressG17P)
 
    agx_instr immediate_form = {};
    immediate_form.op = AGX_OPCODE_LOCAL_ATOMIC;
-   EXPECT_TRUE(agx_allows_16bit_immediate(&immediate_form));
+   EXPECT_TRUE(
+      agx_allows_16bit_immediate(&immediate_form, AGX_ISA_ENCODING_AGX3B));
 
    const struct agx3_local_atomic_desc d = {
       .op = AGX3_ATOMIC_XCHG,
