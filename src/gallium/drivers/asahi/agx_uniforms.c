@@ -250,8 +250,8 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
          if (st->ssbo_writable_mask & BITFIELD_BIT(cb)) {
             if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE)
                batch->vtx_needs_render_barrier = true;
-            agx_batch_writes_range(batch, rsrc, sb->buffer_offset,
-                                   sb->buffer_size);
+            agx_batch_writes_storage_range(batch, rsrc, sb->buffer_offset,
+                                           sb->buffer_size);
             batch->incoherent_writes = true;
          } else {
             agx_batch_reads_range(batch, rsrc, sb->buffer_offset,

@@ -18,6 +18,7 @@
 } } while (0)
 
 static unsigned calls, computes, renders, expected_inputs;
+static struct agx_context *current_ctx;
 static bool fail_submit;
 static bool expect_fragment_barriers;
 static uint32_t first_output;
@@ -27,9 +28,20 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
                struct agx_submit_virt *virt)
 {
    calls++;
+   struct agx_context *ctx = current_ctx;
    CHECK(submit->in_sync_count == expected_inputs);
-   CHECK(submit->out_sync_count == 1 || submit->out_sync_count == 3);
    const struct drm_asahi_sync *syncs = (void *)(uintptr_t)submit->syncs;
+   /* Once a context has sibling work, the final submission of a batch also
+    * signals the context's cumulative anchor, at a fresh point. */
+   if (ctx->sib.anchored && submit->out_sync_count == 4) {
+      const struct drm_asahi_sync *anchor =
+         &syncs[submit->in_sync_count + 3];
+      CHECK(anchor->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE);
+      CHECK(anchor->handle == ctx->sib.anchor);
+      CHECK(anchor->timeline_value == ctx->sib.anchor_point);
+   } else {
+      CHECK(submit->out_sync_count == 1 || submit->out_sync_count == 3);
+   }
    if (submit->out_sync_count == 1) {
       first_output = syncs[submit->in_sync_count].handle;
       CHECK(first_output);
@@ -83,6 +95,7 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    struct agx_screen *screen = agx_screen(pctx->screen);
+   current_ctx = ctx;
    dev->params.max_commands_per_submission = split ? 1 : 64;
    struct agx_batch *batch = agx_get_batch(ctx);
 
@@ -149,6 +162,7 @@ run_fragment_barrier_checks(struct pipe_screen *screen)
    struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
    CHECK(pctx);
    struct agx_context *ctx = agx_context(pctx);
+   current_ctx = ctx;
    struct agx_screen *ascreen = agx_screen(screen);
    p_atomic_set(&ascreen->flush_wait_seqid, 0);
    dev->params.max_commands_per_submission = 64;
@@ -194,6 +208,145 @@ run_fragment_barrier_checks(struct pipe_screen *screen)
    pctx->destroy(pctx);
 }
 
+/* Sibling kernel queues: what one compute or render batch submission named. */
+static struct {
+   unsigned calls;
+   uint32_t queue_id;
+   uint64_t anchor_wait;
+   uint64_t anchor_signal;
+} sib;
+
+static int
+sibling_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
+               struct agx_submit_virt *virt)
+{
+   const struct drm_asahi_sync *syncs = (void *)(uintptr_t)submit->syncs;
+   struct agx_context *ctx = current_ctx;
+
+   sib.calls++;
+   sib.queue_id = submit->queue_id;
+   sib.anchor_wait = 0;
+   for (unsigned i = 0; i < submit->in_sync_count; ++i) {
+      if (syncs[i].handle == ctx->sib.anchor) {
+         CHECK(syncs[i].sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ);
+         sib.anchor_wait = syncs[i].timeline_value;
+      }
+   }
+
+   /* The anchor appears exactly when the context has started it. */
+   CHECK(submit->out_sync_count == (ctx->sib.anchored ? 4 : 3));
+   if (ctx->sib.anchored) {
+      const struct drm_asahi_sync *anchor =
+         &syncs[submit->in_sync_count + submit->out_sync_count - 1];
+      CHECK(anchor->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE);
+      CHECK(anchor->handle == ctx->sib.anchor);
+      CHECK(anchor->timeline_value > sib.anchor_signal);
+      sib.anchor_signal = anchor->timeline_value;
+   }
+
+   /* Compute commands of a sibling submission wait only on that queue. */
+   const struct drm_asahi_cmd_header *h = (void *)(uintptr_t)submit->cmdbuf;
+   if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE)
+      CHECK(h->vdm_barrier == 0 && h->cdm_barrier == 0);
+   return 0;
+}
+
+/* Submit one compute-only batch that dispatched `threads` threads through
+ * shader storage, touching `bo`. */
+static void
+submit_storage_batch(struct agx_context *ctx, struct agx_bo *bo,
+                     uint64_t threads, bool coherent)
+{
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_add_bo(batch, bo);
+   batch->storage_dispatches = 1;
+   batch->storage_min_threads = threads;
+   batch->coherent_writes = coherent;
+   if (ctx->batch == batch)
+      ctx->batch = NULL;
+
+   struct drm_asahi_cmd_compute c = {0};
+   agx_batch_submit(ctx, batch, &c, NULL);
+}
+
+static void
+run_sibling_checks(struct pipe_screen *screen)
+{
+   struct agx_device *dev = agx_device(screen);
+   struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+   CHECK(pctx);
+   struct agx_context *ctx = agx_context(pctx);
+   current_ctx = ctx;
+   p_atomic_set(&agx_screen(screen)->flush_wait_seqid, 0);
+
+   /* Only kernels that can keep completion ordered get siblings. */
+   CHECK((ctx->sib.count > 1) == agx_sibling_compute_supported(dev));
+   if (ctx->sib.count == 1) {
+      CHECK(ctx->sib.id[0] == ctx->queue_id);
+      pctx->destroy(pctx);
+      return;
+   }
+
+   int (*saved)(struct agx_device *, struct drm_asahi_submit *,
+                struct agx_submit_virt *) = dev->ops.submit;
+   dev->ops.submit = sibling_submit;
+   memset(&sib, 0, sizeof(sib));
+
+   struct agx_va va = {.addr = 0x4000};
+   struct agx_bo bos[8] = {0};
+   for (unsigned i = 0; i < ARRAY_SIZE(bos); i++)
+      bos[i] = (struct agx_bo){.handle = 100 + i, .refcnt = 1, .va = &va};
+
+   /* Small dispatches stay on the context's queue however deep, and do not
+    * start the anchor. */
+   for (unsigned i = 0; i < 4; ++i) {
+      submit_storage_batch(ctx, &bos[i], AGX_SIBLING_COMPUTE_MIN_THREADS - 1,
+                           false);
+      CHECK(sib.queue_id == ctx->queue_id && !sib.anchor_wait);
+   }
+   CHECK(!ctx->sib.anchored);
+   agx_sync_all(ctx, "sibling test");
+
+   /* Independent storage-only batches go round-robin once at least two
+    * earlier submissions are in flight. */
+   bool sibling_used = false;
+   for (unsigned i = 0; i < 6; ++i) {
+      submit_storage_batch(ctx, &bos[i], AGX_SIBLING_COMPUTE_MIN_THREADS,
+                           false);
+      CHECK(ctx->sib.anchored);
+      CHECK(!sib.anchor_wait);
+      /* The first candidate starts the anchor on the context's queue. */
+      if (i == 0)
+         CHECK(sib.queue_id == ctx->queue_id);
+      sibling_used |= sib.queue_id != ctx->queue_id;
+      if (sib.queue_id != ctx->queue_id)
+         CHECK(ctx->sib.pending_point == sib.anchor_signal);
+   }
+   CHECK(sibling_used);
+   CHECK(ctx->sib.pending_point);
+   const uint64_t pending = ctx->sib.pending_point;
+
+   /* A batch with a coherent write waits for the sibling work, on the
+    * context's own queue, and settles it for the work after. */
+   submit_storage_batch(ctx, &bos[6], AGX_SIBLING_COMPUTE_MIN_THREADS, true);
+   CHECK(sib.queue_id == ctx->queue_id && sib.anchor_wait == pending);
+   CHECK(!ctx->sib.pending_point);
+
+   /* A memory barrier starts a new epoch: batches recorded before it are no
+    * longer exempt from the BO overlap check. The shim retires every
+    * submission at once, so nothing is left in flight to overlap here and the
+    * next storage-only batch stays independent. */
+   const uint64_t epoch = ctx->memory_barrier_epoch;
+   pctx->memory_barrier(pctx, PIPE_BARRIER_SHADER_BUFFER);
+   CHECK(ctx->memory_barrier_epoch == epoch + 1);
+   submit_storage_batch(ctx, &bos[7], AGX_SIBLING_COMPUTE_MIN_THREADS, false);
+   CHECK(!sib.anchor_wait);
+
+   agx_sync_all(ctx, "sibling test retirement");
+   dev->ops.submit = saved;
+   pctx->destroy(pctx);
+}
+
 int
 main(void)
 {
@@ -222,6 +375,7 @@ main(void)
       pctx->destroy(pctx);
    }
    run_fragment_barrier_checks(screen);
+   run_sibling_checks(screen);
    screen->destroy(screen);
    driDestroyOptionInfo(&info);
    close(fd);

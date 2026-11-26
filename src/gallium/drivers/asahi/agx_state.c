@@ -10250,6 +10250,9 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
                       const struct agx_precompiled_shader *cs,
                       const void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
    const bool g18 = dev->chip == AGX_CHIP_G18G;
 
@@ -10452,6 +10455,9 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
                           const struct agx_precompiled_shader *cs,
                           const void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
 
    if (!agx_precomp_shader_launchable(dev, cs) ||
@@ -10606,6 +10612,9 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                    enum agx_barrier barrier, enum libagx_program program,
                    void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
    struct agx_precompiled_shader *cs =
       agx_get_precompiled(&batch->ctx->bg_eot, program);
@@ -18681,7 +18690,7 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
          continue;
 
       struct agx_resource *buffer = agx_resource(*res);
-      agx_batch_writes(batch, buffer, 0);
+      agx_batch_writes_storage(batch, buffer, 0);
       batch->incoherent_writes = true;
    }
 
@@ -19162,6 +19171,19 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
    agx_launch(batch, grid, wg, cs, NULL, MESA_SHADER_COMPUTE,
               info->variable_shared_mem, indirect);
+
+   /* Count a plain application dispatch: a direct grid with no query. The
+    * compute blitter's launches are driver work. See
+    * agx_batch_sibling_queue(). */
+   if (ctx->compute_blitter.active || indirect || statistic ||
+       ctx->time_elapsed) {
+      batch->compute_internal = true;
+   } else {
+      const uint64_t threads = (uint64_t)grid.count[0] * grid.count[1] *
+                               grid.count[2];
+      batch->storage_dispatches++;
+      batch->storage_min_threads = MIN2(batch->storage_min_threads, threads);
+   }
 
    /* TODO: Dirty tracking? */
    agx_dirty_all(ctx);
