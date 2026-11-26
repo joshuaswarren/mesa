@@ -603,6 +603,141 @@ g17p_equiv_set_raw_form(struct g17p_equiv_probe *p)
    }
 }
 
+/* Two or four 32-bit words that one tile load reads for every probe it
+ * covers. */
+struct g17p_equiv_chunk {
+   unsigned base;
+   unsigned target;
+   unsigned words;
+};
+
+static bool
+g17p_equiv_probe_is_words(const struct g17p_equiv_probe *p)
+{
+   return p->raw_format == PIPE_FORMAT_R32_UINT && p->raw_bit_size == 32 &&
+          (p->base % 4) == 0;
+}
+
+static bool
+g17p_equiv_chunk_words_ok(unsigned words)
+{
+   /* The widths of the RG32 and RGBA32 targets' own reads. */
+   return words == 2 || words == 4;
+}
+
+/*
+ * A tile load names a byte offset and a lane width, not a render target
+ * (agx3_emit_tile()), and every sample of a pixel holds its targets at the
+ * same offsets. So probes whose raw words lie next to each other, usually of
+ * different targets, can be compared with one load of two or four 32-bit
+ * words per sample instead of one load per target. A merged read starts at a
+ * probe's own offset, so at a target, and covers whole probes; a probe inside
+ * another (the same target read in another shape) shares its read. Choose
+ * the split of each run of adjacent probes that needs the fewest reads; any
+ * probe not in a merged read keeps its own. Returns the number of merged
+ * reads and sets chunk_of[k] to the read covering probe k, or -1.
+ */
+static unsigned
+g17p_equiv_build_chunks(const struct g17p_equiv_probe *probes,
+                        unsigned num_probes,
+                        struct g17p_equiv_chunk *chunks, int *chunk_of)
+{
+   unsigned order[G17P_EQUIV_MAX_PROBES];
+   unsigned n = 0;
+
+   for (unsigned k = 0; k < num_probes; ++k) {
+      chunk_of[k] = -1;
+      if (!g17p_equiv_probe_is_words(&probes[k]))
+         continue;
+
+      /* Ascending offset, the wider read first at equal offsets. */
+      unsigned i = n++;
+      for (; i > 0; --i) {
+         const struct g17p_equiv_probe *prev = &probes[order[i - 1]];
+         if (prev->base < probes[k].base ||
+             (prev->base == probes[k].base &&
+              prev->raw_components >= probes[k].raw_components))
+            break;
+         order[i] = order[i - 1];
+      }
+      order[i] = k;
+   }
+
+   /* Units: probes not inside the previous unit. A unit that partly overlaps
+    * the previous one is never merged. */
+   unsigned unit_probe[G17P_EQUIV_MAX_PROBES];
+   unsigned unit_of[G17P_EQUIV_MAX_PROBES];
+   bool unit_alone[G17P_EQUIV_MAX_PROBES];
+   unsigned num_units = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      const struct g17p_equiv_probe *p = &probes[order[i]];
+      if (num_units) {
+         const struct g17p_equiv_probe *u = &probes[unit_probe[num_units - 1]];
+         const unsigned end_u = u->base + 4 * u->raw_components;
+         if (p->base + 4 * p->raw_components <= end_u) {
+            unit_of[i] = num_units - 1;
+            continue;
+         }
+         unit_alone[num_units] = p->base < end_u;
+         if (unit_alone[num_units])
+            unit_alone[num_units - 1] = true;
+      } else {
+         unit_alone[0] = false;
+      }
+      unit_probe[num_units] = order[i];
+      unit_of[i] = num_units++;
+   }
+
+   /* Fewest reads covering units [u, num_units), by merged read or alone. */
+   unsigned cost[G17P_EQUIV_MAX_PROBES + 1];
+   unsigned last[G17P_EQUIV_MAX_PROBES];
+   cost[num_units] = 0;
+   for (int u = (int)num_units - 1; u >= 0; --u) {
+      cost[u] = 1 + cost[u + 1];
+      last[u] = u;
+      unsigned words = probes[unit_probe[u]].raw_components;
+      for (unsigned v = u + 1; v < num_units && !unit_alone[u]; ++v) {
+         const struct g17p_equiv_probe *a = &probes[unit_probe[v - 1]];
+         const struct g17p_equiv_probe *b = &probes[unit_probe[v]];
+         if (unit_alone[v] || b->base != a->base + 4 * a->raw_components)
+            break;
+         words += b->raw_components;
+         if (words > 4)
+            break;
+         /* At equal cost, prefer the longest read from the lowest offset. */
+         if (g17p_equiv_chunk_words_ok(words) && 1 + cost[v + 1] <= cost[u]) {
+            cost[u] = 1 + cost[v + 1];
+            last[u] = v;
+         }
+      }
+   }
+
+   unsigned num_chunks = 0;
+   int unit_chunk[G17P_EQUIV_MAX_PROBES];
+   for (unsigned u = 0; u < num_units;) {
+      const unsigned v = last[u];
+      int c = -1;
+      if (v > u) {
+         const struct g17p_equiv_probe *p = &probes[unit_probe[u]];
+         const struct g17p_equiv_probe *q = &probes[unit_probe[v]];
+         c = num_chunks++;
+         chunks[c] = (struct g17p_equiv_chunk){
+            .base = p->base,
+            .target = p->target,
+            .words = (q->base - p->base) / 4 + q->raw_components,
+         };
+      }
+      for (unsigned w = u; w <= v; ++w)
+         unit_chunk[w] = c;
+      u = v + 1;
+   }
+
+   for (unsigned i = 0; i < n; ++i)
+      chunk_of[order[i]] = unit_chunk[unit_of[i]];
+
+   return num_chunks;
+}
+
 static bool
 g17p_equiv_probe_is_body_read(const struct g17p_equiv_probe *p)
 {
@@ -943,8 +1078,46 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
     * otherwise dominate a wide probe. */
    nir_def *diff16 = NULL, *diff32 = NULL;
 
+   struct g17p_equiv_chunk chunks[G17P_EQUIV_MAX_PROBES];
+   int chunk_of[G17P_EQUIV_MAX_PROBES];
+   const unsigned num_chunks =
+      g17p_equiv_build_chunks(probes, num_probes, chunks, chunk_of);
+   nir_def *chunk_v0[G17P_EQUIV_MAX_PROBES];
+
+   for (unsigned c = 0; c < num_chunks; ++c) {
+      chunk_v0[c] = nir_load_local_pixel_agx(
+         &b, chunks[c].words, 32, sample_masks[0], .base = chunks[c].base,
+         .format = PIPE_FORMAT_R32_UINT, .target = chunks[c].target);
+
+      for (unsigned s = 1; s < nr_samples; ++s) {
+         nir_def *vs = nir_load_local_pixel_agx(
+            &b, chunks[c].words, 32, sample_masks[s], .base = chunks[c].base,
+            .format = PIPE_FORMAT_R32_UINT, .target = chunks[c].target);
+         nir_def *diff = nir_ixor(&b, chunk_v0[c], vs);
+         for (unsigned i = 0; i < chunks[c].words; ++i) {
+            nir_def *d = nir_channel(&b, diff, i);
+            diff32 = diff32 ? nir_ior(&b, diff32, d) : d;
+         }
+      }
+   }
+
    for (unsigned k = 0; k < num_probes; ++k) {
       const bool body_read = g17p_equiv_probe_is_body_read(&probes[k]);
+
+      if (chunk_of[k] >= 0) {
+         const struct g17p_equiv_chunk *c = &chunks[chunk_of[k]];
+         const unsigned first = (probes[k].base - c->base) / 4;
+         v0[k] = nir_channels(&b, chunk_v0[chunk_of[k]],
+                              BITFIELD_MASK(probes[k].raw_components)
+                                 << first);
+         reuse[k] = reuse_small && (body_read ||
+                                    g17p_equiv_probe_can_unpack_v0(&probes[k]))
+                       ? v0[k]
+                       : NULL;
+         any_reuse |= reuse[k] != NULL;
+         continue;
+      }
+
       uint8_t probe_bits = probes[k].raw_bit_size;
       if (body_read && !reuse_small && probe_bits == 32 &&
           (probes[k].format == PIPE_FORMAT_R8_UNORM ||
