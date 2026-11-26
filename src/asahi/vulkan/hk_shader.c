@@ -150,6 +150,13 @@ struct hk_fs_key {
     */
    bool dynamic_zs_self_dep : 1;
 
+   /** A fragment library compiled without its output interface. Only a fast
+    * link uses this compile (an optimized link compiles the shader again), so
+    * draws link it with the split epilog rather than compile an inline-blend
+    * program for it.
+    */
+   bool output_interface_later : 1;
+
    uint8_t pad[3];
 };
 
@@ -797,6 +804,10 @@ hk_populate_fs_key(struct hk_fs_key *key,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !ms->alpha_to_coverage_enable)
       key->discard_color_outputs = true;
+
+   key->output_interface_later =
+      !state->cal &&
+      !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP);
 }
 
 static bool
@@ -6522,7 +6533,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
-      !nir->info.fs.uses_sample_shading;
+      !nir->info.fs.uses_sample_shading &&
+      !(key && key->fs.output_interface_later);
 
    if (preserve_raw_mono) {
       struct blob blob;
