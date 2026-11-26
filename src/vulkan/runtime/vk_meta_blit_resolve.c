@@ -51,6 +51,7 @@ struct vk_meta_blit_key {
    /* Part of the key: it changes the shader's descriptor bindings, so a
     * pipeline built one way must not be reused the other. */
    bool combined_descriptors;
+   bool resolve_rgba8_4x_half_up;
 };
 
 static enum glsl_sampler_dim
@@ -144,7 +145,7 @@ static nir_def *
 build_tex_resolve(nir_builder *b, nir_deref_instr *t,
                   nir_def *coord,
                   VkSampleCountFlagBits samples,
-                  VkResolveModeFlagBits resolve_mode)
+                  VkResolveModeFlagBits resolve_mode, bool rgba8_4x_half_up)
 {
    nir_def *accum = nir_txf_ms(b, coord, nir_imm_int(b, 0), .texture_deref = t);
    if (resolve_mode == VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)
@@ -196,6 +197,15 @@ build_tex_resolve(nir_builder *b, nir_deref_instr *t,
       default:
          UNREACHABLE("Unsupported resolve mode");
       }
+   }
+
+   if (rgba8_4x_half_up) {
+      /* Four UNORM8 bytes average to quarter-byte steps. Adding an eighth
+       * of a byte puts a half-way value above the rounding boundary while
+       * keeping every other value on its original side. The RGBA8 store
+       * clamps at 255 and rounds to the nearest byte. */
+      return nir_ffma(b, accum, nir_imm_float(b, 0.25f),
+                      nir_imm_float(b, 0.125f / 255.0f));
    }
 
    if (resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT)
@@ -330,7 +340,8 @@ build_blit_shader(const struct vk_meta_blit_key *key)
                        .texture_deref = t, .sampler_deref = samp);
       } else {
          val = build_tex_resolve(b, t, nir_f2u32(b, src_coord),
-                                 key->src_samples, resolve_mode);
+                                 key->src_samples, resolve_mode,
+                                 key->resolve_rgba8_4x_half_up);
       }
       val = nir_trim_vector(b, val, out_comps);
 
@@ -918,6 +929,11 @@ vk_meta_resolve_image(struct vk_command_buffer *cmd,
    key.resolve_mode = resolve_mode;
    key.stencil_resolve_mode = stencil_resolve_mode;
    key.dst_format = dst_format;
+   key.resolve_rgba8_4x_half_up =
+      meta->resolve_rgba8_4x_half_up &&
+      src_image->samples == VK_SAMPLE_COUNT_4_BIT &&
+      resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT &&
+      src_format == VK_FORMAT_R8G8B8A8_UNORM && dst_format == src_format;
 
    for (uint32_t r = 0; r < region_count; r++) {
       struct vk_meta_blit_push_data push = {

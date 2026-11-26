@@ -133,7 +133,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
     * buffers reuse already-resident pages without adding per-draw work. */
    if (agx_chip_native_or_m5(dev->dev.chip)) {
       memset(bo->map, 0, bo->bo->size);
-      if (hk_g17p_cached_cmd_memory(&dev->dev))
+      if (flags & AGX_BO_WRITEBACK)
          util_flush_range(bo->map, bo->bo->size);
    }
 

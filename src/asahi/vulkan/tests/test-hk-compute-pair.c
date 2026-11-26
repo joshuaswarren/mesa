@@ -3822,9 +3822,20 @@ test_g17p_compile_occupancy(void)
       { "cmat48_ug_dwa_dfaddcopy", false, 64, 48, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
       { "cmat64x64_ug_dwa_dfaddcopy", false, 64, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true },
       { "cmat64_ug_dwa_dfaddcopy", false, 32, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat32x32_ug",            false, 32, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32x32_ug_im2a_dcopy", false, 32, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
+      { "cmat32x32_ug_dwa_dcopy",  false, 32, 32, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, true  },
+      { "cmat32x16_ug",            false, 32, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat32x16_ug_im2a_dcopy", false, 32, 16, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
+      { "cmat32x16_ug_dwa_dcopy",  false, 32, 16, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, true  },
+      { "cmat16x32_ug",            false, 16, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat16x32_ug_im2a_dcopy", false, 16, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
+      { "cmat16x16_ug",            false, 16, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
+      { "cmat16x16_ug_im2a_dcopy", false, 16, 16, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
       { "cmat16_ug_gemm_dw",       false, 64, 16, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
       { "cmat24_ug_gemm_dw",       false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
       { "cmat32_ug_gemm_dw",       false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
+      { "cmat48_ug_gemm_dw",       false, 64, 48, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
    };
    bool all_ok = true;
    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
@@ -3855,7 +3866,9 @@ test_g17p_compile_occupancy(void)
       const unsigned max_gprs =
          (cases[i].tile_m == 64 && cases[i].tile_n == 64)
             ? (cases[i].dw_a ? 144u : 136u) :
-         (cases[i].im2col_a || cases[i].dw_a ||
+         cases[i].dw_a
+            ? (cases[i].tile_n >= 24 ? 152u : 136u) :
+         (cases[i].im2col_a ||
           cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ||
           (cases[i].tile_m == 64 && cases[i].tile_n == 48))
             ? 128u : 104u;
@@ -3910,6 +3923,16 @@ test_gemm_im2col_a_fusion(void)
       { false, 64, 64, 9, 9, 4, 2, 4, 1, 1, 0, 1, 64, true, true, true },
       /* 9: unguarded cmat48, COPY1X1 fast path, M=64 (64x1), K=32, N=96 */
       { false, 64, 48, 64, 1, 32, 1, 1, 1, 1, 0, 0, 96, true, true, true },
+      /* 10: unguarded cmat32x32, vec4, M=64 (8x8), K=48 (K%32==16 tail), N=32 */
+      { false, 32, 32, 9, 8, 8, 2, 3, 1, 1, 0, 1, 32, true, true, true },
+      /* 11: unguarded cmat32x16, vec4, M=32 (4x8), K=48 (K%32==16 tail), N=16 */
+      { false, 32, 16, 5, 8, 8, 2, 3, 1, 1, 0, 1, 16, true, false, true },
+      /* 12: unguarded cmat16x32, vec4, M=16 (4x4), K=40 (K%32==8 tail), N=64 (multi-gx) */
+      { false, 16, 32, 4, 4, 8, 5, 1, 1, 1, 2, 0, 64, true, true, true },
+      /* 13: unguarded cmat16x16, vec4, M=48 (6x8), K=32, N=16 */
+      { false, 16, 16, 7, 9, 4, 2, 4, 1, 1, 0, 1, 16, false, true, true },
+      /* 14: unguarded cmat16x16, scalar non-vec4, M=16 (4x4), K=24 (hoisted yb/xb + K-tail) */
+      { false, 16, 16, 5, 4, 2, 4, 3, 1, 1, 1, 1, 16, false, false, true },
    };
 
    for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
@@ -4125,6 +4148,17 @@ test_gemm_dw_a_fusion(void)
       { 10, 10,  8,  8, 16, 48, 64, 48, 1,  0,  0, true,  true,  true,  true  },
       {  8,  8,  8,  8, 32, 64, 64, 64, 1, -1, -1, true,  true,  true,  true  },
       {  8,  8,  8,  8, 32, 64, 32, 64, 1, -1, -1, true,  true,  true,  true  },
+      /* K_step=32 small tiles + odd widths exercising both_int_s1 pair reuse and row-wrap fallback. */
+      {  8,  8,  8,  8, 32, 16, 32, 16, 1, -1, -1, true,  true,  true,  true  },
+      {  8,  8,  8,  8, 32, 32, 32, 32, 1, -1, -1, false, true,  false, true  },
+      {  6,  8,  6,  8, 32, 16, 16, 16, 1, -1, -1, true,  true,  true,  false },
+      {  6,  8,  6,  8, 32, 32, 16, 32, 1, -1, -1, true,  false, false, true  },
+      /* Odd out_w=5 (M=35? no, M=80 = 16x5): exercises odd-width row-wrap + interior pairs. */
+      { 16,  5, 16,  5, 32, 16, 16, 16, 1, -1, -1, true,  true,  true,  true  },
+      /* Narrow in_w=3 (M=48 = 16x3): exercises in_w < 4 fallback to rr_lp. */
+      { 16,  3, 16,  3, 32, 16, 16, 16, 1, -1, -1, true,  true,  false, false },
+      /* Stride-2 on K_step=32 tile: exercises !is_s1 fallback. */
+      { 17, 17,  8,  8, 32, 32, 32, 32, 2,  0,  0, true,  true,  true,  false },
    };
 
    for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
@@ -4283,7 +4317,7 @@ test_gemm_dw_a_fusion(void)
       const uint32_t ag[3] = { DIV_ROUND_UP(N, tile_n), DIV_ROUND_UP(M, tile_m), 1u };
       hk_eval_dispatch_wg(alt, ag, sa, n_sa, push_buf, dw_off + sizeof(dp));
 
-      const uint32_t k_step = (tile_m == 32 && tile_n == 64) ? 32u : 16u;
+      const uint32_t k_step = (tile_m <= 32) ? 32u : 16u;
       uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
       params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] = DIV_ROUND_UP(K, k_step);
       uint64_t bound = 0, eff = 0;
@@ -4348,6 +4382,12 @@ test_gemm_dw_fusion(void)
       /* 5: cmat24_ug 8x8 K=24 N=24 negative pad_b={0,-1,0,0} fallback + SKIP_C + SKIP_PAD_DST */
       {  8,  8, 24, 24, 24, 1, true,  true,  false, true,  { 0, -1, 0, 0 },
         HK_GEMM_DW_FLAG_SKIP_C | HK_GEMM_DW_FLAG_SKIP_PAD_DST },
+      /* 6: cmat48_ug 16x16 K=16 N=96 fast path (FD ord=2 shape!) */
+      { 16, 16, 16, 96, 48, 1, true,  true,  true,  true,  { 0,  0, 0, 0 }, 0 },
+      /* 7: cmat48_ug 16x16 K=24 (K%16==8 tail!) N=144 fast path, row bias (FD ord=6 shape!) */
+      { 16, 16, 24, 144, 48, 0, true, true,  true,  true,  { 0,  0, 0, 0 }, 0 },
+      /* 8: cmat48_ug 8x8 K=32 N=96 non-zero pad_b={0,1,1,0} fallback */
+      {  8,  8, 32, 96, 48, 1, true,  true,  true,  true,  { 0,  1, 1, 0 }, 0 },
    };
 
    for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
@@ -5045,6 +5085,110 @@ test_warm_cache_producer_fusion(void)
    ralloc_free(cold);
 }
 
+static void
+test_gemm_cmat_k32_small_tiles(void)
+{
+   /* Bit-exact verification of K_step=32 unguarded tiles (32x32, 32x16, 16x32,
+    * 16x16) across all K%32 tail remainders (8, 16, 24) and exact multiples,
+    * plus guarded and gemm_dw refusal checks and G16G/G17P/G17S compile. */
+   const struct hk_nir_clamp_epilogue relu6 = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = hk_eval_f2u(0.0f), .upper_bits = hk_eval_f2u(6.0f),
+   };
+   const struct gemm_test_opts ug_opts = {
+      .guarded = false, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   const struct gemm_test_opts grd_opts = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   nir_shader *ref_orig = build_tiled_gemm_nir_opts(&grd_opts);
+   nir_shader *ug_pre = build_tiled_gemm_nir_opts(&ug_opts);
+   nir_shader *grd_pre = build_tiled_gemm_nir_opts(&grd_opts);
+   run_hk_preprocess_for_test(ug_pre, false);
+   run_hk_preprocess_for_test(grd_pre, false);
+   struct hk_nir_gemm_output ug_m = {0}, grd_m = {0};
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      ug_pre, nir_address_format_64bit_global_32bit_offset, &ug_m));
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      grd_pre, nir_address_format_64bit_global_32bit_offset, &grd_m));
+
+   const struct { uint32_t tm, tn; } new_tiles[] = {
+      { 32, 32 }, { 32, 16 }, { 16, 32 }, { 16, 16 },
+   };
+   const struct hk_nir_dw_a_cfg dummy_gdw = {0};
+   const enum agx_chip chips[] = { AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17S };
+
+   for (unsigned ti = 0; ti < ARRAY_SIZE(new_tiles); ++ti) {
+      const uint32_t tm = new_tiles[ti].tm;
+      const uint32_t tn = new_tiles[ti].tn;
+
+      /* Guarded and gemm_dw must refuse these K_step=32 small tiles. */
+      HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+         grd_pre, &grd_m, tm, tn, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+         NULL, false, NULL, NULL, NULL) == NULL);
+      HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+         ug_pre, &ug_m, tm, tn, NULL, HK_COMPUTE_PAIR_DUAL_GEMM_DW,
+         NULL, false, NULL, &dummy_gdw, NULL) == NULL);
+
+      struct hk_pack_loop_bound lb = {0};
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         ug_pre, &ug_m, tm, tn, &relu6, HK_COMPUTE_PAIR_DUAL_NONE,
+         NULL, false, NULL, NULL, &lb);
+      HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
+      nir_validate_shader(alt, "gemm_cmat_k32_small");
+
+      const uint32_t k_cases[] = { 8, 16, 24, 32, 40, 48, 56, 64 };
+      for (unsigned ki = 0; ki < ARRAY_SIZE(k_cases); ++ki) {
+         const uint32_t M = tm * 2u;
+         const uint32_t N = tn * 2u;
+         const uint32_t K = k_cases[ki];
+         const size_t a_elems = (size_t)M * K;
+         const size_t b_elems = (size_t)K * N;
+         const size_t c_elems = (size_t)M * N;
+         float *a = calloc(a_elems, 4), *bb = calloc(b_elems, 4);
+         float *bias = calloc(N, 4), *c_ref = calloc(c_elems, 4), *c_alt = calloc(c_elems, 4);
+         uint32_t rng = 0x5100u + ti * 97u + ki * 13u;
+         for (size_t i = 0; i < a_elems; ++i) a[i] = gemm_test_rand_f32(&rng);
+         for (size_t i = 0; i < b_elems; ++i) bb[i] = gemm_test_rand_f32(&rng);
+         for (size_t i = 0; i < N; ++i) bias[i] = gemm_test_rand_f32(&rng);
+
+         struct gemm_push_layout push = {
+            .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = 1,
+         };
+         const uint32_t og[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
+         struct hk_eval_ssbo so[4] = {
+            { 0, 0, a, a_elems * 4, 0 }, { 0, 1, bb, b_elems * 4, 0 },
+            { 0, 2, bias, (size_t)N * 4, 0 }, { 0, 3, c_ref, c_elems * 4, 0 },
+         };
+         hk_eval_dispatch_wg(ref_orig, og, so, 4, &push, sizeof(push));
+         for (size_t i = 0; i < c_elems; ++i)
+            c_ref[i] = fminf(fmaxf(c_ref[i], 0.0f), 6.0f);
+
+         const uint32_t ag[3] = { N / tn, M / tm, 1u };
+         struct hk_eval_ssbo sa[4] = {
+            { 0, 0, a, a_elems * 4, 0 }, { 0, 1, bb, b_elems * 4, 0 },
+            { 0, 2, bias, (size_t)N * 4, 0 }, { 0, 3, c_alt, c_elems * 4, 0 },
+         };
+         hk_eval_dispatch_wg(alt, ag, sa, 4, &push, sizeof(push));
+         for (size_t i = 0; i < c_elems; ++i)
+            HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_ref[i]));
+
+         free(a); free(bb); free(bias); free(c_ref); free(c_alt);
+      }
+
+      for (unsigned ci = 0; ci < ARRAY_SIZE(chips); ++ci) {
+         nir_shader *native = nir_shader_clone(NULL, alt);
+         HK_EVAL_CHECK(compile_gemm_fadd_native(native, chips[ci]));
+         ralloc_free(native);
+      }
+      ralloc_free(alt);
+   }
+
+   ralloc_free(grd_pre);
+   ralloc_free(ug_pre);
+   ralloc_free(ref_orig);
+}
+
 int
 main(void)
 {
@@ -5057,6 +5201,7 @@ main(void)
    test_unit_axis_wgid_compute_pair();
    test_gemm_cmat_certify_and_build();
    test_gemm_cmat_guarded_specialize_and_shape_sweep();
+   test_gemm_cmat_k32_small_tiles();
    test_dual_write_fusion();
    test_gemm_dual_fadd_fusion();
    test_dual_copy2_fusion();

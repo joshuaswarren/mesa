@@ -2702,3 +2702,68 @@ TEST_F(Optimizer, SinkColdCompareIntoElseBlockAfterElse)
       agx_validate(b->shader, "agx_opt_sink_cold_cmp else block");
    }
 }
+
+/* AGX3B: a byte that u2u8 already masked to 0xff, masked again by the
+ * packed 8-bit store, is the masked byte itself. The fold needs every bit of
+ * the inner mask to survive the outer one. */
+TEST_F(Optimizer, AGX3BRedundantByteMask)
+{
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+
+   /* Same-width halves, and a word narrowed into a half by the inner mask. */
+   for (agx_index src : {hx, wx}) {
+      for (unsigned inner_mask : {0xffu, 0x0fu}) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         actual->shader->key = &key;
+         expected->shader->key = &key;
+
+         agx_index byte = agx_temp(actual->shader, AGX_SIZE_16);
+         agx_and_to(actual, byte, src, agx_immediate(inner_mask));
+         agx_index again = agx_temp(actual->shader, AGX_SIZE_16);
+         agx_and_to(actual, again, byte, agx_immediate(0xff));
+         agx_unit_test(actual, again);
+
+         byte = agx_temp(expected->shader, AGX_SIZE_16);
+         agx_and_to(expected, byte, src, agx_immediate(inner_mask));
+         agx_temp(expected->shader, AGX_SIZE_16); /* the folded mask */
+         agx_unit_test(expected, byte);
+
+         agx_optimize_and_dce(actual->shader);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
+}
+
+/* The outer mask clears a bit the inner one keeps (0x1ff & 0xff), the
+ * operation is not an AND, or the target is not AGX3B: nothing folds. */
+TEST_F(Optimizer, AGX3BRedundantByteMaskNegative)
+{
+   struct {
+      enum agx_isa_encoding encoding;
+      unsigned inner_mask;
+      unsigned outer_table;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, 0x1ff, UTIL_LUT2(a & b)},
+      {AGX_ISA_ENCODING_AGX3B, 0xff, UTIL_LUT2(a | b)},
+      {AGX_ISA_ENCODING_AGX3C, 0xff, UTIL_LUT2(a & b)},
+      {AGX_ISA_ENCODING_AGX2, 0xff, UTIL_LUT2(a & b)},
+   };
+   for (auto c : cases) {
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index byte = agx_temp(b->shader, AGX_SIZE_16);
+         agx_and_to(b, byte, hx, agx_immediate(c.inner_mask));
+         agx_index again = agx_temp(b->shader, AGX_SIZE_16);
+         agx_bitop_to(b, again, byte, agx_immediate(0xff), c.outer_table);
+         agx_unit_test(b, again);
+      }
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}

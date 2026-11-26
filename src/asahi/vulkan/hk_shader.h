@@ -35,6 +35,14 @@
 
 #include "vk_shader.h"
 
+static inline bool
+hk_local_read_tilebuffer(enum agx_chip chip)
+{
+   return agx_chip_local_read_tilebuffer(chip) ||
+          (agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2);
+}
+
 struct hk_physical_device;
 struct hk_compute_pair_info;
 struct hk_compute_pair_producer;
