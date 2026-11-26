@@ -1047,6 +1047,18 @@ agx_chip_has_depth_clip_control(enum agx_chip chip)
    return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
 }
 
+/* Whether Borealis enables shader-reconstructed single-plane packed 4:2:2
+ * YCbCr formats (8/10/12/16-bit views backed by plain RGBA word textures and
+ * reconstructed in NIR) and 10/12-bit YCbCr plane UNORM range restoration.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C); AGX2 keeps
+ * its existing path and other HAL300 encodings such as AGX3D (G18G) stay off
+ * until qualified on their hardware. */
+static inline bool
+agx_chip_has_packed_ycbcr(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
