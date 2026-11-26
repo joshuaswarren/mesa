@@ -121,6 +121,7 @@ hk_files = files(
   'hk_render_pack.c',
   'hk_render_pack.h',
   'hk_inline_blend_layout.h',
+  'hk_g17p_varyings.h',
   'hk_partial_mrt_hsr.h',
   'hk_queue.c',
   'hk_queue.h',
@@ -178,6 +179,12 @@ if with_tests
         idep_libagx_shaders_h, idep_agx_pack,
         idep_vulkan_runtime_headers, idep_vulkan_util_headers,
       ]),
+    suite : ['asahi'])
+
+  test('hk_g17p_varyings',
+    executable('hk_g17p_varyings_test',
+      files('tests/test-hk-g17p-varyings.c'),
+      include_directories : [include_directories('.')]),
     suite : ['asahi'])
 
   test('hk_inline_blend_layout',
