@@ -8439,8 +8439,13 @@ agx3_retire_select_waits(struct util_dynarray *emission,
                          enum agx_isa_encoding enc, const agx_instr *I,
                          uint16_t mask)
 {
-   for (unsigned s = 0; s < I->nr_srcs; ++s) {
-      const agx_index operand = I->src[s];
+   /* The mask covers every pending write of the destination this select
+    * overwrites, so with no register source (a constant-program select of
+    * uniforms and immediates) the identity reads the destination once those
+    * writes retire and writes the same value back. */
+   for (unsigned s = 0; s < I->nr_srcs + I->nr_dests; ++s) {
+      const agx_index operand = s < I->nr_srcs ? I->src[s]
+                                              : I->dest[s - I->nr_srcs];
       if (!agx3_src_is_register(operand) || operand.memory ||
           agx_channels(operand) != 1 ||
           (operand.size != AGX_SIZE_16 && operand.size != AGX_SIZE_32))
