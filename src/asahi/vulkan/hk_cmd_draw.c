@@ -13085,24 +13085,57 @@ hk_prelink_object_fragment(struct hk_device *dev, struct hk_api_shader *fs_api)
    hk_prelink_fragment(dev, fs_api, NULL, &dyn, &format, 1, false, false, 0);
 }
 
-/* A vertex shader that reads no attributes links the same prolog for every
- * vertex input state. Link the hardware program, and/or the software program
- * that tessellation and geometry run, for each index size. */
+/* Pre-link a vertex shader at PSO/shader-object creation time so the first draw
+ * does not stall on prolog compilation or link-table setup. Covers both
+ * attribute-less shaders (all states) and complete graphics pipelines with
+ * static vertex input state, including relocatable UVS fragment masks. */
 void
 hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
+                  const struct hk_api_shader *fs_api,
+                  const struct vk_graphics_pipeline_state *state,
                   bool hw_program, bool sw_program)
 {
    static const struct vk_vertex_input_state no_vi;
    static const uint16_t no_strides[MESA_VK_MAX_VERTEX_BINDINGS];
    struct hk_fast_link_key_vs key;
 
+   const struct hk_shader *fs = fs_api ? &fs_api->variants[0] : NULL;
+
    struct hk_shader *hw = &vs_api->variants[HK_VS_VARIANT_HW];
-   if (hw_program && hw->compiled && !hw->info.vs.attribs_read) {
-      hk_vs_link_key_build(
-         dev, hw, true, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
-         &no_vi, no_strides,
-         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
-      hk_get_fast_linked(dev, hw, &key);
+   if (hw_program && hw->compiled) {
+      const struct vk_vertex_input_state *vi = NULL;
+      uint16_t strides[MESA_VK_MAX_VERTEX_BINDINGS] = {0};
+      const uint16_t *vi_strides = no_strides;
+      if (!hw->info.vs.attribs_read) {
+         vi = &no_vi;
+      } else if (state && state->vi &&
+                 !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI) &&
+                 !BITSET_TEST(state->dynamic,
+                              MESA_VK_DYNAMIC_VI_BINDING_STRIDES)) {
+         vi = state->vi;
+         u_foreach_bit(b, vi->bindings_valid)
+            strides[b] = vi->bindings[b].stride;
+         vi_strides = strides;
+      }
+
+      if (vi) {
+         const enum mesa_prim prim =
+            (state && state->ia &&
+             !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY))
+               ? vk_topology_to_mesa(state->ia->primitive_topology)
+               : MESA_PRIM_TRIANGLES;
+         const VkPipelineRobustnessBufferBehaviorEXT vi_robustness =
+            state ? state->vertex_input_robustness
+                  : VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT;
+         hk_vs_link_key_build(dev, hw, true, prim, false,
+                              AGX_INDEX_SIZE_U32, false, vi, vi_strides,
+                              vi_robustness, &key);
+         if (fs && hw->info.uvs.relocatable && hw->info.uvs.written) {
+            key.uvs_flat = fs->info.fs.interp.flat & hw->info.uvs.written;
+            key.uvs_linear = fs->info.fs.interp.linear & hw->info.uvs.written;
+         }
+         hk_get_fast_linked(dev, hw, &key);
+      }
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];

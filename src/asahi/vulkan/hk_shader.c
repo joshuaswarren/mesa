@@ -11320,17 +11320,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
        * either way. */
       if (vs) {
          const bool pre_raster_after_vs = tes || gs;
-         hk_prelink_vertex(dev, vs, !state || !pre_raster_after_vs,
+         hk_prelink_vertex(dev, vs, fs, state, !state || !pre_raster_after_vs,
                            !state || pre_raster_after_vs);
       }
 
       if (fs && !state) {
          hk_prelink_object_fragment(dev, fs);
-      } else if (fs && vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
-         const struct hk_shader *hw_vs =
-            gs    ? &gs->variants[HK_GS_VARIANT_RAST]
-            : tes ? &tes->variants[HK_VS_VARIANT_HW]
-                  : &vs->variants[HK_VS_VARIANT_HW];
+      } else if (fs && state) {
+         const struct hk_shader *hw_vs = NULL;
+         if (vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
+            hw_vs = gs    ? &gs->variants[HK_GS_VARIANT_RAST]
+                    : tes ? &tes->variants[HK_VS_VARIANT_HW]
+                          : &vs->variants[HK_VS_VARIANT_HW];
+         }
          hk_prelink_pipeline_fragment(dev, hw_vs, fs, state);
       }
    }
