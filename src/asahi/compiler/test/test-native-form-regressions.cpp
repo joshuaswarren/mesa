@@ -8430,3 +8430,76 @@ TEST(NativeForms, BoundsPassesClearMetadataAcrossPreambleAndMain)
 
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, AGX3CCompilePlacesPreambleLoadBasesLow)
+{
+   for (bool emit_agx3d : {false, true}) {
+      SCOPED_TRACE(emit_agx3d ? "G18G (AGX3D control)" : "G17S (AGX3C)");
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3c preamble load base low");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *table = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *idx = nir_load_local_invocation_index(&b);
+
+      /* Fill > AGX3_SMP_HANDLE_MAX_HALF (252) uniform halves in the preamble
+       * before exporting the 64-bit load base, using per-thread products on each
+       * component so every uniform scalar stays live into the main shader. */
+      nir_def *acc = nir_imm_int(&b, 0);
+      for (unsigned i = 0; i < 36; ++i) {
+         nir_def *u = _nir_build_load_global_constant(
+            &b, 4, 32, nir_iadd_imm(&b, table, 64 + i * 16), {.align_mul = 16});
+         for (unsigned c = 0; c < 4; ++c) {
+            nir_def *lane = nir_iadd_imm(&b, idx, i * 4 + c + 1);
+            acc = nir_iadd(&b, acc, nir_imul(&b, nir_channel(&b, u, c), lane));
+         }
+      }
+
+      nir_def *base = _nir_build_load_global_constant(
+         &b, 1, 64, nir_iadd_imm(&b, table, 4096), {.align_mul = 8});
+      nir_def *val = _nir_build_load_constant_agx(
+         &b, 1, 32, base, idx,
+         {.access = ACCESS_CAN_REORDER, .base = 2, .format = PIPE_FORMAT_R32_UINT});
+      nir_def *out_addr =
+         nir_iadd(&b, table, nir_u2u64(&b, nir_ishl_imm(&b, idx, 2)));
+      _nir_build_store_global(&b, nir_iadd(&b, acc, val), out_addr, {.align_mul = 4});
+
+      agx_preprocess_nir_m5(b.shader);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = emit_agx3d ? AGX_CHIP_G18G : AGX_CHIP_G17S;
+      key.dev.emit_agx3d = emit_agx3d;
+      key.reserved_preamble = 8;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      ASSERT_NE(part.binary, nullptr);
+      ASSERT_TRUE(part.info.has_preamble);
+
+      int load_base_slot = -1;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_constant_agx)
+               continue;
+            nir_intrinsic_instr *base_load =
+               nir_src_as_intrinsic(nir_instr_as_intrinsic(instr)->src[0]);
+            ASSERT_NE(base_load, nullptr);
+            ASSERT_EQ(base_load->intrinsic, nir_intrinsic_load_preamble);
+            load_base_slot = (int)nir_intrinsic_base(base_load);
+         }
+      }
+      ASSERT_GE(load_base_slot, 0);
+      if (!emit_agx3d) {
+         EXPECT_EQ(load_base_slot, 8);
+      } else {
+         EXPECT_GT(load_base_slot, AGX3_SMP_HANDLE_MAX_HALF);
+      }
+
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
