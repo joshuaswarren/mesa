@@ -1065,6 +1065,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
    dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
+   dev->load_hazard_frag = dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS;
    simple_mtx_init(&dev->host_alias.lock, mtx_plain);
    simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
    list_inithead(&dev->host_alias.cmd_buffers);
