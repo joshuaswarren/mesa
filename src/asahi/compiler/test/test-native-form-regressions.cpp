@@ -8119,6 +8119,38 @@ TEST(NativeForms, M5TaskAndMeshMultisampleFetchLowerAndCompile)
    }
 }
 
+TEST(NativeForms, Agx3cSelectKeepsExplicitCompareModifiers)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C, AGX_ISA_ENCODING_AGX3D}) {
+      SCOPED_TRACE(encoding);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.emit_agx3d = encoding == AGX_ISA_ENCODING_AGX3D;
+      key.dev.encoding = key.dev.emit_agx3d ? AGX_ISA_ENCODING_AGX3C : encoding;
+      key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P :
+                     encoding == AGX_ISA_ENCODING_AGX3D ? AGX_CHIP_G18G :
+                                                         AGX_CHIP_G17S;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index y = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index neg_y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, neg_y, agx_neg(y));
+      agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16),
+                                      x, neg_y, agx_immediate(1),
+                                      agx_immediate(0), AGX_FCOND_LT);
+      agx_unit_test(b, sel->dest[0]);
+
+      agx_optimizer_forward(b->shader);
+      const bool skip_fold = encoding == AGX_ISA_ENCODING_AGX3C;
+      EXPECT_EQ(sel->src[1].neg, !skip_fold);
+      EXPECT_EQ(sel->src[1].value, skip_fold ? neg_y.value : y.value);
+      ralloc_free(mem);
+   }
+}
+
 /* A 16-bit FCMPSEL select immediate must keep raw integer bits unless the
  * optimizer explicitly folded a minifloat into the select slot
  * (fcmpsel_minifloat_select):
@@ -8168,11 +8200,18 @@ TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
          agx_unit_test(b, sel->dest[0]);
          agx_optimizer_forward(b->shader);
          agx_materialize_agx3_alu_constants(b->shader);
-         const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
-         ASSERT_NE(def, nullptr);
-         EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
-         EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
-         EXPECT_EQ(def->imm, 0x0020u);
+         if (target.encoding == AGX_ISA_ENCODING_AGX3C) {
+            EXPECT_EQ(sel->src[2].type, AGX_INDEX_IMMEDIATE);
+            EXPECT_EQ(sel->src[2].value, 0x0020u);
+            EXPECT_EQ(sel->src[3].type, AGX_INDEX_IMMEDIATE);
+            EXPECT_EQ(sel->src[3].value, 0u);
+         } else {
+            const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
+            ASSERT_NE(def, nullptr);
+            EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
+            EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
+            EXPECT_EQ(def->imm, 0x0020u);
+         }
          ralloc_free(mem);
       }
 

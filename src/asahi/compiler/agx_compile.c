@@ -7106,8 +7106,13 @@ agx3c_fsel16_imm_encodable(const agx_context *ctx, const agx_instr *I)
       if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
          if (I->src[s].value > UINT8_MAX)
             return false;
-         const agx_index cmp = I->src[s - 2];
-         if (cmp.type == AGX_INDEX_IMMEDIATE && cmp.value == I->src[s].value)
+         /* A raw integer can have the same bits as a comparison minifloat.
+          * Preserve the immediate unless the packer would read the whole
+          * instruction as the special tied min/max form. */
+         if (!I->invert_cond &&
+             (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+             agx_is_equiv(I->src[0], I->src[2]) &&
+             agx_is_equiv(I->src[1], I->src[3]))
             return false;
       } else if ((I->src[s].type != AGX_INDEX_NORMAL &&
                   I->src[s].type != AGX_INDEX_REGISTER) ||
