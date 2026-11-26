@@ -16,6 +16,7 @@ extern "C" {
 #include "compiler/nir/nir_builder.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -48,6 +49,7 @@ extern "C" {
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
 extern "C" {
+#include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
 }
 #include "probes/g17p-sparse-mrt.h"
@@ -19326,5 +19328,142 @@ TEST_F(AGX3PackBinary, FragmentTexelFetchUsesReservedSamplerZeroOnAgx3c)
       EXPECT_EQ(std::search(code.begin(), code.end(), bytes, bytes + len),
                 code.end())
          << "unexpected AGX3c fragment fetch with sampler_value=1";
+   }
+}
+
+/* Trimmed 16-bit vec3 loads (6 bytes) from global and global-constant memory
+ * (the lowered load_agx and load_constant_agx forms) must shrink before
+ * emission and encode/pack as a 3-component W16 load on AGX2, AGX3B, AGX3C,
+ * and G18G (AGX3D). */
+TEST_F(AGX3PackBinary, TrimmedF16Vec3MemoryLoadsPack)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+
+   for (bool is_ubo : {false, true}) {
+      for (const auto &t : targets) {
+         SCOPED_TRACE(::testing::Message()
+                      << "is_ubo=" << is_ubo << " chip=" << t.chip
+                      << " agx3d=" << t.agx3d);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "f16_vec3_shrink");
+         nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *gid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+         nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, gid, 3)));
+         nir_def *loaded =
+            is_ubo
+               ? agx_test_load_global_constant(&b, 4, 16, addr, 8,
+                                               (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER))
+               : nir_load_global(&b, 4, 16, addr, .align_mul = 8);
+         nir_def *sum = nir_fadd(&b,
+            nir_fadd(&b, nir_channel(&b, loaded, 0), nir_channel(&b, loaded, 1)),
+            nir_channel(&b, loaded, 2));
+         nir_store_global(&b, sum, nir_iadd_imm(&b, addr, 4096), .align_mul = 2);
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key k = {};
+         k.dev.encoding = t.enc;
+         k.dev.chip = t.chip;
+         k.dev.emit_agx3d = t.agx3d;
+         k.no_preamble = true;
+         k.reserved_preamble = 16;
+
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &k, &part));
+         EXPECT_GT(part.info.stats.instrs, 0u);
+         ASSERT_GT(part.info.main_size, 0u);
+
+         const nir_intrinsic_op expect_op =
+            is_ubo ? nir_intrinsic_load_constant_agx : nir_intrinsic_load_agx;
+         unsigned trimmed_nir_loads = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  if (intr->intrinsic == expect_op) {
+                     EXPECT_EQ(intr->def.bit_size, 16u);
+                     EXPECT_EQ(intr->def.num_components, 3u);
+                     trimmed_nir_loads++;
+                  }
+               }
+            }
+         }
+         EXPECT_EQ(trimmed_nir_loads, 1u);
+
+         const uint8_t *code =
+            static_cast<const uint8_t *>(part.binary) + part.info.main_offset;
+         unsigned w16_vec3_loads = 0;
+         unsigned w16_vec4_loads = 0;
+         unsigned off = 0;
+
+         while (off < part.info.main_size) {
+            const char *display = NULL;
+            const size_t avail = part.info.main_size - off;
+            if (t.enc == AGX_ISA_ENCODING_AGX2) {
+               if (avail >= 2 && code[off] == 0x08 && code[off + 1] == 0x00)
+                  break;
+               signed len = agx2_instr_length(code + off, avail, &display);
+               ASSERT_GT(len, 0);
+               if (display && strncmp(display, "load", 4) == 0 &&
+                   (display[4] == '\0' || display[4] == ' ')) {
+                  ASSERT_GE(len, 6);
+                  uint64_t raw = 0;
+                  memcpy(&raw, code + off, std::min<size_t>(len, sizeof(raw)));
+                  unsigned fmt = (((raw >> 48) & 1u) << 3) | ((raw >> 7) & 0x7u);
+                  unsigned mask = (raw >> 52) & 0xfu;
+                  if (fmt == AGX_FORMAT_I16) {
+                     if (mask == 0x7)
+                        w16_vec3_loads++;
+                     else if (mask == 0xf)
+                        w16_vec4_loads++;
+                  }
+               }
+               off += (unsigned)len;
+               continue;
+            }
+
+            signed len = 0;
+            const agx3_table *table = NULL;
+            if (t.enc == AGX_ISA_ENCODING_AGX3B) {
+               len = agx3b_instr_length(code + off, avail, &display);
+               table = &agx3b_table;
+            } else if (t.agx3d) {
+               len = agx3d_instr_length(code + off, avail, &display);
+               table = &agx3d_table;
+            } else {
+               len = agx3c_instr_length(code + off, avail, &display);
+               table = &agx3c_table;
+            }
+            ASSERT_GT(len, 0);
+            uint64_t fields[AGX3_MAX_FIELDS] = {};
+            if (agx3_decode(table, code + off, (unsigned)len, AGX3_MN_lddev,
+                            fields) >= 0 &&
+                fields[10] == AGX3_MEM_W16) {
+               if (fields[73] == 0x7)
+                  w16_vec3_loads++;
+               else if (fields[73] == 0xf)
+                  w16_vec4_loads++;
+            }
+            off += (unsigned)len;
+         }
+
+         EXPECT_EQ(w16_vec3_loads, 1u);
+         EXPECT_EQ(w16_vec4_loads, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
    }
 }

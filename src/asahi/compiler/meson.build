@@ -852,6 +852,7 @@ if with_tests
          'test/test-lower-address-checked-offsets.cpp',
          'test/test-ftz-subgroup-minmax.cpp',
          'test/test-m5-half-widen-once.cpp',
+         'test/test-shrink-memory-loads.cpp',
          'test/test-m5-byte-to-float.cpp',
          'test/test-agx3b-byte-unpack.cpp',
          'test/test-fold-narrowed-half.cpp',
