@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <limits.h>
 #include <math.h>
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
@@ -542,6 +543,111 @@ sincos_filter(const nir_instr *instr, UNUSED const void *_)
           alu->def.bit_size <= 32;
 }
 
+#define SINCOS_MAX_DEPTH 32
+#define SINCOS_MAX_PARTNERS 8
+
+/* cf nodes on the path from instr's block up to the function root. */
+static unsigned
+sincos_cf_chain(nir_instr *instr, nir_cf_node **chain)
+{
+   unsigned n = 0;
+   for (nir_cf_node *node = &instr->block->cf_node;
+        node && n < SINCOS_MAX_DEPTH; node = node->parent)
+      chain[n++] = node;
+   return n;
+}
+
+/* Order of two cf nodes with the same parent: negative if a comes first, 0 if
+ * equal, positive if a comes last, and INT_MAX when they are not siblings in
+ * a single ordered list (the two arms of an if have no order). INT_MAX keeps
+ * every <0 and <=0 dominance check false for the unordered case. */
+static int
+sincos_cf_order(nir_cf_node *a, nir_cf_node *b)
+{
+   if (a == b)
+      return 0;
+   nir_cf_node *parent = a->parent;
+   if (parent == NULL || parent != b->parent)
+      return INT_MAX;
+
+   struct exec_list *lists[3];
+   unsigned nlists = 0;
+   switch (parent->type) {
+   case nir_cf_node_function:
+      lists[nlists++] = &nir_cf_node_as_function(parent)->body;
+      break;
+   case nir_cf_node_loop: {
+      nir_loop *loop = nir_cf_node_as_loop(parent);
+      lists[nlists++] = &loop->body;
+      lists[nlists++] = &loop->continue_list;
+      break;
+   }
+   case nir_cf_node_if: {
+      nir_if *if_node = nir_cf_node_as_if(parent);
+      lists[nlists++] = &if_node->then_list;
+      lists[nlists++] = &if_node->else_list;
+      break;
+   }
+   default:
+      return INT_MAX;
+   }
+
+   int a_list = -1, b_list = -1, a_pos = -1, b_pos = -1;
+   for (unsigned l = 0; l < nlists; ++l) {
+      int pos = 0;
+      foreach_list_typed(nir_cf_node, n, node, lists[l]) {
+         if (n == a) {
+            a_list = l;
+            a_pos = pos;
+         }
+         if (n == b) {
+            b_list = l;
+            b_pos = pos;
+         }
+         ++pos;
+      }
+   }
+   if (a_list < 0 || a_list != b_list)
+      return INT_MAX;
+   return a_pos < b_pos ? -1 : (a_pos > b_pos ? 1 : 0);
+}
+
+/* Is `anc` node-or-ancestor of `node` in the cf tree. */
+static bool
+sincos_cf_contains(nir_cf_node *anc, nir_cf_node *node)
+{
+   for (nir_cf_node *n = node; n; n = n->parent)
+      if (n == anc)
+         return true;
+   return false;
+}
+
+/* The point immediately before `anchor` dominates instr: instr's chain
+ * element at the anchor's level comes at or after the anchor. */
+static bool
+sincos_after_anchor(nir_instr *instr, nir_cf_node *anchor)
+{
+   for (nir_cf_node *n = &instr->block->cf_node; n; n = n->parent)
+      if (n->parent == anchor->parent)
+         return sincos_cf_order(anchor, n) <= 0;
+   return false;
+}
+
+/* def_instr dominates the point immediately before `anchor`. The def may sit
+ * at any ancestor level of the anchor's position, so climb the anchor chain
+ * until a level the def's chain touches; there its element must come first. */
+static bool
+sincos_dominates_anchor(nir_instr *def_instr, nir_cf_node *anchor)
+{
+   nir_cf_node *dchain[SINCOS_MAX_DEPTH];
+   unsigned nd = sincos_cf_chain(def_instr, dchain);
+   for (nir_cf_node *a = anchor; a->parent; a = a->parent)
+      for (unsigned i = 0; i + 1 < nd; ++i)
+         if (dchain[i + 1] == a->parent)
+            return sincos_cf_order(dchain[i], a) < 0;
+   return false;
+}
+
 static nir_def *
 lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 {
@@ -550,6 +656,102 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    /* A pair partner below already produced this result. */
    if (instr->pass_flags)
       return nir_mov_alu(b, alu->src[0], 1);
+
+   /* sin(x) and cos(x) differ only in the quadrant select: the reduction and
+    * both polynomials are identical, so a sin/cos pair on one argument (the
+    * shape of every rotary-embedding and twiddle kernel) needs only one
+    * sequence. Candidates must be collected before anything is emitted:
+    * the shared sequence has to land where it dominates both sides, which
+    * for a pair split across sibling branches (each under its own range
+    * check, the shape of every trig wrapper) is above both branches.
+    * Collecting first also keeps the use list stable while partner fixups
+    * append fresh uses to the argument.
+    */
+   const nir_op partner_op = alu->op == nir_op_fsin ? nir_op_fcos : nir_op_fsin;
+   nir_alu_instr *cands[SINCOS_MAX_PARTNERS];
+   unsigned ncand = 0;
+   list_for_each_entry(nir_src, use, &alu->src[0].src.ssa->uses, use_link) {
+      nir_instr *ins = nir_src_is_if(use) ? NULL : nir_src_use_instr(use);
+      if (ins == NULL || ins == instr || ins->pass_flags ||
+          ins->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *p = nir_instr_as_alu(ins);
+      if (p->op != partner_op || p->def.bit_size > 32 ||
+          p->def.num_components != alu->def.num_components ||
+          use != &p->src[0].src)
+         continue;
+      bool swz = true;
+      for (unsigned i = 0; i < alu->def.num_components; ++i)
+         swz &= p->src[0].swizzle[i] == alu->src[0].swizzle[i];
+      if (!swz)
+         continue;
+      if (ncand < SINCOS_MAX_PARTNERS)
+         cands[ncand++] = p;
+   }
+
+   /* For each candidate the meet of the two cf chains names the elements
+    * the shared sequence must precede to dominate the pair. The anchor is
+    * the earliest position that still dominates every accepted candidate;
+    * candidates in unrelated subtrees cannot share and are left alone. */
+   nir_cf_node *self_chain[SINCOS_MAX_DEPTH];
+   const unsigned nself = ncand ? sincos_cf_chain(instr, self_chain) : 0;
+   nir_cf_node *anchor = NULL;
+
+   for (unsigned ci = 0; ci < ncand; ++ci) {
+      nir_cf_node *pchain[SINCOS_MAX_DEPTH];
+      unsigned npc = sincos_cf_chain(&cands[ci]->instr, pchain);
+
+      nir_cf_node *anchor_c = NULL;
+      for (unsigned j = 1; j < npc; ++j) {
+         unsigned i;
+         for (i = 0; i < nself; ++i)
+            if (pchain[j] == self_chain[i])
+               break;
+         if (i == nself)
+            continue;
+         if (i == 0)
+            break; /* partner inside self's block: always dominated */
+
+         int ord = sincos_cf_order(self_chain[i - 1], pchain[j - 1]);
+         anchor_c = ord == INT_MAX ? pchain[j]
+                                   : (ord < 0 ? self_chain[i - 1]
+                                              : pchain[j - 1]);
+         break;
+      }
+      if (anchor_c == NULL)
+         continue;
+
+      if (anchor == NULL) {
+         anchor = anchor_c;
+      } else if (sincos_cf_contains(anchor_c, anchor)) {
+         /* the higher position dominates the lower one */
+         anchor = anchor_c;
+      } else if (!sincos_cf_contains(anchor, anchor_c)) {
+         int ord = sincos_cf_order(anchor_c, anchor);
+         if (ord < 0)
+            anchor = anchor_c;
+         else if (ord == INT_MAX)
+            cands[ci] = NULL;
+      }
+   }
+
+   /* A block anchor would land before its phis, a first element has no
+    * earlier sibling to emit after, and a previous block ending in a jump
+    * (break/continue/return) would orphan the sequence; the argument must
+    * dominate the point. */
+   nir_cf_node *anchor_prev = anchor ? nir_cf_node_prev(anchor) : NULL;
+   if (anchor && (anchor->type == nir_cf_node_block ||
+                  anchor_prev == NULL ||
+                  anchor_prev->type != nir_cf_node_block ||
+                  nir_block_ends_in_jump(nir_cf_node_as_block(anchor_prev))))
+      anchor = NULL;
+   nir_instr *arg_instr = nir_def_instr(alu->src[0].src.ssa);
+   if (anchor && arg_instr && !sincos_dominates_anchor(arg_instr, anchor))
+      anchor = NULL;
+
+   if (anchor)
+      b->cursor = nir_before_cf_node(anchor);
+
 
    const uint32_t saved_ctrl = b->fp_math_ctrl;
    b->fp_math_ctrl = nir_fp_no_fast_math;
@@ -658,37 +860,45 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
          v = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, v);
    }
 
-   /* sin(x) and cos(x) differ only in the quadrant select: the reduction and
-    * both polynomials are identical, so a sin/cos pair on one argument (the
-    * shape of every rotary-embedding and twiddle kernel) needs only one
-    * sequence. The argument's other uses name the candidates; the partner
-    * must sit in the join block after everything emitted above, where the
-    * shared values dominate. Rewriting its uses lets the flag check above
-    * skip its own pass.
+   /* The partner's tail reuses the shared k (one more quadrant), sn and cs.
+    * Without a hoist it must sit in the join block after everything emitted
+    * above, or in a later element of that block's cf list, where the shared
+    * values dominate. Rewriting its uses lets the flag check above skip its
+    * own pass.
     */
-   const nir_op partner_op = alu->op == nir_op_fsin ? nir_op_fcos : nir_op_fsin;
    nir_instr *boundary = nir_def_instr(v);
    nir_def *vp32 = NULL, *vp16 = NULL;
-   list_for_each_entry(nir_src, use, &alu->src[0].src.ssa->uses, use_link) {
-      nir_instr *ins = nir_src_is_if(use) ? NULL : nir_src_use_instr(use);
-      if (ins == NULL)
-         continue;
-      if (ins->type != nir_instr_type_alu ||
-          ins->block != boundary->block)
+   for (unsigned ci = 0; ci < ncand; ++ci) {
+      nir_alu_instr *p = cands[ci];
+      if (p == NULL)
          continue;
 
-      nir_alu_instr *p = nir_instr_as_alu(ins);
-      if (p->op != partner_op || p->def.bit_size > 32 ||
-          use != &p->src[0].src ||
-          p->src[0].swizzle[0] != alu->src[0].swizzle[0])
-         continue;
-
-      /* Everything emitted above precedes the partner's program order. */
-      nir_instr *scan = nir_instr_next(boundary);
-      for (; scan && scan != ins; scan = nir_instr_next(scan))
-         ;
-      if (scan != ins)
-         continue;
+      if (anchor) {
+         if (!sincos_after_anchor(&p->instr, anchor))
+            continue;
+      } else {
+         /* join-block order: boundary's block must reach the partner */
+         bool after = p->instr.block == boundary->block;
+         if (after) {
+            nir_instr *scan = nir_instr_next(boundary);
+            for (; scan && scan != &p->instr; scan = nir_instr_next(scan))
+               ;
+            after = scan == &p->instr;
+         }
+         if (!after) {
+            /* or in a later element of the join block's cf list */
+            for (nir_cf_node *n = &p->instr.block->cf_node; n;
+                 n = n->parent) {
+               if (n->parent == boundary->block->cf_node.parent &&
+                   sincos_cf_order(&boundary->block->cf_node, n) < 0) {
+                  after = true;
+                  break;
+               }
+            }
+         }
+         if (!after)
+            continue;
+      }
 
       nir_def *cache = p->def.bit_size == 16 ? vp16 : vp32;
       if (cache) {
@@ -733,6 +943,25 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
 bool
 agx_nir_lower_sincos(nir_shader *s)
 {
+   /* Skip the pair setup entirely on shaders with no trig. */
+   bool has_sincos = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            has_sincos |= sincos_filter(instr, NULL);
+         }
+      }
+   }
+   if (!has_sincos)
+      return false;
+
+   /* Pairs only share an argument once each call site's own argument copy
+    * is unified; run the cheap SSA opts so a wrapper that re-evaluates the
+    * argument per call converges on a single def. */
+   bool progress = nir_opt_copy_prop(s);
+   progress |= nir_opt_cse(s);
    nir_shader_clear_pass_flags(s);
-   return nir_shader_lower_instructions(s, sincos_filter, lower_sincos, NULL);
+   progress |= nir_shader_lower_instructions(s, sincos_filter,
+                                             lower_sincos, NULL);
+   return progress;
 }

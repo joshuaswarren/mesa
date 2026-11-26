@@ -203,3 +203,98 @@ TEST_F(LowerMathTest, SinCosDistinctArgsReduceSeparately)
 
    EXPECT_EQ(count_alu(nir_op_fround_even), 2u);
 }
+
+TEST_F(LowerMathTest, DivByOneUsesRcp)
+{
+   set_mode(0);
+   nir_def *d = nir_undef(&b, 1, 32);
+   nir_fdiv(&b, nir_imm_float(&b, 1.0f), d);
+
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
+
+   /* 1.0f/d degenerates to the reciprocal refinement: same histogram as
+    * FrcpDefaultSequencePinned, not the four-fma Markstein tail. */
+   EXPECT_EQ(count_alu(nir_op_frcp), 1u);
+   EXPECT_EQ(count_alu(nir_op_ffma), 2u);
+   EXPECT_EQ(count_alu(nir_op_bcsel), 1u);
+   EXPECT_EQ(count_alu(nir_op_fneu), 1u);
+   EXPECT_EQ(count_alu(nir_op_fmul), 0u);
+}
+
+TEST_F(LowerMathTest, DivVecPartialOneKeepsMarkstein)
+{
+   set_mode(0);
+   nir_def *v = nir_undef(&b, 2, 32);
+   nir_def *num = nir_imm_vec2(&b, 1.0f, 2.0f);
+   nir_fdiv(&b, num, v);
+
+   ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
+
+   /* Only lane 0's numerator is 1.0: the rcp shortcut must not fire, or
+    * lane 1 would compute rcp(d) instead of 2.0/d. A vec ALU op feeding
+    * the divide (nir_vec2) would not exercise the check at all, so this
+    * must be a real constant. */
+   EXPECT_EQ(count_alu(nir_op_ffma), 4u);
+   EXPECT_EQ(count_alu(nir_op_frcp), 1u);
+}
+
+TEST_F(LowerMathTest, CosThenSinPairSharesReduction)
+{
+   set_mode(0);
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_fcos(&b, x);
+   nir_fsin(&b, x);
+
+   agx_nir_lower_sincos(b.shader);
+
+   /* Same one shared reduction with the order flipped; the fsin partner's
+    * zero fixup is the one feq. */
+   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
+   EXPECT_EQ(count_alu(nir_op_feq), 1u);
+}
+
+TEST_F(LowerMathTest, SinCosSiblingIfSharesReduction)
+{
+   set_mode(0);
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_def *c = nir_undef(&b, 1, 32);
+
+   /* The trig-wrapper shape: each op under its own range check. The shared
+    * sequence must hoist above the first branch to dominate both. */
+   nir_push_if(&b, nir_flt(&b, c, nir_imm_float(&b, 1.0f)));
+   nir_fcos(&b, x);
+   nir_push_else(&b, NULL);
+   nir_pop_if(&b, NULL);
+   nir_push_if(&b, nir_flt(&b, c, nir_imm_float(&b, 1.0f)));
+   nir_fsin(&b, x);
+   nir_push_else(&b, NULL);
+   nir_pop_if(&b, NULL);
+
+   agx_nir_lower_sincos(b.shader);
+
+   EXPECT_EQ(count_alu(nir_op_fsin), 0u);
+   EXPECT_EQ(count_alu(nir_op_fcos), 0u);
+   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
+   nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
+}
+
+TEST_F(LowerMathTest, SinCosThenElseArmsShareAboveIf)
+{
+   set_mode(0);
+   nir_def *x = nir_undef(&b, 1, 32);
+   nir_def *c = nir_undef(&b, 1, 32);
+
+   /* Opposite arms of one branch have no program order between them, but
+    * the point above the if dominates both, so sharing is legal as long as
+    * the sequence hoists. */
+   nir_push_if(&b, nir_flt(&b, c, nir_imm_float(&b, 1.0f)));
+   nir_fcos(&b, x);
+   nir_push_else(&b, NULL);
+   nir_fsin(&b, x);
+   nir_pop_if(&b, NULL);
+
+   agx_nir_lower_sincos(b.shader);
+
+   EXPECT_EQ(count_alu(nir_op_fround_even), 1u);
+   nir_validate_shader(b.shader, "after agx_nir_lower_sincos");
+}
