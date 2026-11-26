@@ -7142,15 +7142,15 @@ hk_prolog_epilog_disk_key(struct hk_device *dev, const struct hk_internal_key *k
    return true;
 }
 
-/* A stored part is its agx_shader_info followed by the binary. */
-static struct agx_shader_part *
+struct agx_shader_part *
 hk_part_from_blob(const uint8_t *data, size_t size, void *mem_ctx)
 {
    struct agx_shader_part *part = NULL;
    struct agx_shader_info info;
    if (size >= sizeof(info)) {
       memcpy(&info, data, sizeof(info));
-      if (size == sizeof(info) + info.binary_size && info.binary_size) {
+      if (size == sizeof(info) + info.binary_size && info.binary_size &&
+          agx_shader_part_info_valid(&info)) {
          part = rzalloc(mem_ctx, struct agx_shader_part);
          void *binary = part ? malloc(info.binary_size) : NULL;
          if (binary) {

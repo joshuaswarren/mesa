@@ -3485,6 +3485,14 @@ hk_stat_enabled(uint64_t addr)
    return addr != AGX_SCRATCH_PAGE_ADDRESS;
 }
 
+/* A shader part stored in the disk cache (hk_cmd_draw.c) is its
+ * agx_shader_info followed by the binary. The cache does not authenticate
+ * what it returns, so a record whose info does not fit its binary or binding
+ * array (agx_shader_part_info_valid()) yields NULL: a miss, and the part is
+ * rebuilt. The part and its binary are owned by mem_ctx and malloc. */
+struct agx_shader_part *hk_part_from_blob(const uint8_t *data, size_t size,
+                                          void *mem_ctx);
+
 /* AGX3 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
  * while an ended instance is still continuable decides whether the next one
  * may continue in its stream. */
