@@ -98,10 +98,14 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
 
       /* 1.0f / d is RN(1/d): the Markstein sequence degenerates to the rcp
        * refinement, so skip the quotient steps. Reciprocal-frequency table
-       * lookups hit this constantly.
+       * lookups hit this constantly. Every lane's numerator must be 1.0: a
+       * vec constant like (1.0, 2.0) only qualifies for component 0.
        */
       nir_const_value *cv = nir_src_as_const_value(alu->src[0].src);
-      if (exact && alu->def.bit_size == 32 && cv && cv[0].f32 == 1.0f)
+      bool all_one = cv != NULL;
+      for (unsigned i = 0; all_one && i < alu->def.num_components; ++i)
+         all_one = cv[alu->src[0].swizzle[i]].f32 == 1.0f;
+      if (exact && alu->def.bit_size == 32 && all_one)
          res = rcp_rn(b, d);
       else if (exact && alu->def.bit_size == 32)
          res = div_rn(b, a, d);
