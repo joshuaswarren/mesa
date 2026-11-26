@@ -4315,10 +4315,12 @@ agx3_emit_texture_sample_g17g(struct util_dynarray *emission,
  * waits for that result before it can stage: in a 3x3 comparison filter the
  * seventh to ninth samples each waited for one of the first three to return.
  *
- * Such a sample instead stages on slot 6, which its own SMP waits at once, and
- * returns on slots 1..5, where two results may share a slot. A consumer of
- * either result then waits for both, which costs nothing when the results are
- * combined after the run, and the whole run stays in flight.
+ * When a fragment part has more such samples than slots 1..5, each of them
+ * instead stages on slot 6, which its own SMP waits at once, and returns on
+ * slots 1..5, where two results may share a slot. A consumer of either result
+ * then waits for both, which costs nothing when the results are combined after
+ * the run, and the whole run stays in flight. A part with fewer samples keeps
+ * the single-slot form: it never runs out of slots.
  */
 static bool
 agx3_sample_stages_on_own_slot(enum agx_isa_encoding enc, bool fragment,
@@ -13786,6 +13788,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       break;
    }
 
+   /* agx3_sample_stages_on_own_slot(): split staging only when the part has
+    * more such samples than result slots. */
+   unsigned own_slot_samples = 0;
+   agx_foreach_instr_global(ctx, sample_scan) {
+      own_slot_samples += agx3_sample_stages_on_own_slot(
+         enc, ctx->stage == MESA_SHADER_FRAGMENT, sample_scan);
+   }
+   const bool split_sample_staging =
+      own_slot_samples > AGX3_SAMPLE_STAGING_SLOT - 1;
+
    unsigned k = 0;
    unsigned vertex_loads_scheduled = 0;
    const bool batch_device_loads =
@@ -13917,7 +13929,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             e->preferred_slot = 1;
          if (I->agx3_tex_coords_staged)
             e->preferred_slot = 1;
-         if (agx3_sample_stages_on_own_slot(
+         if (split_sample_staging &&
+             agx3_sample_stages_on_own_slot(
                 enc, ctx->stage == MESA_SHADER_FRAGMENT, I)) {
             e->transient_slots = 1u << (AGX3_SAMPLE_STAGING_SLOT - 1);
             e->max_slot = AGX3_SAMPLE_STAGING_SLOT - 1;
@@ -16264,10 +16277,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                           published && resource_last_use[
                                              published_resource] == instr_index,
                                           ctx->key->g17p_texture_uniform_base,
-                                          agx3_sample_stages_on_own_slot(
-                                             enc,
-                                             ctx->stage == MESA_SHADER_FRAGMENT,
-                                             I)))
+                                          split_sample_staging &&
+                                             agx3_sample_stages_on_own_slot(
+                                                enc,
+                                                ctx->stage ==
+                                                   MESA_SHADER_FRAGMENT,
+                                                I)))
                AGX3_REFUSE(I);
             /* Keep this fixed sampler block owned until its consumer has
              * retired, so later samples, fetches or image writes cannot
