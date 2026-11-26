@@ -10964,6 +10964,37 @@ TEST_F(AGX3PackBinary, HalfSelectRetiresPendingDestination)
              code.end());
 }
 
+TEST_F(AGX3PackBinary, UniformFloatSelectRetiresPendingDestination)
+{
+   /* A constant-program select whose comparands and alternatives are all
+    * uniforms or immediates (Cyberpunk 2077's
+    * fcmpsel r52, u84.h, #0, u108, u48) has no register operand to carry the
+    * wait for a load still writing the destination it overwrites. The
+    * identity then goes on the destination itself. */
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   agx_builder *b = builder(enc);
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_device_load_to(b, agx_register(52, AGX_SIZE_32),
+                      agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_fcmpsel_to(b, agx_register(52, AGX_SIZE_32),
+                  agx_uniform(84, AGX_SIZE_16), agx_immediate(0),
+                  agx_uniform(108, AGX_SIZE_32), agx_uniform(48, AGX_SIZE_32),
+                  AGX_FCOND_LT);
+   agx_stop(b);
+   const auto code = pack(b);
+   ASSERT_FALSE(code.empty());
+
+   const uint16_t operands[] = {52, 52};
+   const enum agx3_alu_hint hints[] = {
+      AGX3_ALU_HINT_NONE, AGX3_ALU_HINT_NONE};
+   uint8_t bytes[AGX3_ALU_MAX_LENGTH], length = 0;
+   ASSERT_TRUE(agx3_alu_bit_reg(enc, AGX3_ALU_BAND, 52, operands, hints, 1,
+                                bytes, &length));
+   EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + length),
+             code.end());
+}
+
 TEST_F(AGX3PackBinary, FloatUnaryPreservesLiveCoordinate)
 {
    /* Apple applegpu_g17p kernels store both OP(x) and x. The original
