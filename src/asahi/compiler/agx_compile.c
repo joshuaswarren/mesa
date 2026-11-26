@@ -64,8 +64,6 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
-   {"compsched", AGX_DBG_COMPSCHED,  "Run the register-pressure scheduler on compute shaders"},
-   {"nolocalfold",AGX_DBG_NOLOCALFOLD,"Do not fold shared-access constants into the index immediate"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -15546,13 +15544,12 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    /* The bottom-up register-pressure scheduler moves each load next to its
     * use, which serializes the memory round trips of small compute kernels
     * (the LLM decode chain: +1.7% tokens/s with it off, bit-identical
-    * results). Compute shaders on G13 therefore skip it unless
-    * AGX_MESA_DEBUG=compsched is set. Other generations keep it until they
-    * are measured. */
+    * results). Chips with AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED skip it on
+    * compute shaders; other generations keep it until they are measured. */
    bool skip_sched = (agx_compiler_debug & AGX_DBG_NOSCHED) ||
                      (nir->info.stage == MESA_SHADER_COMPUTE &&
-                      ctx->key->dev.g13 &&
-                      !(agx_compiler_debug & AGX_DBG_COMPSCHED));
+                      agx_chip_has_cap(ctx->key->dev.chip,
+                                       AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED));
    if (likely(!skip_sched)) {
       AGX_PASS(ctx, agx_pressure_schedule);
    }
@@ -19596,7 +19593,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
    }
 
-   if (key->dev.g13 && !(agx_compiler_debug & AGX_DBG_NOLOCALFOLD)) {
+   if (agx_chip_has_cap(key->dev.chip, AGX_CAP_FOLD_SHARED_OFFSETS)) {
       NIR_PASS(_, nir, agx_fold_shared_offsets);
       NIR_PASS(_, nir, nir_opt_dce);
    }

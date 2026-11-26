@@ -535,11 +535,6 @@ struct agx_device_key {
     * function's code after packing. See agx3_transcode.c for the evidence.
     */
    bool emit_agx3d;
-
-   /* Is the target GPU generation 13 (M1 family)? Selects the compute
-    * codegen defaults that are measured on G13 only.
-    */
-   bool g13;
 };
 
 /* AGX3D uses the AGX3C packer and transcodes its output. Resolve the

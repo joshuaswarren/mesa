@@ -32,8 +32,6 @@ enum agx_compiler_dbg {
    AGX_DBG_LATECOV     = BITFIELD_BIT(13),
    AGX_DBG_REFUSE      = BITFIELD_BIT(14),
    AGX_DBG_BINARIES    = BITFIELD_BIT(15),
-   AGX_DBG_COMPSCHED   = BITFIELD_BIT(16),
-   AGX_DBG_NOLOCALFOLD = BITFIELD_BIT(17),
 };
 /* clang-format on */
 
