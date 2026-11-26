@@ -6014,6 +6014,316 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
 }
 
+static bool
+hk_ail_layouts_identical_gpu(const struct ail_layout *a,
+                             const struct ail_layout *b)
+{
+   if (a->tiling != AIL_TILING_GPU || b->tiling != AIL_TILING_GPU ||
+       a->compressed != b->compressed || a->format != b->format ||
+       a->width_px != b->width_px || a->height_px != b->height_px ||
+       a->depth_px != b->depth_px || a->sample_count_sa != b->sample_count_sa ||
+       a->levels != b->levels || a->size_B == 0 || a->size_B != b->size_B ||
+       a->layer_stride_B != b->layer_stride_B ||
+       a->metadata_offset_B != b->metadata_offset_B ||
+       a->compression_layer_stride_B != b->compression_layer_stride_B ||
+       a->page_aligned_layers != b->page_aligned_layers)
+      return false;
+
+   for (unsigned l = 0; l < a->levels; ++l) {
+      if (a->level_offsets_B[l] != b->level_offsets_B[l] ||
+          a->stride_el[l] != b->stride_el[l] ||
+          a->tilesize_el[l].width_el != b->tilesize_el[l].width_el ||
+          a->tilesize_el[l].height_el != b->tilesize_el[l].height_el)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * Fast 128-bit raw compute copy for identical GPU-tiled images (AGX3 / M5).
+ *
+ * When source and destination have byte-identical AIL layouts (including
+ * compressed color targets, compressed/uncompressed D32S8 depth+stencil, and
+ * uncompressed MSAA images) and the copy covers whole planes or whole
+ * single-mip layers, copy the tiled body (and compression metadata) directly
+ * with 128-bit uvec4 compute loads/stores via hk_copy_batch — avoiding
+ * decompress+recompress or multi-pass graphics render passes.
+ */
+static bool
+hk_agx3_copy_identical_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
+                             struct hk_image *dst,
+                             const VkCopyImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_chip_native_or_m5(dev->dev.chip) || info->regionCount == 0 ||
+       src->vk.format != dst->vk.format ||
+       src->vk.image_type != dst->vk.image_type ||
+       src->vk.samples != dst->vk.samples ||
+       src->vk.mip_levels != dst->vk.mip_levels ||
+       src->vk.array_layers != dst->vk.array_layers ||
+       src->plane_count != dst->plane_count ||
+       src->vk.extent.width != dst->vk.extent.width ||
+       src->vk.extent.height != dst->vk.extent.height ||
+       src->vk.extent.depth != dst->vk.extent.depth ||
+       (src->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
+       (dst->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
+       !hk_g17p_transfer_src_layout_supported(info->srcImageLayout) ||
+       !hk_g17p_transfer_dst_layout_supported(info->dstImageLayout))
+      return false;
+
+   /* Graphics-stage PBE imageStore writes to compressed storage images stay in
+    * the PBE/compression coherency domain and race with out-of-band raw device
+    * loads. Compressed MSAA images also achieve high hardware compression
+    * ratios where copying the full uncompressed backing store transfers far
+    * more DRAM traffic than the compressed meta path. */
+   const VkImageUsageFlags all_usage =
+      src->vk.usage | dst->vk.usage |
+      src->vk.stencil_usage | dst->vk.stencil_usage;
+   const bool disallow_compressed =
+      (all_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0 ||
+      src->vk.samples > VK_SAMPLE_COUNT_1_BIT;
+
+   /* Single-mip whole-plane or whole-layer copies, or full multi-mip all-layer
+    * copies. Keep the staging span array small and stack-allocated. */
+   struct raw_span {
+      uint64_t src_addr;
+      uint64_t dst_addr;
+      uint64_t size;
+      uint8_t plane;
+   };
+   struct raw_span spans[32];
+   unsigned span_count = 0;
+
+   if (src->vk.mip_levels == 1) {
+      for (uint32_t r = 0; r < info->regionCount; ++r) {
+         const VkImageCopy2 *region = &info->pRegions[r];
+         if (region->srcSubresource.aspectMask !=
+                region->dstSubresource.aspectMask ||
+             region->srcSubresource.mipLevel != 0 ||
+             region->dstSubresource.mipLevel != 0 ||
+             region->srcOffset.x != 0 || region->srcOffset.y != 0 ||
+             region->srcOffset.z != 0 || region->dstOffset.x != 0 ||
+             region->dstOffset.y != 0 || region->dstOffset.z != 0 ||
+             region->extent.width != src->vk.extent.width ||
+             region->extent.height != src->vk.extent.height ||
+             region->extent.depth != src->vk.extent.depth)
+            return false;
+
+         const uint32_t src_layers = vk_image_subresource_layer_count(
+            &src->vk, &region->srcSubresource);
+         const uint32_t dst_layers = vk_image_subresource_layer_count(
+            &dst->vk, &region->dstSubresource);
+         if (src_layers == 0 || src_layers != dst_layers ||
+             region->srcSubresource.baseArrayLayer + src_layers >
+                src->vk.array_layers ||
+             region->dstSubresource.baseArrayLayer + dst_layers >
+                dst->vk.array_layers)
+            return false;
+
+         struct hk_g17p_copy_aspect_plan aspects;
+         if (!hk_g17p_copy_aspect_plan(region->srcSubresource.aspectMask,
+                                       region->dstSubresource.aspectMask,
+                                       &aspects))
+            return false;
+
+         const bool whole_plane =
+            region->srcSubresource.baseArrayLayer == 0 &&
+            region->dstSubresource.baseArrayLayer == 0 &&
+            src_layers == src->vk.array_layers;
+
+         for (unsigned a = 0; a < aspects.count; ++a) {
+            const uint8_t p = hk_image_aspects_to_plane(src, aspects.src[a]);
+            if (p >= src->plane_count ||
+                p != hk_image_aspects_to_plane(dst, aspects.dst[a]))
+               return false;
+
+            const struct ail_layout *sl = &src->planes[p].layout;
+            const struct ail_layout *dl = &dst->planes[p].layout;
+            if (!hk_ail_layouts_identical_gpu(sl, dl))
+               return false;
+            if (sl->compressed && disallow_compressed)
+               return false;
+
+            const uint64_t src_base = hk_image_base_address(src, p);
+            const uint64_t dst_base = hk_image_base_address(dst, p);
+            if (!src_base || !dst_base)
+               return false;
+
+            if (whole_plane) {
+               if (span_count >= ARRAY_SIZE(spans))
+                  return false;
+               spans[span_count++] = (struct raw_span){
+                  .src_addr = src_base,
+                  .dst_addr = dst_base,
+                  .size = sl->size_B,
+                  .plane = p,
+               };
+            } else {
+               if (src->vk.image_type != VK_IMAGE_TYPE_2D ||
+                   !sl->layer_stride_B)
+                  return false;
+               const uint64_t body_size =
+                  (uint64_t)src_layers * sl->layer_stride_B;
+               const uint64_t src_body =
+                  src_base + (uint64_t)region->srcSubresource.baseArrayLayer *
+                                sl->layer_stride_B;
+               const uint64_t dst_body =
+                  dst_base + (uint64_t)region->dstSubresource.baseArrayLayer *
+                                sl->layer_stride_B;
+               if (span_count + (sl->compressed ? 2u : 1u) > ARRAY_SIZE(spans))
+                  return false;
+               spans[span_count++] = (struct raw_span){
+                  .src_addr = src_body,
+                  .dst_addr = dst_body,
+                  .size = body_size,
+                  .plane = p,
+               };
+               if (sl->compressed) {
+                  if (!sl->compression_layer_stride_B)
+                     return false;
+                  const uint64_t meta_size =
+                     (uint64_t)src_layers * sl->compression_layer_stride_B;
+                  const uint64_t src_meta =
+                     src_base + sl->metadata_offset_B +
+                     (uint64_t)region->srcSubresource.baseArrayLayer *
+                        sl->compression_layer_stride_B;
+                  const uint64_t dst_meta =
+                     dst_base + sl->metadata_offset_B +
+                     (uint64_t)region->dstSubresource.baseArrayLayer *
+                        sl->compression_layer_stride_B;
+                  spans[span_count++] = (struct raw_span){
+                     .src_addr = src_meta,
+                     .dst_addr = dst_meta,
+                     .size = meta_size,
+                     .plane = p,
+                  };
+               }
+            }
+         }
+      }
+   } else {
+      if (src->vk.mip_levels > 31)
+         return false;
+      uint32_t mip_mask[3] = {0};
+      for (uint32_t r = 0; r < info->regionCount; ++r) {
+         const VkImageCopy2 *region = &info->pRegions[r];
+         const uint32_t level = region->srcSubresource.mipLevel;
+         if (region->srcSubresource.aspectMask !=
+                region->dstSubresource.aspectMask ||
+             level != region->dstSubresource.mipLevel ||
+             level >= src->vk.mip_levels ||
+             region->srcSubresource.baseArrayLayer != 0 ||
+             region->dstSubresource.baseArrayLayer != 0 ||
+             region->srcOffset.x != 0 || region->srcOffset.y != 0 ||
+             region->srcOffset.z != 0 || region->dstOffset.x != 0 ||
+             region->dstOffset.y != 0 || region->dstOffset.z != 0)
+            return false;
+
+         const VkExtent3D mip_ext = vk_image_mip_level_extent(&src->vk, level);
+         if (region->extent.width != mip_ext.width ||
+             region->extent.height != mip_ext.height ||
+             region->extent.depth != mip_ext.depth)
+            return false;
+
+         const uint32_t src_layers = vk_image_subresource_layer_count(
+            &src->vk, &region->srcSubresource);
+         const uint32_t dst_layers = vk_image_subresource_layer_count(
+            &dst->vk, &region->dstSubresource);
+         if (src_layers != src->vk.array_layers ||
+             dst_layers != dst->vk.array_layers)
+            return false;
+
+         struct hk_g17p_copy_aspect_plan aspects;
+         if (!hk_g17p_copy_aspect_plan(region->srcSubresource.aspectMask,
+                                       region->dstSubresource.aspectMask,
+                                       &aspects))
+            return false;
+
+         for (unsigned a = 0; a < aspects.count; ++a) {
+            const uint8_t p = hk_image_aspects_to_plane(src, aspects.src[a]);
+            if (p >= src->plane_count || p >= ARRAY_SIZE(mip_mask) ||
+                p != hk_image_aspects_to_plane(dst, aspects.dst[a]))
+               return false;
+            mip_mask[p] |= BITFIELD_BIT(level);
+         }
+      }
+
+      const uint32_t full_mask = BITFIELD_MASK(src->vk.mip_levels);
+      for (unsigned p = 0; p < src->plane_count; ++p) {
+         if (!mip_mask[p])
+            continue;
+         if (mip_mask[p] != full_mask)
+            return false;
+         const struct ail_layout *sl = &src->planes[p].layout;
+         const struct ail_layout *dl = &dst->planes[p].layout;
+         if (!hk_ail_layouts_identical_gpu(sl, dl))
+            return false;
+         if (sl->compressed && disallow_compressed)
+            return false;
+         const uint64_t src_base = hk_image_base_address(src, p);
+         const uint64_t dst_base = hk_image_base_address(dst, p);
+         if (!src_base || !dst_base || span_count >= ARRAY_SIZE(spans))
+            return false;
+         spans[span_count++] = (struct raw_span){
+            .src_addr = src_base,
+            .dst_addr = dst_base,
+            .size = sl->size_B,
+            .plane = p,
+         };
+      }
+   }
+
+   if (span_count == 0)
+      return false;
+
+   /* Reject any partial VA overlap between sources and destinations. */
+   for (unsigned i = 0; i < span_count; ++i) {
+      for (unsigned j = 0; j < span_count; ++j) {
+         if (spans[i].src_addr == spans[j].dst_addr &&
+             spans[i].size == spans[j].size && i == j)
+            continue;
+         if (spans[i].src_addr < spans[j].dst_addr + spans[j].size &&
+             spans[j].dst_addr < spans[i].src_addr + spans[i].size)
+            return false;
+      }
+   }
+
+   struct hk_meta_save save;
+   hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   struct hk_copy_batch batch = {0};
+   uint8_t touched_planes = 0;
+   for (unsigned i = 0; i < span_count; ++i) {
+      if (spans[i].src_addr == spans[i].dst_addr)
+         continue;
+      /* Large full-plane spans (e.g. D32 16 MiB + S8 4 MiB) saturate the GPU
+       * on their own; flushing them individually uses the single-region 128-bit
+       * copy kernel and avoids hk_copy_batch's max_groups * count wasted
+       * threads across mismatched plane sizes. */
+      if (spans[i].size >= (1u << 20)) {
+         hk_copy_batch_flush(cmd, &batch);
+         vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, spans[i].src_addr,
+                                       spans[i].dst_addr, spans[i].size);
+      } else {
+         hk_copy_batch_add(cmd, &batch, spans[i].src_addr, spans[i].dst_addr,
+                           spans[i].size);
+      }
+      touched_planes |= BITFIELD_BIT(spans[i].plane);
+   }
+   hk_copy_batch_flush(cmd, &batch);
+   if (cmd->current_cs.cs) {
+      u_foreach_bit(p, touched_planes) {
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(src, p),
+                                   src->planes[p].layout.size_B);
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(dst, p),
+                                   dst->planes[p].layout.size_B);
+      }
+   }
+   hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   return true;
+}
+
 static void
 hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
@@ -6022,6 +6332,10 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, src_image, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(hk_image, dst_image, pCopyImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (hk_agx3_copy_identical_image(cmd, src_image, dst_image, pCopyImageInfo))
+      return;
+
    /* VkCmdCopyImage preserves the source bits; compatible source and
     * destination formats do not imply a format conversion.  The element
     * planner checks their block sizes, so prefer the raw tiled copier for
