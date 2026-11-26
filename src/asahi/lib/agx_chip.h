@@ -339,13 +339,15 @@ enum agx_chip_quirk {
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
      AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS |                \
-        AGX_QUIRK_HW_TXF_BOUNDS,                                               \
+        AGX_QUIRK_HW_TXF_BOUNDS | AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,     \
      __VA_ARGS__)                                                              \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
