@@ -332,9 +332,12 @@ struct hk_shader {
    uint64_t constant_data_id;
 
    /* BO for any uploaded shader part */
-   /* Code heap chunk holding the binary, at bo_offset. */
+   /* Code heap chunk holding the binary from byte bo_skip on, at bo_offset. */
    struct agx_bo *bo;
    uint32_t bo_offset;
+
+   /* Leading bytes of the binary left out of the upload (hk_upload_code()). */
+   uint32_t bo_skip;
 
    /* Cache of fast linked variants */
    struct {
@@ -400,10 +403,12 @@ struct hk_shader {
    bool preamble_cs_attempted;
 };
 
+/* The address byte 0 of the binary would have. Only the bytes from bo_skip on
+ * are uploaded, so address no offset below that. */
 static inline uint64_t
 hk_shader_code_va(const struct hk_shader *s)
 {
-   return s->bo->va->addr + s->bo_offset;
+   return s->bo->va->addr + s->bo_offset - s->bo_skip;
 }
 
 enum hk_vs_variant {

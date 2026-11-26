@@ -130,6 +130,7 @@ hk_files = files(
   'hk_shader.c',
   'hk_nir_lower_image_view_min_lod.c',
   'hk_shader.h',
+  'hk_shader_upload_core.h',
   'hk_sync.c',
   'hk_sync.h',
   'hk_tess_batch.c',
@@ -208,6 +209,10 @@ if with_tests
     suite : ['asahi'])
   test('hk_host_alias', executable('hk_host_alias_test',
     files('tests/test-hk-host-alias.c', 'hk_host_alias.c'),
+    include_directories : include_directories('.')),
+    suite : ['asahi'])
+  test('hk_shader_upload', executable('hk_shader_upload_test',
+    files('tests/test-hk-shader-upload.c'),
     include_directories : include_directories('.')),
     suite : ['asahi'])
   test(
