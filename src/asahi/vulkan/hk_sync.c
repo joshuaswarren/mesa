@@ -1175,6 +1175,25 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       st->pending_start_ts = (struct agx_timestamp_req){0};
       st->pending_start_ts_unordered = false;
    }
+
+   /* The command buffer's leading top-of-pipe timestamp rides on the first
+    * stream's first end stamp (hk_sync_write_timestamp()), which waits for
+    * the earlier resets of timestamp queries: a render's vertex half, or the
+    * compute stream. */
+   if (st->lead_ts.handle) {
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      qreset_dep(cmd, cs, dep);
+      if (cs->type == HK_CS_VDM) {
+         assert(!cs->timestamp.vtx_end.handle);
+         cs->timestamp.vtx_end = st->lead_ts;
+         hk_sync_stream_wait(cs, dep);
+      } else {
+         assert(!cs->timestamp.end.handle);
+         cs->timestamp.end = st->lead_ts;
+         stamp_wait(cmd, cs, dep);
+      }
+      st->lead_ts = (struct agx_timestamp_req){0};
+   }
 }
 
 /* Whether the open general compute stream may receive work of the given
@@ -1970,10 +1989,33 @@ sync_state_has_req(const struct hk_sync_state *st)
    return false;
 }
 
+/* A leading top-of-pipe timestamp (hk_sync_state::lead_ts) that no stream
+ * took: a command of its own, ordered after nothing but the recorded
+ * requirements, as hk_sync_write_timestamp() records one. */
+static void
+flush_lead_timestamp(struct hk_cmd_buffer *cmd)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   const struct agx_timestamp_req req = st->lead_ts;
+   st->lead_ts = (struct agx_timestamp_req){0};
+   st->epoch++;
+
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   qreset_dep(cmd, NULL, dep);
+   struct hk_cs *cs = timestamp_only_stream(cmd, dep);
+   if (!cs)
+      return;
+   cs->timestamp.end = req;
+   stamp_carrier_launch(cmd);
+   hk_cmd_buffer_end_compute(cmd);
+}
+
 void
 hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (st->lead_ts.handle)
+      flush_lead_timestamp(cmd);
    if (!st->pending_start_ts.handle)
       return;
 
@@ -2019,7 +2061,7 @@ hk_sync_can_defer_unordered_start_ts(struct hk_cmd_buffer *cmd)
    const struct hk_sync_state *st = &cmd->sync;
 
    return !last_stream(cmd) && !st->pending_start_ts.handle &&
-          !sync_state_has_req(st);
+          !st->lead_ts.handle && !sync_state_has_req(st);
 }
 
 void
@@ -2152,6 +2194,16 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
           last_stream(cmd) == tail &&
           cmd->sync.next_seq == cmd->pass_merge.next_seq)
          cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+      return;
+   }
+
+   /* A top-of-pipe stamp ahead of every stream of the command buffer, on a
+    * chip whose start stamps latch before barriers resolve: the first stream
+    * carries it on an end stamp (hk_sync_state::lead_ts). A command of its
+    * own would sit between that stream and the command buffer's earlier
+    * neighbours, and every later timestamp would wait for it. */
+   if (!tail && !src_kinds && !start_stamps_ordered(cmd)) {
+      st->lead_ts = req;
       return;
    }
 

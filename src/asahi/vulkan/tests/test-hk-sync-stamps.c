@@ -1014,6 +1014,60 @@ test_timestamp_resets_order_query_work_only(void)
    }
 }
 
+/* A top-of-pipe stamp recorded before any stream of the command buffer rides
+ * on the first stream's first end stamp instead of a command of its own. */
+static void
+test_leading_stamp_rides_first_stream(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         /* A barrier first, so the stamp cannot wait for submission to ride
+          * on a start stamp. */
+         struct hk_cmd_buffer *cmd = new_cmd(chips[c], exact);
+         hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+         stamp(cmd, VK_PIPELINE_STAGE_2_NONE, 0);
+         T("leading stamp waits for a stream",
+           list_is_empty(&cmd->control_streams) && cmd->sync.lead_ts.handle);
+         struct hk_cs *r = begin_render(cmd);
+         stamp_all(cmd, 1);
+         end_render(cmd);
+         T("leading stamp is the render's vertex end",
+           same_req(r->timestamp.vtx_end, query(0)) && is_end(r, 1) &&
+           list_is_singular(&cmd->control_streams) && !cmd->sync.lead_ts.handle);
+
+         struct hk_cmd_buffer *k = new_cmd(chips[c], exact);
+         hk_sync_barrier(k, HK_SYNC_ALL, HK_SYNC_ALL);
+         stamp(k, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0);
+         struct hk_cs *d = dispatch(k);
+         T("leading stamp is the dispatch's end",
+           is_end(d, 0) && list_is_singular(&k->control_streams));
+
+         struct hk_cmd_buffer *e = new_cmd(chips[c], exact);
+         hk_sync_barrier(e, HK_SYNC_ALL, HK_SYNC_ALL);
+         stamp(e, VK_PIPELINE_STAGE_2_NONE, 0);
+         hk_sync_flush_pending_timestamp(e);
+         T("leading stamp with no stream gets its own command",
+           list_is_singular(&e->control_streams) && is_end(last_cs(e), 0) &&
+           (last_cs(e)->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+
+         /* The vertex half waits for timestamp resets of earlier command
+          * buffers. */
+         struct hk_cmd_buffer *z = new_cmd(chips[c], exact);
+         struct hk_cs *zr = reset_stamps(z);
+         struct hk_cmd_buffer *v = new_cmd(chips[c], exact);
+         hk_sync_barrier(v, HK_SYNC_ALL, HK_SYNC_ALL);
+         stamp(v, VK_PIPELINE_STAGE_2_NONE, 2);
+         struct hk_cs *rv = render(v);
+         struct hk_cmd_buffer *both[] = {z, v};
+         T("reset and leading-stamp submission resolves",
+           submit(new_queue(exact), both, 2));
+         T("leading stamp's render follows the reset",
+           same_req(rv->timestamp.vtx_end, query(2)) &&
+           vertex_barrier(rv, HK_SYNC_CDM) == zr->sync.index);
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -1031,6 +1085,7 @@ main(void)
    test_copy_consumers_wait();
    test_pass_merge_end_stamp();
    test_timestamp_resets_order_query_work_only();
+   test_leading_stamp_rides_first_stream();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);

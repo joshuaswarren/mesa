@@ -434,6 +434,14 @@ struct hk_sync_state {
     * it, and otherwise moves it to an ordered end-stamp carrier. */
    struct agx_timestamp_req pending_start_ts;
    bool pending_start_ts_unordered;
+
+   /* On chips whose start stamps latch before barriers resolve: a
+    * top-of-pipe timestamp recorded before any stream of the command buffer,
+    * waiting for the first one to carry it on an end stamp, which is latched
+    * after that stream's barriers (a render's vertex end, a compute stream's
+    * end). The first scope is empty, so any such later point is a valid
+    * result, and the stream needs no extra wait for it. */
+   struct agx_timestamp_req lead_ts;
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
 

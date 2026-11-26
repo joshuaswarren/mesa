@@ -449,6 +449,11 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->ts_vtx.start.offset = cs->timestamp.start.offset_B;
    }
 
+   if (cs->timestamp.vtx_end.handle) {
+      c->ts_vtx.end.handle = cs->timestamp.vtx_end.handle;
+      c->ts_vtx.end.offset = cs->timestamp.vtx_end.offset_B;
+   }
+
    if (cs->timestamp.end.handle) {
       c->ts_frag.end.handle = cs->timestamp.end.handle;
       c->ts_frag.end.offset = cs->timestamp.end.offset_B;
@@ -2519,7 +2524,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                        cs->stats.robust_index_dispatches,
                        cs->stats.robust_index_batches);
             assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles ||
-                   cs->timestamp.end.handle || cs->timestamp.start.handle);
+                   cs->timestamp.end.handle || cs->timestamp.start.handle ||
+                   cs->timestamp.vtx_end.handle);
 
             asahi_append_fragment_attachments(dev, &payload, cs);
             if (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES) {

@@ -1680,7 +1680,8 @@ hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
        !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS))
       return;
 
-   bool any = cs->timestamp.start.handle || cs->timestamp.end.handle;
+   bool any = cs->timestamp.start.handle || cs->timestamp.end.handle ||
+              cs->timestamp.vtx_end.handle;
    if (!any && cs->type == HK_CS_VDM) {
       for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
          if (cs->oq_stamp[i].handle) {
@@ -1699,6 +1700,9 @@ hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
    hk_query_stamps_note_one_locked(dev, queue, point,
                                    cs->timestamp.end.handle,
                                    cs->timestamp.end.offset_B);
+   hk_query_stamps_note_one_locked(dev, queue, point,
+                                   cs->timestamp.vtx_end.handle,
+                                   cs->timestamp.vtx_end.offset_B);
    if (cs->type == HK_CS_VDM) {
       for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
          hk_query_stamps_note_one_locked(dev, queue, point,
