@@ -5292,19 +5292,28 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                                       ? util_last_bit(render->view_mask)
                                       : render->layer_count;
       const struct hk_image_view *written[2 * HK_MAX_RTS + 2];
-      bool preserve_loaded_color[2 * HK_MAX_RTS + 2] = {false};
+      bool preserve_loaded[2 * HK_MAX_RTS + 2] = {false};
       unsigned nr_written = 0;
+      /* LOAD preserves samples that later draws may not touch. Keep their
+       * producer even for a whole-tile render area: an earlier attachment
+       * clear may have been lowered to compute (hk_optimize_empty_vdm()),
+       * which nothing else orders before this render. That holds for depth
+       * and stencil as for colour: Counter-Strike 2 clears its depth in a
+       * pass of its own and loads it in the next, without a barrier. */
       for (uint32_t i = 0; i < render->color_att_count; i++) {
-         /* LOAD preserves samples that later draws may not touch. Keep
-          * their producer even for a whole-tile render area: an earlier
-          * attachment clear may have been lowered to compute. */
-         preserve_loaded_color[nr_written] =
+         preserve_loaded[nr_written] =
             pRenderingInfo->pColorAttachments[i].loadOp ==
                VK_ATTACHMENT_LOAD_OP_LOAD;
          written[nr_written++] = render->color_att[i].iview;
          written[nr_written++] = render->color_att[i].resolve_iview;
       }
+      const VkRenderingAttachmentInfo *z_att = pRenderingInfo->pDepthAttachment;
+      const VkRenderingAttachmentInfo *s_att = pRenderingInfo->pStencilAttachment;
+      preserve_loaded[nr_written] =
+         z_att && z_att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
       written[nr_written++] = render->depth_att.iview;
+      preserve_loaded[nr_written] =
+         s_att && s_att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
       written[nr_written++] = render->stencil_att.iview;
       for (unsigned i = 0; i < nr_written; ++i) {
          const struct hk_image_view *iview = written[i];
@@ -5316,7 +5325,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             iview->vk.base_array_layer + MAX2(pass_layers, 1),
             u_minify(iview->vk.image->extent.width, level),
             u_minify(iview->vk.image->extent.height, level), render->area,
-            preserve_loaded_color[i] ||
+            preserve_loaded[i] ||
                (render->view_mask &&
                 render->view_mask != BITFIELD64_MASK(pass_layers)));
       }

@@ -1446,6 +1446,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_clear_pass_load = executable(
+    'g17p-vulkan-clear-pass-load',
+    files('tests/g17p_vulkan_clear_pass_load.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_bg_eot_threads = executable(
     'hk-vulkan-bg-eot-threads',
     files('tests/hk_vulkan_bg_eot_threads.c'),
