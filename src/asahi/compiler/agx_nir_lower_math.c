@@ -621,9 +621,20 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    nir_def *nan = nir_imm_float(b, NAN);
    v = nir_bcsel(b, nir_flt_imm(b, ax, INFINITY), v, nan);
 
-   /* sin(+-0) = +-0 exactly (the reduction returns +0 for -0) */
-   if (alu->op == nir_op_fsin)
-      v = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, v);
+   /* sin(+-0) = +-0 exactly (the reduction returns +0 for -0). The zero
+    * comparison flushes its input, so a subnormal argument matches; under
+    * DenormFlushToZero the argument from an unflushed source (a buffer load)
+    * must not leak out through the select, so return the sign-preserving
+    * zero. Without the mode, preserving the subnormal argument is legal and
+    * sin(subnormal) rounds to it anyway. */
+   if (alu->op == nir_op_fsin) {
+      if (nir_is_denorm_flush_to_zero(
+             b->shader->info.float_controls_execution_mode, 32))
+         v = nir_bcsel(b, nir_feq_imm(b, x, 0.0),
+                       nir_iand_imm(b, x, 0x80000000), v);
+      else
+         v = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, v);
+   }
 
    if (bit_size == 16)
       v = nir_f2f16(b, v);
