@@ -8284,6 +8284,53 @@ TEST(NativeForms, Agx3MaterializeConstantsSkipsDestinationlessInstructions)
    }
 }
 
+/* FCMP shares the FCMPSEL comparand path in agx_materialize_agx3_alu_constants()
+ * but has only two sources. Materializing its nonzero minifloat comparand
+ * must not look at the select slots an FCMPSEL would have. A sanitizer build
+ * reports the out-of-bounds read if it regresses. */
+TEST(NativeForms, Agx3MaterializeFcmpComparandReadsNoSelectSlots)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = target.encoding;
+      key.dev.chip = target.chip;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_instr *cmp = agx_fcmp_to(b, agx_temp(b->shader, AGX_SIZE_16), x,
+                                   agx_immediate_f(0.5f), AGX_FCOND_LT, false);
+      agx_unit_test(b, cmp->dest[0]);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+
+      ASSERT_EQ(cmp->op, AGX_OPCODE_FCMP);
+      ASSERT_EQ(cmp->nr_srcs, 2u);
+      EXPECT_TRUE(agx_is_equiv(cmp->src[0], x));
+      ASSERT_EQ(cmp->src[1].type, AGX_INDEX_NORMAL);
+
+      const agx_instr *def = NULL;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+             agx_is_equiv(I->dest[0], cmp->src[1]))
+            def = I;
+      }
+      ASSERT_NE(def, nullptr);
+      EXPECT_EQ(def->imm, 0x3f000000u);
+      ralloc_free(mem);
+   }
+}
+
 /* A half add with a negated register source becomes fma(a, 1.0h, -b). The
  * add was allocated with two sources and the FMA has three, so the pass must
  * give the instruction a larger source array before it writes the addend.

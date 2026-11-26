@@ -7859,13 +7859,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
 
             /* A tied minimum/maximum selects the same minifloat it compares.
              * The select slot reads a bit pattern, so keep the tie through
-             * the register instead of leaving the minifloat there. */
-            const agx_index sel = I->src[s + 2];
+             * the register instead of leaving the minifloat there. FCMP has
+             * no select slots, so only look at them on FCMPSEL. */
             if (I->op == AGX_OPCODE_FCMPSEL &&
-                I->dest[0].size == AGX_SIZE_32 &&
-                sel.type == AGX_INDEX_IMMEDIATE && sel.value == src.value &&
-                sel.abs == src.abs && sel.neg == src.neg)
-               I->src[s + 2] = I->src[s];
+                I->dest[0].size == AGX_SIZE_32) {
+               const agx_index sel = I->src[s + 2];
+               if (sel.type == AGX_INDEX_IMMEDIATE &&
+                   sel.value == src.value && sel.abs == src.abs &&
+                   sel.neg == src.neg)
+                  I->src[s + 2] = I->src[s];
+            }
          }
       }
 
