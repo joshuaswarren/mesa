@@ -118,6 +118,8 @@ hk_files = files(
   'hk_execution_allowance.h',
   'hk_pack.c',
   'hk_pack.h',
+  'hk_render_pack.c',
+  'hk_render_pack.h',
   'hk_inline_blend_layout.h',
   'hk_partial_mrt_hsr.h',
   'hk_queue.c',
@@ -400,6 +402,31 @@ if with_tests
       executable(
         'hk_pack_test',
         files('tests/test-hk-pack.c', 'hk_pack.c', 'hk_sync.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
+    # Submit-time render packing: the edge checks, the tail links and the
+    # packet's dependency fold, resolved through the real hk_sync resolver;
+    # no device or GPU.
+    test(
+      'hk_render_pack',
+      executable(
+        'hk_render_pack_test',
+        files('tests/test-hk-render-pack.c', 'hk_render_pack.c', 'hk_sync.c'),
+        link_with : [libasahi_lib],
         include_directories : [
           include_directories('.'),
           inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
@@ -1361,6 +1388,17 @@ if with_tests
   hk_vulkan_global_priority = executable(
     'hk-vulkan-global-priority',
     files('tests/hk_vulkan_global_priority.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  # Submit-time render packing on reusable command buffers: packed, replayed,
+  # alone and regrouped submissions, each pixel-exact (hk_render_pack.h).
+  hk_vulkan_render_pack_replay = executable(
+    'hk-vulkan-render-pack-replay',
+    files('tests/hk_vulkan_render_pack_replay.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

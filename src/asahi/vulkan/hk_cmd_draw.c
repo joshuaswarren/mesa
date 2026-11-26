@@ -34,6 +34,7 @@
 #include "agx_vdm_ppp_state_core.h"
 
 #include "agx_vdm_stream_link_core.h"
+#include "agx_vdm_stream_terminate_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
 #include "hk_native_vertex_template.h"
@@ -3505,6 +3506,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.eot.main = eot_main;
    cs->cr.eot.partial = eot_partial;
    cs->anatomy_covered = covered;
+   cs->render_pack_elided = elide;
    perf_debug(cmd, "Dropped untouched colour attachments 0x%x, loads of "
               "covered attachments 0x%x", elide, covered);
 }
@@ -4063,8 +4065,8 @@ hk_xfer_check_draw(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
  * the stream list, the sync epoch and the stream's own state
  * (hk_m5_pass_merge_begin()).
  */
-static bool
-hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+static const char *
+hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -4079,59 +4081,71 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
     * pre/post-graphics streams, heap use or start timestamps attached. An end
     * timestamp stays on the merged stream and latches when the merged pass
     * finishes, which still satisfies Vulkan's after-all-prior-commands rule. */
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
-       cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
-       cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
-       cmd->state.oq_pending_render ||
-       cmd->uses_heap || cs->timestamp.start.handle) {
+   const char *why = !agx_chip_native_or_m5(dev->dev.chip) ? "chip"
+                     : cmd->in_meta                          ? "meta"
+                     : cs->stats.cmds == 0                   ? "no draws"
+                     : cmd->sync.pass_vdm != cs              ? "split pass"
+                     : cmd->current_cs.pre_gfx               ? "pre-graphics"
+                     : cmd->current_cs.post_gfx              ? "post-graphics"
+                     : cmd->state.oq_pending_render          ? "occlusion query"
+                     : cmd->uses_heap                        ? "heap"
+                     : cs->timestamp.start.handle            ? "start timestamp"
+                                                             : NULL;
+   if (why) {
       if (msaa_enabled)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
             cmd->uses_heap, cs->stats.cmds,
             cs->timestamp.start.handle != 0);
-      return false;
+      return why;
    }
 
    if (render->flags & (VK_RENDERING_SUSPENDING_BIT |
                         VK_RENDERING_RESUMING_BIT |
                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
-      return false;
+      return "rendering flags";
 
    /* In-tilebuffer rendering without resolves. Multisample continuation
     * keeps the existing per-sample partial store and reload programs. */
    if (render->view_mask || (msaa && !msaa_enabled) ||
        agx_tilebuffer_spills(&render->tilebuffer) ||
        render->g17p_direct_color_resolve)
-      return false;
+      return "multiview, multisampling, spilling or direct resolve";
    /* Compressed attachments continue like uncompressed ones: the merged
     * render keeps the first instance's load and the last instance's store,
     * and a partial render stores and reloads them as a single instance's
     * would. */
    if (msaa && (render->layer_count != 1 || cs->tib.nr_samples != samples))
-      return false;
+      return "multisampled layers";
 
    unsigned attachments = 0;
    for (unsigned i = 0; i < render->color_att_count; ++i) {
       if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
-         return false;
+         return "resolve";
       if (msaa && render->color_att[i].iview &&
           render->color_att[i].iview->vk.image->samples != samples)
-         return false;
+         return "sample count";
       attachments += render->color_att[i].iview != NULL;
    }
    if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE ||
        render->stencil_att.resolve_mode != VK_RESOLVE_MODE_NONE)
-      return false;
+      return "resolve";
    if (msaa &&
        ((render->depth_att.iview &&
          render->depth_att.iview->vk.image->samples != samples) ||
         (render->stencil_att.iview &&
          render->stencil_att.iview->vk.image->samples != samples)))
-      return false;
+      return "sample count";
    attachments += render->depth_att.iview != NULL;
    attachments += render->stencil_att.iview != NULL;
-   return attachments > 0;
+   return attachments > 0 ? NULL : "no attachments";
+}
+
+static bool
+hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   return !hk_m5_pass_merge_refusal(cmd, cs);
 }
 
 /* Whether the attachment of a beginning instance continues the one the
@@ -4166,55 +4180,6 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
    if (vk_get_rendering_attachment_flags(info) != att->flags)
       return "flags";
    return NULL;
-}
-
-/* How one barrier of a dependency recorded between the instances relates to
- * continuing the first instance's stream with the second. */
-enum hk_m5_merge_dep {
-   /* It does not order the second instance's graphics work after the first
-    * instance's, or only for attachment operations, which the tile pass
-    * orders. */
-   HK_M5_MERGE_DEP_LOCAL,
-   /* It orders the second instance's work after the first instance's beyond
-    * attachment operations (up to ALL_COMMANDS -> ALL_COMMANDS with every
-    * memory access). One tile pass runs the second instance's vertex work
-    * before the first instance's fragment work and stores the attachments
-    * only at its end, so this holds only for a merge that is
-    * memory-equivalent by construction, see hk_m5_ordered_refusal(). */
-   HK_M5_MERGE_DEP_ORDERED,
-   /* A layout transition or queue family ownership transfer between two
-    * graphics scopes: never continued across. */
-   HK_M5_MERGE_DEP_END,
-};
-
-static enum hk_m5_merge_dep
-hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
-                            VkPipelineStageFlags2 dst_stages,
-                            VkAccessFlags2 dst_access, bool buffer,
-                            bool transition)
-{
-   const VkPipelineStageFlags2 local_stages =
-      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
-      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-   const VkAccessFlags2 local_access =
-      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-      VK_ACCESS_2_COLOR_ATTACHMENT_READ_NONCOHERENT_BIT_EXT;
-
-   const bool from_gfx = hk_sync_kinds_src(src_stages) & HK_SYNC_GFX;
-   const bool to_gfx =
-      hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
-   if (!from_gfx || !to_gfx)
-      return HK_M5_MERGE_DEP_LOCAL;
-
-   if (!buffer && !(dst_stages & ~local_stages) &&
-       !(dst_access & ~local_access))
-      return HK_M5_MERGE_DEP_LOCAL;
-
-   return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
 }
 
 static bool hk_m5_image_is_attachment(const struct hk_rendering_state *render,
@@ -4668,6 +4633,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->cr.depth = prev->cr.depth;
    cs->cr.stencil = prev->cr.stencil;
    cs->cr.zls_control = prev->cr.zls_control;
+   cs->render_pack_elided = 0;
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
@@ -4699,6 +4665,404 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
                          ordered ? " ordered" : "");
    perf_debug(cmd, "Continuing the previous render pass instance");
    return true;
+}
+
+/* Submit-time render packing (hk_render_pack.h): how the command buffer's
+ * first render pass instance began and how its last one ended. */
+
+static void
+hk_render_pack_att_from_info(struct hk_render_pack_att *out,
+                             const VkRenderingAttachmentInfo *info)
+{
+   memset(out, 0, sizeof(*out));
+   if (!info || info->imageView == VK_NULL_HANDLE)
+      return;
+
+   VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+   out->iview = iview;
+   out->image = iview->vk.image;
+   out->load_op = info->loadOp;
+   out->store_op = info->storeOp;
+   out->layout = info->imageLayout;
+   out->resolve_mode = info->resolveMode;
+   out->flags = vk_get_rendering_attachment_flags(info);
+   out->samples = iview->vk.image->samples;
+   out->aliasable = hk_m5_attachment_image_aliasable(iview);
+   const VkAttachmentFeedbackLoopInfoEXT *loop = vk_find_struct_const(
+      info->pNext, ATTACHMENT_FEEDBACK_LOOP_INFO_EXT);
+   out->feedback_loop = loop && loop->feedbackLoopEnable;
+}
+
+static void
+hk_render_pack_att_from_render(struct hk_render_pack_att *out,
+                               const struct hk_attachment *att)
+{
+   memset(out, 0, sizeof(*out));
+   if (!att->iview)
+      return;
+
+   out->iview = att->iview;
+   out->image = att->iview->vk.image;
+   out->load_op = att->load_op;
+   out->store_op = att->store_op;
+   out->layout = att->layout;
+   out->resolve_mode = att->resolve_mode;
+   out->flags = att->flags;
+   out->samples = att->iview->vk.image->samples;
+   out->aliasable = hk_m5_attachment_image_aliasable(att->iview);
+}
+
+static bool
+hk_render_pack_names(const struct hk_render_pack_pass *pass,
+                     const struct vk_image *image)
+{
+   for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s) {
+      if (pass->att[s].image == image)
+         return true;
+   }
+   return false;
+}
+
+static unsigned
+hk_render_pack_samples(const struct hk_render_pack_pass *pass)
+{
+   unsigned samples = 1;
+   for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s)
+      samples = MAX2(samples, pass->att[s].samples);
+   return samples;
+}
+
+/* The class of a dependency recorded beside a command buffer's first or
+ * last render pass instance, for submit-time render packing: as
+ * hk_m5_pass_merge_classify() classifies one between two instances of one
+ * command buffer, but for layout transitions of the attachments themselves.
+ *
+ * Borealis performs no work for a layout transition: one that needs any
+ * (metadata initialization, decompression, a transition the driver records
+ * as work, brl_sync_transition_begin()) records it as a stream, and a
+ * command buffer with a stream beside the instance has no head or tail. So
+ * where a head or tail survives, a transition between the two instances
+ * left the attachment's memory as the first instance stored it, which the
+ * second, loading it in the same layout (hk_render_pack_continues()), reads
+ * unchanged: in one tile pass it reads the same bytes from tile memory.
+ * vkd3d-proton records such a transition after every render pass and its
+ * inverse before the next (render-target layout decay). A multisampled
+ * instance still ends at a transition, as in one command buffer, and so does
+ * an ownership transfer or a transition of an image that may alias.
+ *
+ * `pass` is the instance beside the dependency (the tail's), or NULL before
+ * the first instance begins (the head's): the head remembers the
+ * transitioned images in e->transitions until its attachments are known. */
+static uint8_t
+hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+                        const struct hk_render_pack_pass *pass,
+                        struct hk_render_pack_edges *e, bool *msaa_end,
+                        const char **why)
+{
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   const bool msaa = pass && hk_render_pack_samples(pass) > 1;
+   uint8_t dep = HK_M5_MERGE_DEP_LOCAL;
+
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      dep = MAX2(dep, hk_m5_pass_merge_dependency(b->srcStageMask,
+                                                  b->dstStageMask,
+                                                  b->dstAccessMask, false,
+                                                  false));
+   }
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
+      const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
+                                                    b->dstStageMask,
+                                                    b->dstAccessMask, true,
+                                                    transfer);
+      if (d == HK_M5_MERGE_DEP_END)
+         *why = "buffer ownership transfer";
+      dep = MAX2(dep, d);
+      *msaa_end |= transfer;
+   }
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      VK_FROM_HANDLE(vk_image, image, b->image);
+      const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
+      const bool transition = b->oldLayout != b->newLayout || transfer;
+      const bool transparent =
+         transition && !transfer && hk_pass_merge_layout_proof_supported(chip) &&
+         !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
+                                  VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
+      const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
+                                                    b->dstStageMask,
+                                                    b->dstAccessMask, false,
+                                                    transition && !transparent);
+      if (d == HK_M5_MERGE_DEP_END)
+         *why = transfer ? "image ownership transfer"
+                         : "transition of an image that may alias";
+      dep = MAX2(dep, d);
+      if (transition && !transparent) {
+         *msaa_end = true;
+      } else if (transparent && pass) {
+         if (msaa && hk_render_pack_names(pass, image)) {
+            dep = HK_M5_MERGE_DEP_END;
+            *why = "multisampled attachment transition";
+         }
+      } else if (transparent) {
+         /* Only a multisampled first instance needs to know which images
+          * were transitioned (hk_render_pack_begin()). */
+         if (e->transition_count < ARRAY_SIZE(e->transitions))
+            e->transitions[e->transition_count++] = image;
+         else
+            e->transitions_overflow = true;
+      }
+   }
+   return dep;
+}
+
+/* A pipeline barrier beside the command buffer's first (head) or last (tail)
+ * render pass instance. */
+void
+hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
+                            const VkDependencyInfo *info)
+{
+   struct hk_render_pack_edges *e = &cmd->render_pack;
+   if (e->head_open) {
+      if (!list_is_empty(&cmd->control_streams))
+         e->head_open = false;
+      else
+         e->head_dep = MAX2(e->head_dep,
+                            hk_render_pack_classify(cmd, info, NULL, e,
+                                                    &e->head_msaa_end,
+                                                    &e->head_why));
+   }
+   if (e->tail_open) {
+      bool msaa_end = false;
+      const char *why = "barrier";
+      e->tail_dep = MAX2(e->tail_dep,
+                         hk_render_pack_classify(cmd, info, &e->tail_pass, e,
+                                                 &msaa_end, &why));
+      if (msaa_end && e->tail_msaa)
+         why = "multisampled transition";
+      if ((msaa_end && e->tail_msaa) || e->tail_dep == HK_M5_MERGE_DEP_END) {
+         e->tail_open = false;
+         e->tail_why = why;
+      }
+   }
+}
+
+/* The barrier was recorded: what it changed is part of the edges. */
+void
+hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd)
+{
+   struct hk_render_pack_edges *e = &cmd->render_pack;
+   if (e->head_open)
+      e->head_epoch = cmd->sync.epoch;
+   if (e->tail_open)
+      e->tail_epoch = cmd->sync.epoch;
+}
+
+/* Nothing but pipeline barriers since vkBeginCommandBuffer. Returns NULL or
+ * what was. */
+static const char *
+hk_render_pack_head_refusal(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_render_pack_edges *e = &cmd->render_pack;
+   if (cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return "meta or secondary";
+   if (!list_is_empty(&cmd->control_streams) || cmd->sync.next_seq ||
+       cmd->current_cs.cs || cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
+       cmd->current_cs.post_gfx)
+      return "stream";
+   if (cmd->sync.epoch != e->head_epoch)
+      return "dependency";
+   if (cmd->state.deferred_clear_count || cmd->sync.pending_start_ts.handle ||
+       cmd->sync.stamp_copy_count || cmd->state.uses_events ||
+       cmd->state.oq_pending_render || cmd->sync.in_pass)
+      return "state";
+   return NULL;
+}
+
+static void
+hk_render_pack_pass_from_render(struct hk_render_pack_pass *p,
+                                const struct hk_rendering_state *render)
+{
+   memset(p, 0, sizeof(*p));
+   for (unsigned i = 0; i < render->color_att_count; ++i)
+      hk_render_pack_att_from_render(&p->att[i], &render->color_att[i]);
+   hk_render_pack_att_from_render(&p->att[HK_RENDER_PACK_DEPTH],
+                                  &render->depth_att);
+   hk_render_pack_att_from_render(&p->att[HK_RENDER_PACK_STENCIL],
+                                  &render->stencil_att);
+   p->area = render->area;
+   p->layer_count = render->layer_count;
+   p->view_mask = render->view_mask;
+   p->flags = render->flags;
+   p->color_count = render->color_att_count;
+}
+
+/* A render pass instance begins: the first one of the command buffer may be
+ * its head, and the tail closes (the instance's end opens it again). */
+static void
+hk_render_pack_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
+{
+   struct hk_render_pack_edges *e = &cmd->render_pack;
+   e->tail_open = false;
+   if (likely(!e->head_open))
+      return;
+   e->head_open = false;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const char *barrier_why = e->head_why;
+   const char *why = hk_render_pack_head_refusal(cmd);
+   e->head_why = why;
+   if (why) {
+      hk_frame_anatomy_note(dev, "pass-merge render pack: no head: %s", why);
+      return;
+   }
+
+   struct hk_render_pack_pass *p = &e->head_pass;
+   memset(p, 0, sizeof(*p));
+   for (uint32_t i = 0; i < info->colorAttachmentCount; ++i)
+      hk_render_pack_att_from_info(&p->att[i], &info->pColorAttachments[i]);
+   hk_render_pack_att_from_info(&p->att[HK_RENDER_PACK_DEPTH],
+                                info->pDepthAttachment);
+   hk_render_pack_att_from_info(&p->att[HK_RENDER_PACK_STENCIL],
+                                info->pStencilAttachment);
+   p->area = info->renderArea;
+   p->layer_count = info->layerCount;
+   p->view_mask = info->viewMask;
+   p->flags = info->flags;
+   p->color_count = info->colorAttachmentCount;
+   p->layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
+
+   /* A multisampled instance ends at a transition of an attachment, or at
+    * any the head could not take as transparent. */
+   uint8_t dep = e->head_dep;
+   if (dep == HK_M5_MERGE_DEP_END)
+      why = barrier_why ? barrier_why : "barrier";
+   if (hk_render_pack_samples(p) > 1) {
+      bool transitioned = e->head_msaa_end || e->transitions_overflow;
+      for (unsigned t = 0; t < e->transition_count; ++t)
+         transitioned |= hk_render_pack_names(p, e->transitions[t]);
+      if (transitioned) {
+         dep = HK_M5_MERGE_DEP_END;
+         why = "multisampled transition";
+      }
+   }
+
+   e->head_dep = dep;
+   e->head = dep != HK_M5_MERGE_DEP_END;
+   e->head_stream = NULL;
+   e->head_ended = false;
+   if (!e->head) {
+      e->head_why = why;
+      hk_frame_anatomy_note(dev, "pass-merge render pack: no head: %s", why);
+   }
+}
+
+/* A render pass instance ended in `cs` as a continuation candidate or not
+ * (`refusal`): the command buffer's tail opens or stays closed. */
+static void
+hk_render_pack_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                   const struct hk_rendering_state *render,
+                   const char *refusal)
+{
+   struct hk_render_pack_edges *e = &cmd->render_pack;
+   e->tail_why = refusal;
+   e->tail_open = !refusal;
+   if (refusal)
+      return;
+
+   hk_render_pack_pass_from_render(&e->tail_pass, render);
+   e->tail_msaa = hk_render_pack_samples(&e->tail_pass) > 1;
+   /* An ordered dependency recorded before an earlier continuation of the
+    * stream counts for a later one too (hk_m5_pass_merge_begin()). */
+   e->tail_dep = cs->m5_ordered ? HK_M5_MERGE_DEP_ORDERED
+                                : HK_M5_MERGE_DEP_LOCAL;
+   e->tail_stream = cs;
+   e->tail_seq = cs->sync.seq;
+   e->tail_current = cs->current;
+   e->tail_end = cs->end;
+   e->tail_next_seq = cmd->sync.next_seq;
+   e->tail_epoch = cmd->sync.epoch;
+}
+
+/* Nothing but pipeline barriers since the tail opened. Returns NULL or what
+ * was recorded. */
+static const char *
+hk_render_pack_tail_moved(const struct hk_cmd_buffer *cmd,
+                          const struct hk_cs *cs)
+{
+   const struct hk_render_pack_edges *e = &cmd->render_pack;
+   if (e->tail_stream != cs || e->tail_seq != cs->sync.seq)
+      return "later stream";
+   if (cmd->in_meta || cmd->state.deferred_clear_count ||
+       cmd->current_cs.cs || cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
+       cmd->current_cs.post_gfx || cmd->state.oq_pending_render ||
+       cmd->sync.in_pass || cmd->sync.pending_start_ts.handle)
+      return "state";
+   if (cmd->sync.next_seq != e->tail_next_seq ||
+       cmd->sync.epoch != e->tail_epoch)
+      return "dependency";
+   if (cs->current != e->tail_current || cs->end != e->tail_end ||
+       cs->timestamp.start.handle || cs->timestamp.end.handle)
+      return "stream";
+   return NULL;
+}
+
+/* vkEndCommandBuffer, after every stream is final: what a submission needs
+ * to pack this command buffer with its neighbours. */
+void
+hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd)
+{
+   struct hk_render_pack_edges *e = &cmd->render_pack;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool tail_open = e->tail_open;
+   e->head_open = false;
+   e->tail_open = false;
+   e->tail = false;
+   e->terminate = NULL;
+   e->linked = 0;
+
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+       !list_is_singular(&cmd->control_streams)) {
+      e->head = false;
+      return;
+   }
+
+   struct hk_cs *cs =
+      list_first_entry(&cmd->control_streams, struct hk_cs, node);
+   if (cs->type != HK_CS_VDM) {
+      e->head = false;
+      return;
+   }
+
+   /* The head instance must have begun this very stream. */
+   if (e->head && (!e->head_ended || e->head_stream != cs ||
+                   e->head_seq != cs->sync.seq)) {
+      e->head = false;
+      e->head_why = "head stream";
+   }
+
+   /* The terminate record hk_cmd_buffer_end_graphics() wrote last, with room
+    * for a stream link in the stream's chunk (HK_CS_SPACE_PADDING keeps more
+    * than that past every record). */
+   struct agx_vdm_stream_terminate_core terminate;
+   if (agx_vdm_stream_terminate_core_pack(dev->dev.chip, &terminate)) {
+      uint8_t *at = (uint8_t *)cs->current - terminate.length;
+      if ((uint8_t *)cs->end - at >= AGX_VDM_STREAM_LINK_CORE_LENGTH &&
+          !memcmp(at, terminate.bytes, terminate.length))
+         e->terminate = at;
+   }
+
+   const char *why = !tail_open ? (e->tail_why ? e->tail_why : "candidate")
+                                : hk_render_pack_tail_moved(cmd, cs);
+   if (why) {
+      e->tail_why = why;
+      hk_frame_anatomy_note(dev, "pass-merge render pack: no tail: %s", why);
+      return;
+   }
+   e->tail = true;
 }
 
 static bool
@@ -4853,6 +5217,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
+
+   hk_render_pack_begin(cmd, pRenderingInfo);
 
    if (unlikely(cmd->pass_merge.valid) &&
        hk_m5_pass_merge_begin(cmd, pRenderingInfo))
@@ -5798,7 +6164,16 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * ended in, before the terminator. */
    struct hk_pass_merge_candidate *merge = &cmd->pass_merge;
    merge->valid = false;
-   const bool continuable = cs && hk_m5_pass_merge_candidate(cmd, cs);
+   const char *refusal = cs ? hk_m5_pass_merge_refusal(cmd, cs) : "no stream";
+   const bool continuable = !refusal;
+
+   /* The stream the command buffer's first instance began, for submit-time
+    * render packing (hk_render_pack_end_cmd()). */
+   if (cmd->render_pack.head && !cmd->render_pack.head_ended) {
+      cmd->render_pack.head_ended = true;
+      cmd->render_pack.head_stream = cs;
+      cmd->render_pack.head_seq = cs ? cs->sync.seq : 0;
+   }
    void *const resume_current = cs ? cs->current : NULL;
    void *const end_before = cs ? cs->end : NULL;
 
@@ -5966,6 +6341,14 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       merge->ordered = false;
       merge->valid = true;
    }
+   /* The render state is cleared by now; the candidate kept a copy. */
+   hk_render_pack_end(cmd, cs, &merge->render,
+                      !continuable                  ? refusal
+                      : need_resolve                ? "resolve"
+                      : cs->end != end_before ||
+                            vk_command_buffer_has_error(&cmd->vk)
+                         ? "stream"
+                         : NULL);
 
    if (need_resolve) {
       perf_debug(cmd, "Resolving render pass, colour store op %u",
@@ -14669,6 +15052,19 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (cs)
       cs->m5_shader_writes_memory |=
          gfx->shaders_write_memory || gfx->xfb_enabled;
+
+   /* Submit-time render packing continues across an ordered dependency only
+    * into and out of streams whose draws hk_m5_ordered_draw_hazard() would
+    * pass; shader memory writes and transform feedback are tracked above. */
+   if (cs && !cmd->in_meta &&
+       (cmd->state.conditional.active ||
+        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
+        gfx->shaders[MESA_SHADER_MESH] ||
+        mesa_prim_has_adjacency(vk_topology_to_mesa(
+           cmd->vk.dynamic_graphics_state.ia.primitive_topology))))
+      cs->render_pack_unsafe = true;
 
    if (!cs)
       return NULL;

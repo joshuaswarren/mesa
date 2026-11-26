@@ -611,6 +611,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
 }
@@ -1081,6 +1082,13 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    hk_cmd_buffer_begin_compute(cmd, pBeginInfo);
    hk_cmd_buffer_begin_graphics(cmd, pBeginInfo);
 
+   /* Submit-time render packing: until something but a pipeline barrier is
+    * recorded, the first render pass instance may continue the previous
+    * command buffer's last one (hk_render_pack.h). */
+   cmd->render_pack.head_open =
+      cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+   cmd->render_pack.head_epoch = cmd->sync.epoch;
+
    return VK_SUCCESS;
 }
 
@@ -1303,6 +1311,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_cmd_buffer_publish_root_uploads(cmd, fenced);
    hk_cmd_buffer_end_alias_sites(cmd);
 
+   hk_render_pack_end_cmd(cmd);
+
    hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
@@ -1519,6 +1529,8 @@ brl_discard_init_record(struct hk_cmd_buffer *cmd,
    /* The transition is work now: an ended pass instance cannot continue
     * across it (hk_m5_pass_merge_classify() assumes transitions do none). */
    cmd->pass_merge.valid = false;
+   cmd->render_pack.tail_open = false;
+   cmd->render_pack.tail_why = "layout transition work";
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1595,6 +1607,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->pass_merge.valid))
       hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
+   /* Likewise across command buffers, at submission (hk_render_pack.h): a
+    * barrier before the first instance or after the last. */
+   if (cmd->render_pack.head_open || cmd->render_pack.tail_open)
+      hk_render_pack_note_barrier(cmd, pDependencyInfo);
 
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
@@ -1706,6 +1722,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * or extended still ends the candidacy there. */
    if (unlikely(cmd->pass_merge.valid))
       cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+   hk_render_pack_barrier_done(cmd);
 }
 
 __attribute__((hot)) void
