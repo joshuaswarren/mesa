@@ -261,19 +261,30 @@ pack_layered(uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
       (dimension == AGX_PBE_DIMENSION_2D_ARRAY ||
        dimension == AGX_PBE_DIMENSION_2D_ARRAY_MULTISAMPLE ||
        dimension == AGX_PBE_DIMENSION_3D);
+   const bool gen10_compressed_layered =
+      generation == AGX_PBE_AGX3_GENERATION_10 &&
+      fields && fields->layout == AGX_PBE_LAYOUT_GPU &&
+      (dimension == AGX_PBE_DIMENSION_2D_ARRAY ||
+       (dimension == AGX_PBE_DIMENSION_3D && level == 0 && levels == 1));
    if ((generation != AGX_PBE_AGX3_GENERATION_9 && !m5_layered) || !fields ||
        (fields->compressed &&
         !((generation == AGX_PBE_AGX3_GENERATION_9 &&
            fields->layout == AGX_PBE_LAYOUT_GPU &&
            (dimension == AGX_PBE_DIMENSION_2D_ARRAY ||
             (level == 0 && levels == 1))) ||
-          (generation == AGX_PBE_AGX3_GENERATION_10 &&
-           dimension == AGX_PBE_DIMENSION_2D_ARRAY && layers == 1 &&
-           level == 0 && levels == 1))) ||
+          gen10_compressed_layered)) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR || layers < 1 ||
        layers > UINT16_MAX + 1u || !levels || levels > 16 ||
-       level >= levels ||
-       !agx_pbe_agx3_2d_pack(generation, fields, out))
+       level >= levels)
+      return false;
+
+   /* Keep agx_pbe_agx3_2d_pack() strict about page_aligned_layers on
+    * non-layered Gen10 compressed descriptors, and apply the layered flag
+    * below where the array/3D dimension is set. */
+   struct agx_pbe_agx3_2d_fields base = *fields;
+   if (generation == AGX_PBE_AGX3_GENERATION_10 && fields->compressed)
+      base.page_aligned_layers = false;
+   if (!agx_pbe_agx3_2d_pack(generation, &base, out))
       return false;
 
    uint64_t word0 = agx_load_le64(&out->bytes[0]);

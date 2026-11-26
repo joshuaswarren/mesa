@@ -81,6 +81,29 @@ if with_tests
     args : ['--nir-only'],
     suite : ['asahi'],
   )
+
+  asahi_reload_elision_test = executable(
+    'asahi-reload-elision',
+    files('tests/test-agx-reload-elision.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  test(
+    'asahi-reload-elision-nir',
+    asahi_reload_elision_test,
+    args : ['--nir-only'],
+    suite : ['asahi'],
+  )
 endif
 
 if with_tests and with_tools.contains('drm-shim')
@@ -655,6 +678,16 @@ if with_tests and with_tools.contains('drm-shim')
       'asahi-' + chip + '-zero-lod-bias',
       prog_python,
       args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_zero_lod_bias_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'asahi-' + chip + '-reload-elision',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_reload_elision_test],
       env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
       suite : ['asahi'],
     )

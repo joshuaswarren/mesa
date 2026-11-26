@@ -304,8 +304,9 @@ struct agx_compiled_shader {
     * native texture and sampler table pointers when they access resources. */
    bool g17p_texture_resources;
 
-   /* Exact G17P compute write-only image protocol: PBE pointer and native
-    * write-control record occupy uniform halves 0..15. */
+   /* Native compute write-only image protocol (currently enabled only on
+    * G18G): PBE pointer and write-control record occupy the reserved low
+    * uniform root halves. */
    bool g17p_storage_write;
 
    /* The variant contains Honeykrisp-style custom-border emulation. */
@@ -399,8 +400,23 @@ struct agx_uncompiled_shader {
       bool writes_memory;
       /* A vertex or tessellation evaluation shader that writes gl_Layer. */
       bool writes_layer;
+      /* A vertex shader that writes gl_ViewportIndex or clip distances. */
+      bool writes_viewport;
+      bool writes_clip_distance;
       /* API output, excluding synthetic early depth/stencil mask updates. */
       bool writes_api_sample_mask;
+
+      /* Static fullscreen-triangle coverage analysis for vertex shaders:
+       * 0 = none, 1 = CCW in NDC, 2 = CW in NDC. */
+      uint8_t fullscreen_tri_winding;
+      bool fullscreen_tri_z_in_01;
+      bool fullscreen_tri_z_in_m11;
+
+      /* Fragment shader static opaque overwrite analysis: bit i is set iff
+       * colour attachment i is unconditionally written in all four channels
+       * on every non-discarded execution path. */
+      uint8_t fs_unconditional_color_outputs;
+      bool fs_uses_discard;
 
       /* Some image intrinsic other than a read or a size/sample query:
        * stores, atomics, texel addresses and anything not known to only
@@ -726,6 +742,13 @@ struct agx_batch {
     */
    bool incoherent_writes;
 
+   /* If true, this render batch's tiling/vertex work reads or writes a BO with
+    * an in-flight GPU writer (or uses a pre-fragment stage that writes memory),
+    * so tiling must wait for prior renders instead of deferring the barrier to
+    * the fragment stage via DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
+    */
+   bool vtx_needs_render_barrier;
+
    struct agx_pool pool, pipeline_pool;
    struct util_dynarray g17p_vdm_aliases;
 
@@ -799,6 +822,10 @@ struct agx_blend {
 
    /* PIPE_CLEAR_* bitmask corresponding to this blend state */
    uint32_t store;
+
+   /* PIPE_CLEAR_COLOR* mask of render targets whose blend state writes all
+    * four channels without reading the destination tilebuffer. */
+   uint32_t opaque_overwrite;
 };
 
 struct asahi_vs_shader_key {
@@ -1934,6 +1961,13 @@ uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);
 
 void agx_batch_init_state(struct agx_batch *batch);
+void agx_batch_note_vtx_read(struct agx_batch *batch,
+                             struct agx_resource *rsrc);
+uint8_t agx_nir_analyze_fullscreen_tri(nir_shader *nir,
+                                       bool *out_z_in_01,
+                                       bool *out_z_in_m11);
+uint8_t agx_nir_analyze_fs_color_outputs(nir_shader *nir,
+                                         bool *out_uses_discard);
 
 struct asahi_bg_eot {
    uint64_t usc;

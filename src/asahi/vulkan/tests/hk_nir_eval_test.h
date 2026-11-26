@@ -33,8 +33,11 @@ struct hk_eval_ssbo {
    size_t base_offset; /* Simulated runtime VkDescriptorBufferInfo.offset for alignment checks */
 };
 
+static uint64_t hk_eval_last_max_loop_backedges = 0;
+
 struct hk_eval_env {
    const struct hk_eval_ssbo *ssbos;
+   uint64_t loop_backedges;
    unsigned num_ssbos;
    const void *push;
    size_t push_size;
@@ -326,6 +329,12 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
             r = hk_eval_f2u(fmaxf(a, b));
             break;
          }
+         case nir_op_ffloor:
+            r = hk_eval_f2u(floorf(hk_eval_u2f((uint32_t)s0)));
+            break;
+         case nir_op_fceil:
+            r = hk_eval_f2u(ceilf(hk_eval_u2f((uint32_t)s0)));
+            break;
          case nir_op_feq:
             r = hk_eval_u2f((uint32_t)s0) == hk_eval_u2f((uint32_t)s1);
             break;
@@ -617,6 +626,7 @@ hk_eval_cf_list(struct hk_eval_env *env, const struct exec_list *list,
                break;
             if (f == HK_EVAL_FLOW_RETURN)
                return f;
+            env->loop_backedges++;
          }
       } else {
          HK_EVAL_CHECK(!"unsupported cf node");
@@ -635,6 +645,7 @@ hk_eval_dispatch(nir_shader *nir, const uint32_t grid[3],
    uint64_t (*ssa)[4] = calloc(impl->ssa_alloc + 1, sizeof(*ssa));
    HK_EVAL_CHECK(ssa);
 
+   hk_eval_last_max_loop_backedges = 0;
    const uint32_t lx = nir->info.workgroup_size[0];
    const uint32_t ly = nir->info.workgroup_size[1];
    const uint32_t lz = nir->info.workgroup_size[2];
@@ -663,8 +674,11 @@ hk_eval_dispatch(nir_shader *nir, const uint32_t grid[3],
                      env.gid[0] = wx * lx + tx;
                      env.gid[1] = wy * ly + ty;
                      env.gid[2] = wz * lz + tz;
+                     env.loop_backedges = 0;
                      nir_block *prev = NULL;
                      hk_eval_cf_list(&env, &impl->body, &prev);
+                     if (env.loop_backedges > hk_eval_last_max_loop_backedges)
+                        hk_eval_last_max_loop_backedges = env.loop_backedges;
                   }
                }
             }
@@ -757,6 +771,7 @@ hk_wg_step_thread(struct hk_wg_thread *thr, uint8_t *shared_mem,
       if (!fr->node) {
          if (fr->is_loop) {
             HK_EVAL_CHECK(++fr->iters < 100000);
+            thr->env.loop_backedges++;
             fr->node = exec_list_is_empty(fr->list)
                           ? NULL
                           : exec_node_data(nir_cf_node, exec_list_get_head_const(fr->list), node);
@@ -1075,6 +1090,7 @@ hk_eval_dispatch_wg(nir_shader *nir, const uint32_t grid[3],
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_index_ssa_defs(impl);
 
+   hk_eval_last_max_loop_backedges = 0;
    const uint32_t lx = nir->info.workgroup_size[0];
    const uint32_t ly = nir->info.workgroup_size[1];
    const uint32_t lz = nir->info.workgroup_size[2];
@@ -1214,8 +1230,13 @@ hk_eval_dispatch_wg(nir_shader *nir, const uint32_t grid[3],
                   else if (thrs[tid].state == HK_WG_BARRIER)
                      n_bar++;
                }
-               if (n_done == wg_threads)
+               if (n_done == wg_threads) {
+                  for (uint32_t tid = 0; tid < wg_threads; ++tid) {
+                     if (thrs[tid].env.loop_backedges > hk_eval_last_max_loop_backedges)
+                        hk_eval_last_max_loop_backedges = thrs[tid].env.loop_backedges;
+                  }
                   break;
+               }
                if (n_bar == wg_threads) {
                   for (uint32_t tid = 0; tid < wg_threads; ++tid)
                      thrs[tid].state = HK_WG_RUN;

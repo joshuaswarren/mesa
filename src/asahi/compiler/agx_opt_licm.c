@@ -4,6 +4,7 @@
  */
 
 #include "util/bitset.h"
+#include "util/sparse_bitset.h"
 #include "util/u_dynarray.h"
 #include "agx_compiler.h"
 
@@ -63,6 +64,22 @@ plain_use(const agx_instr *I)
    default:
       return agx_opcodes_info[I->op].schedule_class == AGX_SCHEDULE_CLASS_NONE;
    }
+}
+
+/* M5 unpacked 2D/3D scalar LOD/bias samples require their half-float source to
+ * be discarded at the sample (agx3_pack_binary.c). Hoisting a loop-local copy
+ * into the preheader makes it live across the back-edge and strips discard. */
+static bool
+m5_unpacked_scalar_lod(const agx_context *ctx, const agx_instr *I)
+{
+   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&ctx->key->dev) &&
+          I->op == AGX_OPCODE_TEXTURE_SAMPLE && !I->memory_is_packed &&
+          (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_3D) &&
+          (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+           I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
+          I->src[1].type == AGX_INDEX_NORMAL &&
+          I->src[1].size == AGX_SIZE_16;
 }
 
 static bool
@@ -163,6 +180,8 @@ agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs)
       if (!plain_use(I)) {
          agx_foreach_ssa_src(I, s)
             BITSET_SET(pinned, I->src[s].value);
+      } else if (m5_unpacked_scalar_lod(ctx, I)) {
+         BITSET_SET(pinned, I->src[1].value);
       }
    }
    struct util_dynarray hoisted, moves, rewrites, merged;
@@ -201,13 +220,26 @@ agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs)
          if (!blocks[b])
             continue;
 
+         /* Avoid hoisting outer-loop immediates/uniforms across an enclosed
+          * inner loop that does not execute `blocks[b]`: doing so keeps the
+          * constant live across every inner-loop iteration while saving at
+          * most one execution per outer iteration. */
+         bool outside_inner_loop = false;
+         for (unsigned k = 0; k < l; ++k) {
+            if (loop.header < loops[k].header && loops[k].latch <= loop.latch &&
+                (b < loops[k].header || b > loops[k].latch)) {
+               outside_inner_loop = true;
+               break;
+            }
+         }
+
          agx_foreach_instr_in_block_safe(blocks[b], I) {
             agx_foreach_ssa_dest(I, d) {
                width = MAX2(width, util_next_power_of_two(
                                       agx_index_size_16(I->dest[d])));
             }
 
-            if (!hoistable(ctx, I, pinned))
+            if (outside_inner_loop || !hoistable(ctx, I, pinned))
                continue;
 
             agx_instr *same = NULL;
@@ -275,6 +307,139 @@ agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs)
    util_dynarray_fini(&hoisted);
    free(pinned);
    free(replace);
+   free(loops);
+   free(blocks);
+   return progress;
+}
+
+/*
+ * Sink single-block-used MOV_IMM instructions closer to their sole consumer
+ * block whenever doing so reduces cross-block live range without increasing
+ * inner-loop execution frequency:
+ *   1. use_depth <= def_depth (never executes more often), OR
+ *   2. the immediate is currently live-in across a strictly deeper inner loop
+ *      (depth > use_depth), such as outer-loop or cold-branch immediates
+ *      defined in block0 and kept live across a hot inner loop.
+ */
+bool
+agx_opt_sink_immediates(agx_context *ctx)
+{
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+   if (nr_blocks <= 1 || !ctx->alloc)
+      return false;
+
+   agx_block **blocks = calloc(nr_blocks, sizeof(*blocks));
+   struct licm_loop *loops = calloc(nr_blocks, sizeof(*loops));
+   unsigned *loop_depth = calloc(nr_blocks, sizeof(*loop_depth));
+   unsigned nr_loops = 0;
+
+   agx_foreach_block(ctx, block)
+      blocks[block->index] = block;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (!succ->loop_header || succ->index > block->index)
+            continue;
+
+         unsigned i;
+         for (i = 0; i < nr_loops && loops[i].header != succ->index; ++i)
+            ;
+         if (i == nr_loops)
+            loops[nr_loops++] = (struct licm_loop){succ->index, block->index};
+         loops[i].latch = MAX2(loops[i].latch, block->index);
+      }
+   }
+
+   for (unsigned l = 0; l < nr_loops; ++l) {
+      for (unsigned b = loops[l].header; b <= loops[l].latch; ++b) {
+         if (blocks[b])
+            loop_depth[b]++;
+      }
+   }
+
+   agx_instr **def_instr = calloc(ctx->alloc, sizeof(*def_instr));
+   agx_block **def_block = calloc(ctx->alloc, sizeof(*def_block));
+   agx_block **use_block = calloc(ctx->alloc, sizeof(*use_block));
+   agx_instr **first_use = calloc(ctx->alloc, sizeof(*first_use));
+   agx_block *const MULTI_USE = (agx_block *)(uintptr_t)1;
+
+   agx_foreach_block(ctx, block) {
+      bool past_cf = false;
+      agx_foreach_instr_in_block(block, I) {
+         if (instr_after_logical_end(I))
+            past_cf = true;
+
+         if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+             I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
+             (I->dest[0].size == AGX_SIZE_16 ||
+              I->dest[0].size == AGX_SIZE_32)) {
+            unsigned v = I->dest[0].value;
+            if (v < ctx->alloc) {
+               def_instr[v] = I;
+               def_block[v] = block;
+            }
+         }
+
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v >= ctx->alloc)
+               continue;
+            if (I->op == AGX_OPCODE_PHI || past_cf) {
+               use_block[v] = MULTI_USE;
+            } else if (!use_block[v]) {
+               use_block[v] = block;
+               first_use[v] = I;
+            } else if (use_block[v] != block) {
+               use_block[v] = MULTI_USE;
+            }
+         }
+      }
+   }
+
+   bool have_liveness = false;
+   bool progress = false;
+
+   for (unsigned v = 0; v < ctx->alloc; ++v) {
+      if (!def_instr[v] || !use_block[v] || use_block[v] == MULTI_USE ||
+          use_block[v] == def_block[v])
+         continue;
+
+      const unsigned def_d = loop_depth[def_block[v]->index];
+      const unsigned use_d = loop_depth[use_block[v]->index];
+      bool should_sink = (use_d <= def_d);
+
+      if (!should_sink && nr_loops) {
+         if (!have_liveness) {
+            agx_compute_liveness(ctx);
+            have_liveness = true;
+         }
+         for (unsigned l = 0; l < nr_loops; ++l) {
+            agx_block *hdr = blocks[loops[l].header];
+            if (hdr && loop_depth[hdr->index] > use_d &&
+                u_sparse_bitset_test(&hdr->live_in, v)) {
+               should_sink = true;
+               break;
+            }
+         }
+      }
+
+      if (!should_sink)
+         continue;
+
+      agx_instr *I = def_instr[v];
+      agx_remove_instruction(I);
+      agx_cursor cursor = agx_before_instr(first_use[v]);
+      agx_builder_insert(&cursor, I);
+      progress = true;
+   }
+
+   free(first_use);
+   free(use_block);
+   free(def_block);
+   free(def_instr);
+   free(loop_depth);
    free(loops);
    free(blocks);
    return progress;

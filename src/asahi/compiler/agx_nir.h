@@ -11,10 +11,9 @@
 
 struct nir_shader;
 struct nir_instr;
+struct nir_intrinsic_instr;
 struct nir_builder;
 struct nir_def;
-struct nir_alu_instr;
-struct hash_table;
 
 /* BASE bit3 selects an explicit byte-scaled AGX3 load/store index. */
 #define AGX_NIR_MEMORY_INDEX_BYTES 8u
@@ -66,6 +65,7 @@ bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
 bool agx_nir_fuse_selects(struct nir_shader *shader);
+bool agx_nir_fold_ineg_add(struct nir_shader *shader);
 bool agx_nir_m5_split_or_selects(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
 bool agx_nir_opt_narrow_subword_loads(struct nir_shader *shader);
@@ -75,6 +75,7 @@ bool agx_nir_opt_sink_conditional_loads(struct nir_shader *shader);
 bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
 bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
 bool agx_nir_opt_guard_chains(struct nir_shader *shader);
+bool agx_nir_opt_pack_byte_lut_select(struct nir_shader *shader);
 bool agx_nir_opt_factor_loop_mac(struct nir_shader *shader);
 bool agx_nir_opt_flatten_short_circuit_uniform_loads(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
@@ -114,11 +115,16 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
+bool agx_nir_reassociate_loop_invariant_eq(struct nir_shader *shader);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
+bool agx_nir_opt_licm_agx2_integer(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_licm_direct_sfu(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
 bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
+bool agx_nir_opt_const_loop_unroll(struct nir_shader *shader,
+                                   unsigned max_factor, unsigned *widest);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
@@ -133,6 +139,9 @@ bool agx_nir_lower_g17p_helper_samples(struct nir_shader *s);
 bool agx_nir_lower_g17p_texture_early(struct nir_shader *s,
                                      bool support_lod_bias,
                                      bool sampler_has_lod_bias);
+bool agx_nir_lower_agx3d_texture_early(struct nir_shader *s,
+                                      bool support_lod_bias,
+                                      bool sampler_has_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);
 /* G18G (M6) shares the G17G family's Gen10 descriptors, but keeps the texture
  * lowering forms the J873 GL 4.6 campaign qualified. A G18G caller ORs this
@@ -405,8 +414,6 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
 bool agx_nir_opt_nonneg_idiv(struct nir_shader *shader);
 
 bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
-bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
-                                  struct hash_table *cache);
 bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
 bool agx_nir_has_loop(const struct nir_shader *nir);
@@ -418,12 +425,21 @@ bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
 
 bool agx_nir_merge_global_words(struct nir_shader *shader);
+bool agx_nir_hoist_readonly_loop_loads(struct nir_shader *shader);
 bool agx_nir_narrow_single_subgroup_barriers(struct nir_shader *shader);
 bool agx_nir_narrow_subgroup0_barriers(struct nir_shader *shader);
 bool agx_nir_opt_uniform_stride(struct nir_shader *shader);
 bool agx_nir_fold_m5_offsets(struct nir_shader *shader, bool soft_fault);
 bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
                                   unsigned max_instrs, unsigned *widest);
+bool agx_nir_unroll_and_jam(struct nir_shader *shader, unsigned factor,
+                            unsigned *widest);
+bool agx_nir_opt_u8_absdiff_fp(struct nir_shader *shader);
+bool agx_nir_reassoc_const_offsets(struct nir_shader *shader);
+bool agx_nir_opt_guard_selected_loads(struct nir_shader *shader);
+bool agx_nir_opt_forward_merge_loads(struct nir_shader *shader);
+bool agx_nir_fold_const_select_alu(struct nir_shader *shader);
+bool agx_nir_opt_narrow_u8_fadd_tree(struct nir_shader *shader);
 
 bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
 bool agx_nir_opt_shared_flat_phase_cse(struct nir_shader *shader);

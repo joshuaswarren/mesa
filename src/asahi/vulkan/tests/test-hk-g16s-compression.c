@@ -120,7 +120,8 @@ check_shape(VkFormat format, bool is_zs)
    /* Chip and plane. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(g16s_eligible((enum agx_chip)chip, 0, &base) ==
-            (chip == AGX_CHIP_G17P));
+            agx_chip_has_cap((enum agx_chip)chip,
+                             AGX_CAP_HAL200_LOSSLESS_COMPRESSION));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
    CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
@@ -250,7 +251,7 @@ check_shape(VkFormat format, bool is_zs)
  * Cover every admitted colour format, including the smallest ones that can
  * spill next to wide targets, and input/transient attachment combinations.
  * 2x and 4x MSAA colour attachments (single-layer and layered, including
- * input/transient) are all admitted now that hk_hal200_decompress_attachment
+ * input/transient) are all admitted now that hk_agx3_decompress_attachment
  * decompresses any spilled attachment on demand.
  */
 static void
@@ -672,11 +673,11 @@ check_shared(void)
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
    CHECK(SHARED(base));
 
-   /* G17P only, plane 0 only. */
+   /* Native HAL200 (G16G, G17P) and M5 only, plane 0 only. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
                                                 &base) ==
-            (chip == AGX_CHIP_G17P || agx_chip_g17_m5((enum agx_chip)chip)));
+            hk_chip_shared_compression_supported((enum agx_chip)chip));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
 
@@ -839,10 +840,12 @@ check_m4_max(void)
    d.arrayLayers = 4;
    CHECK(M4_MAX(d) && NEO(d));
 
-   /* Other chips never (except native HAL200 G16G for 2x/4x MSAA depth). */
+   /* Native HAL200 (G16G, G17P) compress colour and 1x/2x/4x depth; non-HAL200
+    * parts (AGX2, G15* M3, M5 HAL300, G18G) stay out of the HAL200 policy. */
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
    d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
-   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15G, 0, 0, &d));
    d.samples = VK_SAMPLE_COUNT_2_BIT;
    CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
    CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15G, 0, 0, &d));

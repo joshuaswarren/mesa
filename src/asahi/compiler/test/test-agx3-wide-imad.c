@@ -781,6 +781,37 @@ test_wide_multiply_shaders(void)
          free(part.binary);
       }
    }
+
+   /* G18G: signed and unsigned 32x32->64 multiplies by a byte immediate must
+    * materialize the constant with matching sign extension so agx3_imad_encode_g18g()
+    * does not reject mixed-sign products. */
+   {
+      nir_builder b = begin_compute("G18G wide multiply signed/unsigned imm8");
+      nir_def *in = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *x = nir_load_global(&b, 1, 32, in, .align_mul = 4);
+      nir_def *y =
+         nir_load_global(&b, 1, 32, nir_iadd_imm(&b, in, 4), .align_mul = 4);
+      nir_store_global(&b, nir_imul_2x32_64(&b, x, nir_imm_int(&b, 253)), out,
+                       .align_mul = 8);
+      nir_store_global(&b, nir_umul_2x32_64(&b, y, nir_imm_int(&b, 253)),
+                       nir_iadd_imm(&b, out, 8), .align_mul = 8);
+      agx_preprocess_nir_g17p(b.shader);
+
+      struct agx_shader_key key = {
+         .dev.chip = AGX_CHIP_G18G,
+         .dev.encoding = AGX_ISA_ENCODING_AGX3C,
+         .dev.emit_agx3d = true,
+         .reserved_preamble = 8,
+         .no_preamble = true,
+      };
+      struct agx_shader_part part;
+      memset(&part, 0, sizeof(part));
+      CHECK(agx_compile_shader_nir(b.shader, &key, &part));
+      CHECK(part.binary != NULL && part.info.binary_size > 0);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
 }
 
 int

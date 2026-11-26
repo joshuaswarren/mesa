@@ -568,7 +568,8 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
           key->tib.spilled[0] ||
           agx_tilebuffer_offset_B(&key->tib, 0) != 0 ||
           (!(cache->dev->chip == AGX_CHIP_G18G &&
-             key->tib.logical_format[0] == PIPE_FORMAT_R11G11B10_FLOAT) &&
+             (key->tib.logical_format[0] == PIPE_FORMAT_R11G11B10_FLOAT ||
+              key->tib.logical_format[0] == PIPE_FORMAT_R9G9B9E5_FLOAT)) &&
            !agx_g17g_rt0_eot_physical_format_supported(
               agx_tilebuffer_physical_format(&key->tib, 0))))
          return NULL;
@@ -773,11 +774,9 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
          /* M5 reads the packed word as the packed-float tile format and
           * converts it to the R11G11B10 PBE (agx_rt0_pbe_format). */
          physical = (enum pipe_format)AIL_ISA_FORMAT_RG11B10F;
-      } else if ((agx_chip_native_or_m5(cache->dev->chip) &&
-                  (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
-                   key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
-                 (g18g &&
-                  key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT)) {
+      } else if (agx_chip_agx3_path(cache->dev->chip) &&
+                 (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
+                  key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) {
          /* G17P keeps packed-float tiles as one raw 32-bit word. The matching
           * PBE descriptor also uses R32_UINT to preserve those exact bits.
           * G17G stores RG11B10Float and RGB9E5Float tiles the same way: one
@@ -801,7 +800,9 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       nir_image_store_block_agx(
          &b, nir_imm_intN_t(&b, rt, 16), nir_imm_int(&b, offset_B), coords,
          .format = physical,
-         .image_dim = dim, .image_array = key->tib.layered,
+         .image_dim = (key->resolve_mask & BITFIELD_BIT(rt))
+                         ? GLSL_SAMPLER_DIM_2D : dim,
+         .image_array = key->tib.layered,
          .explicit_coord = explicit);
 
       if (key->store_and_resolve) {

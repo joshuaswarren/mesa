@@ -199,14 +199,15 @@ enum agx_chip_record {
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR |                                 \
     AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY | AGX_RECORD_CDM_SECONDARY_BARRIER)
 
-/* G18G has the records its J873 native captures contain. The codecs of the
- * other G15-G17 records refuse it: the VDM stream link and tessellate codecs
- * because no capture contains the record, the rest as their lists stood
- * before this table (see each codec). */
+/* G18G has the records its J873 native captures contain plus the direct 8-byte
+ * HAL300 VDM stream link verified on J873g hardware. The tessellate codec
+ * still refuses it because no capture contains that record, and the rest stay
+ * as their lists stood before this table (see each codec). */
 #define AGX_RECORDS_G18G                                                       \
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
-    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_VIEWPORT |                \
-    AGX_RECORD_PPP_W_CLAMP_CULL2 | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |       \
+    AGX_RECORD_VDM_STREAM_LINK | AGX_RECORD_VDM_STREAM_TERMINATE |             \
+    AGX_RECORD_PPP_VIEWPORT | AGX_RECORD_PPP_W_CLAMP_CULL2 |                   \
+    AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |                                      \
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR | AGX_RECORD_CDM_LAUNCH |         \
     AGX_RECORD_CDM_INDIRECT_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH_36 |       \
     AGX_RECORD_CDM_BARRIER | AGX_RECORD_HAL300_NATIVE_CAPTURE)
@@ -1046,6 +1047,39 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether the Borealis graphics path supplies the depth/stencil feedback-loop
+ * shader twin (hk_fbl_twin()) and draw-time dynamic transition
+ * (hk_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C). */
+static inline bool
+agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether VK_EXT_depth_clip_control (and
+ * extendedDynamicState3DepthClipNegativeOneToOne) is qualified on this chip.
+ * Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table across
+ * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300
+ * encodings such as AGX3D (G18G) stay off until qualified on their hardware. */
+static inline bool
+agx_chip_has_depth_clip_control(enum agx_chip chip)
+{
+   return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether Borealis enables shader-reconstructed single-plane packed 4:2:2
+ * YCbCr formats (8/10/12/16-bit views backed by plain RGBA word textures and
+ * reconstructed in NIR) and 10/12-bit YCbCr plane UNORM range restoration.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C); AGX2 keeps
+ * its existing path and other HAL300 encodings such as AGX3D (G18G) stay off
+ * until qualified on their hardware. */
+static inline bool
+agx_chip_has_packed_ycbcr(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
@@ -1237,6 +1271,26 @@ agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS;
 }
 
+/* Whether an AGX3 chip supplies the quad ballot/shuffle encodings and
+ * draw-time triangle-merge control required by VK_KHR_shader_quad_control.
+ * Native AGX3B (G15/G16/G17P) and M5 AGX3C (G17G/G17S/G17C) share both;
+ * AGX2 uses its legacy path and bring-up G18G stays off. */
+static inline bool
+agx_chip_agx3_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether Vulkan VK_KHR_shader_quad_control / shaderQuadControl is supported
+ * on this chip (AGX2 native support, or AGX3 with quad encodings and
+ * draw-time triangle-merge control). */
+static inline bool
+agx_chip_has_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_isa(chip) == AGX_ISA_AGX2 ||
+          agx_chip_agx3_shader_quad_control(chip);
+}
+
 /* Whether an image load misses a store made earlier in the same invocation,
  * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
  * behave this way; G15 loads observe the invocation's own stores. */
@@ -1267,13 +1321,14 @@ agx_chip_has_fp32_denorm_preserve(enum agx_chip chip)
           agx_chip_native_or_m5(chip);
 }
 
-/* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
- * layout has a bias field; Gen4 does not, so the shader applies the bias. */
+/* Whether the sampler state word carries the LOD bias.  The HAL200 and Gen5
+ * sampler layouts have a bias field; Gen4 does not, so the shader applies it. */
 static inline bool
 agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 {
-   return agx_chip_sampler_generation(chip) ==
-          AGX_SAMPLER_GENERATION_GEN4_HAL200;
+   const enum agx_sampler_generation gen = agx_chip_sampler_generation(chip);
+   return gen == AGX_SAMPLER_GENERATION_GEN4_HAL200 ||
+          gen == AGX_SAMPLER_GENERATION_GEN5;
 }
 
 /*
@@ -1405,6 +1460,20 @@ agx_chip_local_read_tilebuffer(enum agx_chip chip)
 
    return (enc == AGX_ISA_ENCODING_AGX3B && cs == AGX_CS_GENERATION_HAL200) ||
           (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
+}
+
+/*
+ * Whether the varying coefficient table selects perspective-correct
+ * interpolation with shade model 5 instead of AGX2's 7.
+ *
+ * HAL300 parts (M5 G17G/G17S/G17C and M6 G18G) treat shade model 7 as linear,
+ * so smooth perspective bindings must be rewritten to shade model 5 via
+ * agx_cf_bindings_select_perspective().
+ */
+static inline bool
+agx_chip_uses_shade_model_5(enum agx_chip chip)
+{
+   return agx_chip_hal300_path(chip);
 }
 
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */

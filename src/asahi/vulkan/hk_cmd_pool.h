@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 #include "util/macros.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_device.h"
 #include "util/cache_ops.h"
 
@@ -65,6 +66,12 @@ hk_cmd_pool_ioto_span_cache_max(const struct agx_device *dev)
              : HK_CMD_POOL_BO_MAX;
 }
 
+static inline unsigned
+hk_cmd_pool_vdm_span_cache_max(const struct agx_device *dev)
+{
+   return hk_cmd_pool_ioto_span_cache_max(dev);
+}
+
 /* Recyclable command buffer BO, used for both push buffers and upload */
 struct hk_cmd_bo {
    struct agx_bo *bo;
@@ -100,13 +107,14 @@ struct agx_device;
 struct agx_ptr;
 struct hk_device;
 
-/* G17P command-buffer memory (main/USC pools, VDM slabs, Ioto arenas) is
- * CPU-cached; recording cleans what it wrote before submission
- * (hk_cmd_buffer_publish_cached_uploads()). */
+/* Command-buffer memory (main/USC/root pools, VDM slabs, Ioto arenas) is
+ * CPU-cached on chips with AGX_CAP_CACHED_CMD_MEMORY; recording cleans what it
+ * wrote before submission (hk_cmd_buffer_publish_cached_uploads()). */
 static inline bool
 hk_g17p_cached_cmd_memory(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
+   return agx_chip_has_cap(dev->chip, AGX_CAP_CACHED_CMD_MEMORY) &&
+          util_has_cache_ops();
 }
 
 struct hk_cmd_pool;
@@ -139,6 +147,12 @@ struct hk_cmd_pool {
    /** Recyclable Ioto arena spans (HK_CMD_SLAB_IOTO, HK_CMD_SPAN_SIZE). */
    struct list_head free_ioto_spans;
    uint32_t num_free_ioto_spans;
+   /** Recyclable VDM spans (HK_CMD_SLAB_VDM, HK_G17P_VDM_UPLOAD_CHUNK_SIZE). */
+   struct list_head free_vdm_spans;
+   uint32_t num_free_vdm_spans;
+   /** Recyclable control-stream descriptors with warm scissor/depth_bias storage. */
+   struct list_head free_cs;
+   uint32_t num_free_cs;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_cmd_pool, vk.base, VkCommandPool,
@@ -172,6 +186,11 @@ VkResult hk_cmd_pool_alloc_ioto_span(struct hk_cmd_pool *pool,
                                      struct hk_vdm_allocation **allocation);
 void hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
                                 struct hk_vdm_allocation *allocation);
+VkResult hk_cmd_pool_alloc_vdm_span(struct hk_cmd_pool *pool, uint64_t size,
+                                    uint64_t alignment, struct agx_ptr *ptr,
+                                    struct hk_vdm_allocation **allocation);
+void hk_cmd_pool_free_vdm_span(struct hk_cmd_pool *pool,
+                               struct hk_vdm_allocation *allocation);
 void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);

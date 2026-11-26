@@ -21,6 +21,8 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_identity_copy4.h"
+#include "hk_nir_tensor_ops.h"
+#include "hk_pack_loop_bound.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -32,6 +34,14 @@
 #include "nir_defines.h"
 
 #include "vk_shader.h"
+
+static inline bool
+hk_local_read_tilebuffer(enum agx_chip chip)
+{
+   return agx_chip_local_read_tilebuffer(chip) ||
+          (agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2);
+}
 
 struct hk_physical_device;
 struct hk_compute_pair_info;
@@ -177,6 +187,9 @@ struct hk_shader_info {
    bool agx3_gen1_fragment_rq;
    /* HK_ROOT_READS_* classes of root bytes the shader may read. */
    uint8_t agx3_root_reads;
+   /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
+    * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
+   uint64_t agx3_dynbuf_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -247,6 +260,7 @@ struct hk_local_read_shader_meta {
    struct agx_fs_epilog_link_info epilog_key;
    uint8_t set_count;
    uint8_t agx3_root_reads;
+   uint64_t agx3_dynbuf_reads;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
@@ -307,6 +321,8 @@ struct hk_shader {
     * dispatch for multi-draw batches. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
+   struct hk_pack_loop_bound pack_loop_bound;
+
    const void *code_ptr;
    uint32_t code_size;
 
@@ -325,6 +341,10 @@ struct hk_shader {
       simple_mtx_t lock;
       struct hash_table *ht;
       bool lazy_ht;
+      /* Lock-free fast path for the first linked variant (first_key is
+       * write-once under lock before release-storing first). */
+      struct hk_linked_shader *first;
+      const void *first_key;
    } linked;
 
    /* The variant was compiled (hk_compile_nir) or deserialized from a
@@ -507,6 +527,7 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  */
 #include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 
 struct hk_byte_stencil_variant {
    struct hk_byte_stencil_plan plan;
@@ -515,6 +536,11 @@ struct hk_byte_stencil_variant {
 
 struct hk_2d_stencil_variant {
    struct hk_2d_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_compute_opt_variant {
+   struct hk_compute_opt_plan plan;
    struct hk_shader shader;
 };
 
@@ -583,6 +609,16 @@ struct hk_api_shader {
     * stencil: holds the dispatch validation plan and compiled tiled variant. */
    struct hk_2d_stencil_variant *stencil_2d;
 
+   /* Non-NULL for a compute shader matched by hk_compute_opt: holds the
+    * dispatch validation plan and compiled vectorized/tiled variant. */
+   struct hk_compute_opt_variant *compute_opt;
+
+   /* Non-NULL for a compute shader matched as a 3D tensor concat or
+    * nearest-neighbor resample: holds zero-division vectorized alternate(s). */
+   struct hk_shader *tensor_op_primary;
+   struct hk_shader *tensor_op_secondary;
+   struct hk_tensor_op_info tensor_op_info;
+
    struct hk_shader variants[];
 };
 
@@ -609,6 +645,11 @@ VkResult hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
 VkResult hk_fs_build_sample_variant(struct hk_device *dev,
                                     struct hk_api_shader *obj,
                                     unsigned samples);
+
+/* Whether variant `idx` of a fragment shader has been completely published
+ * and is safe to read locklessly (acquire-loads sample_source->ready_mask
+ * when lazy sample variants are present). */
+bool hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx);
 
 void hk_shader_binary_cache_finish(struct hk_device *dev);
 bool hk_shader_ensure_link_ht_locked(struct hk_shader *shader);
@@ -1059,7 +1100,8 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
                          bool coherent_images_in_memory,
-                         bool m5_store_window);
+                         bool m5_store_window,
+                         bool lower_array_cube_lod_query);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,
@@ -1105,3 +1147,12 @@ bool hk_nir_merge_buffer_words(nir_shader *nir);
  * or compilation fails. */
 struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
                                             struct hk_shader *vs);
+
+struct blob;
+struct blob_reader;
+
+void hk_shader_serialize(struct vk_device *vk_dev,
+                         const struct hk_shader *shader, struct blob *blob);
+VkResult hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
+                               struct hk_shader *shader, bool absent,
+                               bool cache_candidate);

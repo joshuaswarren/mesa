@@ -59,6 +59,10 @@ struct hk_descriptor_set_layout {
     * this ABI because Gen9 covers several distinct chips. */
    bool native_sampler_indices;
 
+   /* Precomputed at layout creation: true if the layout or any binding permits
+    * UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING. */
+   bool has_update_after_bind;
+
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;
@@ -78,6 +82,13 @@ struct hk_descriptor_set_layout {
    /* Bindings in this descriptor set */
    struct hk_descriptor_set_binding_layout binding[0];
 };
+
+static inline bool
+hk_descriptor_set_layout_allows_update_after_bind(
+   const struct hk_descriptor_set_layout *layout)
+{
+   return !layout || layout->has_update_after_bind;
+}
 
 static inline uint16_t
 hk_sampler_descriptor_index(const struct hk_descriptor_set_layout *layout,

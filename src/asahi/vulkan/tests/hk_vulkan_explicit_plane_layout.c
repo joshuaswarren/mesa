@@ -121,9 +121,14 @@ create_modifier_image(uint64_t modifier, VkFormat format, uint32_t w,
       .drmFormatModifierPlaneCount = planes,
       .pPlaneLayouts = layouts,
    };
+   const VkImageDrmFormatModifierListCreateInfoEXT list_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+      .drmFormatModifierCount = 1,
+      .pDrmFormatModifiers = &modifier,
+   };
    const VkImageCreateInfo info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-      .pNext = &explicit_info,
+      .pNext = layouts ? (const void *)&explicit_info : (const void *)&list_info,
       .flags = flags,
       .imageType = VK_IMAGE_TYPE_2D,
       .format = format,
@@ -420,7 +425,7 @@ check_tiled_modifiers(void)
       VkSubresourceLayout layout = {0};
       VkImage image0, image1;
       CHECK(create_modifier_image(mods[m].modifier, format, 256, 256, 0,
-                                  usage, 1, &layout, &image0));
+                                  usage, 0, NULL, &image0));
       layout.rowPitch =
          subresource_layout(image0, VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
             .rowPitch;

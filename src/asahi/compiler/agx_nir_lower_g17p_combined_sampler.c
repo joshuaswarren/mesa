@@ -226,9 +226,9 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5, bool g17p)
             * handle, which has no AGX3 encoding, and the pipeline failed
             * with VK_ERROR_UNKNOWN. */
            !register_level && !register_bias &&
-           /* G17P also takes a constant level or bias: the backend keeps
-            * it in a register (agx_optimizer_inline_imm), so it is staged
-            * beside the layer like a per-lane one. */
+           /* AGX3B native backends also take a constant level or bias: the
+            * backend keeps it in a register (agx_optimizer_inline_imm), so it
+            * is staged beside the layer like a per-lane one. */
            !(g17p && !cube &&
              ((tex->op == nir_texop_txl && level_src >= 0) ||
               (tex->op == nir_texop_txb && bias_src >= 0))) &&
@@ -1481,7 +1481,7 @@ g17p_storage_image_shape(const nir_intrinsic_instr *intr, bool load,
       dim == GLSL_SAMPLER_DIM_2D && !nir_intrinsic_image_array(intr);
    if (intr->intrinsic != (load ? nir_intrinsic_bindless_image_load
                                 : nir_intrinsic_bindless_image_store) ||
-       (nir_intrinsic_access(intr) & ACCESS_BUFFER_AGX) ||
+       ((nir_intrinsic_access(intr) & ACCESS_BUFFER_AGX) && !any_format) ||
        (!plain_2d && !g18_dim_ok) || !format_ok ||
        nir_src_num_components(intr->src[1]) != 4 ||
        nir_src_bit_size(intr->src[1]) != 32 ||

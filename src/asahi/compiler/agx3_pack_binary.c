@@ -2271,7 +2271,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
                         uint16_t ms_array_scratch,
                         struct agx3_staging_banks *banks,
                         uint16_t outstanding,
-                        uint16_t *staged_end, bool fragment, bool pixel_entry,
+                        uint16_t *staged_end, bool pixel_entry,
                         uint32_t *pixel_entry_offset, uint16_t heap_uniform_base,
                         struct agx3_fetch_group *group)
 {
@@ -2282,7 +2282,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       const bool encoded = agx3_emit_texture_fetch_g17g(emission, enc, I, slot, wait_mask,
           final, stage_coordinates, separate_write_coords, image_read_bank0,
           g18g, ms_array_scratch, pixel_entry, pixel_entry_offset, &why);
-      if (!encoded)
+      if (!encoded && (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE)))
          fprintf(stderr, "AGX3 fetch refused: %s (g18=%u stage=%u slot=%u scratch=%u)\n",
                  why, g18g, stage_coordinates, slot, ms_array_scratch);
       return encoded;
@@ -2649,9 +2649,12 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       .array = I->dim == AGX_DIM_2D_ARRAY || ms_array,
       .multisample = ms_2d || ms_array,
       .staged_sample = (ms_2d || ms_array) && stage_coordinates,
-      /* M5 raw reads use sampler selector1 in fragment programs and0 in
-       * compute programs, for both ordinary and multisampled images. */
-      .sampler_value = m5 ? (fragment ? 1 : 0) :
+      /* AGX3c (M5) reserves the texel-fetch sampler at heap index 0 across all
+       * stages; slot 1 holds the first application or meta VkSampler. Using
+       * selector 1 in fragment fetches read whatever sampler occupied slot 1
+       * (e.g. a meta blit sampler with maxLod = 0, breaking mipmapped
+       * texelFetch). */
+      .sampler_value = m5 ? 0 :
          ((ms_2d || ms_array) && stage_coordinates ? 1 : 0),
       .three_d = three_d,
       .lod_x64 = immediate_lod ? I->src[1].value * 64 : 0,
@@ -8436,8 +8439,13 @@ agx3_retire_select_waits(struct util_dynarray *emission,
                          enum agx_isa_encoding enc, const agx_instr *I,
                          uint16_t mask)
 {
-   for (unsigned s = 0; s < I->nr_srcs; ++s) {
-      const agx_index operand = I->src[s];
+   /* The mask covers every pending write of the destination this select
+    * overwrites, so with no register source (a constant-program select of
+    * uniforms and immediates) the identity reads the destination once those
+    * writes retire and writes the same value back. */
+   for (unsigned s = 0; s < I->nr_srcs + I->nr_dests; ++s) {
+      const agx_index operand = s < I->nr_srcs ? I->src[s]
+                                              : I->dest[s - I->nr_srcs];
       if (!agx3_src_is_register(operand) || operand.memory ||
           agx_channels(operand) != 1 ||
           (operand.size != AGX_SIZE_16 && operand.size != AGX_SIZE_32))
@@ -15702,7 +15710,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                          staged_bank_reads ? &staging_banks
                                                            : NULL,
                                          outstanding_here, &staged_end,
-                                         ctx->stage == MESA_SHADER_FRAGMENT,
                                          open_pixel_fetch,
                                          &ctx->agx3_colour_link.entry_offset,
                                          ctx->key->g17p_texture_uniform_base,
@@ -17849,7 +17856,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * imageBuffer read). Retire the live generations on the grounded
              * identity carrier before issuing the existing barrier pair. */
             const bool g18g_texture_barrier = ctx->key->dev.emit_agx3d &&
-               I->imm == AGX3_BARRIER_SCOPE_TEXTURE;
+               (I->imm == AGX3_BARRIER_SCOPE_TEXTURE ||
+                I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT ||
+                I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP);
             /* Image-write slots are assigned by the staging allocator after
              * the general scheduler. A device fence must also complete these
              * issued writes, which the scheduler's drain cannot see. */

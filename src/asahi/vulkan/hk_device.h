@@ -460,10 +460,6 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
-   /* Unconditional per-launch CDM barrier (disables tracking). */
-   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(9),
-   /* Opt into dependency tracking on chips where it is not the default. */
-   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(10),
    /* Force the full CDM barrier word on every chip (perftest only). */
    HK_PERF_FULLCDMBARRIER = BITFIELD_BIT(11),
 };
