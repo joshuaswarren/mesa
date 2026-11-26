@@ -16429,18 +16429,20 @@ agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
    };
    NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
 
-   /* Has to run after nir_lower_idiv. Skipped on internal shaders:
-    * agx_nir_lower_fdiv refines every frcp there. On application shaders it
-    * has to stay ahead so the exact-marked frcp nir_lower_idiv emits keep
-    * their cheap refinement.
-    */
-   if (!nir->info.internal)
+   /* Has to run after nir_lower_idiv. Skipped when the exact path owns the
+    * shader (internal shaders, or the exactmath debug flag): it refines
+    * every frcp itself, so this pass would only refine the idiv reciprocal
+    * a second time. */
+   const bool exact_fp32 =
+      nir->info.internal ||
+      ((agx_get_compiler_debug() | agx_compiler_debug) & AGX_DBG_EXACTMATH);
+   if (!exact_fp32)
       NIR_PASS(progress, nir, nir_shader_alu_pass, libagx_lower_fdiv,
                nir_metadata_control_flow, NULL);
 
-   /* fdiv has no hardware: every stage gets a * frcp(d). Driver-internal
-    * shaders and ops an application marked fully exact additionally get
-    * correctly rounded frcp/fdiv/log.
+   /* fdiv has no hardware: every stage gets a * frcp(d). Shaders the
+    * exactmath flag or internal status selects additionally get correctly
+    * rounded frcp/fdiv/log.
     */
    NIR_PASS(progress, nir, agx_nir_lower_fdiv);
    NIR_PASS(progress, nir, agx_nir_lower_log);
@@ -16679,10 +16681,9 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (!post_lower) {
       NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
       /* Chips with a native sinc keep it on every stage, internal
-       * shaders included; everywhere else driver-internal shaders take the
-       * exact lowering for every fsin/fcos, and on application shaders it
-       * lowers only the ops marked fully exact before the stock
-       * approximation lowers the rest. */
+       * shaders included; everywhere else the exact lowering runs first
+       * and the stock approximation lowers whatever it skipped (all of it
+       * on application shaders without the exactmath flag). */
       const unsigned native =
          g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0;
       if (native) {

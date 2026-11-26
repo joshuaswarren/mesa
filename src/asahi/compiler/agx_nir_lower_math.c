@@ -65,12 +65,16 @@ div_rn(nir_builder *b, nir_def *a, nir_def *d)
  * compute workload for results that are bit-identical anyway, so nothing
  * the app merely declares (float controls, NoContraction -- DXVK stamps it
  * on every op and SPIR-V maps it to full nir_fp_exact) can be the switch.
+ *
+ * The debug global is only refreshed at agx_compile_shader_nir, which runs
+ * after these passes, so read the option directly too.
  */
 static bool
 wants_exact_fp32(const nir_shader *s)
 {
    return s->info.internal ||
-          (agx_compiler_debug & AGX_DBG_EXACTMATH);
+          ((agx_get_compiler_debug() | agx_compiler_debug) &
+           AGX_DBG_EXACTMATH);
 }
 
 static bool

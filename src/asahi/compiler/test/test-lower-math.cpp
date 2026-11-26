@@ -343,7 +343,8 @@ TEST_F(LowerMathTest, ExactmathFlagOptsIn)
    /* With the flag set an ordinary application shader takes the exact
     * forms: Markstein for the divide, one reduction for the sin. */
    b.shader->info.internal = false;
-   agx_compiler_debug |= AGX_DBG_EXACTMATH;
+   const int saved_debug = agx_compiler_debug;
+   agx_compiler_debug = saved_debug | AGX_DBG_EXACTMATH;
    nir_def *a = nir_undef(&b, 1, 32);
    nir_def *d = nir_undef(&b, 1, 32);
    nir_fdiv(&b, a, d);
@@ -352,7 +353,7 @@ TEST_F(LowerMathTest, ExactmathFlagOptsIn)
 
    ASSERT_TRUE(agx_nir_lower_fdiv(b.shader));
    ASSERT_TRUE(agx_nir_lower_sincos(b.shader));
-   agx_compiler_debug &= ~AGX_DBG_EXACTMATH;
+   agx_compiler_debug = saved_debug;
 
    EXPECT_EQ(count_alu(nir_op_fdiv), 0u);
    EXPECT_EQ(count_alu(nir_op_frcp), 1u);
