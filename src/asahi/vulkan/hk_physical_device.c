@@ -1129,12 +1129,12 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
-   /* AGX3 parts (G15/G16/G17P, M5, and G18G) view texel buffers through the
-    * 2D texture/PBE descriptor with the software alignment tail.
+   /* Both AGX2 and AGX3/M5/G18G view texel buffers through the 2D texture/PBE
+    * descriptor with a software alignment tail.
     */
-   const bool agx3_texel_buffer_tail = agx_chip_agx3_path(dev->chip);
    const bool texel_buffer_single_texel_alignment =
-      hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
+      hk_descriptor_generation_is_agx2(descriptor_generation) ||
+      agx_chip_agx3_path(dev->chip);
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
     * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
@@ -1197,13 +1197,13 @@ hk_get_device_properties(const struct agx_device *dev,
           agx_chip_g17_m5(dev->chip)) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      /* The native AGX3 and M5 texture/PBE includes the software alignment
-       * tail in its height. Reserve the worst-case 15 R8 texels so a
-       * maximally sized view at a single-texel offset still fits the native
-       * 2D descriptor.
+      /* Every 2D texel-buffer texture/PBE with single-texel alignment includes
+       * its software alignment tail in its height. Reserve the worst-case 15
+       * R8 texels so a maximally sized view at a single-texel offset still
+       * fits the 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (agx3_texel_buffer_tail ? 15 : 0),
+                               (texel_buffer_single_texel_alignment ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* Storage buffers are lowered to global address arithmetic with a
