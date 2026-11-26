@@ -2617,6 +2617,13 @@ load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
 # base = byte offset, target = logical colour attachment index
 store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [])
+# Decode one raw 32-bit tilebuffer word, as read by load_local_pixel_agx with
+# a 32-bit integer format, into the channels a load_local_pixel_agx of FORMAT
+# at the same offset returns.
+#
+# src[] = { raw word }
+intrinsic("unpack_local_pixel_agx", src_comp=[1], dest_comp=0,
+          indices=[FORMAT], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Combined depth/stencil emit, applying to a mask of samples. base indicates
 # which to write (1 = depth, 2 = stencil, 3 = both).

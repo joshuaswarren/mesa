@@ -1477,7 +1477,15 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
    agx_index coords = explicit ? agx_src_index(&instr->src[2]) : agx_null();
 
    b->shader->out->tag_write_disable = false;
-   agx_index sample = agx_src_index(&instr->src[1]);
+   /* An AGX3B compute imageblock store takes its sample mask as an
+    * immediate, the whole pixel. */
+   const bool compute_explicit =
+      explicit && b->shader->stage == MESA_SHADER_COMPUTE &&
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      nir_src_is_const(instr->src[1]);
+   agx_index sample = compute_explicit
+                         ? agx_immediate(nir_src_as_uint(instr->src[1]))
+                         : agx_src_index(&instr->src[1]);
    if (b->shader->key->dev.emit_agx3d &&
        b->shader->key->fs.nr_samples == 1 && !explicit &&
        !nir_src_is_const(instr->src[1]) &&
@@ -2116,6 +2124,39 @@ agx_emit_local_load_pixel(agx_builder *b, agx_index dest,
    agx_emit_cached_split(b, dest, nr_comps);
 }
 
+/*
+ * Decode a raw 32-bit tilebuffer word that the shader already read into the
+ * channels a load_local_pixel_agx of an 8-bit normalized format returns. The
+ * packed tile read and a raw read of the same pixel bytes deliver the bytes in
+ * the same order, two channels to each 16-bit half, so the halves of the word
+ * feed the same `normflt` unpack as agx_unpack_normalized_agx3().
+ */
+static void
+agx_emit_unpack_local_pixel(agx_builder *b, agx_index dest,
+                            nir_intrinsic_instr *instr)
+{
+   const unsigned nr_comps = instr->def.num_components;
+   const enum agx_format format =
+      agx_format_for_pipe(nir_intrinsic_format(instr));
+
+   assert(agx_isa_is_agx3(b->shader->key->dev.encoding));
+   assert(format == AGX_FORMAT_U8NORM || format == AGX_FORMAT_S8NORM ||
+          format == AGX_FORMAT_SRGBA8);
+   assert(nr_comps >= 1 && nr_comps <= 4);
+   assert(instr->src[0].ssa->num_components == 1 &&
+          instr->src[0].ssa->bit_size == 32);
+
+   agx_index word = agx_src_index(&instr->src[0]);
+   agx_index halves[4] = {agx_null()};
+   for (unsigned i = 0; i < DIV_ROUND_UP(nr_comps, 2); ++i) {
+      halves[i] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_subdivide_to(b, halves[i], word, i);
+   }
+
+   agx_unpack_normalized_halves_agx3(b, dest, halves, format, nr_comps,
+                                     nir_def_components_read(&instr->def));
+}
+
 static bool
 nir_is_coherent(nir_intrinsic_instr *instr)
 {
@@ -2561,7 +2602,16 @@ agx_tex_dim(enum glsl_sampler_dim dim, bool array)
 static agx_instr *
 agx_emit_block_image_store(agx_builder *b, nir_intrinsic_instr *instr)
 {
-   agx_index offset = agx_src_index(&instr->src[1]);
+   /* An AGX3B compute block store takes a constant imageblock offset as an
+    * immediate. End-of-tile programs keep their offset register. */
+   const bool compute_bindless =
+      instr->intrinsic == nir_intrinsic_bindless_image_store_block_agx &&
+      b->shader->stage == MESA_SHADER_COMPUTE &&
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      nir_src_is_const(instr->src[1]);
+   agx_index offset = compute_bindless
+                         ? agx_immediate(nir_src_as_uint(instr->src[1]))
+                         : agx_src_index(&instr->src[1]);
    agx_index coords = agx_src_index(&instr->src[2]);
    enum agx_format format = agx_format_for_pipe(nir_intrinsic_format(instr));
 
@@ -3713,6 +3763,10 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       agx_emit_local_load_pixel(b, dst, instr);
       return NULL;
 
+   case nir_intrinsic_unpack_local_pixel_agx:
+      agx_emit_unpack_local_pixel(b, dst, instr);
+      return NULL;
+
    case nir_intrinsic_load_pixel_coord:
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2) {
          return agx_emit_collect_to(
@@ -4480,7 +4534,16 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          if (nir_intrinsic_execution_scope(instr) >= SCOPE_WORKGROUP &&
              !emitted) {
             assert(mesa_shader_stage_is_compute(b->shader->nir->info.stage));
-            agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_EXECUTION);
+            /* In a kernel with an imageblock, the workgroup barrier is the
+             * one that makes its imageblock stores visible to a block
+             * store. */
+            const bool imageblock =
+               b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+               b->shader->nir->info.stage == MESA_SHADER_COMPUTE &&
+               b->shader->nir->info.cs.image_block_size_per_thread_agx;
+            agx_scoped_barrier_agx3(b, imageblock
+                                          ? AGX3_BARRIER_SCOPE_IMAGEBLOCK
+                                          : AGX3_BARRIER_SCOPE_EXECUTION);
          }
 
          return NULL;
@@ -15302,8 +15365,9 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       /* AGX3B and AGX3C main programs use bounded pressure-aware CSE so
        * uniform-source copies can merge without exceeding the shader's
        * existing peak register pressure. */
-      if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-           ctx->stage != MESA_SHADER_VERTEX) ||
+      if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+            key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+           !ctx->is_preamble && ctx->stage != MESA_SHADER_VERTEX) ||
           m5_bounded_cse) {
          AGX_PASS(ctx, agx_opt_cse_bounded);
       } else {

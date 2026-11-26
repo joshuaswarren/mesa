@@ -80,6 +80,24 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     )
   endforeach
 
+  # A draw with a pipeline fast-linked from libraries compiles nothing.
+  test(
+    'hk-g17p-gpl-fast-link',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_gpl_fast_link,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'MESA_SHADER_CACHE_DISABLE=true',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
   # state changes (scissor, viewport, cull mode, depth op, color blend).
   test(
