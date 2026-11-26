@@ -152,7 +152,7 @@ static unsigned checks;
        "0000 01110 0100 00000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x6041, 4),                 \
        "0000 01110 0100 10000 0 0")                                            \
-   ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10000 0 0") \
+   ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10111 0 0") \
    ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 10000 0 0")   \
    ROW(agx_chip_exact_fma32(c), "1111 11111 1111 11111 1 1")                   \
    ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11111 1 0")          \

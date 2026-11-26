@@ -107,6 +107,7 @@ struct hk_g17p_loader {
    uint32_t scratch_size;
    uint32_t compiler_d;
    uint32_t threadgroup_memory_size_B;
+   uint16_t imageblock_stride_B;
    uint32_t constant_program_size;
    uint16_t nr_gprs;
    bool compiler_d_valid;
@@ -285,6 +286,7 @@ hk_g17p_loader_matches(const struct hk_g17p_loader *l,
        l->compiler_d_valid != d->compiler_d_valid ||
        l->compiler_d != d->compiler_d ||
        l->threadgroup_memory_size_B != d->threadgroup_memory_size_B ||
+       l->imageblock_stride_B != d->imageblock_stride_B ||
        l->launch_sources.ti_spill_bytes != d->launch_sources.ti_spill_bytes ||
        l->launch_sources.ti_largest_ipr_bytes !=
           d->launch_sources.ti_largest_ipr_bytes ||
@@ -346,6 +348,7 @@ hk_g17p_loader_create(struct hk_device *dev,
       .scratch_size = desc->scratch_size,
       .compiler_d = desc->compiler_d,
       .threadgroup_memory_size_B = desc->threadgroup_memory_size_B,
+      .imageblock_stride_B = desc->imageblock_stride_B,
       .constant_program_size = desc->constant_program.code_size,
       .nr_gprs = desc->nr_gprs,
       .compiler_d_valid = desc->compiler_d_valid,
@@ -1168,6 +1171,7 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
       .threadgroup_memory_size_B =
          s->b.info.local_size ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
                               : 0,
+      .imageblock_stride_B = s->b.info.imageblock_stride,
       .launch_sources = launch_sources,
       .ldshdr_f1 = kind,
       .constant_program = constant_program,

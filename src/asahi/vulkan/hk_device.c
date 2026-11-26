@@ -530,7 +530,6 @@ hk_init_vm_status_mirror(struct hk_device *dev)
 }
 
 #define HK_CODE_CHUNK_SIZE (1024 * 1024)
-#define HK_CODE_ALIGNMENT  256
 
 struct agx_bo *
 hk_code_alloc(struct hk_device *dev, size_t size, uint32_t *offset)

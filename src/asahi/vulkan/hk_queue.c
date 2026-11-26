@@ -1603,10 +1603,13 @@ static_assert(HK_G17P_SIBLING_QUEUES <= HK_QUEUE_SIBLINGS_MAX,
 #define HK_G17P_SIBLING_MIN_IN_FLIGHT 2
 
 /* Fewest application dispatch threads a stream needs to go to a sibling
- * (hk_sibling_eligible). A 32-thread stream at depth 4 ran 13% slower on
- * siblings, the 2.1 GFLOP ALU stream faster; 65536 lies between them but
- * was not swept, so the crossover is not known more closely. */
-#define HK_G17P_SIBLING_MIN_THREADS 65536
+ * (hk_sibling_eligible). On the A18 Pro, 65536-thread streams lose on
+ * siblings: gpubench compute.uber ran 25% slower (ilp, depth 4 and 16) and
+ * 5% slower (divergent) than on the primary kernel queue alone, while the
+ * 262144-thread ALU stream breaks even and the 4M-thread bandwidth stream
+ * gains. A 32-thread stream at depth 4 also ran 13% slower. Gallium's
+ * sibling routing uses the same floor. */
+#define HK_G17P_SIBLING_MIN_THREADS 262144
 
 /* A submission a sibling kernel queue may run (hk_queue::sib): its streams
  * dispatch at least HK_G17P_SIBLING_MIN_THREADS threads each (or only

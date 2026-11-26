@@ -742,6 +742,29 @@ struct agx_batch {
     */
    bool incoherent_writes;
 
+   /* Whether this batch wrote a resource other than through a shader storage
+    * binding (SSBO, image or global buffer). Shader storage writes are
+    * incoherent in GL: later commands see them only after a memory barrier.
+    */
+   bool coherent_writes;
+
+   /* Plain application compute dispatches (a direct grid, no query), and the
+    * fewest threads any of them launched. A compute-only batch with only
+    * these, no driver work (compute_internal), no scratch and only shader
+    * storage writes may run on a sibling kernel queue
+    * (agx_batch_sibling_queue).
+    */
+   unsigned storage_dispatches;
+   uint64_t storage_min_threads;
+   bool compute_internal;
+
+   /* agx_context::memory_barrier_epoch when the batch began. */
+   uint64_t barrier_epoch;
+
+   /* Set at submission: the batch is compute-only and its writes are all
+    * incoherent, so later independent work need not wait for it. */
+   bool storage_only;
+
    /* If true, this render batch's tiling/vertex work reads or writes a BO with
     * an in-flight GPU writer (or uses a pre-fragment stage that writes memory),
     * so tiling must wait for prior renders instead of deferring the barrier to
@@ -1073,6 +1096,32 @@ struct agx_context {
    /* The queue returns from a submission with output syncs before it retires
     * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT). */
    bool async_submit;
+
+   /* Incremented by every memory barrier. */
+   uint64_t memory_barrier_epoch;
+
+   /* Sibling kernel queues (agx_batch_sibling_queue): independent
+    * storage-only compute batches go round-robin to id[0] (queue_id) and the
+    * siblings, which the firmware runs at the same time. count is 1 when the
+    * kernel cannot order completion across them.
+    */
+   struct {
+      uint32_t id[AGX_SIBLING_COMPUTE_QUEUES];
+      unsigned count, next;
+      enum drm_asahi_priority priority;
+
+      /* Private cumulative timeline: once the context first has work a
+       * sibling could run (anchored), every submission signals the next
+       * point and its outputs include all earlier points, so completion
+       * stays in submission order even when execution does not. */
+      uint32_t anchor;
+      uint64_t anchor_point, anchor_signalled;
+      bool anchored;
+
+      /* Anchor point of the latest sibling submission that work which must
+       * be ordered after it has not waited for yet (0 for none). */
+      uint64_t pending_point;
+   } sib;
 
    struct agx_batch *batch;
    struct agx_bo *timestamps;
@@ -1862,6 +1911,11 @@ void agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
                            uint64_t offset, uint64_t size);
 void agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                             unsigned offset, unsigned size);
+void agx_batch_writes_storage(struct agx_batch *batch,
+                              struct agx_resource *rsrc, unsigned level);
+void agx_batch_writes_storage_range(struct agx_batch *batch,
+                                    struct agx_resource *rsrc,
+                                    unsigned offset, unsigned size);
 void agx_batch_track_image(struct agx_batch *batch,
                            struct pipe_image_view *image);
 

@@ -121,6 +121,7 @@ hk_files = files(
   'hk_render_pack.c',
   'hk_render_pack.h',
   'hk_inline_blend_layout.h',
+  'hk_g17p_varyings.h',
   'hk_partial_mrt_hsr.h',
   'hk_queue.c',
   'hk_queue.h',
@@ -132,6 +133,7 @@ hk_files = files(
   'hk_shader.c',
   'hk_nir_lower_image_view_min_lod.c',
   'hk_shader.h',
+  'hk_shader_upload_core.h',
   'hk_sync.c',
   'hk_sync.h',
   'hk_tess_batch.c',
@@ -179,6 +181,12 @@ if with_tests
       ]),
     suite : ['asahi'])
 
+  test('hk_g17p_varyings',
+    executable('hk_g17p_varyings_test',
+      files('tests/test-hk-g17p-varyings.c'),
+      include_directories : [include_directories('.')]),
+    suite : ['asahi'])
+
   test('hk_inline_blend_layout',
     executable('hk_inline_blend_layout_test',
       files('tests/test-hk-inline-blend-layout.c'),
@@ -210,6 +218,10 @@ if with_tests
     suite : ['asahi'])
   test('hk_host_alias', executable('hk_host_alias_test',
     files('tests/test-hk-host-alias.c', 'hk_host_alias.c'),
+    include_directories : include_directories('.')),
+    suite : ['asahi'])
+  test('hk_shader_upload', executable('hk_shader_upload_test',
+    files('tests/test-hk-shader-upload.c'),
     include_directories : include_directories('.')),
     suite : ['asahi'])
   test(
@@ -1358,6 +1370,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_gpl_fast_link = executable(
+    'g17p-vulkan-gpl-fast-link',
+    files('tests/g17p_vulkan_gpl_fast_link.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_indirect_multi = executable(
     'g17p-vulkan-indirect-multi',
     files('tests/g17p_vulkan_indirect_multi.c'),
@@ -1441,6 +1462,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_clear_pass_load = executable(
+    'g17p-vulkan-clear-pass-load',
+    files('tests/g17p_vulkan_clear_pass_load.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_bg_eot_threads = executable(
     'hk-vulkan-bg-eot-threads',
     files('tests/hk_vulkan_bg_eot_threads.c'),
@@ -1511,6 +1541,15 @@ if with_tests
     files('tests/vulkan_storage_compression.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan'), dep_m],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
+    'vulkan-storage-alias',
+    files('tests/vulkan_storage_alias.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',
   )

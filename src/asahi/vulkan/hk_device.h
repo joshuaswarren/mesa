@@ -684,6 +684,9 @@ hk_device_alloc_scratch(struct hk_device *dev, mesa_shader_stage stage,
 void hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev);
 void hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev);
 
+/* Alignment of every hk_code_alloc() offset. */
+#define HK_CODE_ALIGNMENT 256
+
 /* Allocate size bytes of executable memory. Returns a reference to the chunk
  * BO holding it, with the allocation at *offset; release it with
  * agx_bo_unreference(). */

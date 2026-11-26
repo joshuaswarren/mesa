@@ -30,6 +30,10 @@ struct agx3_g17p_compute_program_desc {
    bool compiler_d_valid;
    uint32_t compiler_d;
    uint32_t threadgroup_memory_size_B;
+   /* Bytes per pixel of the kernel's imageblock, or 0 without one. A compute
+    * imageblock is a 32x32 tile of one sample per pixel, the tile a 32x32
+    * workgroup stages for its block store. */
+   uint16_t imageblock_stride_B;
    struct agx3_cdm_direct_template_sources launch_sources;
    enum agx_ioto_g17p_compute_ldshdr_f1 ldshdr_f1;
    const struct agx_ioto_preshader_desc *preshader;

@@ -1,0 +1,10 @@
+#version 450
+/* Keeps the compute subqueue busy: a dependent ALU chain, one store. */
+layout(local_size_x = 64) in;
+layout(binding = 0, std430) buffer O { uint o[]; };
+layout(push_constant) uniform P { uint iters; } p;
+void main() {
+   uint x = gl_GlobalInvocationID.x;
+   for (uint i = 0u; i < p.iters; i++) x = x * 1664525u + 1013904223u;
+   o[gl_GlobalInvocationID.x & 1023u] = x;
+}

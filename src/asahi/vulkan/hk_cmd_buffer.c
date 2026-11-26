@@ -13,6 +13,7 @@
 #include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
+#include "hk_g17p_varyings.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -835,11 +836,11 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* A G17P compute root consumes a whole command BO. Keep control-stream
-    * roots on their own bump cursor so allocating one cannot evict a partially
-    * used main-upload BO and move that allocator's slow path into the next
-    * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_chip_native_agx3(dev->dev.chip)
+   /* Keep control-stream roots on their own bump cursor on native AGX3 and M5
+    * so allocating one cannot evict a partially used main-upload BO and so
+    * unlinked stream BOs are marked stream_only for exact-extent cache cleans
+    * at vkEndCommandBuffer(). Ownership remains on the ordinary main BO list. */
+   struct hk_uploader *uploader = agx_chip_native_or_m5(dev->dev.chip)
                                      ? &cmd->uploader.streams
                                      : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
@@ -2678,12 +2679,12 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||
                                 cull_slot;
          if (!user_slot || (cull_slot && (b->perspective || !b->smooth)) ||
-             (b->perspective && !has_rhw) ||
-             b->offset + b->count > vs->info.uvs.components[b->slot])
+             (b->perspective && !has_rhw))
             return false;
          ++user_bindings;
-         const unsigned slot = gfx->linked_varyings.slots[b->slot];
-         if (slot < 4 || slot + b->offset + b->count > vs->info.uvs.size)
+         if (!hk_g17p_user_varying_binding_fits(
+                b->offset, b->count, vs->info.uvs.components[b->slot],
+                gfx->linked_varyings.slots[b->slot], vs->info.uvs.size))
             return false;
       }
       next_cf += b->count;
@@ -4872,7 +4873,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
    s = hk_linked_shader_source(s, linked);
-   if (!agx_chip_native_hal200(dev->dev.chip) ||
+   if ((!agx_chip_native_hal200(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
        s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
        !gfx->root || gfx->g17p_hoisted_preamble_va)
       return 0;

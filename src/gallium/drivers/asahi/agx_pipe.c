@@ -941,10 +941,10 @@ agx_batch_track_image(struct agx_batch *batch, struct pipe_image_view *image)
       batch->incoherent_writes = true;
 
       if (rsrc->base.b.target == PIPE_BUFFER) {
-         agx_batch_writes_range(batch, rsrc, image->u.buf.offset,
-                                image->u.buf.size);
+         agx_batch_writes_storage_range(batch, rsrc, image->u.buf.offset,
+                                        image->u.buf.size);
       } else {
-         agx_batch_writes(batch, rsrc, image->u.tex.level);
+         agx_batch_writes_storage(batch, rsrc, image->u.tex.level);
       }
    } else {
       agx_batch_reads(batch, rsrc);
@@ -2791,6 +2791,12 @@ agx_destroy_context(struct pipe_context *pctx)
    agx_scratch_fini(&ctx->scratch_cs);
 
    agx_destroy_command_queue(dev, ctx->queue_id);
+   for (unsigned i = 1; i < ARRAY_SIZE(ctx->sib.id); ++i) {
+      if (ctx->sib.id[i] != UINT32_MAX)
+         agx_destroy_command_queue(dev, ctx->sib.id[i]);
+   }
+   if (ctx->sib.anchor)
+      drmSyncobjDestroy(dev->fd, ctx->sib.anchor);
 
    slab_destroy_child(&ctx->transfer_pool);
    slab_destroy_child(&ctx->transfer_pool_unsync);
@@ -3001,6 +3007,27 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
                                     ? PIPE_CONTEXT_PRIORITY_HIGH
                                     : PIPE_CONTEXT_PRIORITY_MEDIUM;
    ctx->virt_ring_idx = priority + 1;
+
+   /* Sibling kernel queues are created on first use (agx_batch.c). Without
+    * the private cumulative anchor that keeps completion ordered across
+    * them, the context keeps to its own queue. */
+   ctx->sib.id[0] = ctx->queue_id;
+   for (unsigned i = 1; i < ARRAY_SIZE(ctx->sib.id); ++i)
+      ctx->sib.id[i] = UINT32_MAX;
+   ctx->sib.count = 1;
+   ctx->sib.priority = priority;
+   if (agx_sibling_compute_supported(agx_device(screen))) {
+      uint64_t first_point = 1;
+      if (!drmSyncobjCreate(agx_device(screen)->fd, 0, &ctx->sib.anchor) &&
+          !drmSyncobjTimelineSignal(agx_device(screen)->fd, &ctx->sib.anchor,
+                                    &first_point, 1)) {
+         ctx->sib.anchor_point = ctx->sib.anchor_signalled = first_point;
+         ctx->sib.count = AGX_SIBLING_COMPUTE_QUEUES;
+      } else if (ctx->sib.anchor) {
+         drmSyncobjDestroy(agx_device(screen)->fd, ctx->sib.anchor);
+         ctx->sib.anchor = 0;
+      }
+   }
 
    slab_create_child(&ctx->transfer_pool, &agx_screen(screen)->transfer_pool);
    slab_create_child(&ctx->transfer_pool_unsync,
