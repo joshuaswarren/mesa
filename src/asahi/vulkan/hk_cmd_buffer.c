@@ -4873,7 +4873,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
    s = hk_linked_shader_source(s, linked);
-   if (!agx_chip_native_hal200(dev->dev.chip) ||
+   if ((!agx_chip_native_hal200(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
        s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
        !gfx->root || gfx->g17p_hoisted_preamble_va)
       return 0;
