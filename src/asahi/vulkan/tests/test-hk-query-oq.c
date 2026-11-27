@@ -888,6 +888,103 @@ test_join_moves_query_access_ranges(void)
         p1->imm_write_query_untracked);
 }
 
+static void
+test_no_query_access_and_m5_reverse(void)
+{
+   /* M5 uses reverse resolution just like HAL200. */
+   test_chip = AGX_CHIP_G17S;
+   struct hk_cmd_buffer *c = new_cmd();
+   struct hk_cs *r[3], *p[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      r[i] = add(c, false);
+      p[i] = add_post(c, r[i], 1, 1 + i);
+   }
+   T("m5-rev: three passes defer",
+     deferred(c, p[0]) && deferred(c, p[1]) && deferred(c, p[2]));
+   hk_resolve_deferred_oq_available(c);
+   T("m5-rev: every render carries its own store",
+     slot_is(r[0], 1, 1) && slot_is(r[1], 1, 2) && slot_is(r[2], 1, 3) &&
+        ndispatched == 0 && !listed(c, p[0]) && !listed(c, p[1]) && !listed(c, p[2]));
+
+   /* With COMPUTE_NO_QUERY_ACCESS, a barrier between renders or at CB tail
+    * does not force a standalone LIBAGX_WRITE_U32S compute stream when the
+    * render has free retirement stamp slots and the VDM dependency covers it. */
+   c = new_cmd();
+   hk_cmd_buffer_device(c)->dev.params.features |=
+      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+   struct hk_cs *r1 = add(c, false);
+   struct hk_cs *p1 = add_post(c, r1, 1, 11);
+   T("nqa-r2r: post defers", deferred(c, p1));
+   struct hk_cs *r2 = add(c, false);
+   r2->sync.dep[HK_SYNC_VDM].cut = r1;
+   r2->sync.dep[HK_SYNC_CDM].cut = p1;
+   r2->sync.dep_ta[HK_SYNC_VDM].cut = r1;
+   r2->sync.dep_ta[HK_SYNC_CDM].cut = p1;
+   c->sync.req[util_logbase2(HK_SYNC_GFX)][HK_SYNC_VDM].cut = r1;
+   c->sync.req[util_logbase2(HK_SYNC_GFX)][HK_SYNC_CDM].cut = p1;
+   hk_resolve_deferred_oq_available(c);
+   T("nqa-r2r: stamps on render and drops post between renders",
+     slot_is(r1, 1, 11) && !listed(c, p1) && ndispatched == 0 &&
+        r2->sync.dep[HK_SYNC_VDM].cut == r1 && r2->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+   /* With COMPUTE_NO_QUERY_ACCESS, a later non-query compute waiting on render
+    * still allows stamping; a later query-accessing compute keeps post. */
+   c = new_cmd();
+   hk_cmd_buffer_device(c)->dev.params.features |=
+      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+   r1 = add(c, false);
+   p1 = add_post(c, r1, 1, 12);
+   T("nqa-cmp: post defers", deferred(c, p1));
+   struct hk_cs *cmp = add(c, true);
+   cmp->sync.dep[HK_SYNC_VDM].cut = r1;
+   cmp->sync.dep[HK_SYNC_CDM].cut = p1;
+   hk_resolve_deferred_oq_available(c);
+   T("nqa-cmp: non-query compute allows render stamping",
+     slot_is(r1, 1, 12) && !listed(c, p1) && ndispatched == 0 &&
+        cmp->sync.dep[HK_SYNC_VDM].cut == r1 && cmp->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+   c = new_cmd();
+   hk_cmd_buffer_device(c)->dev.params.features |=
+      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+   r1 = add(c, false);
+   p1 = add_post(c, r1, 1, 13);
+   T("nqa-qcopy: post defers", deferred(c, p1));
+   struct hk_cs *qcopy = add(c, true);
+   qcopy->query_access = true;
+   qcopy->sync.dep[HK_SYNC_VDM].cut = r1;
+   qcopy->sync.dep[HK_SYNC_CDM].cut = p1;
+   hk_resolve_deferred_oq_available(c);
+   T("nqa-qcopy: query-accessing compute keeps post",
+     r1->oq_stamp[1].handle == 0 && listed(c, p1) && ndispatched == 1 &&
+        dispatched[0].cs == p1);
+
+   /* With COMPUTE_NO_QUERY_ACCESS, inline pending OQ stamps at EndCommandBuffer
+    * even when a tail barrier names the render. */
+   c = new_cmd();
+   hk_cmd_buffer_device(c)->dev.params.features |=
+      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+   r1 = add_inline_render(c, 1);
+   c->sync.req[util_logbase2(HK_SYNC_COMPUTE)][HK_SYNC_VDM].cut = r1;
+   hk_resolve_pending_oq_available(c);
+   T("nqa-inline: tail barrier still stamps inline on render",
+     slot_is(r1, 1, 1) && cs_allocs == 0 && !c->state.oq_pending_render);
+
+   /* Without VDM coverage of render, a CDM-only waiter on post keeps post. */
+   c = new_cmd();
+   hk_cmd_buffer_device(c)->dev.params.features |=
+      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+   r1 = add(c, false);
+   p1 = add_post(c, r1, 1, 14);
+   T("nqa-uncovered: post defers", deferred(c, p1));
+   cmp = add(c, true);
+   cmp->sync.dep[HK_SYNC_CDM].cut = p1;
+   hk_resolve_deferred_oq_available(c);
+   T("nqa-uncovered: CDM-only waiter without VDM edge keeps post",
+     r1->oq_stamp[1].handle == 0 && listed(c, p1) && ndispatched == 1);
+
+   test_chip = AGX_CHIP_G17P;
+}
+
 int
 main(void)
 {
@@ -908,6 +1005,7 @@ main(void)
    test_order_forward();
    test_stamp_chips();
    test_join_moves_query_access_ranges();
+   test_no_query_access_and_m5_reverse();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
