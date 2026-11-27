@@ -326,11 +326,18 @@ struct vk_sync {
    const struct vk_sync_type *type;
    enum vk_sync_flags flags;
 
-   /** Lower bound on the pending timeline value (or 1 for binary) already
-    * submitted or signaled in the underlying primitive for a non-shareable,
-    * non-shared sync.  Updated with release semantics after the backend
-    * signal/submit succeeds, and cleared before any reset, move, or
-    * import/export operation.
+   /** What this device knows is already submitted or signaled in the
+    * underlying primitive of a non-shareable, non-shared sync.
+    *
+    * For a timeline, a lower bound on the pending value.  It only grows,
+    * except when the payload is replaced by an import.
+    *
+    * For a binary sync, bit 0 says a signal is pending and the other bits
+    * are a generation.  vk_sync_pending_token() is read before the backend
+    * signal or submit starts and vk_sync_note_pending() sets bit 0 only if
+    * the generation is unchanged.  Every reset, move, import or export
+    * advances the generation both before and after it touches the payload,
+    * so a signal that overlaps one of them never marks the sync pending.
     */
    uint64_t pending_value;
 };
@@ -433,7 +440,10 @@ VkResult MUST_CHECK vk_sync_move(struct vk_device *device,
                                  struct vk_sync *dst,
                                  struct vk_sync *src);
 
-void vk_sync_note_pending(struct vk_sync *sync, uint64_t value);
+uint64_t vk_sync_pending_token(struct vk_sync *sync);
+
+void vk_sync_note_pending(struct vk_sync *sync, uint64_t value,
+                          uint64_t token);
 
 void vk_sync_clear_pending(struct vk_sync *sync);
 

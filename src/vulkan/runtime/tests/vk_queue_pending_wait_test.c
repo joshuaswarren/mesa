@@ -26,6 +26,19 @@ static int alloc_calls;
 static bool fail_next_submit_oom;
 static int track_allocs;
 
+/* Gate for holding a submit inside driver_submit, the way a real submit
+ * ioctl returns some time after the kernel made its fence visible to other
+ * waiters.
+ */
+enum gate_mode {
+   GATE_NONE,
+   GATE_AFTER_SIGNAL,
+   GATE_BEFORE_SIGNAL,
+};
+static int gate_mode;
+static int in_gate;
+static int gate_open;
+
 static void
 require(bool condition, const char *message)
 {
@@ -180,6 +193,50 @@ static const struct vk_sync_type mock_sync_type = {
    .wait_many = mock_wait_many,
 };
 
+static void
+gate_hold(void)
+{
+   p_atomic_set(&in_gate, 1);
+   while (!p_atomic_read(&gate_open)) {
+      const struct timespec delay = { .tv_nsec = 1000000 };
+      thrd_sleep(&delay, NULL);
+   }
+   p_atomic_set(&in_gate, 0);
+}
+
+static void
+gate_close(enum gate_mode mode)
+{
+   p_atomic_set(&gate_open, 0);
+   p_atomic_set(&gate_mode, mode);
+}
+
+static void
+gate_release(void)
+{
+   p_atomic_set(&gate_open, 1);
+}
+
+static void
+wait_in_gate(void)
+{
+   const int64_t deadline = os_time_get_nano() + 2 * ONE_SECOND_IN_NS;
+   while (!p_atomic_read(&in_gate)) {
+      require(os_time_get_nano() < deadline, "submit never reached the gate");
+      const struct timespec delay = { .tv_nsec = 1000000 };
+      thrd_sleep(&delay, NULL);
+   }
+}
+
+static int
+release_gate_later(void *data)
+{
+   const struct timespec delay = { .tv_nsec = 100000000 };
+   thrd_sleep(&delay, NULL);
+   gate_release();
+   return 0;
+}
+
 static VkResult
 mock_driver_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
@@ -188,9 +245,16 @@ mock_driver_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
+   const int mode = p_atomic_read(&gate_mode);
+   if (mode == GATE_BEFORE_SIGNAL && submit->signal_count)
+      gate_hold();
+
    for (uint32_t i = 0; i < submit->signal_count; i++)
       mock_signal(queue->base.device, submit->signals[i].sync,
                   submit->signals[i].signal_value);
+
+   if (mode == GATE_AFTER_SIGNAL && submit->signal_count)
+      gate_hold();
 
    p_atomic_inc(&driver_submit_calls);
    return VK_SUCCESS;
@@ -233,6 +297,59 @@ wait_for_submits(int target, const char *msg)
       const struct timespec delay = { .tv_nsec = 1000000 };
       thrd_sleep(&delay, NULL);
    }
+}
+
+static VkResult
+submit_binary(struct vk_queue *q, struct vk_semaphore *wait_sem,
+              struct vk_semaphore *signal_sem)
+{
+   const VkSemaphoreSubmitInfo w = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+      .semaphore = wait_sem ? vk_semaphore_to_handle(wait_sem) : VK_NULL_HANDLE,
+   };
+   const VkSemaphoreSubmitInfo s = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+      .semaphore = signal_sem ? vk_semaphore_to_handle(signal_sem) : VK_NULL_HANDLE,
+   };
+   const VkSubmitInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+      .waitSemaphoreInfoCount = wait_sem ? 1 : 0,
+      .pWaitSemaphoreInfos = &w,
+      .signalSemaphoreInfoCount = signal_sem ? 1 : 0,
+      .pSignalSemaphoreInfos = &s,
+   };
+   return vk_common_QueueSubmit2(vk_queue_to_handle(q), 1, &info,
+                                 VK_NULL_HANDLE);
+}
+
+struct immediate_signal {
+   struct vk_queue *queue;
+   struct vk_semaphore *sem;
+   VkResult result;
+};
+
+static int
+immediate_signal_thread(void *data)
+{
+   struct immediate_signal *args = data;
+   args->result = submit_binary(args->queue, NULL, args->sem);
+   return 0;
+}
+
+static void
+queue_wait_idle(struct vk_queue *q)
+{
+   require(vk_common_QueueWaitIdle(vk_queue_to_handle(q)) == VK_SUCCESS,
+           "vkQueueWaitIdle failed");
+}
+
+/* A sync must never be known pending while its payload is empty. */
+static void
+require_pending_has_payload(struct vk_semaphore *sem, const char *msg)
+{
+   struct mock_sync *ms = (struct mock_sync *)&sem->permanent;
+   require(!vk_sync_wait_is_known_pending(&sem->permanent, 0) ||
+           p_atomic_read(&ms->pending_point) != 0, msg);
 }
 
 int
@@ -536,14 +653,117 @@ main(void)
            "unblock signal failed");
    wait_for_submits(submits_before + 2,
                     "threaded submit did not finish after signal");
-   /* Wait briefly for vk_queue_submit_final to finish noting pending values. */
-   vk_queue_finish(&q1);
+   /* Wait for vk_queue_submit_final to finish noting pending values. */
+   queue_wait_idle(&q1);
    require(vk_sync_wait_is_known_pending(&tl_out->permanent, 1),
            "threaded timeline signal did not note pending after submit");
    require(vk_sync_wait_is_known_pending(&bin_out->permanent, 0),
            "threaded binary signal did not note pending after submit");
    printf("wait-before-signal and threaded deferral: PASS\n");
 
+   /* 8. A binary signal consumed while its submit is still inside
+    * driver_submit must not be marked pending afterwards.
+    *
+    * q1 is threaded now.  Its submit thread installs X's payload and is held
+    * inside driver_submit; the wait on X, submitted from this thread, sees
+    * the payload through WAIT_PENDING and moves it to a temporary.  Once
+    * driver_submit returns, X is empty and must not be known pending, or
+    * the next wait on X skips WAIT_PENDING and moves an empty payload,
+    * which on a threaded queue waits forever.
+    */
+   struct vk_semaphore *x = create_sem(&device, VK_SEMAPHORE_TYPE_BINARY, 0, 0);
+   require(q1.submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED,
+           "q1 is not threaded");
+
+   gate_close(GATE_AFTER_SIGNAL);
+   require(submit_binary(&q1, NULL, x) == VK_SUCCESS,
+           "threaded binary signal failed");
+   wait_in_gate();
+   require(submit_binary(&q1, x, NULL) == VK_SUCCESS,
+           "threaded binary wait failed");
+   gate_release();
+   queue_wait_idle(&q1);
+   gate_close(GATE_NONE);
+   require_pending_has_payload(x, "consumed threaded binary signal "
+                                  "left an empty payload marked pending");
+
+   /* The next signal of X is still queued on q1's thread when the next wait
+    * on X comes in; the wait must reach driver_submit.
+    */
+   int before = p_atomic_read(&driver_submit_calls);
+   gate_close(GATE_BEFORE_SIGNAL);
+   require(submit_binary(&q1, NULL, x) == VK_SUCCESS,
+           "second threaded binary signal failed");
+   wait_in_gate();
+   thrd_t releaser;
+   require(thrd_create(&releaser, release_gate_later, NULL) == thrd_success,
+           "thrd_create failed");
+   require(submit_binary(&q1, x, NULL) == VK_SUCCESS,
+           "second threaded binary wait failed");
+   wait_for_submits(before + 2,
+                    "wait on a reused binary semaphore never reached "
+                    "driver_submit");
+   thrd_join(releaser, NULL);
+   queue_wait_idle(&q1);
+   gate_close(GATE_NONE);
+   require_pending_has_payload(x, "reused threaded binary semaphore left "
+                                  "an empty payload marked pending");
+
+   /* Same race across queues: q1's thread installs X and is held inside
+    * driver_submit while an immediate submit on q0 waits on X and resets
+    * it.  X must not be known pending afterwards, and the next immediate
+    * wait on X must probe it instead of taking the fast path.
+    */
+   require(q0.submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE,
+           "q0 is not immediate");
+   gate_close(GATE_AFTER_SIGNAL);
+   require(submit_binary(&q1, NULL, x) == VK_SUCCESS,
+           "cross-queue binary signal failed");
+   wait_in_gate();
+   require(submit_binary(&q0, x, NULL) == VK_SUCCESS,
+           "cross-queue immediate binary wait failed");
+   require(q0.submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE,
+           "cross-queue wait unexpectedly started q0's submit thread");
+   gate_release();
+   queue_wait_idle(&q1);
+   gate_close(GATE_NONE);
+   require(!vk_sync_wait_is_known_pending(&x->permanent, 0),
+           "cross-queue consumed binary signal left X marked pending");
+   require_pending_has_payload(x, "cross-queue consumed binary signal left "
+                                  "an empty payload marked pending");
+
+   /* And with the signal on the immediate queue: q0's driver_submit runs
+    * on another application thread and is held after installing X while a
+    * wait on threaded q1 moves X's payload away.
+    */
+   gate_close(GATE_AFTER_SIGNAL);
+   thrd_t signaler;
+   struct immediate_signal sig_args = { .queue = &q0, .sem = x };
+   require(thrd_create(&signaler, immediate_signal_thread,
+                       &sig_args) == thrd_success,
+           "thrd_create failed");
+   wait_in_gate();
+   require(submit_binary(&q1, x, NULL) == VK_SUCCESS,
+           "threaded wait on immediate binary signal failed");
+   gate_release();
+   thrd_join(signaler, NULL);
+   require(sig_args.result == VK_SUCCESS, "immediate binary signal failed");
+   queue_wait_idle(&q1);
+   gate_close(GATE_NONE);
+   require(!vk_sync_wait_is_known_pending(&x->permanent, 0),
+           "immediate binary signal consumed inside driver_submit left X "
+           "marked pending");
+
+   /* A clear that overlaps a host signal also wins. */
+   const uint64_t token = vk_sync_pending_token(&x->permanent);
+   vk_sync_clear_pending(&x->permanent);
+   vk_sync_note_pending(&x->permanent, 0, token);
+   require(!vk_sync_wait_is_known_pending(&x->permanent, 0),
+           "stale token marked a cleared binary sync pending");
+   printf("binary signal consumed inside driver_submit: PASS\n");
+   destroy_sem(&device, x);
+
+   vk_queue_finish(&q1);
    vk_queue_finish(&q0);
    destroy_sem(&device, bin_out);
    destroy_sem(&device, tl_out);
