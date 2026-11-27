@@ -2512,6 +2512,7 @@ struct hk_cmd_buffer {
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
+   bool heap_slot_assigned;
    uint8_t heap_slot;
 
    /* The push descriptor sets hk_meta_begin() saves, each only as long as
@@ -3583,6 +3584,8 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
     * to queue a free for it again.
     */
    cmd->uses_heap = false;
+   cmd->heap_slot_assigned = false;
+   cmd->heap_slot = 0;
    return cs != NULL;
 }
 

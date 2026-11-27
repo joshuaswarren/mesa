@@ -1335,6 +1335,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       list_inithead(&dev->vdm.full[class]);
    }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
    simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
    list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
@@ -1489,7 +1490,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bo_unreference(&dev->dev, dev->rodata.heap_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.indexed_heap_pointers_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
-   agx_bo_unreference(&dev->dev, dev->heap);
+   for (unsigned s = 0; s < HK_HEAP_SLOTS; ++s)
+      agx_bo_unreference(&dev->dev, dev->heap_slots[s]);
+   simple_mtx_destroy(&dev->heap_lock);
    hk_g17p_bg_eot_dev_cache_finish(dev);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);

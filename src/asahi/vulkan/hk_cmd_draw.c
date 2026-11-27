@@ -6535,32 +6535,48 @@ hk_heap_ring_enabled(const struct hk_device *dev)
    return agx_chip_native_or_m5(dev->dev.chip);
 }
 
-static size_t
-hk_heap_slot_size(const struct hk_device *dev)
-{
-   return hk_heap_ring_enabled(dev) ? (dev->heap->size / HK_HEAP_SLOTS)
-                                    : dev->heap->size;
-}
-
 static uint64_t
 hk_heap_base(const struct hk_cmd_buffer *cmd)
 {
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   return dev->heap->va->addr + (uint64_t)cmd->heap_slot * hk_heap_slot_size(dev);
+   struct agx_bo *bo =
+      __atomic_load_n(&dev->heap_slots[cmd->heap_slot], __ATOMIC_ACQUIRE);
+   assert(bo && "heap consumers require checked preparation/admission");
+   return bo->va->addr;
 }
 
-static void
-hk_init_heap(const void *data)
+static size_t
+hk_heap_size(const struct hk_cmd_buffer *cmd)
 {
-   struct hk_device *dev = (struct hk_device *)data;
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct agx_bo *bo =
+      __atomic_load_n(&dev->heap_slots[cmd->heap_slot], __ATOMIC_ACQUIRE);
+   assert(bo && "heap consumers require checked preparation/admission");
+   return bo->size;
+}
 
-   perf_debug_dev(&dev->dev, "Allocating heap");
+static VkResult
+hk_device_ensure_geometry_heap_slot(struct hk_device *dev, uint8_t slot)
+{
+   assert(slot < HK_HEAP_SLOTS);
+   if (likely(__atomic_load_n(&dev->heap_slots[slot], __ATOMIC_ACQUIRE) != NULL))
+      return VK_SUCCESS;
 
-   size_t size = 128 * 1024 * 1024;
+   simple_mtx_lock(&dev->heap_lock);
+   if (dev->heap_slots[slot]) {
+      simple_mtx_unlock(&dev->heap_lock);
+      return VK_SUCCESS;
+   }
+
+   perf_debug_dev(&dev->dev, "Allocating geometry heap slot %u", slot);
+
+   const size_t size = 128 * 1024 * 1024;
    struct agx_bo *heap =
       agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
-   if (!heap)
-      return;
+   if (!heap) {
+      simple_mtx_unlock(&dev->heap_lock);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
 
    /* The geometry state buffer is initialized here and then is treated by
     * the CPU as rodata, even though the GPU uses it for scratch internally.
@@ -6568,53 +6584,56 @@ hk_init_heap(const void *data)
    struct poly_heap *map = agx_bo_map(dev->rodata.heap_bo);
    if (!map) {
       agx_bo_unreference(&dev->dev, heap);
-      return;
+      simple_mtx_unlock(&dev->heap_lock);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
-   if (hk_heap_ring_enabled(dev)) {
-      const size_t slot_size = size / HK_HEAP_SLOTS;
-      for (unsigned s = 0; s < HK_HEAP_SLOTS; ++s) {
-         map[s] = (struct poly_heap){
-            .base = heap->va->addr + (uint64_t)s * slot_size,
-            .size = slot_size,
-         };
-      }
-   } else {
-      map[0] = (struct poly_heap){
-         .base = heap->va->addr,
-         .size = size,
-      };
-   }
-   dev->heap = heap;
+   map[slot] = (struct poly_heap){
+      .base = heap->va->addr,
+      .size = size,
+   };
+   __atomic_store_n(&dev->heap_slots[slot], heap, __ATOMIC_RELEASE);
+   simple_mtx_unlock(&dev->heap_lock);
+   return VK_SUCCESS;
 }
 
 /*
  * Allocating the geometry heap is a 128 MB agx_bo_create(), measured at 15.5 ms
  * on G17P: the kernel has to find and zero the pages.  Every consumer of the
- * heap is reached from a draw, so leaving the allocation to util_call_once()
- * put those 15.5 ms inside the first vkCmdDraw() that used geometry or
- * tessellation -- a stall in the middle of a render pass, and ~150x the cost of
- * the same draw once warm (median 105 us).
- *
- * Nothing about the heap depends on the draw, only on the device, so the
- * allocation can be forced as soon as we know the client has a stage that will
- * need it. Command preparation and draw admission also check the result,
- * including heap users introduced by indirect adjacency or index robustness.
+ * heap is reached from a draw, so pre-warming slot 0 on pipeline creation
+ * avoids stalling in the middle of the first draw that needs it. Additional
+ * ring slots lazily allocate their own full 128 MB buffer on first use (and
+ * fall back to slot 0 on OOM so low-memory systems never regress).
  */
 VkResult
 hk_device_ensure_geometry_heap(struct hk_device *dev)
 {
-   util_call_once_data(&dev->heap_init_once, hk_init_heap, dev);
-   return dev->heap ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   return hk_device_ensure_geometry_heap_slot(dev, 0);
 }
 
 static bool
 hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd)
 {
-   VkResult result = hk_device_ensure_geometry_heap(hk_cmd_buffer_device(cmd));
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return false;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!cmd->heap_slot_assigned) {
+      uint8_t slot =
+         hk_heap_ring_enabled(dev)
+            ? (uint8_t)(p_atomic_fetch_add(&dev->heap_next_slot, 1) %
+                        HK_HEAP_SLOTS)
+            : 0;
+      VkResult result = slot == 0
+                           ? hk_device_ensure_geometry_heap(dev)
+                           : hk_device_ensure_geometry_heap_slot(dev, slot);
+      if (result != VK_SUCCESS && slot != 0) {
+         slot = 0;
+         result = hk_device_ensure_geometry_heap(dev);
+      }
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return false;
+      }
+      cmd->heap_slot = slot;
+      cmd->heap_slot_assigned = true;
    }
    return true;
 }
@@ -6624,25 +6643,21 @@ hk_heap(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   assert(dev->heap && "heap consumers require checked preparation/admission");
+   assert(cmd->heap_slot_assigned &&
+          __atomic_load_n(&dev->heap_slots[cmd->heap_slot], __ATOMIC_ACQUIRE) &&
+          "heap consumers require checked preparation/admission");
 
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
       perf_debug(cmd, "Freeing heap");
+      const uint8_t slot = cmd->heap_slot;
+      const uint64_t addr =
+         dev->rodata.heap + (uint64_t)slot * sizeof(struct poly_heap);
       if (hk_heap_ring_enabled(dev)) {
-         const uint8_t slot =
-            (uint8_t)(p_atomic_fetch_add(&dev->heap_next_slot, 1) %
-                      HK_HEAP_SLOTS);
-         cmd->heap_slot = slot;
-         const uint64_t addr =
-            dev->rodata.heap + (uint64_t)slot * sizeof(struct poly_heap);
          hk_sync_heap_slot_used(cmd, slot);
          hk_queue_write(cmd, addr + offsetof(struct poly_heap, bottom), 0,
                         true /* after gfx */);
       } else {
-         cmd->heap_slot = 0;
-         uint64_t addr = dev->rodata.heap;
-
          /* One device-wide bump allocator: every pass that uses it runs after
           * every earlier stream and its free runs after the pass. */
          hk_sync_heap_used(cmd);
@@ -6762,7 +6777,6 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
 static uint64_t
 hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
    struct hk_shader *fs = hk_bound_fs(cmd);
@@ -6839,7 +6853,7 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
          hk_heap(cmd);
 
          cmd->geom_index_buffer = hk_heap_base(cmd);
-         cmd->geom_index_count = hk_heap_slot_size(dev);
+         cmd->geom_index_count = hk_heap_size(cmd);
       } else {
          cmd->geom_index_count =
             poly_gs_rast_vertices(gsi->shape, gsi->max_indices, 1, 0);
@@ -6875,7 +6889,6 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 static void
 hk_init_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *tcs = hk_only_variant(gfx->shaders[MESA_SHADER_TESS_CTRL]);
@@ -7055,7 +7068,6 @@ static struct agx_draw
 hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                         uint32_t draw_count)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
    perf_debug(cmd, "Unrolling primitive restart due to GS/XFB");
@@ -7086,7 +7098,7 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                                 poly_compact_prim(prim));
 
    return agx_draw_indexed_indirect(ia.out_draw, hk_heap_base(cmd),
-                                    hk_heap_slot_size(dev), draw.index_size,
+                                    hk_heap_size(cmd), draw.index_size,
                                     false /* restart */);
 }
 
@@ -7400,7 +7412,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    return agx_draw_indexed_indirect(gfx->tess.out_draws, hk_heap_base(cmd),
-                                    hk_heap_slot_size(dev), AGX_INDEX_SIZE_U32,
+                                    hk_heap_size(cmd), AGX_INDEX_SIZE_U32,
                                     false);
 }
 
@@ -15421,14 +15433,10 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    adj &= !geom;
    *needs_idx_robust =
       hk_needs_index_robustness(cmd, draw, conditional_direct);
-   /* Reject heap allocation failure before parameter upload or lowering can
-    * dereference the heap. Direct adjacency without restart uses no heap. */
    const bool needs_heap = geom || tess || (*needs_idx_robust && !adj) ||
       (adj && (draw->restart ||
                (agx_chip_agx3_path(dev->dev.chip) &&
                 agx_is_indirect(draw->b))));
-   if (needs_heap && !hk_cmd_ensure_geometry_heap(cmd))
-      return NULL;
 
    /* The G17P robust-index producer emits the same native HAL200 indexed
     * body as an ordinary draw, only after a pre-graphics compute pass has
@@ -15551,6 +15559,12 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 
       hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
    }
+
+   /* Reject heap allocation failure after any render-pass split above (which
+    * resets cmd->heap_slot_assigned) and before parameter upload or lowering
+    * can dereference the heap. Direct adjacency without restart uses no heap. */
+   if (needs_heap && !hk_cmd_ensure_geometry_heap(cmd))
+      return NULL;
 
    hk_flush_dynamic_state(cmd, cs, draw_id, *draw,
                           ordinary_draw_path || g17p_transformed_path,
@@ -16404,7 +16418,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                   prim);
 
                draw = agx_draw_indexed_indirect(out_draw, hk_heap_base(cmd),
-                                                hk_heap_slot_size(dev),
+                                                hk_heap_size(cmd),
                                                 AGX_INDEX_SIZE_U32, false);
             } else {
                struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
@@ -17242,6 +17256,9 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
     * direct path must record depth/stencil use exactly as hk_draw_impl()
     * does for ZLS elision. */
    hk_g17p_note_depth_use(cmd);
+
+   if (batch && !hk_cmd_ensure_geometry_heap(cmd))
+      return;
 
    /* The general path from here on, with its no-op branches removed. */
    hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);

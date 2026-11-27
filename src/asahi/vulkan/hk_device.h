@@ -411,13 +411,13 @@ struct hk_device {
    /* Indirected for common secondary emulation */
    struct vk_device_dispatch_table cmd_dispatch;
 
-   /* Heap used for GPU-side memory allocation for geometry/tessellation.
-    *
-    * Control streams accessing the heap must be serialized. This is not
-    * expected to be a legitimate problem. If it is, we can rework later.
+   /* Heaps used for GPU-side memory allocation for geometry/tessellation and
+    * software index robustness. Each ring slot lazily allocates a full 128 MiB
+    * buffer on first use so per-pass capacity is never reduced while distinct
+    * slots execute without global serialization.
     */
-   struct agx_bo *heap;
-   util_once_flag heap_init_once;
+   struct agx_bo *heap_slots[HK_HEAP_SLOTS];
+   simple_mtx_t heap_lock;
 
    struct {
       struct agx_scratch vs, fs, cs;
