@@ -1306,28 +1306,25 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       st->pending_start_ts_unordered = false;
    }
 
-   /* The command buffer's leading timestamp rides on the first stream's
-    * first end stamp (hk_sync_write_timestamp()), which waits for the
-    * stamp's first scope: a render's vertex half, or the compute stream.
-    * Nothing was recorded between the stamp and this stream, so the scope
-    * names the same earlier work it did then. */
+   /* The command buffer's leading timestamp rides on a first render stream's
+    * vertex end stamp (hk_sync_write_timestamp()), which waits for the
+    * stamp's first scope. A compute stream has no separate start-side end
+    * stamp, so hk_cmd_buffer_get_cs_general() flushes lead_ts into a
+    * preceding timestamp-only carrier before creating one. Nothing was
+    * recorded between the stamp and this stream, so the scope names the same
+    * earlier work it did then. */
    if (st->lead_ts.handle) {
+      assert(cs->type == HK_CS_VDM);
+      assert(!cs->timestamp.vtx_end.handle);
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, st->lead_scope, cs, dep);
-      if (cs->type == HK_CS_VDM) {
-         assert(!cs->timestamp.vtx_end.handle);
-         cs->timestamp.vtx_end = st->lead_ts;
-         hk_sync_stream_wait(cs, dep);
-      } else {
-         assert(!cs->timestamp.end.handle);
-         cs->timestamp.end = st->lead_ts;
-         stamp_wait(cmd, cs, dep);
-      }
+      cs->timestamp.vtx_end = st->lead_ts;
+      hk_sync_stream_wait(cs, dep);
       st->lead_ts = (struct agx_timestamp_req){0};
       /* Later stamps recorded before this stream are copies of it. */
       if (st->stamp_copy_count) {
-         const unsigned sq = hk_sync_sq(cs);
-         st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], cs);
+         st->stamp_copy_after[HK_SYNC_VDM] =
+            hk_sync_later(st->stamp_copy_after[HK_SYNC_VDM], cs);
       }
    }
 }
@@ -2117,8 +2114,6 @@ stamp_copies_follow(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    return true;
 }
 
-static void flush_lead_timestamp(struct hk_cmd_buffer *cmd);
-
 void
 hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
 {
@@ -2126,10 +2121,10 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    if (!st->stamp_copy_count)
       return;
 
-   /* Copies of a leading stamp that no stream took yet read it after the
-    * command it then gets of its own. */
+   /* Copies of a leading stamp that no render stream took yet read it after
+    * the command it then gets of its own. */
    if (st->lead_ts.handle)
-      flush_lead_timestamp(cmd);
+      hk_sync_flush_lead_timestamp(cmd);
 
    /* And the copies write timestamp queries: after their resets. */
    struct hk_sync_dep after[HK_SYNC_NUM_SQ];
@@ -2169,29 +2164,43 @@ sync_state_has_req(const struct hk_sync_state *st)
    return false;
 }
 
-/* A leading timestamp (hk_sync_state::lead_ts) that no stream took: a
+/* A leading timestamp (hk_sync_state::lead_ts) that no render stream took: a
  * command of its own, ordered after its first scope, as
  * hk_sync_write_timestamp() records one. */
-static void
-flush_lead_timestamp(struct hk_cmd_buffer *cmd)
+void
+hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (!st->lead_ts.handle)
+      return;
+
    const struct agx_timestamp_req req = st->lead_ts;
    st->lead_ts = (struct agx_timestamp_req){0};
    st->epoch++;
 
+   /* The carrier belongs to the leading timestamp alone, not to an active
+    * transfer or layout transition whose compute stream triggered the flush. */
+   const bool brl = st->brl_transition_active;
+   const uint32_t xfer = st->xfer_depth;
+   st->brl_transition_active = false;
+   st->xfer_depth = 0;
+
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, st->lead_scope, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
-   if (!cs)
-      return;
-   cs->timestamp.end = req;
-   if (st->stamp_copy_count) {
-      st->stamp_copy_after[HK_SYNC_CDM] =
-         hk_sync_later(st->stamp_copy_after[HK_SYNC_CDM], cs);
+   if (cs) {
+      assert(!cs->timestamp.end.handle);
+      cs->timestamp.end = req;
+      if (st->stamp_copy_count) {
+         st->stamp_copy_after[HK_SYNC_CDM] =
+            hk_sync_later(st->stamp_copy_after[HK_SYNC_CDM], cs);
+      }
+      stamp_carrier_launch(cmd);
+      hk_cmd_buffer_end_compute(cmd);
    }
-   stamp_carrier_launch(cmd);
-   hk_cmd_buffer_end_compute(cmd);
+
+   st->brl_transition_active = brl;
+   st->xfer_depth = xfer;
 }
 
 void
@@ -2199,7 +2208,7 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
    if (st->lead_ts.handle)
-      flush_lead_timestamp(cmd);
+      hk_sync_flush_lead_timestamp(cmd);
    if (!st->pending_start_ts.handle)
       return;
 
@@ -2398,13 +2407,13 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    }
 
    /* A stamp ahead of every stream of the command buffer, on a chip whose
-    * start stamps latch before barriers resolve: the first stream carries it
-    * on an end stamp and waits for its first scope (hk_sync_state::lead_ts).
-    * A command of its own would sit between that stream and the command
-    * buffer's earlier neighbours, and every later timestamp would wait for
-    * it: a render ending in a timestamp would wait for a compute command
-    * that waits for the previous render. A top-of-pipe stamp keeps the wait
-    * on the resets of timestamp queries alone, as its first scope is empty.
+    * start stamps latch before barriers resolve: a first render stream
+    * carries it on its vertex end stamp and waits for its first scope
+    * (hk_sync_state::lead_ts), avoiding a cross-engine carrier ahead of the
+    * render. If a compute stream is opened first instead, it flushes lead_ts
+    * into a preceding carrier (hk_sync_flush_lead_timestamp()). A top-of-pipe
+    * stamp keeps the wait on the resets of timestamp queries alone, as its
+    * first scope is empty.
     */
    if (!tail && !start_stamps_ordered(cmd)) {
       st->lead_ts = req;
@@ -2414,10 +2423,12 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    /* A command of its own, after every earlier stream in the first scope,
     * tail included: tail is no stream this stamp rides on. */
+   hk_sync_end_cs_if_timestamped(cmd);
    hk_sync_src_dep(cmd, scope, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
+   assert(!cs->timestamp.end.handle);
    cs->timestamp.end = req;
    /* The pending copies ride on it when it follows the stamps they read. */
    if (st->stamp_copy_count && stamp_only(cs) && stamp_copies_follow(cmd, cs))

@@ -1039,8 +1039,16 @@ test_leading_stamp_rides_first_stream(void)
          hk_sync_barrier(k, HK_SYNC_ALL, HK_SYNC_ALL);
          stamp(k, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0);
          struct hk_cs *d = dispatch(k);
-         T("leading stamp is the dispatch's end",
-           is_end(d, 0) && list_is_singular(&k->control_streams));
+         struct hk_cs *kc =
+            list_first_entry(&k->control_streams, struct hk_cs, node);
+         T("leading stamp before a dispatch flushes into a preceding carrier",
+           kc != d && is_end(kc, 0) && !d->timestamp.end.handle &&
+           (kc->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           list_length(&k->control_streams) == 2 && !k->sync.lead_ts.handle);
+         stamp_all(k, 1);
+         T("trailing stamp after dispatch stays distinct from leading stamp",
+           is_end(kc, 0) && is_end(d, 1) && !k->sync.stamp_copy_count &&
+           list_length(&k->control_streams) == 2);
 
          struct hk_cmd_buffer *e = new_cmd(chips[c], exact);
          hk_sync_barrier(e, HK_SYNC_ALL, HK_SYNC_ALL);
@@ -1105,18 +1113,24 @@ test_leading_stamp_rides_first_stream(void)
          T("leading ALL_COMMANDS stamp's vertex half follows earlier work",
            vertex_barrier(rs, HK_SYNC_CDM) == ad->sync.index);
 
-         /* The same on a dispatch, after an earlier render. */
+         /* On a dispatch after an earlier render, the leading ALL_COMMANDS
+          * stamp flushes into a preceding carrier ordered after the render,
+          * leaving the dispatch unstamped for a trailing stamp. */
          struct hk_cmd_buffer *g = new_cmd(chips[c], exact);
          struct hk_cs *gr = render(g);
          struct hk_cmd_buffer *h = new_cmd(chips[c], exact);
          stamp_all(h, 6);
          struct hk_cs *hd = dispatch(h);
+         struct hk_cs *hc =
+            list_first_entry(&h->control_streams, struct hk_cs, node);
          struct hk_cmd_buffer *gh[] = {g, h};
-         T("leading ALL_COMMANDS stamp is the dispatch's end",
-           is_end(hd, 6) && list_is_singular(&h->control_streams) &&
+         T("leading ALL_COMMANDS stamp before a dispatch is a preceding carrier",
+           hc != hd && is_end(hc, 6) && !hd->timestamp.end.handle &&
+           (hc->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           list_length(&h->control_streams) == 2 &&
            submit(new_queue(exact), gh, 2));
-         T("leading ALL_COMMANDS stamp's dispatch follows the render",
-           hd->sync.barrier[HK_SYNC_VDM] == gr->sync.index);
+         T("leading ALL_COMMANDS carrier follows the render",
+           hc->sync.barrier[HK_SYNC_VDM] == gr->sync.index);
 
          /* A query command first: the stamp gets a command of its own,
           * after its first scope. */
@@ -1183,6 +1197,93 @@ test_leading_stamp_rides_first_stream(void)
    }
 }
 
+/* Regression test: a compute workload bracketed by leading and trailing
+ * ALL_COMMANDS timestamps with interleaved graphics+compute barriers
+ * (vkd3d-proton EndQuery(0) -> Dispatch -> Barrier -> Dispatch -> Barrier ->
+ * EndQuery(1) -> CopyQueryPoolResults, with hoisted reset in a prior CB).
+ * Both stamps must be emitted on distinct streams (start before compute, end
+ * after compute), neither dropped nor collapsed to a copy. */
+static void
+test_leading_stamp_compute_bracket_and_barriers(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         struct hk_cmd_buffer *z = new_cmd(chips[c], exact);
+         struct hk_cs *zr = reset_stamps(z);
+
+         struct hk_cmd_buffer *cmd = new_cmd(chips[c], exact);
+         stamp_all(cmd, 0);
+         struct hk_cs *d0 = dispatch(cmd);
+         struct hk_cs *c0 =
+            list_first_entry(&cmd->control_streams, struct hk_cs, node);
+         hk_sync_barrier(cmd, HK_SYNC_GFX | HK_SYNC_COMPUTE,
+                         HK_SYNC_GFX | HK_SYNC_COMPUTE);
+         struct hk_cs *d1 = dispatch(cmd);
+         hk_sync_barrier(cmd, HK_SYNC_GFX | HK_SYNC_COMPUTE,
+                         HK_SYNC_GFX | HK_SYNC_COMPUTE);
+         stamp_all(cmd, 1);
+         struct hk_cs *cq = copy_query_results(cmd);
+
+         bool saw_q0 = false, saw_q1 = false;
+         list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+            saw_q0 |= is_end(cs, 0);
+            saw_q1 |= is_end(cs, 1);
+         }
+         T("bracketed compute with GFX+COMPUTE barriers emits both stamps distinctly",
+           c0 != d0 && d0 == d1 && is_end(c0, 0) && is_end(d1, 1) &&
+           saw_q0 && saw_q1 && c0->sync.seq < d1->sync.seq &&
+           !cmd->sync.stamp_copy_count &&
+           (c0->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           cq != d1 && cq->sync.dep[HK_SYNC_CDM].cut == d1);
+
+         struct hk_cmd_buffer *pair[] = {z, cmd};
+         T("bracketed compute with prior reset resolves",
+           submit(new_queue(exact), pair, 2));
+         T("leading compute carrier waits on prior reset and copy follows end stamp",
+           c0->sync.barrier[HK_SYNC_CDM] == zr->sync.index &&
+           cq->sync.barrier[HK_SYNC_CDM] == d1->sync.index);
+
+         /* Two leading stamps before a dispatch: first flushes into a carrier
+          * and the copy reads that carrier (not the dispatch), while a later
+          * trailing stamp rides on the dispatch. */
+         struct hk_cmd_buffer *two = new_cmd(chips[c], exact);
+         hk_sync_barrier(two, HK_SYNC_XFER, HK_SYNC_XFER);
+         stamp(two, VK_PIPELINE_STAGE_2_NONE, 12);
+         stamp_all(two, 13);
+         struct hk_cs *td = dispatch(two);
+         struct hk_cs *tc =
+            list_first_entry(&two->control_streams, struct hk_cs, node);
+         stamp_all(two, 14);
+         T("two leading stamps before dispatch attach copy to carrier, not dispatch",
+           tc != td && is_end(tc, 12) && is_end(td, 14) &&
+           two->sync.stamp_copy_count == 1 &&
+           copy_is(&two->sync.stamp_copies[0], 13, query(12)) &&
+           two->sync.stamp_copy_after[HK_SYNC_CDM] == tc);
+         record_count = 0;
+         hk_sync_flush_stamp_copies(two);
+         T("copy of leading compute carrier launches after carrier",
+           record_count == 1 && records[0].count == 1 &&
+           records[0].cs->sync.dep[HK_SYNC_CDM].cut == tc &&
+           submit(new_queue(exact), &two, 1));
+
+         /* A transfer compute stream opening with lead_ts keeps the flushed
+          * carrier pure HK_SYNC_STAMP without inheriting HK_SYNC_XFER. */
+         struct hk_cmd_buffer *xf = new_cmd(chips[c], exact);
+         stamp_all(xf, 15);
+         xf->sync.xfer_depth = 1;
+         struct hk_cs *xd = dispatch(xf);
+         xf->sync.xfer_depth = 0;
+         struct hk_cs *xc =
+            list_first_entry(&xf->control_streams, struct hk_cs, node);
+         T("leading stamp flushed by transfer stays HK_SYNC_STAMP",
+           xc != xd && is_end(xc, 15) && !xd->timestamp.end.handle &&
+           (xc->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           (xd->sync.kind & HK_SYNC_XFER) &&
+           submit(new_queue(exact), &xf, 1));
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -1201,6 +1302,7 @@ main(void)
    test_pass_merge_end_stamp();
    test_timestamp_resets_order_query_work_only();
    test_leading_stamp_rides_first_stream();
+   test_leading_stamp_compute_bracket_and_barriers();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
