@@ -31,7 +31,8 @@
  *    memory:
  *    - Within a single basic block, track the latest store_agx in a linear
  *      forward walk and forward it to matching load_agx instructions with no
- *      intervening aliasing store or synchronization instruction.
+ *      intervening aliasing store or synchronization instruction, and into
+ *      the unaliased prefix of an immediately following `if` arm.
  *    - Across an if/else merge, when both arms end with matching store_agx
  *      instructions to the exact same base pointer, format, and canonical
  *      index expression, and the merge block re-reads that location before
@@ -132,6 +133,12 @@ try_guard_select_in_block(nir_builder *b, nir_block *block,
                break;
             }
          }
+
+         /* A lone select has no shared fallback. Guarding it can turn a
+          * predicate such as "set this bit" into an extra divergent branch
+          * around the loads that produce the condition. */
+         if (chain_len < 2)
+            continue;
 
          nir_def *base_val = cur.def;
          nir_def *fallback = fb_sc.def;
@@ -533,16 +540,53 @@ instr_may_alias_or_sync(const nir_instr *instr)
 }
 
 static bool
-store_matches_load(nir_intrinsic_instr *st, nir_intrinsic_instr *load)
+is_raw_forwarding_format(enum pipe_format fmt, unsigned bit_size,
+                         unsigned num_components)
 {
-   return (nir_intrinsic_access(st) & (ACCESS_VOLATILE | ACCESS_COHERENT)) == 0 &&
-          nir_intrinsic_base(st) == nir_intrinsic_base(load) &&
-          nir_intrinsic_format(st) == nir_intrinsic_format(load) &&
-          nir_intrinsic_sign_extend(st) == nir_intrinsic_sign_extend(load) &&
-          st->src[0].ssa->bit_size == load->def.bit_size &&
-          st->src[0].ssa->num_components == load->def.num_components &&
-          same_base_ptr(st->src[1].ssa, load->src[0].ssa) &&
-          same_index_expr(st->src[2].ssa, load->src[1].ssa);
+   return util_format_is_pure_integer(fmt) &&
+          util_format_get_blocksizebits(fmt) == bit_size * num_components;
+}
+
+static bool
+store_matches_load(const nir_intrinsic_instr *store,
+                   const nir_intrinsic_instr *load)
+{
+   enum pipe_format fmt = nir_intrinsic_format(load);
+   return (nir_intrinsic_access(store) &
+           (ACCESS_VOLATILE | ACCESS_COHERENT)) == 0 &&
+          (nir_intrinsic_access(load) &
+           (ACCESS_VOLATILE | ACCESS_COHERENT)) == 0 &&
+          is_raw_forwarding_format(fmt, load->def.bit_size,
+                                   load->def.num_components) &&
+          nir_intrinsic_base(store) == nir_intrinsic_base(load) &&
+          nir_intrinsic_format(store) == fmt &&
+          nir_intrinsic_sign_extend(store) == nir_intrinsic_sign_extend(load) &&
+          store->src[0].ssa->bit_size == load->def.bit_size &&
+          store->src[0].ssa->num_components == load->def.num_components &&
+          same_base_ptr(store->src[1].ssa, load->src[0].ssa) &&
+          same_index_expr(store->src[2].ssa, load->src[1].ssa);
+}
+
+static bool
+forward_store_into_block_prefix(nir_intrinsic_instr *store, nir_block *block)
+{
+   bool progress = false;
+   nir_foreach_instr_safe(instr, block) {
+      if (instr->type == nir_instr_type_phi)
+         continue;
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_agx &&
+             store_matches_load(store, intr)) {
+            nir_def_replace(&intr->def, store->src[0].ssa);
+            progress = true;
+            continue;
+         }
+      }
+      if (instr_may_alias_or_sync(instr))
+         break;
+   }
+   return progress;
 }
 
 static nir_intrinsic_instr *
@@ -554,21 +598,16 @@ find_trailing_matching_store(nir_block *block, nir_intrinsic_instr *load)
    nir_foreach_instr_reverse(instr, block) {
       if (instr->type == nir_instr_type_intrinsic) {
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic == nir_intrinsic_store_agx)
-            return store_matches_load(intr, load) ? intr : NULL;
+         if (intr->intrinsic == nir_intrinsic_store_agx) {
+            if (store_matches_load(intr, load))
+               return intr;
+            return NULL;
+         }
       }
       if (instr_may_alias_or_sync(instr))
          return NULL;
    }
    return NULL;
-}
-
-static bool
-is_raw_forwarding_format(enum pipe_format fmt, unsigned bit_size,
-                         unsigned num_components)
-{
-   return util_format_is_pure_integer(fmt) &&
-          util_format_get_blocksizebits(fmt) == bit_size * num_components;
 }
 
 bool
@@ -581,84 +620,98 @@ agx_nir_opt_forward_merge_loads(nir_shader *shader)
       nir_index_ssa_defs(impl);
 
       nir_foreach_block(block, impl) {
-         /* First, forward same-block store_agx -> load_agx pairs in a single
-          * linear forward walk tracking the most recent store_agx with no
-          * intervening aliasing store or synchronization instruction. */
-         nir_intrinsic_instr *last_store = NULL;
+         nir_cf_node *prev = nir_cf_node_prev(&block->cf_node);
+         if (prev && prev->type == nir_cf_node_if &&
+             util_dynarray_num_elements(&block->predecessors, nir_block *) == 2) {
+            nir_if *nif = nir_cf_node_as_if(prev);
+            nir_block *then_blk = nir_if_last_then_block(nif);
+            nir_block *else_blk = nir_if_last_else_block(nif);
+            bool has_then = false, has_else = false;
+            util_dynarray_foreach(&block->predecessors, nir_block *, pred) {
+               has_then |= (*pred == then_blk);
+               has_else |= (*pred == else_blk);
+            }
+            if (has_then && has_else) {
+               nir_foreach_instr_safe(instr, block) {
+                  if (instr->type == nir_instr_type_phi)
+                     continue;
+
+                  if (instr->type == nir_instr_type_intrinsic) {
+                     nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+                     if (load->intrinsic == nir_intrinsic_load_agx &&
+                         !(nir_intrinsic_access(load) &
+                           (ACCESS_VOLATILE | ACCESS_COHERENT))) {
+                        if (is_raw_forwarding_format(
+                               nir_intrinsic_format(load), load->def.bit_size,
+                               load->def.num_components)) {
+                           nir_intrinsic_instr *ts =
+                              find_trailing_matching_store(then_blk, load);
+                           nir_intrinsic_instr *es =
+                              ts ? find_trailing_matching_store(else_blk, load)
+                                 : NULL;
+                           if (ts && es) {
+                              nir_phi_instr *phi = nir_phi_instr_create(shader);
+                              nir_def_init(&phi->instr, &phi->def,
+                                           load->def.num_components,
+                                           load->def.bit_size);
+                              nir_phi_instr_add_src(phi, then_blk,
+                                                    ts->src[0].ssa);
+                              nir_phi_instr_add_src(phi, else_blk,
+                                                    es->src[0].ssa);
+                              nir_instr_insert_before_block(block, &phi->instr);
+                              nir_def_replace(&load->def, &phi->def);
+                              impl_progress = true;
+                              continue;
+                           }
+                        }
+                     }
+                  }
+
+                  if (instr_may_alias_or_sync(instr))
+                     break;
+               }
+            }
+         }
+
+         /* Also forward same-block straight-line non-coherent store_agx to
+          * subsequent load_agx of the identical address and format (for
+          * example after unswitching a diamond outside a loop), and into the
+          * unaliased prefix of an immediately following `if` arm. */
+         nir_intrinsic_instr *cur_store = NULL;
          nir_foreach_instr_safe(instr, block) {
             if (instr->type == nir_instr_type_intrinsic) {
                nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                if (intr->intrinsic == nir_intrinsic_store_agx) {
-                  last_store = intr;
+                  cur_store = NULL;
+                  enum pipe_format fmt = nir_intrinsic_format(intr);
+                  if (!(nir_intrinsic_access(intr) &
+                        (ACCESS_VOLATILE | ACCESS_COHERENT)) &&
+                      is_raw_forwarding_format(
+                         fmt, intr->src[0].ssa->bit_size,
+                         intr->src[0].ssa->num_components))
+                     cur_store = intr;
                   continue;
                }
-               if (intr->intrinsic == nir_intrinsic_load_agx && last_store &&
-                   !(nir_intrinsic_access(intr) &
-                     (ACCESS_VOLATILE | ACCESS_COHERENT))) {
-                  if (is_raw_forwarding_format(nir_intrinsic_format(intr),
-                                               intr->def.bit_size,
-                                               intr->def.num_components) &&
-                      store_matches_load(last_store, intr)) {
-                     nir_def_replace(&intr->def, last_store->src[0].ssa);
-                     impl_progress = true;
-                     continue;
-                  }
+               if (cur_store && intr->intrinsic == nir_intrinsic_load_agx &&
+                   store_matches_load(cur_store, intr)) {
+                  nir_def_replace(&intr->def, cur_store->src[0].ssa);
+                  impl_progress = true;
+                  continue;
                }
             }
             if (instr_may_alias_or_sync(instr))
-               last_store = NULL;
+               cur_store = NULL;
          }
-         nir_cf_node *prev = nir_cf_node_prev(&block->cf_node);
-         if (!prev || prev->type != nir_cf_node_if)
-            continue;
 
-         nir_if *nif = nir_cf_node_as_if(prev);
-         nir_block *then_blk = nir_if_last_then_block(nif);
-         nir_block *else_blk = nir_if_last_else_block(nif);
-         if (util_dynarray_num_elements(&block->predecessors, nir_block *) != 2)
-            continue;
-         bool has_then = false, has_else = false;
-         util_dynarray_foreach(&block->predecessors, nir_block *, pred) {
-            has_then |= (*pred == then_blk);
-            has_else |= (*pred == else_blk);
-         }
-         if (!has_then || !has_else)
-            continue;
-
-         nir_foreach_instr_safe(instr, block) {
-            if (instr->type == nir_instr_type_phi)
-               continue;
-
-            if (instr->type == nir_instr_type_intrinsic) {
-               nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
-               if (load->intrinsic == nir_intrinsic_load_agx &&
-                   !(nir_intrinsic_access(load) &
-                     (ACCESS_VOLATILE | ACCESS_COHERENT))) {
-                  if (is_raw_forwarding_format(nir_intrinsic_format(load),
-                                               load->def.bit_size,
-                                               load->def.num_components)) {
-                     nir_intrinsic_instr *ts =
-                        find_trailing_matching_store(then_blk, load);
-                     nir_intrinsic_instr *es =
-                        ts ? find_trailing_matching_store(else_blk, load) : NULL;
-                     if (ts && es) {
-                        nir_phi_instr *phi = nir_phi_instr_create(shader);
-                        nir_def_init(&phi->instr, &phi->def,
-                                     load->def.num_components,
-                                     load->def.bit_size);
-                        nir_phi_instr_add_src(phi, then_blk, ts->src[0].ssa);
-                        nir_phi_instr_add_src(phi, else_blk, es->src[0].ssa);
-                        nir_instr_insert_before_block(block, &phi->instr);
-                        nir_def_replace(&load->def, &phi->def);
-                        impl_progress = true;
-                        continue;
-                     }
-                  }
-               }
+         if (cur_store && !nir_block_ends_in_jump(block)) {
+            nir_cf_node *next = nir_cf_node_next(&block->cf_node);
+            if (next && next->type == nir_cf_node_if) {
+               nir_if *nif = nir_cf_node_as_if(next);
+               impl_progress |= forward_store_into_block_prefix(
+                  cur_store, nir_if_first_then_block(nif));
+               impl_progress |= forward_store_into_block_prefix(
+                  cur_store, nir_if_first_else_block(nif));
             }
-
-            if (instr_may_alias_or_sync(instr))
-               break;
          }
       }
 
@@ -944,8 +997,10 @@ agx_nir_opt_narrow_u8_fadd_tree(nir_shader *shader)
    nir_foreach_function_impl(impl, shader) {
       nir_index_ssa_defs(impl);
       unsigned n_defs = impl->ssa_alloc;
-      if (!n_defs)
+      if (!n_defs) {
+         nir_no_progress(impl);
          continue;
+      }
 
       struct u8_int_node *nodes = rzalloc_array(NULL, struct u8_int_node, n_defs);
       nir_def **defs_by_idx = rzalloc_array(NULL, nir_def *, n_defs);

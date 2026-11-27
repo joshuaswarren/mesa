@@ -70,8 +70,9 @@ hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
        !util_is_power_of_two_nonzero(blocksize_B))
       return 0;
 
-   const uint64_t map_page = buffer->sparse_map->va->addr / AIL_PAGESIZE;
-   assert((buffer->sparse_map->va->addr % AIL_PAGESIZE) == 0);
+   const uint64_t map_addr = hk_buffer_sparse_map_addr(buffer);
+   const uint64_t map_page = map_addr / AIL_PAGESIZE;
+   assert((map_addr % AIL_PAGESIZE) == 0);
    /* The packed field leaves 28 bits for the map page.  Fail loudly rather
     * than silently truncating if the VA layout ever outgrows it; a wrong map
     * address would read residency from arbitrary memory. */
@@ -81,6 +82,19 @@ hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
    }
    return (uint32_t)(map_page << AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) |
           (uint32_t)util_logbase2(blocksize_B);
+}
+
+/* The sparse buffer that holds address. Call with hk_device::sparse_buffers.lock
+ * held. */
+static const struct hk_buffer *
+hk_sparse_buffer_at_locked(struct hk_device *dev, uint64_t address)
+{
+   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers.list,
+                       sparse_link) {
+      if (address - buffer->va->addr < buffer->vk.size)
+         return buffer;
+   }
+   return NULL;
 }
 
 uint32_t
@@ -93,17 +107,53 @@ hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
    if (!p_atomic_read(&dev->sparse_buffers.count))
       return 0;
 
-   uint32_t word = 0;
    simple_mtx_lock(&dev->sparse_buffers.lock);
-   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers.list,
-                       sparse_link) {
-      if (address - buffer->va->addr < buffer->vk.size) {
-         word = hk_buffer_sparse_texel_word(buffer, blocksize_B);
-         break;
-      }
-   }
+   const uint32_t word = hk_buffer_sparse_texel_word(
+      hk_sparse_buffer_at_locked(dev, address), blocksize_B);
    simple_mtx_unlock(&dev->sparse_buffers.lock);
    return word;
+}
+
+uint32_t
+hk_sparse_map_page_at(struct hk_device *dev, uint64_t address)
+{
+   /* Only M5 lowers storage loads through this word (get_buffer_address()).
+    * Elsewhere it is the address format's byte offset and must stay zero. */
+   if (!agx_chip_g17_m5(dev->dev.chip) ||
+       !p_atomic_read(&dev->sparse_buffers.count))
+      return 0;
+
+   uint32_t page = 0;
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   const struct hk_buffer *buffer = hk_sparse_buffer_at_locked(dev, address);
+   if (buffer && buffer->sparse_map) {
+      const uint64_t map_addr = hk_buffer_sparse_map_addr(buffer);
+      assert((map_addr % AIL_PAGESIZE) == 0);
+      assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);
+      page = map_addr / AIL_PAGESIZE;
+   }
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return page;
+}
+
+bool
+hk_sparse_address_is_sparse(struct hk_device *dev, uint64_t address)
+{
+   if (!p_atomic_read(&dev->sparse_buffers.count))
+      return false;
+
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   const bool sparse = hk_sparse_buffer_at_locked(dev, address) != NULL;
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return sparse;
+}
+
+static bool
+hk_buffer_in_sparse_list(const struct hk_buffer *buffer)
+{
+   return buffer->sparse_map != NULL ||
+          (buffer->va != NULL &&
+           (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT));
 }
 
 static uint32_t
@@ -141,21 +191,20 @@ hk_get_buffer_alignment(const struct hk_physical_device *pdev,
    return alignment;
 }
 
-static uint64_t
-hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
+static void
+hk_get_buffer_replay_addrs(const VkBufferCreateInfo *pCreateInfo,
+                           uint64_t *bda_addr_out,
+                           uint64_t *sparse_map_addr_out)
 {
    uint64_t addr = 0;
+   uint64_t sparse_map_addr = 0;
    vk_foreach_struct_const(sType, ext, pCreateInfo->pNext) {
       switch (sType) {
       case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO: {
          const VkBufferOpaqueCaptureAddressCreateInfo *bda = ext;
          if (bda->opaqueCaptureAddress != 0) {
-#ifdef NDEBUG
-            return bda->opaqueCaptureAddress;
-#else
             assert(addr == 0 || bda->opaqueCaptureAddress == addr);
             addr = bda->opaqueCaptureAddress;
-#endif
          }
          break;
       }
@@ -163,28 +212,32 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
       case VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT: {
          const VkBufferDeviceAddressCreateInfoEXT *bda = ext;
          if (bda->deviceAddress != 0) {
-#ifdef NDEBUG
-            return bda->deviceAddress;
-#else
             assert(addr == 0 || bda->deviceAddress == addr);
             addr = bda->deviceAddress;
-#endif
          }
          break;
       }
 
       case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT: {
          /* VK_EXT_descriptor_buffer replay: hk_GetBufferOpaqueCapture-
-          * DescriptorDataEXT() recorded the buffer's own VA. */
+          * DescriptorDataEXT() recorded the buffer's VA and, for sparse-
+          * resident buffers, its residency map's VA. */
          if (!(pCreateInfo->flags &
                VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT))
             break;
          const VkOpaqueCaptureDescriptorDataCreateInfoEXT *info = ext;
+         if (!info->opaqueCaptureDescriptorData)
+            break;
          struct hk_buffer_capture capture;
          memcpy(&capture, info->opaqueCaptureDescriptorData, sizeof(capture));
          if (capture.va != 0) {
             assert(addr == 0 || capture.va == addr);
             addr = capture.va;
+         }
+         if (capture.sparse_map_va != 0) {
+            assert(sparse_map_addr == 0 ||
+                   capture.sparse_map_va == sparse_map_addr);
+            sparse_map_addr = capture.sparse_map_va;
          }
          break;
       }
@@ -194,7 +247,8 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
       }
    }
 
-   return addr;
+   *bda_addr_out = addr;
+   *sparse_map_addr_out = sparse_map_addr;
 }
 
 VkResult
@@ -279,6 +333,9 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      p_atomic_set(&dev->sparse_used, 1);
+
    if (buffer->vk.size > 0 &&
        (buffer->vk.create_flags &
         (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
@@ -290,17 +347,22 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       uint64_t vma_size_B = align64(buffer->vk.size, alignment);
 
       /* A buffer with its own VA replays it for descriptor buffers too. */
-      const bool bda_capture_replay =
+      const bool desc_capture_replay =
          buffer->vk.create_flags &
-         (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |
-          VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT);
+         VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT;
+      const bool bda_capture_replay =
+         desc_capture_replay ||
+         (buffer->vk.create_flags &
+          VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT);
 
       enum agx_va_flags flags = 0;
       uint64_t bda_fixed_addr = 0;
+      uint64_t sparse_map_fixed_addr = 0;
       if (bda_capture_replay) {
          if (dev->dev.replay_heap_initialized)
             flags |= AGX_VA_CAPTURE_REPLAY;
-         bda_fixed_addr = hk_get_bda_replay_addr(pCreateInfo);
+         hk_get_buffer_replay_addrs(pCreateInfo, &bda_fixed_addr,
+                                    &sparse_map_fixed_addr);
          if (bda_fixed_addr != 0)
             flags |= AGX_VA_FIXED;
       }
@@ -350,8 +412,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          }
       }
 
-      if ((dev->dev.chip == AGX_CHIP_G17P ||
-           agx_chip_g17_m5(dev->dev.chip)) &&
+      if (agx_chip_g17p_or_m5(dev->dev.chip) &&
           (buffer->vk.create_flags &
            VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) {
          const uint64_t entries = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
@@ -396,6 +457,61 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          map->page_count = entries;
 
          agx_bo_assert_range(buffer->sparse_map, 0, map_size_B);
+
+         if (desc_capture_replay) {
+            if (sparse_map_fixed_addr % AIL_PAGESIZE != 0) {
+               agx_bo_unreference(&dev->dev, buffer->sparse_map);
+               buffer->sparse_map = NULL;
+               hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
+               agx_va_free(&dev->dev, buffer->va, true);
+               buffer->va = NULL;
+               vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+               return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                                "Misaligned sparse map capture/replay address %#llx",
+                                (unsigned long long)sparse_map_fixed_addr);
+            }
+
+            enum agx_va_flags map_flags =
+               sparse_map_fixed_addr ? AGX_VA_FIXED : 0;
+            if (dev->dev.replay_heap_initialized)
+               map_flags |= AGX_VA_CAPTURE_REPLAY;
+
+            /* Reserve the deterministic map_size_B span rather than
+             * buffer->sparse_map->size so BO-cache over-allocation cannot
+             * change the VA footprint between capture and replay. */
+            buffer->sparse_map_va = agx_va_alloc(
+               &dev->dev, map_size_B, AIL_PAGESIZE, map_flags,
+               sparse_map_fixed_addr);
+            if (!buffer->sparse_map_va) {
+               agx_bo_unreference(&dev->dev, buffer->sparse_map);
+               buffer->sparse_map = NULL;
+               hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
+               agx_va_free(&dev->dev, buffer->va, true);
+               buffer->va = NULL;
+               vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+               if (sparse_map_fixed_addr != 0)
+                  return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                                   "Sparse map capture/replay address %#llx is in use",
+                                   (unsigned long long)sparse_map_fixed_addr);
+               return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                "Sparse map capture/replay VA allocation failed");
+            }
+
+            if (agx_bo_bind(&dev->dev, buffer->sparse_map,
+                            buffer->sparse_map_va->addr, map_size_B, 0,
+                            DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+               agx_va_free(&dev->dev, buffer->sparse_map_va, false);
+               buffer->sparse_map_va = NULL;
+               agx_bo_unreference(&dev->dev, buffer->sparse_map);
+               buffer->sparse_map = NULL;
+               hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
+               agx_va_free(&dev->dev, buffer->va, true);
+               buffer->va = NULL;
+               vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+               return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                "Sparse map capture/replay bind failed");
+            }
+         }
       }
    }
 
@@ -405,6 +521,10 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       if (result != VK_SUCCESS) {
          hk_update_physical_sparse_map(dev, buffer->va->addr,
             align64(buffer->vk.size, AIL_PAGESIZE), false);
+         if (buffer->sparse_map_va) {
+            agx_va_free(&dev->dev, buffer->sparse_map_va, true);
+            buffer->sparse_map_va = NULL;
+         }
          agx_bo_unreference(&dev->dev, buffer->sparse_map);
          hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
          agx_va_free(&dev->dev, buffer->va, true);
@@ -422,7 +542,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
                                      ? HK_ALIAS_CAUSE_SPARSE
                                      : HK_ALIAS_CAUSE_CAPTURE_REPLAY);
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_sparse_list(buffer)) {
       simple_mtx_lock(&dev->sparse_buffers.lock);
       list_addtail(&buffer->sparse_link, &dev->sparse_buffers.list);
       p_atomic_inc(&dev->sparse_buffers.count);
@@ -446,7 +566,7 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    hk_device_quiesce_lost_submissions(dev);
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_sparse_list(buffer)) {
       simple_mtx_lock(&dev->sparse_buffers.lock);
       list_del(&buffer->sparse_link);
       p_atomic_dec(&dev->sparse_buffers.count);
@@ -463,6 +583,10 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    }
    hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
 
+   if (buffer->sparse_map_va) {
+      agx_va_free(&dev->dev, buffer->sparse_map_va, true);
+      buffer->sparse_map_va = NULL;
+   }
    agx_bo_unreference(&dev->dev, buffer->sparse_map);
 
    vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
@@ -592,6 +716,11 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
             hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
+         if (!mem->replay_va &&
+             !(mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE | AGX_BO_HOST_PTR))) {
+            buffer->storage_backing_handle = mem->bo->handle;
+            buffer->storage_backing_offset = pBindInfos[i].memoryOffset;
+         }
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);
@@ -626,9 +755,12 @@ hk_GetBufferOpaqueCaptureDescriptorDataEXT(
    VK_FROM_HANDLE(hk_buffer, buffer, pInfo->buffer);
 
    /* A buffer bound to memory takes the memory's (replayed) address; only a
-    * VA of its own needs replaying. */
+    * VA of its own (and, for sparse-resident buffers, its residency map's VA)
+    * needs replaying. */
    const struct hk_buffer_capture capture = {
       .va = buffer->va ? buffer->va->addr : 0,
+      .sparse_map_va =
+         buffer->sparse_map_va ? buffer->sparse_map_va->addr : 0,
    };
    memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;

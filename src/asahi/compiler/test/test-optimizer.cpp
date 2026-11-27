@@ -4,6 +4,7 @@
  */
 
 #include "agx_builder.h"
+#include "agx3_pack.h"
 #include "agx3_select_core.h"
 #include "agx_compiler.h"
 #include "agx_test.h"
@@ -412,7 +413,8 @@ TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmax)
    /* Burn the index the dead constant held, so only the folding differs. */
    (void)agx_temp(expected->shader, AGX_SIZE_32);
    out = agx_temp(expected->shader, AGX_SIZE_32);
-   agx_fcmpsel_to(expected, out, wx, folded, wx, folded, AGX_FCOND_GTN);
+   agx_fcmpsel_to(expected, out, wx, folded, wx, folded, AGX_FCOND_GTN)
+      ->fcmpsel_minifloat_select = true;
    agx_unit_test(expected, out);
 
    agx_optimize_and_dce(actual->shader);
@@ -465,7 +467,8 @@ TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmaxWrittenFirst)
    const agx_index folded = agx_immediate_f(0.0f);
    (void)agx_temp(expected->shader, AGX_SIZE_32);
    out = agx_temp(expected->shader, AGX_SIZE_32);
-   agx_fcmpsel_to(expected, out, folded, wx, folded, wx, AGX_FCOND_GTN);
+   agx_fcmpsel_to(expected, out, folded, wx, folded, wx, AGX_FCOND_GTN)
+      ->fcmpsel_minifloat_select = true;
    agx_unit_test(expected, out);
 
    agx_optimize_and_dce(actual->shader);
@@ -1001,6 +1004,64 @@ TEST_F(Optimizer, G17PBallotOfTwoRegistersKeepsTheComparison)
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
+/* No AGX3 ballot compare takes a source modifier. A SIMD ballot of a
+ * comparison against |y| or -y ballots the opposite comparison against zero
+ * instead; a quad ballot keeps the comparison as its boolean. */
+TEST_F(Optimizer, AGX3BallotOfModifiedComparisonKeepsTheComparison)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (bool negate : {false, true}) {
+         for (bool quad : {false, true}) {
+            SCOPED_TRACE(testing::Message() << encoding << negate << quad);
+            agx_builder *actual = agx_test_builder(mem_ctx);
+            agx_builder *expected = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            key.dev.encoding = encoding;
+            actual->shader->key = &key;
+            expected->shader->key = &key;
+
+            agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+            agx_index rhs = agx_fmov(actual, negate ? agx_neg(wy) : agx_abs(wy));
+            agx_index cmp = agx_fcmp(actual, wx, rhs, AGX_FCOND_LT, false);
+            if (quad)
+               agx_quad_ballot_to(actual, out, cmp);
+            else
+               agx_ballot_to(actual, out, cmp);
+            agx_unit_test(actual, out);
+
+            agx_index modified = negate ? agx_neg(wy) : agx_abs(wy);
+            out = agx_temp(expected->shader, AGX_SIZE_32);
+            agx_temp(expected->shader, AGX_SIZE_32);
+            if (quad) {
+               cmp = agx_temp(expected->shader, AGX_SIZE_32);
+               agx_fcmp_to(expected, cmp, wx, modified, AGX_FCOND_LT, false);
+               agx_quad_ballot_to(expected, out, cmp);
+            } else {
+               agx_temp(expected->shader, AGX_SIZE_16);
+               agx_index opposite = agx_temp(expected->shader, AGX_SIZE_16);
+               agx_fcmp_to(expected, opposite, wx, modified, AGX_FCOND_LT,
+                           true);
+               agx_icmp_ballot_to(expected, out, opposite, agx_zero(),
+                                  AGX_ICOND_UEQ, false);
+            }
+            agx_unit_test(expected, out);
+
+            agx_optimize_and_dce(actual->shader);
+            ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+         }
+      }
+   }
+}
+
+/* AGX2 encodes source modifiers on its fused ballot compare. */
+TEST_F(Optimizer, BallotConditionKeepsModifiersOnAGX2)
+{
+   CASE32(agx_ballot_to(b, out, agx_fcmp(b, wx, agx_fmov(b, agx_abs(wy)),
+                                         AGX_FCOND_LT, false)),
+          agx_fcmp_ballot_to(b, out, wx, agx_abs(wy), AGX_FCOND_LT, false));
+}
+
 /* Astro Bot's mesh shader: ballot(x < 6), signed. AGX3B has no immediate
  * ballot form for a signed comparison against a nonzero constant. */
 TEST_F(Optimizer, G17PBallotOfSignedCompareWithConstantKeepsTheComparison)
@@ -1301,42 +1362,46 @@ TEST_F(Optimizer, TileSampleImmediateControls)
 
 TEST_F(Optimizer, G17PAbsorbsExclusiveSelectGuards)
 {
-   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
-      for (unsigned target = 0; target < 8; ++target) {
-         for (unsigned guard = 0; guard < 8; ++guard) {
-            for (bool reverse : {false, true}) {
-               agx_builder *actual = agx_test_builder(mem_ctx);
-               agx_builder *expected = agx_test_builder(mem_ctx);
-               struct agx_shader_key key = {};
-               key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-               for (agx_builder *b : {actual, expected}) {
-                  b->shader->key = &key;
-                  agx_index variable = agx_preload(b, agx_register(0, size));
-                  agx_index predicate = agx_icmp(
-                     b, variable, agx_immediate(guard), AGX_ICOND_UEQ, false);
-                  agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
-                  agx_icmpsel_to(b, inner, variable, agx_immediate(target), wy,
-                                 wz, AGX_ICOND_UEQ);
-                  agx_index out = agx_temp(b->shader, AGX_SIZE_32);
-                  if (b == expected && guard == target) {
-                     agx_unit_test(b, wz);
-                     continue;
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+         for (unsigned target = 0; target < 8; ++target) {
+            for (unsigned guard = 0; guard < 8; ++guard) {
+               for (bool reverse : {false, true}) {
+                  agx_builder *actual = agx_test_builder(mem_ctx);
+                  agx_builder *expected = agx_test_builder(mem_ctx);
+                  struct agx_shader_key key = {};
+                  key.dev.encoding = encoding;
+                  for (agx_builder *b : {actual, expected}) {
+                     b->shader->key = &key;
+                     agx_index variable = agx_preload(b, agx_register(0, size));
+                     agx_index predicate =
+                        agx_icmp(b, variable, agx_immediate(guard),
+                                 AGX_ICOND_UEQ, false);
+                     agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+                     agx_icmpsel_to(b, inner, variable, agx_immediate(target),
+                                    wy, wz, AGX_ICOND_UEQ);
+                     agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+                     if (b == expected && guard == target) {
+                        agx_unit_test(b, wz);
+                        continue;
+                     }
+                     if (b == expected)
+                        agx_icmpsel_to(b, out, variable, agx_immediate(target),
+                                       wy, wz, AGX_ICOND_UEQ);
+                     else if (b == expected && !reverse)
+                        agx_icmpsel_to(b, out, variable, agx_immediate(guard),
+                                       wz, inner, AGX_ICOND_UEQ);
+                     else
+                        agx_icmpsel_to(b, out, predicate, agx_zero(),
+                                       reverse ? wz : inner,
+                                       reverse ? inner : wz,
+                                       reverse ? AGX_ICOND_UGT : AGX_ICOND_UEQ);
+                     agx_unit_test(b, out);
                   }
-                  if (b == expected)
-                     agx_icmpsel_to(b, out, variable, agx_immediate(target), wy,
-                                    wz, AGX_ICOND_UEQ);
-                  else if (b == expected && !reverse)
-                     agx_icmpsel_to(b, out, variable, agx_immediate(guard), wz,
-                                    inner, AGX_ICOND_UEQ);
-                  else
-                     agx_icmpsel_to(b, out, predicate, agx_zero(),
-                                    reverse ? wz : inner, reverse ? inner : wz,
-                                    reverse ? AGX_ICOND_UGT : AGX_ICOND_UEQ);
-                  agx_unit_test(b, out);
+                  agx_optimize_and_dce(actual->shader);
+                  agx_dce(expected->shader, true);
+                  ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
                }
-               agx_optimize_and_dce(actual->shader);
-               agx_dce(expected->shader, true);
-               ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
             }
          }
       }
@@ -1640,29 +1705,172 @@ TEST_F(Optimizer, G17POuterInputProvesCompoundSelectGuard)
 
 TEST_F(Optimizer, G17PSelectGuardImmediateBoundary)
 {
-   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
-      for (unsigned threshold : {254u, 255u}) {
-         agx_builder *b = agx_test_builder(mem_ctx);
-         struct agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-         b->shader->key = &key;
-         agx_index variable = agx_preload(b, agx_register(0, size));
-         agx_index predicate = agx_icmp(
-            b, variable, agx_immediate(threshold), AGX_ICOND_UGT, false);
-         agx_index out = agx_temp(b->shader, AGX_SIZE_16);
-         agx_icmpsel_to(b, out, variable, agx_immediate(threshold), predicate,
-                        agx_zero(), AGX_ICOND_UGT);
-         agx_unit_test(b, out);
-         agx_optimize_and_dce(b->shader);
-         agx_foreach_instr_global(b->shader, I) {
-            agx_foreach_src(I, s) {
-               if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
-                  EXPECT_LT(I->src[s].value, 0x100u);
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+         for (unsigned threshold : {254u, 255u}) {
+            agx_builder *b = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            key.dev.encoding = encoding;
+            b->shader->key = &key;
+            agx_index variable = agx_preload(b, agx_register(0, size));
+            agx_index predicate = agx_icmp(
+               b, variable, agx_immediate(threshold), AGX_ICOND_UGT, false);
+            agx_index out = agx_temp(b->shader, AGX_SIZE_16);
+            agx_icmpsel_to(b, out, variable, agx_immediate(threshold),
+                           predicate, agx_zero(), AGX_ICOND_UGT);
+            agx_unit_test(b, out);
+            agx_optimize_and_dce(b->shader);
+            agx_foreach_instr_global(b->shader, I) {
+               agx_foreach_src(I, s) {
+                  if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+                     EXPECT_LT(I->src[s].value, 0x100u);
+                  }
                }
             }
+            for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)
+               EXPECT_EQ(select_test_run(b->shader, input), input > threshold);
          }
-         for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)
-            EXPECT_EQ(select_test_run(b->shader, input), input > threshold);
+      }
+   }
+}
+
+TEST_F(Optimizer, AGX3CSelectGuardFoldsAndPacksToBinary)
+{
+   const struct {
+      enum agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_CHIP_G17S, false},
+      {AGX_CHIP_G18G, true},
+   };
+
+   for (const auto &t : targets) {
+      for (unsigned guard : {3u, 5u}) {
+         agx_builder *b = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         struct agx_shader_info info = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = t.chip;
+         key.dev.emit_agx3d = t.emit_agx3d;
+         b->shader->key = &key;
+         b->shader->out = &info;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->nir = rzalloc(mem_ctx, nir_shader);
+         b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+         agx_index variable = agx_preload(b, agx_register(0, AGX_SIZE_32));
+         agx_index tval = agx_preload(b, agx_register(2, AGX_SIZE_32));
+         agx_index fval = agx_preload(b, agx_register(4, AGX_SIZE_32));
+         agx_index predicate =
+            agx_icmp(b, variable, agx_immediate(guard), AGX_ICOND_UEQ, false);
+         agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+         agx_icmpsel_to(b, inner, variable, agx_immediate(3), tval, fval,
+                        AGX_ICOND_UEQ);
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         agx_icmpsel_to(b, out, predicate, agx_zero(), inner, fval,
+                        AGX_ICOND_UEQ);
+         agx_device_store(b, out, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                          AGX_FORMAT_I32, 1, 0, false);
+         agx_stop(b);
+
+         agx_optimize_and_dce(b->shader);
+
+         unsigned icmpsel_count = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op == AGX_OPCODE_ICMPSEL)
+               icmpsel_count++;
+         }
+         EXPECT_EQ(icmpsel_count, guard == 3u ? 0u : 1u);
+
+         agx_ra(b->shader);
+         ASSERT_FALSE(b->shader->ra_failed);
+         agx_lower_pseudo(b->shader);
+
+         struct util_dynarray binary;
+         util_dynarray_init(&binary, mem_ctx);
+         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+         EXPECT_GT(binary.size, 0u);
+      }
+   }
+}
+
+/* A compare or select of two immediates folds to a constant on every AGX3
+ * encoding. When that constant feeds an iadd that already has an immediate
+ * operand, it has to stay in its register, because no AGX3 packer encodes an
+ * iadd of two immediates. The sign extension `iadd d32, h16, #0` of a folded
+ * compare is the shape robustness2's null-descriptor vertex fetches reached
+ * on M5 Max. */
+TEST_F(Optimizer, AGX3FoldedCompareFeedingIaddPacksToBinary)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+
+   for (const auto &t : targets) {
+      for (bool via_select : {false, true}) {
+         for (unsigned lhs : {1u, 5u}) {
+            agx_builder *b = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            struct agx_shader_info info = {};
+            key.dev.encoding = t.encoding;
+            key.dev.chip = t.chip;
+            key.dev.emit_agx3d = t.emit_agx3d;
+            b->shader->key = &key;
+            b->shader->out = &info;
+            b->shader->stage = MESA_SHADER_COMPUTE;
+            b->shader->nir = rzalloc(mem_ctx, nir_shader);
+            b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+            agx_index sum = agx_temp(b->shader, AGX_SIZE_32);
+            if (via_select) {
+               agx_index chosen = agx_temp(b->shader, AGX_SIZE_32);
+               agx_icmpsel_to(b, chosen, agx_immediate(lhs), agx_immediate(3),
+                              agx_immediate(7), agx_immediate(9),
+                              AGX_ICOND_UGT);
+               agx_iadd_to(b, sum, chosen, agx_immediate(4), 0);
+            } else {
+               agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+               agx_icmp_to(b, cmp, agx_immediate(lhs), agx_immediate(3),
+                           AGX_ICOND_UGT, false);
+               agx_iadd_to(b, sum, cmp, agx_immediate(0), 0);
+            }
+            agx_device_store(b, sum, agx_uniform(0, AGX_SIZE_64),
+                             agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+            agx_stop(b);
+
+            agx_optimize_and_dce(b->shader);
+
+            unsigned compares = 0, iadds = 0;
+            agx_foreach_instr_global(b->shader, I) {
+               if (I->op == AGX_OPCODE_ICMP || I->op == AGX_OPCODE_ICMPSEL)
+                  compares++;
+               if (I->op == AGX_OPCODE_IADD) {
+                  iadds++;
+                  EXPECT_FALSE(I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                               I->src[1].type == AGX_INDEX_IMMEDIATE)
+                     << "chip " << t.chip << " select " << via_select;
+               }
+            }
+            EXPECT_EQ(compares, 0u);
+            EXPECT_EQ(iadds, 1u);
+
+            agx_ra(b->shader);
+            ASSERT_FALSE(b->shader->ra_failed);
+            agx_lower_pseudo(b->shader);
+
+            struct util_dynarray binary;
+            util_dynarray_init(&binary, mem_ctx);
+            EXPECT_TRUE(agx3_pack_binary(b->shader, &binary))
+               << "chip " << t.chip << " select " << via_select << " lhs "
+               << lhs;
+            EXPECT_GT(binary.size, 0u);
+         }
       }
    }
 }
@@ -1714,5 +1922,848 @@ TEST_F(Optimizer, G17PCompoundInnerGuardSemantics)
             }
          }
       }
+   }
+}
+
+TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFfma)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      enum agx_opcode op;
+      bool saturate;
+      bool src_neg;
+      bool has_imm;
+      bool has_uniform;
+      bool expect_folded;
+   };
+   const Case cases[] = {
+      {"agx3b_ffma_plain", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, false, false, false, true},
+      {"agx3b_fadd_plain", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, true},
+      {"agx3b_fmul_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL,
+       false, false, false, false, false},
+      {"agx3b_ffma_saturate_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FFMA, true, false, false, false, false},
+      {"agx3b_ffma_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, true, false, false, false},
+      {"agx3b_ffma_imm_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, false, true, false, false},
+      {"agx3b_ffma_uniform_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FFMA, false, false, false, true, false},
+      {"g18g_ffma_blocked", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FFMA,
+       false, false, false, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index half = agx_preload(b, hx);
+      agx_index widened = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, widened, half);
+
+      agx_index s0 = widened;
+      if (c.src_neg)
+         s0 = agx_neg(s0);
+      agx_index s1 = c.has_imm       ? agx_immediate_f(1.0f)
+                     : c.has_uniform ? agx_uniform(0, AGX_SIZE_32)
+                                     : agx_preload(b, wy);
+      agx_index s2 = agx_preload(b, wz);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+
+      agx_instr *I;
+      if (c.op == AGX_OPCODE_FADD)
+         I = agx_fadd_to(b, out, s0, s1);
+      else if (c.op == AGX_OPCODE_FMUL)
+         I = agx_fmul_to(b, out, s0, s1);
+      else
+         I = agx_ffma_to(b, out, s0, s1, s2);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(I->src[0].size, c.expect_folded ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+   }
+}
+
+/* A constant index folds into a device load only while the index at its
+ * scale plus the load's byte displacement is still a signed 16-bit offset.
+ */
+static enum agx_index_type
+device_load_index_type(void *mem_ctx, uint32_t index, int16_t displacement)
+{
+   agx_builder *b = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   b->shader->key = &key;
+
+   agx_index idx = agx_mov_imm(b, 32, index);
+   agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *load = agx_device_load_to(b, out, agx_register(0, AGX_SIZE_64),
+                                        idx, AGX_FORMAT_I32, 1, 0, false);
+   load->memory_byte_offset = displacement;
+   agx_unit_test(b, out);
+
+   agx_optimizer_forward(b->shader);
+   return load->src[1].type;
+}
+
+TEST_F(Optimizer, DeviceLoadImmediateIndexKeepsItsDisplacementEncodable)
+{
+   /* 32764 + (8 << 2) = 32796 does not fit, so the index stays a register. */
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32764), AGX_INDEX_NORMAL);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, -32768), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 0, 32764), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 0), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32735), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32736), AGX_INDEX_NORMAL);
+}
+
+TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFadd)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      enum agx_opcode op;
+      bool half_second;
+      bool both_half;
+      bool saturate;
+      bool src_neg;
+      bool has_imm;
+      bool has_uniform;
+      bool expect_folded;
+   };
+   const Case cases[] = {
+      {"agx3b_fadd_half_first", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, false, false, true},
+      {"agx3b_fadd_half_second", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       true, false, false, false, false, false, true},
+      {"agx3b_fadd_both_half_keeps_one_wide", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, true, false, false, false, false, true},
+      {"agx3b_fadd_saturate_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, false, true, false, false, false, false},
+      {"agx3b_fadd_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, true, false, false, false},
+      {"agx3b_fadd_imm_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, true, false, false},
+      {"agx3b_fadd_uniform_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, false, false, false, false, true, false},
+      {"agx3b_fmul_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL,
+       false, false, false, false, false, false, false},
+      {"g18g_fadd_blocked", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FADD,
+       false, false, false, false, false, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index half0 = agx_preload(b, hx);
+      agx_index w0 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, w0, half0);
+      if (c.src_neg)
+         w0 = agx_neg(w0);
+
+      agx_index other;
+      if (c.both_half) {
+         agx_index half1 = agx_preload(b, hy);
+         other = agx_temp(b->shader, AGX_SIZE_32);
+         agx_fmov_to(b, other, half1);
+      } else if (c.has_imm) {
+         other = agx_immediate_f(1.0f);
+      } else if (c.has_uniform) {
+         other = agx_uniform(0, AGX_SIZE_32);
+      } else {
+         other = agx_preload(b, wy);
+      }
+
+      agx_index s0 = c.half_second ? other : w0;
+      agx_index s1 = c.half_second ? w0 : other;
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = c.op == AGX_OPCODE_FADD ? agx_fadd_to(b, out, s0, s1)
+                                             : agx_fmul_to(b, out, s0, s1);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      const unsigned idx = c.half_second ? 1 : 0;
+      EXPECT_EQ(I->src[idx].size, c.expect_folded ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      if (c.both_half)
+         EXPECT_EQ(I->src[1 - idx].size, AGX_SIZE_32) << c.name;
+   }
+}
+
+/* Folding a half into an AGX3B f32 add leaves the other operand as the add's
+ * one word source. Compacting constants afterwards must not narrow it, or the
+ * add reads two halves, which no AGX3B form encodes: `float(h) + 5.15625`,
+ * whose constant is exact in f16, failed dEQP-GLES3 random shaders. */
+TEST_F(Optimizer, Agx3bHalfFaddKeepsOneWordSourceThroughCompaction)
+{
+   for (bool constant_first : {false, true}) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      b->shader->key = &key;
+
+      agx_index half = agx_preload(b, hx);
+      agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, wide, half);
+      agx_index c = agx_mov_imm(b, 32, fui(5.15625));
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = constant_first ? agx_fadd_to(b, out, c, wide)
+                                    : agx_fadd_to(b, out, wide, c);
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+      agx_opt_compact_constants(b->shader);
+
+      unsigned halves = 0;
+      for (unsigned s = 0; s < 2; ++s)
+         halves += I->src[s].size == AGX_SIZE_16;
+      EXPECT_EQ(I->src[constant_first ? 1 : 0].size, AGX_SIZE_16)
+         << constant_first;
+      EXPECT_EQ(halves, 1u) << constant_first;
+   }
+}
+
+
+TEST_F(Optimizer, Agx3bFoldsZeroExtendedHalfIntoIadd)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      bool both_half;
+      bool neg0;
+      bool neg1;
+      bool saturate;
+      unsigned shift;
+      bool expect_fold0;
+      bool expect_fold1;
+   };
+   const Case cases[] = {
+      {"u16_plus_u16", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       false, 0, true, true},
+      {"u16_minus_u16", AGX_ISA_ENCODING_AGX3B, false, true, false, true,
+       false, 0, true, true},
+      {"u16_plus_u32", AGX_ISA_ENCODING_AGX3B, false, false, false, false,
+       false, 0, true, false},
+      {"u16_minus_u32", AGX_ISA_ENCODING_AGX3B, false, false, false, true,
+       false, 0, true, false},
+      {"u32_minus_u16", AGX_ISA_ENCODING_AGX3B, false, false, true, false,
+       false, 0, true, false},
+      {"both_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, true, true, true,
+       false, 0, false, false},
+      {"saturate_blocked", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       true, 0, false, false},
+      {"shifted_blocked", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       false, 2, false, false},
+      {"g18g_blocked", AGX_ISA_ENCODING_AGX3C, true, true, false, false,
+       false, 0, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index h0 = agx_preload(b, hx);
+      agx_index w0 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, w0, h0);
+      agx_index s0 = c.neg0 ? agx_neg(w0) : w0;
+
+      agx_index s1;
+      if (c.both_half) {
+         agx_index h1 = agx_preload(b, hy);
+         agx_index w1 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_mov_to(b, w1, h1);
+         s1 = c.neg1 ? agx_neg(w1) : w1;
+      } else {
+         agx_index w1 = agx_preload(b, wy);
+         s1 = c.neg1 ? agx_neg(w1) : w1;
+      }
+
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = agx_iadd_to(b, out, s0, s1, c.shift);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(I->src[0].size, c.expect_fold0 ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      EXPECT_EQ(I->src[0].abs, c.expect_fold0) << c.name;
+      EXPECT_EQ(I->src[0].neg, c.neg0) << c.name;
+      EXPECT_EQ(I->src[1].size, c.expect_fold1 ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      EXPECT_EQ(I->src[1].abs, c.expect_fold1) << c.name;
+      EXPECT_EQ(I->src[1].neg, c.neg1) << c.name;
+   }
+}
+
+TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
+{
+   struct load_case {
+      const char *name;
+      mesa_shader_stage stage;
+      enum agx_format fmt;
+      enum agx_size dst_size;
+      unsigned channels;
+      unsigned mask;
+      bool packed;
+      bool coherent;
+      bool internal;
+      bool secondary;
+      bool preamble;
+      unsigned base_u;
+      bool expect_fold;
+   };
+
+   const load_case cases[] = {
+      /* Compute I8 scalar (16/32) & packed (partial/full), aligned low uniform -> fold */
+      {"compute-i8-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 4u, true},
+      {"compute-i8-scalar16", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_16, 1,
+       0x1, false, false, false, false, false, 252u, true},
+      {"compute-i8-packed", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0xf, true, false, false, false, false, 8u, true},
+      {"compute-i8-packed-partial", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0x3, true, false, false, false, false, 252u, true},
+      /* Compute I16/F16/I32 scalar & vector masks -> fold */
+      {"compute-i16-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-i16-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 8u, true},
+      {"compute-f16-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-f16-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 252u, true},
+      {"compute-f16-vec4-32", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_32, 4,
+       0xf, false, false, false, false, false, 16u, true},
+      {"compute-i32-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-i32-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 4,
+       0xf, false, false, false, false, false, 8u, true},
+      /* Unaligned or high uniform file -> refuse */
+      {"unaligned-u2", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 2u, false},
+      {"unaligned-f16-u2", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 1,
+       0x1, false, false, false, false, false, 2u, false},
+      {"high-file-u256", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 256u, false},
+      /* Non-compute, coherent, internal, secondary, preamble, invalid shape -> refuse */
+      {"vertex-i32", MESA_SHADER_VERTEX, AGX_FORMAT_I32, AGX_SIZE_32, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+      {"fragment-i32", MESA_SHADER_FRAGMENT, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 4u, false},
+      {"coherent-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, true, false, false, false, 4u, false},
+      {"internal-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, true, false, false, 4u, false},
+      {"secondary-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, true, false, 4u, false},
+      {"preamble-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, true, 4u, false},
+      {"dest-64bit", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_64, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+      {"packed-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1, 0xf,
+       true, false, false, false, false, 4u, false},
+      {"i32-dst16", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_16, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+      {"mask-exceeds-ch", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 1,
+       0xf, false, false, false, false, false, 4u, false},
+   };
+
+   for (const load_case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.secondary = c.secondary;
+      b->shader->key = &key;
+      b->shader->stage = c.stage;
+      b->shader->is_preamble = c.preamble;
+      b->shader->nir = rzalloc(mem_ctx, nir_shader);
+      b->shader->nir->info.stage = c.stage;
+      b->shader->nir->info.internal = c.internal;
+
+      agx_index base = agx_temp(b->shader, AGX_SIZE_64);
+      agx_instr *col = agx_collect_to(b, base, 2);
+      col->src[0] = agx_uniform(c.base_u, AGX_SIZE_32);
+      col->src[1] = agx_uniform(c.base_u + 2, AGX_SIZE_32);
+
+      agx_index dst = agx_vec_temp(b->shader, c.dst_size, c.channels);
+      agx_instr *ld =
+         agx_device_load_to(b, dst, base, wx, c.fmt, c.mask, 0, false);
+      ld->memory_is_packed = c.packed;
+      ld->coherent = c.coherent;
+      agx_unit_test(b, dst);
+
+      agx_optimize_and_dce(b->shader);
+
+      if (c.expect_fold) {
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_UNIFORM) << c.name;
+         EXPECT_EQ(ld->src[0].value, c.base_u) << c.name;
+         EXPECT_EQ(ld->src[0].size, AGX_SIZE_64) << c.name;
+      } else {
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_NORMAL) << c.name;
+      }
+   }
+}
+
+TEST_F(Optimizer, FoldXorBoolInvertIntoCompare)
+{
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_GE, false);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_fcmp_to(b, out, wx, wy, AGX_FCOND_GE, true));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_LT, true);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_fcmp_to(b, out, wx, wy, AGX_FCOND_LT, false));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmp_to(b, cmp, wx, wy, AGX_ICOND_UEQ, false);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_icmp_to(b, out, wx, wy, AGX_ICOND_UEQ, true));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmp_to(b, cmp, wx, wy, AGX_ICOND_ULT, true);
+         agx_xor_to(b, out, agx_immediate(1), cmp);
+      },
+      agx_icmp_to(b, out, wx, wy, AGX_ICOND_ULT, false));
+
+   /* Multi-use compare must stay untouched so the other user keeps its sense. */
+   agx_builder *b = agx_test_builder(mem_ctx);
+   agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+   agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_GE, false);
+   agx_index inv = agx_temp(b->shader, AGX_SIZE_16);
+   agx_xor_to(b, inv, cmp, agx_immediate(1));
+   agx_unit_test(b, cmp);
+   agx_unit_test(b, inv);
+   agx_optimize_and_dce(b->shader);
+
+   unsigned fcmps = 0, xors = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_FCMP) {
+         fcmps++;
+         EXPECT_FALSE(I->invert_cond);
+      } else if (I->op == AGX_OPCODE_BITOP &&
+                 I->truth_table == UTIL_LUT2(a ^ b)) {
+         xors++;
+      }
+   }
+   EXPECT_EQ(fcmps, 1u);
+   EXPECT_EQ(xors, 1u);
+}
+
+TEST_F(Optimizer, PackFourWayBoolOrBranch)
+{
+   for (bool invert : {false, true}) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *target = agx_test_block(b->shader);
+      agx_block_add_successor(entry, target);
+
+      agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+      agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+
+      agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_instr *br =
+         agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, invert, target);
+
+      agx_opt_pack_bool_or_branch(b->shader);
+
+      unsigned icmpsels = 0, collects = 0, ors32 = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_ICMPSEL)
+            icmpsels++;
+         else if (I->op == AGX_OPCODE_COLLECT)
+            collects++;
+         else if (I->op == AGX_OPCODE_BITOP &&
+                  I->truth_table == UTIL_LUT2(a | b) &&
+                  I->dest[0].size == AGX_SIZE_32)
+            ors32++;
+      }
+      EXPECT_EQ(icmpsels, 0u);
+      EXPECT_EQ(collects, 2u);
+      EXPECT_EQ(ors32, 1u);
+      EXPECT_EQ(br->src[0].size, AGX_SIZE_32);
+      EXPECT_EQ(br->invert_cond, invert);
+   }
+
+   /* When leaves stay live into nested branches, rewrite the serial icmpsel
+    * chain into a balanced 16-bit bitwise OR tree without collects. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *target = agx_test_block(b->shader);
+      agx_block_add_successor(entry, target);
+
+      agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+      agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+
+      agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_unit_test(b, c0);
+      agx_instr *br =
+         agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, true, target);
+
+      agx_opt_pack_bool_or_branch(b->shader);
+
+      unsigned icmpsels = 0, collects = 0, ors16 = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_ICMPSEL)
+            icmpsels++;
+         else if (I->op == AGX_OPCODE_COLLECT)
+            collects++;
+         else if (I->op == AGX_OPCODE_BITOP &&
+                  I->truth_table == UTIL_LUT2(a | b) &&
+                  I->dest[0].size == AGX_SIZE_16)
+            ors16++;
+      }
+      EXPECT_EQ(icmpsels, 0u);
+      EXPECT_EQ(collects, 0u);
+      EXPECT_EQ(ors16, 3u);
+      EXPECT_EQ(br->src[0].size, AGX_SIZE_16);
+   }
+
+   /* An intermediate OR node with an extra user must not be folded away. */
+   agx_builder *b = agx_test_builder(mem_ctx);
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *target = agx_test_block(b->shader);
+   agx_block_add_successor(entry, target);
+
+   agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+   agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+   agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+   agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+   agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+   agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_unit_test(b, or01);
+   agx_instr *br =
+      agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, true, target);
+
+   agx_opt_pack_bool_or_branch(b->shader);
+
+   EXPECT_EQ(br->src[0].size, AGX_SIZE_16);
+}
+
+static unsigned
+count_ops_in_block(const agx_block *blk, enum agx_opcode op)
+{
+   unsigned n = 0;
+   agx_foreach_instr_in_block(blk, I) {
+      if (I->op == op)
+         n++;
+   }
+   return n;
+}
+
+TEST_F(Optimizer, SinkColdCompareIntoSinglePredSucc)
+{
+   /* Positive: FCMP in entry used only inside then (and a nested block under
+    * then) sinks to the head of then; another FCMP used in entry or in merge
+    * stays in entry. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *nested = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, merge);
+      agx_block_add_successor(then_blk, nested);
+      agx_block_add_successor(then_blk, merge);
+      agx_block_add_successor(nested, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index z = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_mov_to(b, z, wz);
+      agx_index cold_direct = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
+      agx_index cold_nested = agx_icmp(b, x, z, AGX_ICOND_UEQ, true);
+      agx_index hot_use = agx_fcmp(b, y, z, AGX_FCOND_LT, false);
+      agx_index merge_use = agx_fcmp(b, x, z, AGX_FCOND_GT, false);
+      agx_unit_test(b, hot_use);
+      agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, cold_direct);
+      agx_if_icmp(b, wy, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(nested);
+      agx_unit_test(b, cold_nested);
+
+      b->cursor = agx_after_block(merge);
+      agx_unit_test(b, merge_use);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 2u);
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_ICMP), 0u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_ICMP), 1u);
+   }
+
+   /* Negative: must not sink into a loop header or a multi-predecessor block. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *loop_hdr = agx_test_block(b->shader);
+      agx_block *exit_blk = agx_test_block(b->shader);
+      loop_hdr->loop_header = true;
+
+      agx_block_add_successor(entry, loop_hdr);
+      agx_block_add_successor(entry, exit_blk);
+      agx_block_add_successor(loop_hdr, exit_blk);
+
+      b->cursor = agx_after_block(entry);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_index cmp = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
+      agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, exit_blk);
+
+      b->cursor = agx_after_block(loop_hdr);
+      agx_unit_test(b, cmp);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(loop_hdr, AGX_OPCODE_FCMP), 0u);
+   }
+
+   /* Negative: a compare reading a pre-coloured register must not sink, since
+    * the register could be overwritten before the successor runs. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, merge);
+      agx_block_add_successor(then_blk, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index cmp = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
+      agx_if_icmp(b, wz, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, cmp);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_FCMP), 0u);
+   }
+}
+
+TEST_F(Optimizer, SinkColdCompareIntoElseBlockAfterElse)
+{
+   /* An else block has one predecessor and no phis but starts with
+    * else_fcmp/else_icmp. Compares used only in the else arm must sink after
+    * that instruction so they run under the else execution mask and the block
+    * keeps the form agx_validate_block_form() requires. */
+   for (bool else_icmp : {false, true}) {
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+
+      agx_builder *b = agx_test_builder(mem_ctx);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *else_blk = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, else_blk);
+      agx_block_add_successor(then_blk, merge);
+      agx_block_add_successor(else_blk, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index f = agx_temp(b->shader, AGX_SIZE_16);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_mov_to(b, f, hz);
+      agx_index cold_f = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
+      agx_index cold_i = agx_icmp(b, x, y, AGX_ICOND_UEQ, true);
+      agx_if_icmp(b, f, agx_zero(), 1, AGX_ICOND_UEQ, true, else_blk);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, f);
+
+      b->cursor = agx_after_block(else_blk);
+      agx_instr *else_ =
+         else_icmp
+            ? agx_else_icmp(b, agx_zero(), agx_zero(), 1, AGX_ICOND_UEQ, false,
+                            else_blk)
+            : agx_else_fcmp(b, agx_zero(), agx_zero(), 1, AGX_FCOND_EQ, false,
+                            else_blk);
+      agx_unit_test(b, cold_f);
+      agx_unit_test(b, cold_i);
+
+      b->cursor = agx_after_block(merge);
+      agx_pop_exec(b, 1);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 0u);
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_ICMP), 0u);
+      EXPECT_EQ(count_ops_in_block(else_blk, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(else_blk, AGX_OPCODE_ICMP), 1u);
+
+      /* else_* stays first, both compares follow it before their uses. */
+      agx_instr *first = agx_first_instr(else_blk);
+      ASSERT_EQ(first, else_);
+      agx_instr *second = list_entry(first->link.next, agx_instr, link);
+      agx_instr *third = list_entry(second->link.next, agx_instr, link);
+      EXPECT_TRUE(second->op == AGX_OPCODE_FCMP ||
+                  second->op == AGX_OPCODE_ICMP);
+      EXPECT_TRUE(third->op == AGX_OPCODE_FCMP || third->op == AGX_OPCODE_ICMP);
+      EXPECT_NE(second->op, third->op);
+
+      /* Assert builds check the whole block form, including the else head. */
+      agx_validate(b->shader, "agx_opt_sink_cold_cmp else block");
+   }
+}
+
+/* AGX3B: a byte that u2u8 already masked to 0xff, masked again by the
+ * packed 8-bit store, is the masked byte itself. The fold needs every bit of
+ * the inner mask to survive the outer one. */
+TEST_F(Optimizer, AGX3BRedundantByteMask)
+{
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+
+   /* Same-width halves, and a word narrowed into a half by the inner mask. */
+   for (agx_index src : {hx, wx}) {
+      for (unsigned inner_mask : {0xffu, 0x0fu}) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         actual->shader->key = &key;
+         expected->shader->key = &key;
+
+         agx_index byte = agx_temp(actual->shader, AGX_SIZE_16);
+         agx_and_to(actual, byte, src, agx_immediate(inner_mask));
+         agx_index again = agx_temp(actual->shader, AGX_SIZE_16);
+         agx_and_to(actual, again, byte, agx_immediate(0xff));
+         agx_unit_test(actual, again);
+
+         byte = agx_temp(expected->shader, AGX_SIZE_16);
+         agx_and_to(expected, byte, src, agx_immediate(inner_mask));
+         agx_temp(expected->shader, AGX_SIZE_16); /* the folded mask */
+         agx_unit_test(expected, byte);
+
+         agx_optimize_and_dce(actual->shader);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
+}
+
+/* The outer mask clears a bit the inner one keeps (0x1ff & 0xff), the
+ * operation is not an AND, or the target is not AGX3B: nothing folds. */
+TEST_F(Optimizer, AGX3BRedundantByteMaskNegative)
+{
+   struct {
+      enum agx_isa_encoding encoding;
+      unsigned inner_mask;
+      unsigned outer_table;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, 0x1ff, UTIL_LUT2(a & b)},
+      {AGX_ISA_ENCODING_AGX3B, 0xff, UTIL_LUT2(a | b)},
+      {AGX_ISA_ENCODING_AGX3C, 0xff, UTIL_LUT2(a & b)},
+      {AGX_ISA_ENCODING_AGX2, 0xff, UTIL_LUT2(a & b)},
+   };
+   for (auto c : cases) {
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index byte = agx_temp(b->shader, AGX_SIZE_16);
+         agx_and_to(b, byte, hx, agx_immediate(c.inner_mask));
+         agx_index again = agx_temp(b->shader, AGX_SIZE_16);
+         agx_bitop_to(b, again, byte, agx_immediate(0xff), c.outer_table);
+         agx_unit_test(b, again);
+      }
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
    }
 }

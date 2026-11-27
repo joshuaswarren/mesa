@@ -30,7 +30,7 @@ agx_zls_pixels(enum agx_chip chip, uint32_t width, uint32_t height,
    if ((depth_base | depth_meta | stencil_base | stencil_meta) == 0)
       return 0;
 
-   const unsigned shift = (agx_chip_hal300_records(chip) || agx_chip_g17_m5(chip)) ? 16 : 15;
+   const unsigned shift = agx_chip_hal300_path(chip) ? 16 : 15;
    assert(width >= 1 && width <= (1u << shift));
    assert(height >= 1 && height <= (1u << shift));
    return (width - 1) | ((height - 1) << shift);

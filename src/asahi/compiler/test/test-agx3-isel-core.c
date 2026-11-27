@@ -310,8 +310,16 @@ main(void)
       u.true_kind = AGX3_ISEL_UNIFORM; /* uniform comparand and select */
       u.sel_true = 10;
       CHECK(!agx3_isel_encode(AGX_ISA_ENCODING_AGX3B, &u, out, &len));
+      u.true_kind = AGX3_ISEL_IMMEDIATE; /* uniform comparand and immediate select */
+      u.sel_true = 1;
+      CHECK(!agx3_isel_encode(AGX_ISA_ENCODING_AGX3B, &u, out, &len));
       u.true_kind = AGX3_ISEL_REGISTER;
       u.sel_true = 2;
+      u.false_kind = AGX3_ISEL_IMMEDIATE;
+      u.sel_false = 0;
+      CHECK(!agx3_isel_encode(AGX_ISA_ENCODING_AGX3B, &u, out, &len));
+      u.false_kind = AGX3_ISEL_REGISTER;
+      u.sel_false = 4;
       u.cmp0 = 9; /* misaligned uniform word */
       CHECK(!agx3_isel_encode(AGX_ISA_ENCODING_AGX3B, &u, out, &len));
       u.cmp0 = 256; /* high uniform file */

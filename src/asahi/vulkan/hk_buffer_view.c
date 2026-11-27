@@ -41,7 +41,7 @@ hk_as_vtx_format_supported(const struct hk_physical_device *pdev,
    case VK_FORMAT_R64G64_SFLOAT:
    case VK_FORMAT_R64G64B64_SFLOAT:
    case VK_FORMAT_R64G64B64A64_SFLOAT:
-      return pdev->dev.chip == AGX_CHIP_G17P;
+      return agx_chip_native_hal200(pdev->dev.chip);
    default:
       return vk_acceleration_struct_vtx_format_supported(vk_format);
    }
@@ -79,12 +79,17 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
       if (p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
           (p_format == PIPE_FORMAT_R32_FLOAT &&
-           (pdev->dev.chip == AGX_CHIP_G17P ||
-            agx_chip_g17_m5(pdev->dev.chip))))
+           pdev->vk.supported_features.shaderImageFloat32Atomics))
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 
    return features;
+}
+
+static bool
+hk_texel_rgb32(enum pipe_format format)
+{
+   return ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -103,10 +108,9 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    enum pipe_format format = hk_format_to_pipe_format(view->vk.format);
    const struct util_format_description *desc = util_format_description(format);
-   const bool g17p = agx_native_graphics(&device->dev) ||
-                      agx_chip_g17_m5(device->dev.chip);
-   const bool rgb32 =
-      ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
+   const unsigned blocksize_B = util_format_get_blocksize(format);
+   const bool g17p = agx_chip_agx3_path(device->dev.chip);
+   const bool rgb32 = hk_texel_rgb32(format);
 
    uint8_t format_swizzle[4] = {
       desc->swizzle[0],
@@ -136,35 +140,43 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    uint64_t rw_base = hk_buffer_address_rw(buffer, 0) + head_offset_B;
    uint64_t ro_base = hk_buffer_address_ro(buffer, 0) + head_offset_B;
 
-   /* Which mapping the sampled texel-buffer descriptor addresses on G17P.
-    *
-    * The read-only shadow at +sparse_ro_offset is the mechanism every other
-    * read-only descriptor uses to get sparseResidencyNonResidentStrict for
-    * free: an unbound page reads as zero there.  For a texel buffer G17P
-    * cannot rely on it, so the descriptor names the primary mapping and the
-    * shader masks a non-resident texel to zero from the residency bitmap
-    * instead -- one address and one residency source for both the sparse
-    * fetch and the ordinary read.  See buffer_texel_resident() in
-    * agx_nir_lower_texture.c.
-    *
-    * For a non-sparse buffer hk_buffer_address() returns the same address
-    * either way (the shadow only exists for buffer->va != NULL), so this
-    * cannot move an ordinary texel buffer.
+   /* On AGX3/M5, address the primary mapping rather than the read-only sparse
+    * shadow; non-resident texels are masked to zero in the shader from the
+    * residency bitmap (see buffer_texel_resident() in agx_nir_lower_texture.c).
+    * Non-sparse buffers return the same VA from both helpers.
     */
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
-   uint32_t tail_offset_B = view->vk.offset & 0xf;
+   const uint32_t tail_offset_B = view->vk.offset & 0xf;
    /* The G17P metadata names the view's exact address
-    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits component-aligned
-    * offsets, which cannot in general be expressed as a whole-texel tail, and
-    * it reads only that address; its unused hardware texture stays aligned.
+    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits 4-byte
+    * component-aligned offsets, which cannot in general be expressed as a
+    * whole-texel tail: G17P reads metadata_base directly, while AGX2 keeps the
+    * 16-byte-aligned descriptor address and stores the 4-byte word tail (0..3)
+    * in buffer_offset_sw for libagx_texture_load_rgb32(). In both cases the
+    * unused hardware 2D texture stays aligned with no whole-texel tail.
     */
    const uint64_t metadata_base = sampled_base + tail_offset_B;
-   if (g17p && rgb32)
-      tail_offset_B = 0;
-   uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
-   assert(tail_offset_el * util_format_get_blocksize(format) == tail_offset_B &&
-          "must be texel aligned");
+   uint32_t tail_offset_el = 0;
+   uint32_t texture_buffer_offset_sw = 0;
+   if (rgb32) {
+      assert(tail_offset_B % 4 == 0 && "must be component aligned");
+      texture_buffer_offset_sw = tail_offset_B / 4;
+   } else {
+      tail_offset_el = tail_offset_B / blocksize_B;
+      assert(tail_offset_el * blocksize_B == tail_offset_B &&
+             "must be texel aligned");
+      texture_buffer_offset_sw = tail_offset_el;
+   }
+
+   if (view->vk.elements > AGX_TEXTURE_BUFFER_MAX_SIZE - tail_offset_el) {
+      vk_buffer_view_destroy(&device->vk, pAllocator, &view->vk);
+      return vk_error(device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
+   const uint32_t height =
+      MAX2(DIV_ROUND_UP(view->vk.elements + tail_offset_el,
+                        AGX_TEXTURE_BUFFER_WIDTH),
+           1);
 
    const unsigned generation =
       agx_chip_descriptor_generation(device->dev.chip);
@@ -181,20 +193,19 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
 
       texture.width = AGX_TEXTURE_BUFFER_WIDTH;
-      texture.height = DIV_ROUND_UP(view->vk.elements, texture.width);
+      texture.height = height;
       texture.first_level = texture.last_level = 0;
 
       texture.address = sampled_base;
       texture.buffer_size_sw = view->vk.elements;
-      texture.buffer_offset_sw = tail_offset_el;
+      texture.buffer_offset_sw = texture_buffer_offset_sw;
 
       texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
       texture.srgb_2_channel =
          texture.srgb && util_format_colormask(desc) == 0x3;
 
       texture.depth = 1;
-      texture.stride =
-         (texture.width * util_format_get_blocksize(format)) - 16;
+      texture.stride = (texture.width * blocksize_B) - 16;
    }
    if (g17p && rgb32) {
       texture.channels = AGX_CHANNELS_R32;
@@ -203,15 +214,11 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.stride = texture.width * sizeof(uint32_t) - 16;
    }
    if (g17p) {
-      /* A sparse-resident buffer carries a per-page residency bitmap, and the
-       * buffer texture descriptor has no hardware sparse mode to report
-       * residency with, so a sparse texel fetch reads that bitmap instead.
-       * Pack the map and the element size the shader needs to find the page;
-       * see AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET.  A non-power-of-two
-       * element size (the emulated RGB32 layout) takes the raw load path,
-       * which claims residency anyway, so leave the word zero for it. */
-      const uint32_t sparse = hk_buffer_sparse_texel_word(
-         buffer, util_format_get_blocksize(format));
+      /* Pack the per-page residency bitmap and element size for sparse texel
+       * fetches (AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET); leave zero for
+       * non-power-of-two emulated RGB32, which uses raw loads.
+       */
+      const uint32_t sparse = hk_buffer_sparse_texel_word(buffer, blocksize_B);
 
       view->buffer_metadata = (struct hk_g17p_buffer_texture_metadata){
          .elements = view->vk.elements,
@@ -224,8 +231,6 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * explicit metadata, while hardware sees the aligned base texture.
        */
       texture.buffer_offset_sw = 0;
-      texture.height = DIV_ROUND_UP(view->vk.elements + tail_offset_el,
-                                    texture.width);
    }
    if (!hk_pack_native_texture(generation, &view->tex, &texture)) {
       vk_buffer_view_destroy(&device->vk, pAllocator, &view->vk);
@@ -257,17 +262,19 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       pbe.buffer_offset_sw = tail_offset_el;
 
       pbe.width = AGX_TEXTURE_BUFFER_WIDTH;
-      pbe.height = DIV_ROUND_UP(view->vk.elements, pbe.width);
+      pbe.height = height;
       pbe.level = 0;
-      pbe.stride = (pbe.width * util_format_get_blocksize(format)) - 4;
+      pbe.stride = (pbe.width * blocksize_B) - 4;
       pbe.layers = 1;
       pbe.levels = 1;
    }
 
    if (hk_native_pbe_supported(generation)) {
-      hk_pack_native_pbe(generation, &view->pbe, &pbe);
-   } else if (agx_native_graphics(&device->dev) ||
-              agx_chip_g17_m5(device->dev.chip)) {
+      if (rgb32)
+         hk_set_null_native_pbe(generation, &view->pbe);
+      else
+         hk_pack_native_pbe(generation, &view->pbe, &pbe);
+   } else if (agx_chip_agx3_path(device->dev.chip)) {
       /* AGX3's linear PBE is architectural and has no software tail field,
        * exactly like the texture above: the store lowering adds the tail from
        * the buffer metadata. A format the native packer cannot represent (the
@@ -275,18 +282,13 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * null PBE.
        */
       pbe.buffer_offset_sw = 0;
-      pbe.height = DIV_ROUND_UP(view->vk.elements + tail_offset_el, pbe.width);
       if (!hk_pack_native_pbe(generation, &view->pbe, &pbe))
          hk_set_null_native_pbe(generation, &view->pbe);
    } else {
       memset(&view->pbe, 0, sizeof(view->pbe));
    }
 
-   /* G17P reaches a sampled texture through the device heap, so the view's
-    * texture descriptor has to live there and the descriptor carries only its
-    * index.  Without this the index stays 0 and every texel-buffer fetch
-    * resolves to the null texture.  Mirrors hk_image_view.c's per-plane
-    * hk_descriptor_table_add(). */
+   /* Register the sampled texture in the device heap (mirrors hk_image_view.c). */
    if (g17p) {
       VkResult result = hk_descriptor_table_add(
          device, &device->sampled_images, &view->tex,
@@ -320,24 +322,16 @@ hk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 }
 
 /*
- * VK_EXT_descriptor_buffer texel buffers on G17P.
+ * VK_EXT_descriptor_buffer texel buffers on AGX3/M5.
  *
- * vkGetDescriptorEXT() names a texel buffer by address, range and format, so
- * there is no view object to own the device heap texture that G17P samples
- * through (hk_CreateBufferView()). Instead each format gets a fixed set of
- * maximum-sized buffer textures, "windows", over the application VA: 2^28
- * texels each, one starting every 2^27 texels, so any view of at most 2^27
- * texels lies inside one of them. The descriptor's software metadata selects
- * the view's texels in the window: the element offset and count that the
- * texel fetch, image load/store and atomic lowerings already apply
- * (agx_nir_lower_texture.c). The heap indices are reserved when the device is
- * created, in a fixed order, and a window is written when first used, so a
- * descriptor does not depend on the order views were asked for
- * (capture/replay). A larger view, or one outside the VA, gets a texture of
- * its own, kept until the device is destroyed.
- *
- * The emulated RGB32 formats read memory directly at the metadata address;
- * their texture is only read out of bounds, so one window serves each.
+ * Since vkGetDescriptorEXT() has no VkBufferView object to own a heap slot,
+ * each format reserves overlapping 2^28-texel "windows" stepped every 2^27
+ * texels across the application VA so any view <= 2^27 texels fits in one,
+ * with software metadata selecting offset and count (agx_nir_lower_texture.c).
+ * Indices are reserved in fixed order at device creation and populated on first
+ * use for capture/replay determinism; larger/out-of-range views allocate a
+ * dedicated device-lifetime slot. Emulated RGB32 reads memory directly and
+ * needs only one window per format.
  */
 #define HK_TEXEL_WINDOW_EL      (AGX_TEXTURE_BUFFER_WIDTH * AGX_TEXTURE_BUFFER_MAX_HEIGHT)
 #define HK_TEXEL_WINDOW_STEP_EL (HK_TEXEL_WINDOW_EL / 2)
@@ -361,12 +355,6 @@ struct hk_texel_windows {
    /* hk_texel_window_key -> heap index */
    struct hash_table *dedicated;
 };
-
-static bool
-hk_texel_rgb32(enum pipe_format format)
-{
-   return ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
-}
 
 /* The buffer texture hk_CreateBufferView() builds for G17P, over `height`
  * rows of AGX_TEXTURE_BUFFER_WIDTH texels at `base`. */
@@ -654,8 +642,119 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
    uint8_t *packed = out;
 
    const enum pipe_format format =
-      info && info->address ? hk_format_to_pipe_format(info->format)
-                            : PIPE_FORMAT_NONE;
+      info && info->address && info->range
+         ? hk_format_to_pipe_format(info->format)
+         : PIPE_FORMAT_NONE;
+
+   /* AGX2 embeds its 24-byte texture and PBE descriptors directly in the
+    * descriptor record with inline buffer_size_sw and buffer_offset_sw, so it
+    * does not need a device texture heap or texel windows. */
+   if (!agx_chip_agx3_path(dev->dev.chip)) {
+      bool ok = false;
+      if (format != PIPE_FORMAT_NONE) {
+         const struct util_format_description *desc =
+            util_format_description(format);
+         const unsigned blocksize_B = util_format_get_blocksize(format);
+         const bool rgb32 = hk_texel_rgb32(format);
+         const uint64_t elements = info->range / blocksize_B;
+         const uint64_t rw_base = info->address & ~UINT64_C(0xf);
+         const uint32_t tail_offset_B = info->address & 0xf;
+         const bool aligned =
+            rgb32 ? (tail_offset_B % 4 == 0) : (tail_offset_B % blocksize_B == 0);
+         const uint32_t tail_offset_el = rgb32 ? 0 : tail_offset_B / blocksize_B;
+         const uint32_t buffer_offset_sw =
+            rgb32 ? tail_offset_B / 4 : tail_offset_el;
+         const uint64_t sampled_base =
+            hk_sparse_address_is_sparse(dev, info->address)
+               ? rw_base + dev->dev.sparse_ro_offset
+               : rw_base;
+         const bool in_bounds =
+            elements <= AGX_TEXTURE_BUFFER_MAX_SIZE - tail_offset_el;
+
+         if (aligned && in_bounds) {
+            const uint32_t height =
+               MAX2(DIV_ROUND_UP(elements + tail_offset_el,
+                                 AGX_TEXTURE_BUFFER_WIDTH),
+                    1);
+            uint8_t format_swizzle[4] = {
+               desc->swizzle[0],
+               desc->swizzle[1],
+               desc->swizzle[2],
+               desc->swizzle[3],
+            };
+            if (util_format_is_depth_or_stencil(format)) {
+               format_swizzle[0] = 0;
+               format_swizzle[1] = 0;
+               format_swizzle[2] = 0;
+               format_swizzle[3] = 0;
+            }
+
+            struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
+            texture.dimension = AGX_TEXTURE_DIMENSION_2D;
+            texture.layout = AGX_LAYOUT_LINEAR;
+            texture.channels = ail_pixel_format[format].channels;
+            texture.type = ail_pixel_format[format].type;
+            texture.swizzle_r = agx_channel_from_pipe(format_swizzle[0]);
+            texture.swizzle_g = agx_channel_from_pipe(format_swizzle[1]);
+            texture.swizzle_b = agx_channel_from_pipe(format_swizzle[2]);
+            texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
+            texture.width = AGX_TEXTURE_BUFFER_WIDTH;
+            texture.height = height;
+            texture.first_level = texture.last_level = 0;
+            texture.address = sampled_base;
+            texture.buffer_size_sw = elements;
+            texture.buffer_offset_sw = buffer_offset_sw;
+            texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
+            texture.srgb_2_channel =
+               texture.srgb && util_format_colormask(desc) == 0x3;
+            texture.depth = 1;
+            texture.stride = (texture.width * blocksize_B) - 16;
+
+            ok = hk_pack_native_texture(generation, &tex, &texture);
+            if (ok && storage && !rgb32) {
+               struct AGX_PBE pbe_cfg = {AGX_PBE_header};
+               pbe_cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+               pbe_cfg.layout = AGX_LAYOUT_LINEAR;
+               pbe_cfg.channels = ail_pixel_format[format].channels;
+               pbe_cfg.type = ail_pixel_format[format].type;
+               pbe_cfg.srgb = util_format_is_srgb(format);
+               for (unsigned i = 0; i < desc->nr_channels; ++i) {
+                  if (desc->swizzle[i] == 0)
+                     pbe_cfg.swizzle_r = i;
+                  else if (desc->swizzle[i] == 1)
+                     pbe_cfg.swizzle_g = i;
+                  else if (desc->swizzle[i] == 2)
+                     pbe_cfg.swizzle_b = i;
+                  else if (desc->swizzle[i] == 3)
+                     pbe_cfg.swizzle_a = i;
+               }
+               pbe_cfg.buffer = rw_base;
+               pbe_cfg.buffer_offset_sw = tail_offset_el;
+               pbe_cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
+               pbe_cfg.height = height;
+               pbe_cfg.level = 0;
+               pbe_cfg.stride = (pbe_cfg.width * blocksize_B) - 4;
+               pbe_cfg.layers = 1;
+               pbe_cfg.levels = 1;
+               if (!hk_pack_native_pbe(generation, &pbe, &pbe_cfg))
+                  hk_set_null_native_pbe(generation, &pbe);
+            } else {
+               hk_set_null_native_pbe(generation, &pbe);
+            }
+         }
+      }
+
+      if (!ok) {
+         hk_set_null_native_texture(generation, &tex);
+         hk_set_null_native_pbe(generation, &pbe);
+      }
+
+      memcpy(packed + native.texture, &tex,
+             hk_texture_descriptor_size(generation));
+      memcpy(packed + native.pbe, &pbe, hk_pbe_descriptor_size(generation));
+      return;
+   }
+
    uint32_t index = 0, offset_el = 0;
    uint64_t base = 0, elements = 0;
    if (format != PIPE_FORMAT_NONE && dev->texel_windows) {

@@ -179,3 +179,26 @@ hk_g17p_patch_plan_apply(const struct hk_g17p_patch_plan *plan,
                           rel->dest[1], (uint32_t)(base >> 32));
    }
 }
+
+/* The LDIMMs plan patches, a low then a high half for each relocation: their
+ * offsets in the program it was made from, and the immediates they take for
+ * ranges (either may be NULL). Returns their count. */
+static inline unsigned
+hk_g17p_patch_plan_ldimms(const struct hk_g17p_patch_plan *plan,
+                          const struct agx3_ioto_uniform_range *ranges,
+                          unsigned *offsets, uint32_t *immediates)
+{
+   for (unsigned r = 0; r < plan->reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &plan->relocs[r];
+      if (offsets) {
+         offsets[2 * r] = rel->offset;
+         offsets[2 * r + 1] = rel->offset + ((rel->short_mask & 1) ? 2 : 8);
+      }
+      if (immediates) {
+         const uint64_t base = ranges[rel->range].address + rel->delta;
+         immediates[2 * r] = (uint32_t)base;
+         immediates[2 * r + 1] = (uint32_t)(base >> 32);
+      }
+   }
+   return 2 * plan->reloc_count;
+}

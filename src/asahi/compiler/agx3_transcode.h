@@ -48,3 +48,13 @@ struct agx3_transcode_ioto {
 bool agx3_transcode_agx3d_ioto(struct util_dynarray *binary, unsigned start,
                                const struct agx3_transcode_ioto *ioto,
                                const char **why, unsigned *fail_offset);
+
+/* As agx3_transcode_agx3d_ioto(), relocating the instruction offsets in
+ * offsets[0, count) (relative to start) as agx3_transcode_agx3d_with_offsets()
+ * does; they change only on success. */
+bool agx3_transcode_agx3d_ioto_with_offsets(struct util_dynarray *binary,
+                                            unsigned start,
+                                            const struct agx3_transcode_ioto *ioto,
+                                            unsigned *offsets, unsigned count,
+                                            const char **why,
+                                            unsigned *fail_offset);

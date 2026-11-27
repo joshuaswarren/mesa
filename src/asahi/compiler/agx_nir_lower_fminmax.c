@@ -161,9 +161,11 @@ zero_constant(nir_scalar s)
  * already exact for signed zeros except when +0 and -0 tie: then it returns
  * its second operand. Integer min/max of the bits orders the two zeros as
  * IEEE 754-2019 does (-0 < +0) and returns either operand of any other tie,
- * as they are identical. That needs feq to compare denormals exactly, as
- * G17P does: a compare that flushed its inputs would tie two different
- * denormals of one sign and imin/imax would pick by bit pattern. NaNs never
+ * as they are identical. That needs feq to compare denormals exactly when
+ * the shader preserves them (AGX_CAP_SIGNED_ZERO_MINMAX_SELECT): a compare
+ * that flushed its inputs would tie two different denormals of one sign and
+ * imin/imax would pick by bit pattern. Where denormals may be flushed, such
+ * a pick differs from the exact result only by a denormal. NaNs never
  * tie. This replaces the generic lower_fminmax_signed_zero emulation (up to
  * 9 instructions) with 3, with the bare min/max when a source is a nonzero
  * constant, or with one select against a zero constant.

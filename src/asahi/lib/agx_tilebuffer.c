@@ -72,6 +72,12 @@ format_size_B(enum pipe_format format)
    return size_B;
 }
 
+unsigned
+agx_tilebuffer_format_size_B(enum pipe_format format)
+{
+   return format_size_B(format);
+}
+
 struct agx_tilebuffer_layout
 agx_build_tilebuffer_layout(const enum pipe_format *formats, uint8_t nr_cbufs,
                             uint8_t nr_samples, bool layered)
@@ -290,6 +296,93 @@ agx_build_tilebuffer_layout_resident(
    return agx_build_tilebuffer_layout_internal(
       formats, nr_cbufs, nr_samples, layered, max_sample_size_B,
       max_bytes_per_tile, max_samples_per_tile, true, resident_mask);
+}
+
+void
+agx_tilebuffer_apply_first_mask(struct agx_tilebuffer_layout *tib,
+                                uint8_t first_mask)
+{
+   assert(tib->resident_mask == 0 && "first_mask conflicts with resident_mask");
+
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS];
+   unsigned nr_cbufs = 0;
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
+      formats[rt] = tib->logical_format[rt];
+      if (formats[rt] != PIPE_FORMAT_NONE)
+         nr_cbufs = rt + 1;
+   }
+   first_mask &= BITFIELD_MASK(nr_cbufs);
+
+   const unsigned max_bytes_per_sample =
+      tib->native_imageblock ? tib->max_sample_size_B :
+      MIN2(tib->max_sample_size_B ? tib->max_sample_size_B : MAX_BYTES_PER_SAMPLE,
+           tib->max_bytes_per_tile > 65536 ? 248 : MAX_ENCODABLE_BYTES_PER_SAMPLE);
+   const unsigned tile_capacity =
+      tib->max_bytes_per_tile ? tib->max_bytes_per_tile : MAX_BYTES_PER_TILE;
+
+   uint32_t offset_B =
+      agx_tilebuffer_allocate(tib, formats, nr_cbufs, tib->nr_samples,
+                              max_bytes_per_sample, tile_capacity, first_mask);
+
+   assert(offset_B <= max_bytes_per_sample && "loop invariant");
+
+   if (tib->nr_samples > 1)
+      offset_B = MAX2(offset_B, 1);
+
+   if (tib->native_imageblock && tib->layered)
+      offset_B = MAX2(offset_B, 1);
+
+   tib->sample_size_B = align(offset_B, 8);
+   tib->tile_size = agx_select_tile_size(
+      tib->sample_size_B, tib->nr_samples, tile_capacity,
+      tib->max_samples_per_tile);
+   tib->first_mask = first_mask;
+
+   agx_tilebuffer_pack_usc(tib);
+}
+
+bool
+agx_tilebuffer_pack_first_if_fits(struct agx_tilebuffer_layout *tib,
+                                  uint8_t first_mask,
+                                  uint32_t max_first_end_B)
+{
+   if (tib->resident_mask != 0)
+      return false;
+
+   uint8_t active_first = 0;
+   bool already_fits = true;
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
+      if (!(first_mask & BITFIELD_BIT(rt)) ||
+          tib->logical_format[rt] == PIPE_FORMAT_NONE)
+         continue;
+      active_first |= BITFIELD_BIT(rt);
+      if (tib->spilled[rt] ||
+          tib->_offset_B[rt] + format_size_B(tib->logical_format[rt]) >
+             max_first_end_B)
+         already_fits = false;
+   }
+   if (!active_first || already_fits)
+      return false;
+
+   struct agx_tilebuffer_layout cand = *tib;
+   agx_tilebuffer_apply_first_mask(&cand, active_first);
+
+   if (cand.tile_size < tib->tile_size)
+      return false;
+
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
+      if (!tib->spilled[rt] && cand.spilled[rt])
+         return false;
+      if (active_first & BITFIELD_BIT(rt)) {
+         if (cand.spilled[rt] ||
+             cand._offset_B[rt] + format_size_B(cand.logical_format[rt]) >
+                max_first_end_B)
+            return false;
+      }
+   }
+
+   *tib = cand;
+   return true;
 }
 
 /*
@@ -706,8 +799,8 @@ agx_g18g_native_mixed_tile_bytes(const enum pipe_format *formats,
    return sample_B * 32 * 32;
 }
 
-unsigned
-agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
+static unsigned
+agx_g18g_native_mixed_layout_mask(const struct agx_tilebuffer_layout *tib)
 {
    if (!tib || tib->nr_samples != 1 || tib->tile_size != 32 * 32 ||
        tib->layered || agx_tilebuffer_spills(tib))
@@ -727,9 +820,7 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
    unsigned active;
    const unsigned end = agx_g18g_index_order_offsets(
       tib->logical_format, AGX_MAX_RENDER_TARGETS, offset_B, &active);
-   if (active < 2 || tib->sample_size_B != ALIGN_POT(end, 8) ||
-       agx_g18g_owned_by_existing_path(tib->logical_format,
-                                       AGX_MAX_RENDER_TARGETS))
+   if (active < 2 || tib->sample_size_B != ALIGN_POT(end, 8))
       return 0;
 
    u_foreach_bit(rt, mask) {
@@ -737,6 +828,22 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
          return 0;
    }
    return mask;
+}
+
+unsigned
+agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
+{
+   const unsigned mask = agx_g18g_native_mixed_layout_mask(tib);
+   if (!mask || agx_g18g_owned_by_existing_path(tib->logical_format,
+                                                AGX_MAX_RENDER_TARGETS))
+      return 0;
+   return mask;
+}
+
+unsigned
+agx_g18g_native_mixed_epilog_mask(const struct agx_tilebuffer_layout *tib)
+{
+   return agx_g18g_native_mixed_layout_mask(tib);
 }
 
 unsigned

@@ -43,30 +43,10 @@ enum agx3_tile_width {
 };
 
 /*
- * The sample-mask operand of lstcol/lldcol. It is an ordinary source, not a
- * "coverage selector": the form's choice group is either an 8-bit immediate
- * (f51=1, f43) or a 16-bit register naming a half register (f51=2, f44, with
- * f53 carrying register bit 8 -- never needed below 192 -- and f55 an extra
- * bit that is set in every store witness and clear in the one load witness,
- * consistent with a last-use hint, so it is driven from the IR's kill flag
- * rather than pinned to a constant).
- *
- * Grounded against Apple's own applegpu_g17p output (MetalToolchain
- * 27.1.5194.15):
- *
- *   1x, any format          lstcol ... f51=1 f43=1
- *   2x/4x per-pixel         rld h10 <- SR39 ; lstcol ... f51=2 f44=10 f55=1
- *   4x per-sample (unrolled)  rld h16 <- SR39
- *                             bit_and h11 = h16 & 1   ... & 2, & 4, & 8
- *                             lstcol ... f44=11 / 9 / 10 / 8, f51=2, f55=1
- *   2x/4x framebuffer fetch lldcol ... f51=2 f44=19  (f55 clear: not a last use)
- *
- * The per-sample `& 1/2/4/8` sequence is what pins the meaning: the register
- * holds a plain sample bitmask in bits 0..3, and SR39's low nibble is the
- * live coverage. A per-pixel store therefore passes SR39 straight through --
- * "every sample this fragment covers" -- which is precisely what a
- * multisample store has to do. There is no all-sample immediate in any
- * witness; Apple always materialises the mask into a register at 2x and 4x.
+ * Sample-mask operand of `lstcol`/`lldcol`: either an 8-bit immediate
+ * (f51=1, f43; used at 1x) or a 16-bit half-register holding the sample
+ * bitmask in bits 0..3 (f51=2, f44, bit 8 in f53, kill hint in f55; used at
+ * 2x/4x from SR39 or per-sample masked SR39).
  */
 struct agx3_tile_sample {
    /* false: `value` is an 8-bit immediate sample mask.
@@ -157,6 +137,58 @@ bool agx3_tile_load_g18_mixed(enum agx_isa_encoding enc, uint16_t dest,
                               struct agx3_tile_sample sample, bool first,
                               bool last, uint8_t out[AGX3_TILE_MAX_LENGTH],
                               uint8_t *len);
+
+/*
+ * Compute imageblock store (st_tile with explicit coordinates), AGX3B.
+ *
+ * A compute `lstcol` names the pixel instead of taking the fragment's: x is
+ * the 16-bit half `coords` and y the half after it. `data`, `width`,
+ * `chan_mask` and `tile_off` mean what they mean for the fragment store; the
+ * sample operand is the whole-pixel immediate. `last` marks the program's
+ * last imageblock store. The shapes are the ones compiled from our own
+ * imageblock compute kernels (8-bit lanes x1 or x4, one 32-bit lane).
+ */
+bool agx3_tile_store_explicit(enum agx_isa_encoding enc, uint16_t data,
+                              enum agx3_tile_width width, uint8_t chan_mask,
+                              uint16_t tile_off, uint16_t coords, bool last,
+                              uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len);
+
+/* The lane class a compute block store names for an imageblock format, or -1:
+ * 8-bit lanes, 16-bit float lanes and raw 32-bit words. */
+int agx3_block_store_lane_class(enum agx3_tile_width width, bool f16);
+
+enum agx3_block_store_index {
+   AGX3_BLOCK_STORE_INDEX_IMMEDIATE,
+   AGX3_BLOCK_STORE_INDEX_UNIFORM,
+   AGX3_BLOCK_STORE_INDEX_REGISTER,
+};
+
+/*
+ * Compute block store of the workgroup's 2D imageblock tile (AGX3B).
+ *
+ * The tile's origin is staged as two 32-bit words, x from register half `x`
+ * and y from `y`, at staging halves 0 and 2, with the packed imageblock
+ * offset (zero) and layer (zero) at 4; the store then writes the tile through
+ * the PBE descriptor `index` of the descriptor heap whose 64-bit base is
+ * uniform half `base_uniform`.
+ */
+struct agx3_block_store_desc {
+   uint16_t x, y;
+   bool x_kill, y_kill;
+   int lane_class;
+   uint16_t base_uniform;
+   enum agx3_block_store_index index_kind;
+   uint16_t index;
+   bool index_kill;
+};
+
+#define AGX3_BLOCK_STORE_MAX_LENGTH 64u
+#define AGX3_BLOCK_STORE_STAGING_HALFS 6u
+
+bool agx3_block_store_compute(enum agx_isa_encoding enc,
+                              const struct agx3_block_store_desc *d,
+                              uint8_t out[AGX3_BLOCK_STORE_MAX_LENGTH],
+                              size_t *len);
 
 #ifdef __cplusplus
 }

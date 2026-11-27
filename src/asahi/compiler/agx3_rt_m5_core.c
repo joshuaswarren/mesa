@@ -22,7 +22,7 @@ agx3_rt_m5_encode_enter_query(enum agx_isa_encoding encoding,
       KV(2, destination), KV(9, 2),   KV(10, 2),
       KV(14, 3),          KV(15, 90), KV(24, allocation_index),
    };
-   return agx3_bind_compose(encoding, "incStk", 0, fields,
+   return agx3_bind_compose(encoding, AGX3_MN_incStk, 0, fields,
                             sizeof(fields) / sizeof(fields[0]), NULL, 0, out,
                             length);
 }
@@ -52,7 +52,7 @@ agx3_rt_m5_encode_intersect(enum agx_isa_encoding encoding,
       KV(d->bvh_uniform ? 63 : 62, d->bvh_base),
       KV(69, d->bvh_uniform ? 3 : 2), KV(73, d->bvh_kill),
    };
-   return agx3_bind_compose(encoding, "intersect_ray", 0, base,
+   return agx3_bind_compose(encoding, AGX3_MN_intersect_ray, 0, base,
                            sizeof(base) / sizeof(base[0]), operands,
                            sizeof(operands) / sizeof(operands[0]), out, length);
 }
@@ -71,7 +71,7 @@ agx3_rt_m5_encode_continue(enum agx_isa_encoding encoding,
       KV(5, 8), KV(9, 5), KV(10, 2), KV(12, 8), KV(13, 1),
       KV(14, 2), KV(15, 34), KV(16, 1),
    };
-   return agx3_bind_compose(encoding, "continue_ray", 0, fields,
+   return agx3_bind_compose(encoding, AGX3_MN_continue_ray, 0, fields,
                            sizeof(fields) / sizeof(fields[0]), NULL, 0,
                            out, length);
 }

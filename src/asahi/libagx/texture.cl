@@ -380,11 +380,15 @@ libagx_texture_load_rgb32(constant struct agx_texture_packed *ptr, uint coord,
 {
    agx_unpack(NULL, ptr, TEXTURE, d);
 
-   /* This is carefully written to let us do the * 3 with a 32-bit operation but
-    * still use the free 64-bit add-extend-shift for the rest.
+   /* This is carefully written to let us do the * 3 + offset with a 32-bit
+    * operation while still using the free 64-bit add-extend-shift for the rest.
+    * For emulated RGB32 descriptors, buffer_offset_sw stores the sub-16-byte
+    * base-address tail in 4-byte components (0..3).
     */
-   uint64_t addr = d.address + ((uint64_t)(coord * 3)) * 4;
-   constant uint3 *data = (constant uint3 *)addr;
+   uint64_t addr =
+      d.address + ((uint64_t)(coord * 3 + d.buffer_offset_sw)) * 4;
+   typedef uint3 __attribute__((aligned(4))) uint3_align4;
+   constant uint3_align4 *data = (constant uint3_align4 *)addr;
 
    return (uint4)(*data, is_float ? as_uint(1.0f) : 1);
 }

@@ -741,18 +741,27 @@ test_closed_forms(void)
                                      sizeof(packed_vdm_barrier)));
    CHECK(!agx_vdm_barrier_core_unpack(AGX_CHIP_G18G, apple_vdm_barrier,
                                      sizeof(apple_vdm_barrier) - 1));
-   /* Stream links and tessellation still lack G18 evidence. */
-   CHECK(!agx_vdm_stream_link_core_supported(AGX_CHIP_G18G));
+   /* Direct 8-byte VDM stream links work on G18G; tessellation still lacks
+    * G18 evidence. */
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G18G));
+   struct agx_vdm_stream_link_core vdm_link;
+   uint64_t unpacked_vdm_link = 0;
+   CHECK(agx_vdm_stream_link_core_pack(AGX_CHIP_G18G, UINT64_C(0x3a4b5c6d8),
+                                       &vdm_link));
+   CHECK(agx_vdm_stream_link_core_unpack(AGX_CHIP_G18G, vdm_link.bytes,
+                                         vdm_link.length, &unpacked_vdm_link));
+   CHECK(unpacked_vdm_link == UINT64_C(0x3a4b5c6d8));
    CHECK(!agx_vdm_tessellate_direct_target_supported(AGX_CHIP_G18G));
 
-   /* Lines are a G18G shape; a point size on a line has no capture. */
+   /* Lines are a G18G shape, including TES isolines carrying a default
+    * point-size UVS word. */
    struct agx_ppp_hal300_graphics_fields lines = {
       .fragment_program = 0x10000168780,
       .object_type = AGX_PPP_HAL300_LINES,
       .point_size_output = true,
    };
    struct agx_ppp_hal300_graphics_core out;
-   CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
+   CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
    lines.point_size_output = false;
    CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
    lines.object_type = (enum agx_ppp_hal300_object_type)3;

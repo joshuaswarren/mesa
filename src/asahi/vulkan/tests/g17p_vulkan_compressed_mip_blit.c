@@ -409,11 +409,16 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
                      VK_IMAGE_LAYOUT_GENERAL, 1, &to_plain, VK_FILTER_LINEAR);
       barrier(cmd);
    }
-   /* Levels of HK_G17P_MIP_PBE_MIN_TEXELS (1 << 17) texels and more take
-    * a render pass, the rest compute */
+   /* Exact 2x2 compressed levels use the compressed compute block-mip path
+    * on HAL200/AGX3B; only non-exact-2x2 levels of at least
+    * HK_G17P_MIP_PBE_MIN_TEXELS (1 << 17) texels take a render pass. */
    unsigned passes = 0;
-   for (uint32_t l = 1; l < levels; ++l)
-      passes += (uint64_t)minify(w, l) * minify(h, l) >= (1u << 17);
+   for (uint32_t l = 1; l < levels; ++l) {
+      const uint32_t sw = minify(w, l - 1), sh = minify(h, l - 1);
+      const uint32_t dw = minify(w, l), dh = minify(h, l);
+      const bool exact_2x2 = sw == 2 * dw && sh == 2 * dh;
+      passes += !exact_2x2 && (uint64_t)dw * dh >= (1u << 17);
+   }
    if (expect_compute && capture_end("Rendering ") != passes) {
       fprintf(stderr, "%s: FAIL: the blits did not record %u render passes\n",
               name, passes);

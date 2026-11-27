@@ -159,7 +159,7 @@ agx3_mem_encode_load_form(enum agx_isa_encoding enc,
    if (!mem_load_fields(enc, d, ep, base, &nbase, ov, &n))
       return false;
 
-   return agx3_bind_compose(enc, "lddev", ep, base, nbase, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_lddev, ep, base, nbase, ov, n, out, len);
 }
 
 /*
@@ -191,7 +191,7 @@ agx3d_mem_encode_load(const struct agx3_mem_desc *d,
       return false;
    ov[n++] = (struct agx3_field_kv)KV(87, 2);
 
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3D, "lddev",
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3D, AGX3_MN_lddev,
                             AGX3_BIND_APPLE_ORDER, base, nbase, ov, n, out,
                             len);
 }
@@ -239,12 +239,12 @@ agx3_mem_encode_store(enum agx_isa_encoding enc, const struct agx3_mem_desc *d,
    if (enc == AGX_ISA_ENCODING_AGX3C) {
       static const uint8_t forms[] = {0, 1, 3, 4, 2, 5};
       for (unsigned i = 0; i < sizeof(forms); ++i) {
-         if (agx3_bind_compose(enc, "stdev", forms[i], base, nbase,
+         if (agx3_bind_compose(enc, AGX3_MN_stdev, forms[i], base, nbase,
                                ov, n, out, len))
             return true;
       }
       return false;
    }
-   return agx3_bind_compose(enc, "stdev", agx3_bind_ep(enc, 0), base, nbase,
+   return agx3_bind_compose(enc, AGX3_MN_stdev, agx3_bind_ep(enc, 0), base, nbase,
                             ov, n, out, len);
 }

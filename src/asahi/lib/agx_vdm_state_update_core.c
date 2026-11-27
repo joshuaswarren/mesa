@@ -11,23 +11,12 @@
 #include <string.h>
 
 /*
- * Pack/unpack the complete seven-word AGX3 VDM State Update emitted by the
- * inspected Apple VDMEncoderGen5 and VDMEncoderGen6 paths:
- *
- *   word 0: exact 0x4000002e header
- *   word 1: raw vertex-shader word 0
- *   words 2..3: widened 48-bit vertex-pipeline pair
- *   words 4..5: raw two-word vertex-output payload
- *   word 6: raw vertex-unknown payload
- *
- * Only the pipeline field's 64-byte alignment and 48-bit address range are
- * fully named.  The remaining payloads are preserved losslessly because their
- * complete AGX3 bit semantics are not independently grounded.
- *
- * The target allowlist contains only identities directly served by the
- * inspected Apple Metal plugins.  G16P and G17A remain closed despite sharing
- * neighboring command-stream generations.  This helper does not emit a live
- * command or enable lowering, scheduling, submission, or device admission.
+ * Seven-word AGX3 VDM State Update record:
+ *   word 0:     0x4000002e header
+ *   word 1:     raw vertex-shader word 0
+ *   words 2..3: 64-byte-aligned 48-bit vertex-pipeline pair
+ *   words 4..5: raw vertex-output payload
+ *   word 6:     raw vertex-unknown payload
  */
 bool
 agx_vdm_state_update_supported(enum agx_chip chip)
@@ -97,30 +86,10 @@ agx_vdm_state_update_unpack(enum agx_chip chip, const void *bytes, size_t size,
    return true;
 }
 
-static bool
-agx_vdm_state_update_is_hal300(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-   default:
-      return false;
-   }
-}
-
 /*
- * Materialize/pack the exact six-template path observed in:
- *
- *   G15X_M1, G16X, G17P: VertexProgramVariant + VDMEncoderGen5
- *   G17G, G17X:          VertexProgramVariant + VDMEncoderGen6
- *
- * HAL300 intentionally differs: vertex word 0 has no pre-HAL300 bit-31 rule,
- * and the six per-template output constants are 0x20/0/0x21/1/0x22/2 instead
- * of 0x30/0/0x31/1/0x32/2.  Both calls are transactional and fail closed
- * outside the directly observed target/input domains.
+ * Materialize/pack one of the six AGX3 VDM State Update templates.
+ * HAL300 omits the pre-HAL300 bit-31 flag in vertex word 0 and uses output
+ * variant constants 0x20/0/0x21/1/0x22/2 instead of 0x30/0/0x31/1/0x32/2.
  */
 bool
 agx_vdm_state_update_template_materialize(
@@ -137,7 +106,7 @@ agx_vdm_state_update_template_materialize(
        info->variant > AGX_VDM_STATE_UPDATE_TEMPLATE_21)
       return false;
 
-   const bool hal300 = agx_vdm_state_update_is_hal300(chip);
+   const bool hal300 = agx_chip_hal300_path(chip);
    if (hal300 && (info->pre_hal300_flag_group_nonzero ||
                   info->pre_hal300_flag_bit_4))
       return false;
@@ -209,31 +178,11 @@ agx_vdm_state_update_template_pack(
 }
 
 /*
- * Publish a vertex constant program's thread-invariant (TI) resources in the
- * two state-load counts, from the compiler's TI spill-buffer bytes and TI
- * largest-IPR bytes. G17P and HAL300.
- *
- * G17P (HAL200):
- *
- *   The two counts are
- *     spill = (thread_invariant_spill_buffer_bytes + 3) >> 2
- *     ipr   = (((thread_invariant_largest_ipr_bytes + 3) >> 2) + 1) & ~1
- *   (the IPR byte count is 0 when absent).
- *
- *   Every one of the six templates carries them as
- *     vertex-shader word 0 |= ipr << 8     (12-bit field at bit 8)
- *     pipeline template     = spill << 3   (18-bit field at bit 3)
- *
- * i.e. raw_state_load_count_12 is the TI IPR quad count and
- * raw_state_load_count_18 the TI spill quad count. The fragment variant
- * publishes the identical pair in its HAL200 record
- * (agx_ppp_hal200_fragment_ti_resources). A vertex shader without a constant
- * program leaves both zero. Fails closed, leaving `info` unchanged, outside
- * the encodable range.
- *
- * HAL300 uses the same two quad counts and packs each template's vertex-shader
- * word 0 as IPR << 8 (12 bits) and its pipeline template as spill << 3 (18
- * bits); the HAL300 form only omits bit 31.
+ * Encode a vertex constant program's thread-invariant (TI) spill and
+ * largest-IPR byte counts into the two state-load quad counts:
+ *   spill = (spill_bytes + 3) >> 2                 -> pipeline template << 3 (18 bits)
+ *   ipr   = (((largest_ipr_bytes + 3) >> 2) + 1) & ~1 -> vertex word 0 << 8  (12 bits)
+ * Leaves `info` unchanged on failure.
  */
 bool
 agx_vdm_state_update_vertex_ti_resources(
@@ -246,7 +195,7 @@ agx_vdm_state_update_vertex_ti_resources(
 
    /* Same bounds as the HAL200 fragment record: an 18-bit spill field and
     * the 12-bit IPR field, whose even rounding caps it at 0xffe. */
-   if ((!agx_chip_native_agx3(chip) && !agx_vdm_state_update_is_hal300(chip)) ||
+   if (!agx_chip_agx3_path(chip) ||
        !info || spill_quads > UINT32_C(0x3ffff) ||
        ipr_quads > UINT32_C(0xffe))
       return false;
@@ -317,7 +266,7 @@ agx_g17p_vertex_program_info(
    const bool preamble_ok =
       compiler_info &&
       (compiler_info->has_preamble
-          ? (agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
+          ? agx_chip_native_or_m5(chip) &&
                compiler_info->constant_program_allowed &&
                compiler_info->preamble_staging_known &&
                compiler_info->nr_preamble_gprs != 0 &&
@@ -325,8 +274,7 @@ agx_g17p_vertex_program_info(
           : compiler_info->nr_preamble_gprs == 0 &&
                compiler_info->preamble_scratch_size == 0);
 
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip) &&
-        chip != AGX_CHIP_G18G) ||
+   if (!agx_chip_agx3_path(chip) ||
        !compiler_info || !program ||
        !compiler_info->hardware_vertex || !preamble_ok ||
        compiler_info->position_off != 0 || compiler_info->varyings_off != 4 ||
@@ -359,19 +307,15 @@ agx_g17p_vertex_program_info(
              */
             .raw_state_load_count_12 = 0,
             .raw_state_load_count_18 = 0,
-            /* VsStateConfig+0xc is the total f32 UVS footprint, including
-             * position AND user outputs; +0x14 stays zero in this all-f32
-             * path. Apple vs0/vs2/vs4 __GPU_LD_MD root.field1.field3 gives
-             * 4/6/8, with field4 absent. The native position+point-size
-             * vertex shader likewise gives field3=5 with field4 absent. The former 4/user split described
-             * the wrong vertex layout even though its middle sum matched. */
+            /* Total f32 UVS footprint (position + user outputs); count_2 stays
+             * zero in this all-f32 path. */
             .raw_vs_output_count_0 = compiler_info->uvs_size,
             .raw_vs_output_count_2 = 0,
             .raw_vs_output_count_1_extra = false,
             .raw_vs_output_selector = 0,
             .raw_vs_output_flag_6 = false,
             .pre_hal300_flag_group_nonzero =
-               !agx_vdm_state_update_is_hal300(chip),
+               !agx_chip_hal300_path(chip),
             .pre_hal300_flag_bit_4 = false,
             .variant = AGX_VDM_STATE_UPDATE_TEMPLATE_00,
             .raw_active_context_selector = UINT32_MAX,

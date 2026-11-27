@@ -161,6 +161,60 @@ TEST(M5RuntimeLoops, TopTestedUnrolls)
    ralloc_free(s);
 }
 
+/* A second counted loop bounded by the count the first one leaves (its
+ * induction variable after it, as a geometry shader's vertex loop leaves the
+ * number of vertices): unrolling the first turns that header phi into a
+ * register, and the second loop's guard must read the value that replaces
+ * it. */
+TEST(M5RuntimeLoops, LaterBoundFromEarlierLoop)
+{
+   nir_builder b = compute_shader("chained-bounds");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *kv = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *first = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, first);
+   nir_def *count = nir_load_var(&b, iv);
+   nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
+   nir_loop *second = nir_push_loop(&b);
+   {
+      nir_def *k = nir_load_var(&b, kv);
+      nir_break_if(&b, nir_ige(&b, k, count));
+      nir_def *v = nir_load_global(
+         &b, 1, 32,
+         buffer_address(&b, nir_iadd_imm(&b, nir_amul_imm(&b, k, 4), 256)),
+         .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 1);
+   }
+   nir_pop_loop(&b, second);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+   ASSERT_EQ(count_loops(s), 2u);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
+   nir_validate_shader(s, "bound from an earlier loop");
+   /* Both loops unrolled: a main loop in front of each. */
+   EXPECT_EQ(count_loops(s), 4u);
+   ralloc_free(s);
+}
+
 static unsigned
 loops_inside_ifs(nir_shader *shader)
 {
@@ -275,6 +329,52 @@ TEST(M5RuntimeLoops, BudgetRefused)
    nir_def *hi;
    nir_shader *s = counted_loop(TOP_TESTED, &hi, false, INT64_MAX);
    EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 8, NULL));
+   ralloc_free(s);
+}
+
+/* load_const and undef instructions are cheap and should not inflate the
+ * unroll instruction budget. */
+TEST(M5RuntimeLoops, ConstAndUndefExcludedFromBudget)
+{
+   nir_builder b = compute_shader("const-undef-budget");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      /* Add many distinct load_const and undef instructions inside the loop
+       * body; they should not count toward the unroll budget. */
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .align_mul = 4);
+      nir_def *u0 = nir_undef(&b, 1, 32);
+      nir_def *u1 = nir_undef(&b, 1, 32);
+      (void)u0;
+      (void)u1;
+      for (unsigned k = 0; k < 24; ++k)
+         (void)nir_imm_int(&b, 0x11 + k);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   /* Keep load_const/undef in place (no DCE) to verify count_unrollable skips
+    * them under a budget (72) that fits factor 4 for the 17 non-const/non-undef
+    * instructions (17 * 4 = 68 <= 72) while refusing even factor 2 if the 26+
+    * const/undef ops are counted ((17 + 26) * 2 = 86 > 72). */
+   unsigned widest = 0;
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 72, &widest));
+   nir_validate_shader(s, "const-undef-budget after");
+   EXPECT_EQ(widest, 4u);
+   EXPECT_EQ(count_loops(s), 2u);
    ralloc_free(s);
 }
 
@@ -522,7 +622,7 @@ TEST(M5FoldOffsets, ByteSiblings)
    }
    nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, false));
    nir_validate_shader(b.shader, "byte siblings");
    nir_def *index = NULL;
    for (unsigned k = 0; k < 3; ++k) {
@@ -530,6 +630,39 @@ TEST(M5FoldOffsets, ByteSiblings)
       ASSERT_NE(load, nullptr);
       EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, k);
       EXPECT_FALSE(nir_intrinsic_sign_extend(load));
+      if (index)
+         EXPECT_EQ(load->src[1].ssa, index);
+      index = load->src[1].ssa;
+   }
+   ralloc_free(b.shader);
+}
+
+/* Speculative byte siblings are refused without soft faults, and folded with
+ * sign-extended shared indices under soft faults so an executed lane cannot
+ * wrap past 2^32 even if an earlier sibling was hoisted from a guard. */
+TEST(M5FoldOffsets, SoftFaultSpeculativeByteSiblings)
+{
+   nir_builder b = compute_shader("byte-siblings-spec");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *sum = nir_imm_int(&b, 0);
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_def *v = nir_load_global(
+         &b, 1, 8, buffer_address(&b, nir_iadd_imm(&b, x, k)),
+         .access = (gl_access_qualifier)ACCESS_CAN_SPECULATE, .align_mul = 1);
+      sum = nir_iadd(&b, sum, nir_u2u32(&b, v));
+   }
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, true));
+   nir_validate_shader(b.shader, "soft-fault byte siblings");
+   nir_def *index = NULL;
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, k);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, k);
+      EXPECT_TRUE(nir_intrinsic_sign_extend(load));
       if (index)
          EXPECT_EQ(load->src[1].ssa, index);
       index = load->src[1].ssa;
@@ -547,7 +680,7 @@ TEST(M5FoldOffsets, LoneByteKept)
    nir_store_global(&b, nir_u2u32(&b, v), buffer_address(&b, nir_imm_int(&b, 64)),
                     .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
    ralloc_free(b.shader);
 }
 
@@ -566,7 +699,7 @@ TEST(M5FoldOffsets, PhysicalPointerRefused)
    }
    nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
    ralloc_free(b.shader);
 }
 
@@ -590,7 +723,7 @@ TEST(M5FoldOffsets, PackedUvec4Refused)
             }
             nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
             NIR_PASS(_, b.shader, nir_opt_cse);
-            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader))
+            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false))
                << "bytes src " << src << " vec_pack " << vec_pack;
             ralloc_free(b.shader);
          }
@@ -603,7 +736,7 @@ TEST(M5FoldOffsets, PackedUvec4Refused)
             nir_def *v = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
             nir_store_global(&b, v, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
             NIR_PASS(_, b.shader, nir_opt_cse);
-            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader))
+            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false))
                << "array src " << src << " vec_pack " << vec_pack;
             ralloc_free(b.shader);
          }
@@ -621,7 +754,7 @@ TEST(M5FoldOffsets, ArrayElement)
                                 .align_mul = 4);
    nir_store_global(&b, v, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, false));
    nir_validate_shader(b.shader, "array element");
    nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, 0);
    ASSERT_NE(load, nullptr);
@@ -781,6 +914,34 @@ TEST(M5NarrowBarriers, SingleSubgroupWorkgroup)
       EXPECT_EQ(nir_intrinsic_memory_scope(exec), SCOPE_NONE);
       EXPECT_EQ(nir_intrinsic_execution_scope(device), SCOPE_WORKGROUP);
       EXPECT_EQ(nir_intrinsic_memory_scope(device), SCOPE_WORKGROUP);
+      ralloc_free(b.shader);
+   }
+}
+
+/* SPIR-V often emits OpMemoryBarrier(Device, WorkgroupMemory) beside a
+ * workgroup control barrier. Shared memory is private to one workgroup, so
+ * a single-subgroup workgroup still narrows SCOPE_DEVICE to SCOPE_SUBGROUP
+ * when only nir_var_mem_shared is ordered, while keeping SCOPE_DEVICE when
+ * global memory is also ordered. */
+TEST(M5NarrowBarriers, SingleSubgroupDeviceScopeSharedOnly)
+{
+   for (unsigned width : {32u, 16u, 64u}) {
+      nir_builder b = compute_shader("narrow-device-shared");
+      b.shader->info.workgroup_size[0] = width;
+      nir_intrinsic_instr *shared_dev =
+         barrier_in(&b, nir_var_mem_shared, SCOPE_DEVICE);
+      nir_intrinsic_instr *global_dev =
+         barrier_in(&b, (nir_variable_mode)(nir_var_mem_shared | nir_var_mem_global),
+                    SCOPE_DEVICE);
+      const bool narrows = width <= 32;
+      EXPECT_EQ(agx_nir_narrow_single_subgroup_barriers(b.shader), narrows);
+      nir_validate_shader(b.shader, "narrow device shared barriers");
+      EXPECT_EQ(nir_intrinsic_execution_scope(shared_dev),
+                narrows ? SCOPE_SUBGROUP : SCOPE_WORKGROUP);
+      EXPECT_EQ(nir_intrinsic_memory_scope(shared_dev),
+                narrows ? SCOPE_SUBGROUP : SCOPE_DEVICE);
+      EXPECT_EQ(nir_intrinsic_execution_scope(global_dev), SCOPE_WORKGROUP);
+      EXPECT_EQ(nir_intrinsic_memory_scope(global_dev), SCOPE_DEVICE);
       ralloc_free(b.shader);
    }
 }
@@ -1243,5 +1404,209 @@ TEST(M5RuntimeLoops, NestedWindowUnswitches)
       EXPECT_EQ(loops_inside_ifs(s), 0u) << "variant " << v;
       expect_no_undef_header_phis(s);
       ralloc_free(s);
+   }
+}
+
+/* Under soft_fault on AGX3C, non-robust shaders (checked_offsets == false)
+ * merge consecutive buffer words into a single vector load and fold constant
+ * byte offsets, while robust shaders (checked_offsets == true) leave wrapping
+ * reads separate. */
+TEST(M5MergeWords, SoftFaultRespectsCheckedOffsets)
+{
+   auto compile_and_count_loads = [](bool checked_offsets, unsigned &num_loads,
+                                     unsigned &max_comps) {
+      nir_builder b = compute_shader(checked_offsets ? "sf-checked" : "sf-unchecked");
+      nir_def *idx = nir_load_preamble(&b, 1, 32, .base = 2);
+      nir_def *off = nir_ishl_imm(&b, idx, 2);
+      nir_def *sum = nir_imm_int(&b, 0);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *v = nir_load_global(
+            &b, 1, 32, buffer_address(&b, nir_iadd_imm(&b, off, 4 * k)),
+            .access = RO_ACCESS, .align_mul = 4);
+         sum = nir_iadd(&b, sum, v);
+      }
+      nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)),
+                       .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.soft_fault = true;
+      key.checked_offsets = checked_offsets;
+      key.reserved_preamble = 8;
+      key.no_preamble = true;
+      struct agx_shader_part out = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &out));
+      num_loads = 0;
+      max_comps = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_agx &&
+                   !(nir_intrinsic_access(intr) & ACCESS_BUFFER_BINDING_AGX)) {
+                  num_loads++;
+                  max_comps = MAX2(max_comps, intr->def.num_components);
+               }
+            }
+         }
+      }
+      free(out.binary);
+      ralloc_free(b.shader);
+   };
+
+   unsigned unchecked_loads = 0, unchecked_comps = 0;
+   compile_and_count_loads(false, unchecked_loads, unchecked_comps);
+   EXPECT_EQ(unchecked_loads, 1u);
+   EXPECT_EQ(unchecked_comps, 4u);
+
+   unsigned checked_loads = 0, checked_comps = 0;
+   compile_and_count_loads(true, checked_loads, checked_comps);
+   EXPECT_EQ(checked_loads, 4u);
+   EXPECT_EQ(checked_comps, 1u);
+}
+
+TEST(M5RuntimeLoops, RuntimeStepReductionUnrolls)
+{
+   /* Bottom-tested signed and top-tested unsigned read-only strided reduction
+    * loops unroll by 8; a strided loop that writes memory is left alone. */
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      const bool bottom = (mode == 0);
+      const bool is_unsigned = (mode == 1);
+      const bool has_store = (mode == 2);
+
+      nir_builder b = compute_shader("runtime-step");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "off");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "sum");
+      nir_def *step = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *bound = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+      nir_def *idx = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_float(&b, 0.0f), 1);
+
+      nir_loop *lp = nir_push_loop(&b);
+      {
+         nir_def *off = nir_load_var(&b, iv);
+         if (!bottom) {
+            nir_def *done = is_unsigned ? nir_uge(&b, off, bound) : nir_ige(&b, off, bound);
+            nir_break_if(&b, done);
+         }
+         nir_def *addr = buffer_address(&b, nir_ishl_imm(&b, nir_iadd(&b, off, idx), 2));
+         nir_def *v = nir_load_global(&b, 1, 32, addr,
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .align_mul = 4);
+         if (has_store) {
+            nir_store_global(&b, v, addr, .align_mul = 4);
+         } else {
+            nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), v), 1);
+         }
+         nir_def *next = nir_iadd(&b, off, step);
+         nir_store_var(&b, iv, next, 1);
+         if (bottom) {
+            nir_def *done = is_unsigned ? nir_uge(&b, next, bound) : nir_ige(&b, next, bound);
+            nir_break_if(&b, done);
+         }
+      }
+      nir_pop_loop(&b, lp);
+      nir_store_global(&b, nir_load_var(&b, acc), buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "runtime-step before");
+
+      unsigned widest = 0;
+      const bool progress = agx_nir_unroll_runtime_loops(b.shader, 8, 320, &widest);
+      nir_validate_shader(b.shader, "runtime-step after");
+      if (has_store) {
+         EXPECT_FALSE(progress);
+         EXPECT_EQ(count_loops(b.shader), 1u);
+      } else {
+         EXPECT_TRUE(progress) << "mode " << mode;
+         EXPECT_EQ(widest, 8u) << "mode " << mode;
+         EXPECT_EQ(count_loops(b.shader), 2u) << "mode " << mode;
+         expect_no_undef_header_phis(b.shader);
+      }
+      ralloc_free(b.shader);
+   }
+
+   /* Exhaustive boundary check of signed and unsigned runtime-step guards. */
+   const uint32_t F = 8;
+   static const int32_t s_vals[] = {
+      INT32_MIN, INT32_MIN + 7, INT32_MIN + 8, -100, -1, 0, 1, 7, 8, 9, 320,
+      INT32_MAX / 8, INT32_MAX / 8 + 1, INT32_MAX - 8, INT32_MAX - 1, INT32_MAX,
+   };
+   for (int32_t step : s_vals) {
+      for (int32_t bound : s_vals) {
+         const uint32_t span = (uint32_t)step * F;
+         const bool valid = (step > 0) && (step <= INT32_MAX / (int32_t)F) &&
+                            (bound >= (int32_t)(span + (uint32_t)INT32_MIN));
+         const int32_t g = valid ? (int32_t)((uint32_t)bound - span) : INT32_MIN;
+         for (int32_t iv : s_vals) {
+            if (iv < g) {
+               ASSERT_TRUE(valid);
+               int64_t end = (int64_t)iv + (int64_t)F * (int64_t)step;
+               ASSERT_LT(end, (int64_t)bound);
+               ASSERT_LE(end, (int64_t)INT32_MAX);
+            }
+         }
+      }
+   }
+   static const uint32_t u_vals[] = {
+      0u, 1u, 7u, 8u, 9u, 320u, UINT32_MAX / 8u, UINT32_MAX / 8u + 1u,
+      UINT32_MAX - 8u, UINT32_MAX - 1u, UINT32_MAX,
+   };
+   for (uint32_t step : u_vals) {
+      for (uint32_t bound : u_vals) {
+         const uint32_t span = step * F;
+         const bool valid = (step != 0u) && (step <= UINT32_MAX / F) && (bound >= span);
+         const uint32_t g = valid ? (bound - span) : 0u;
+         for (uint32_t iv : u_vals) {
+            if (iv < g) {
+               ASSERT_TRUE(valid);
+               uint64_t end = (uint64_t)iv + (uint64_t)F * (uint64_t)step;
+               ASSERT_LT(end, (uint64_t)bound);
+               ASSERT_LE(end, (uint64_t)UINT32_MAX);
+            }
+         }
+      }
+   }
+}
+
+TEST(M5RuntimeLoops, SharedStepOverflowSkipsUnroll)
+{
+   /* A stride-32 loop indexing 4-byte shared elements when shared_size == 128
+    * cannot run two in-bounds iterations; skip dead runtime unrolling. When
+    * shared_size == 1024 (room for 8 iterations), unrolling proceeds. */
+   for (unsigned sh_bytes : {128u, 1024u}) {
+      nir_builder b = compute_shader("shared-step-overflow");
+      b.shader->info.shared_size = sh_bytes;
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_store_var(&b, iv, lid, 1);
+
+      nir_loop *lp = nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, iv);
+         nir_break_if(&b, nir_ige(&b, i, n));
+         nir_def *v = nir_load_global(&b, 1, 32, buffer_address(&b, nir_ishl_imm(&b, i, 2)),
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .align_mul = 4);
+         nir_store_shared(&b, v, nir_ishl_imm(&b, i, 2), .write_mask = 1, .align_mul = 4);
+         nir_store_var(&b, iv, nir_iadd_imm(&b, i, 32), 1);
+      }
+      nir_pop_loop(&b, lp);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "shared-step-overflow before");
+
+      const bool progress = agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL);
+      nir_validate_shader(b.shader, "shared-step-overflow after");
+      EXPECT_EQ(progress, sh_bytes > 128u) << "sh_bytes=" << sh_bytes;
+      EXPECT_EQ(count_loops(b.shader), sh_bytes > 128u ? 2u : 1u);
+      ralloc_free(b.shader);
    }
 }

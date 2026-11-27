@@ -146,6 +146,32 @@ test_g17p_graphics_root_requirement(void)
    CHECK(hk_agx3_g17p_graphics_needs_root(true, false, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, true, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, false, 1));
+
+   /* Set pointers after a root pointer at half 12: set k at 16 + 4k. */
+   uint64_t halfs[8] = {0};
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   CHECK(!hk_agx3_g17p_graphics_needs_root(false, false, 0));
+   /* Unknown reads, or no sets: the layout's count. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, false, 12, 2) == 2);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 0) == 0);
+   /* The root pointer itself (halves 12..15) is not a set pointer. */
+   halfs[0] = BITFIELD64_RANGE(12, 4);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Any half of any set pointer keeps all of them. */
+   for (unsigned h = 16; h < 24; ++h) {
+      halfs[0] = BITFIELD64_BIT(h);
+      CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 2);
+   }
+   halfs[0] = BITFIELD64_BIT(24);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Across a word boundary: root at 56, sets at 60..67. */
+   halfs[0] = 0;
+   halfs[1] = BITFIELD64_BIT(65 - 64);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 2);
+   halfs[1] = 0;
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 0);
+   /* A window past the recorded halves is not known to be dead. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 1, true, 56, 2) == 2);
    return 0;
 }
 
@@ -1454,21 +1480,29 @@ static int
 test_g17p_root_range(void)
 {
    struct agx3_ioto_uniform_range range = {0};
-   CHECK(hk_agx3_g17p_root_range(12, 0, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 0, UINT64_C(0x10000024000), 8, &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 4 &&
          range.address == UINT64_C(0x10000024000));
-   CHECK(hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 16, &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 8);
-   CHECK(hk_agx3_g17p_root_range(12, 8, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 8, UINT64_C(0x10000024000), 4096,
+                                 &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 36);
 
    const struct agx3_ioto_uniform_range before = range;
-   CHECK(!hk_agx3_g17p_root_range(13, 0, UINT64_C(0x10000024000), &range));
+   CHECK(!hk_agx3_g17p_root_range(13, 0, UINT64_C(0x10000024000), 4096,
+                                  &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
    CHECK(!hk_agx3_g17p_root_range(12, HK_AGX3_G17P_MAX_ROOT_SETS + 1,
-                                  UINT64_C(0x10000024000), &range));
+                                  UINT64_C(0x10000024000), 4096, &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
-   CHECK(!hk_agx3_g17p_root_range(12, 0, 0, &range));
+   CHECK(!hk_agx3_g17p_root_range(12, 0, 0, 4096, &range));
+   CHECK(memcmp(&range, &before, sizeof(range)) == 0);
+   /* The set pointers must lie inside the uploaded root: one set needs 16
+    * bytes, so an 8-byte root is refused rather than read past. */
+   CHECK(!hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 8, &range));
+   CHECK(!hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 15,
+                                  &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
 
    struct agx3_ioto_uniform_range rodata = {0};
@@ -1970,7 +2004,7 @@ test_g17p_single_layer_rt0_layout(void)
    CHECK(tib.nr_samples == 2 && tib.sample_size_B == 8 &&
          tib.tile_size == 32 * 32 && !tib.spilled[0]);
    CHECK(hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, true, false));
+      &tib, 1, true, true, false, false));
 
    enum pipe_format bgra_srgb[AGX_MAX_RENDER_TARGETS] = {
       PIPE_FORMAT_B8G8R8A8_SRGB,
@@ -1981,13 +2015,13 @@ test_g17p_single_layer_rt0_layout(void)
          tib.sample_size_B == 8 && tib.tile_size == 32 * 32 &&
          !tib.spilled[0]);
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 2, true, true, false));
+      &tib, 2, true, true, false, false));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, false, true, false));
+      &tib, 1, false, true, false, false));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, false, false));
+      &tib, 1, true, false, false, false));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, true, true));
+      &tib, 1, true, true, true, false));
    tib = agx_build_tilebuffer_layout(rgba, 1, 4, false);
    const struct agx_usc_shared_packed msaa4_usc = tib.usc;
    CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
@@ -2000,13 +2034,13 @@ test_g17p_single_layer_rt0_layout(void)
    CHECK(msaa4_cmd.utile_height_px == 16);
    CHECK(agx_tilebuffer_total_size(&tib) < 32768);
    CHECK(hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, true, false));
+      &tib, 1, true, true, false, false));
    tib = agx_build_tilebuffer_layout(rgba, 1, 8, false);
    CHECK(!hk_agx3_g17p_rt0_tile_layout_supported(&tib));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, true, false));
+      &tib, 1, true, true, false, false));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      NULL, 1, true, true, false));
+      NULL, 1, true, true, false, false));
 
    /* Raw 32-bit float lanes keep their samples for the resolve after the
     * pass, while the store of those samples stays admitted. */
@@ -2014,7 +2048,7 @@ test_g17p_single_layer_rt0_layout(void)
    tib = agx_build_tilebuffer_layout(r32f, 1, 4, false);
    CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
    CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-      &tib, 1, true, true, false));
+      &tib, 1, true, true, false, false));
    CHECK(hk_agx3_g17p_multisample_store_supported(&tib, 1, true, 4));
 
    /* So do RGB9E5 samples, each one packed word. */
@@ -2025,7 +2059,23 @@ test_g17p_single_layer_rt0_layout(void)
       tib = agx_build_tilebuffer_layout(rgb9e5, 1, samples, false);
       CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
       CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
-         &tib, 1, true, true, false));
+         &tib, 1, true, true, false, false));
+      CHECK(hk_agx3_g17p_multisample_store_supported(&tib, 1, true, samples));
+   }
+
+   /* R11G11B10_FLOAT direct resolve requires the own-class PBE (G17P); on
+    * raw-class chips (G15x, and G16G without own-class PBE) it falls back to
+    * multisample store + shader resolve. */
+   enum pipe_format r11g11b10[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R11G11B10_FLOAT,
+   };
+   for (unsigned samples = 2; samples <= 4; samples += 2) {
+      tib = agx_build_tilebuffer_layout(r11g11b10, 1, samples, false);
+      CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
+      CHECK(!hk_agx3_g17p_direct_color_resolve_supported(
+         &tib, 1, true, true, false, false));
+      CHECK(hk_agx3_g17p_direct_color_resolve_supported(
+         &tib, 1, true, true, false, true));
       CHECK(hk_agx3_g17p_multisample_store_supported(&tib, 1, true, samples));
    }
    CHECK(!hk_agx3_g17p_rt0_tile_layout_supported(NULL));
@@ -2363,6 +2413,342 @@ test_stk_advanced_pipeline_framebuffers(void)
    return 0;
 }
 
+static int
+test_g17p_mixed_direct_color_resolve(void)
+{
+   /* Deferred local-read 5-RT MSAA4 shape: 4 G-buffer attachments
+    * (DONT_CARE) plus 1 RGBA8 color attachment at offset 20 B (resolve-only). */
+   const enum pipe_format deferred_formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout(deferred_formats, 5, 4, false);
+   CHECK(tib.nr_samples == 4 && tib.sample_size_B == 24 &&
+         !agx_tilebuffer_spills(&tib));
+   CHECK(agx_tilebuffer_offset_B(&tib, 4) == 20);
+
+   struct hk_agx3_g17p_mixed_resolve_target one = {
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .view_format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .has_resolve_target = true,
+      .average_resolve = true,
+      .store_source = false,
+      .resolve_pbe_valid = true,
+      .resolve_format_matches = true,
+      .resolve_samples = 1,
+   };
+
+   /* Final EOT on full render area with 5 MSAA + 1 resolve view (6 <= 14). */
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, false, false, false, 6));
+
+   /* SNORM resolve targets are admitted (hardware PBE averages signed lanes). */
+   struct hk_agx3_g17p_mixed_resolve_target snorm = one;
+   snorm.format = PIPE_FORMAT_R8G8B8A8_SNORM;
+   snorm.view_format = PIPE_FORMAT_R8G8B8A8_SNORM;
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &snorm, 1, false, false, false, false, 6));
+   snorm.format = PIPE_FORMAT_R16G16B16A16_SNORM;
+   snorm.view_format = PIPE_FORMAT_R16G16B16A16_SNORM;
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &snorm, 1, false, false, false, false, 6));
+
+   /* sRGB resolve targets are rejected via the unmapped view format, even if
+    * the EOT key format were remapped to linear UNORM. */
+   struct hk_agx3_g17p_mixed_resolve_target srgb = one;
+   srgb.format = PIPE_FORMAT_B8G8R8A8_SRGB;
+   srgb.view_format = PIPE_FORMAT_B8G8R8A8_SRGB;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &srgb, 1, false, false, false, false, 6));
+   srgb.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   srgb.view_format = PIPE_FORMAT_B8G8R8A8_SRGB;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &srgb, 1, false, false, false, false, 6));
+
+   /* 2x MSAA is admitted; 1x and 8x are refused. */
+   struct agx_tilebuffer_layout tib2 =
+      agx_build_tilebuffer_layout(deferred_formats, 5, 2, false);
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib2, &one, 1, false, false, false, false, 6));
+   struct agx_tilebuffer_layout tib1 =
+      agx_build_tilebuffer_layout(deferred_formats, 5, 1, false);
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib1, &one, 1, false, false, false, false, 6));
+
+   /* Partial render, incomplete render area (including sparse multiview
+    * viewMask), suspended/resumed dynamic rendering
+    * (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT), unstored
+    * resolve, and exceeding the 14 color+resolve write-range budget all fall
+    * back. */
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, true, false, false, false, 6));
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, true, false, false, 6));
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, false, true, false, 6));
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, false, false, true, 6));
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, false, false, false,
+      HK_AGX3_G17P_MAX_COLOR_RESOLVE_WRITE_RANGES + 1));
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &one, 1, false, false, false, false,
+      HK_AGX3_G17P_MAX_COLOR_RESOLVE_WRITE_RANGES));
+
+   /* STORE_OP_STORE, non-AVERAGE, missing/mismatched/MS resolve view fall back. */
+   struct hk_agx3_g17p_mixed_resolve_target bad = one;
+   bad.store_source = true;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+   bad = one;
+   bad.average_resolve = false;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+   bad = one;
+   bad.has_resolve_target = false;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+   bad = one;
+   bad.resolve_pbe_valid = false;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+   bad = one;
+   bad.resolve_format_matches = false;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+   bad = one;
+   bad.resolve_samples = 4;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+
+   /* Raw-word formats (R32F, RGB9E5, R11G11B10F) and pure integers fall back. */
+   const enum pipe_format shader_resolve_formats[] = {
+      PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R9G9B9E5_FLOAT,
+      PIPE_FORMAT_R11G11B10_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UINT,
+      PIPE_FORMAT_R16G16_SINT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(shader_resolve_formats); ++i) {
+      bad = one;
+      bad.format = shader_resolve_formats[i];
+      bad.view_format = shader_resolve_formats[i];
+      CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+         &tib, &bad, 1, false, false, false, false, 6));
+   }
+
+   /* On G17P hk_eot_key_format() remaps R11G11B10_FLOAT to R10G10B10A2_UNORM
+    * in key.tib.logical_format[]. Direct resolve must still reject it via the
+    * unmapped view_format. */
+   bad = one;
+   bad.format = PIPE_FORMAT_R10G10B10A2_UNORM;
+   bad.view_format = PIPE_FORMAT_R11G11B10_FLOAT;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, &bad, 1, false, false, false, false, 6));
+
+   /* Multi-target direct resolve succeeds when every stored target qualifies
+    * and falls back if any target stores source or needs shader resolve. */
+   struct hk_agx3_g17p_mixed_resolve_target pair[2] = {one, one};
+   pair[1].format = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   pair[1].view_format = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   CHECK(hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, pair, 2, false, false, false, false, 7));
+   pair[1].store_source = true;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, pair, 2, false, false, false, false, 7));
+   pair[1].store_source = false;
+   pair[1].format = PIPE_FORMAT_R32_FLOAT;
+   pair[1].view_format = PIPE_FORMAT_R32_FLOAT;
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &tib, pair, 2, false, false, false, false, 7));
+
+   /* Spilled tilebuffers refuse direct resolve. */
+   const enum pipe_format spill_formats[] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_UINT,
+   };
+   struct agx_tilebuffer_layout spilled = agx_build_tilebuffer_layout_bounded(
+      spill_formats, 3, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE);
+   CHECK(agx_tilebuffer_spills(&spilled));
+   CHECK(!hk_agx3_g17p_mixed_direct_color_resolve_supported(
+      &spilled, &one, 1, false, false, false, false, 4));
+
+   /* Verify the Ioto EOT program generator accepts both the single-stored-RT
+    * deferred shape (count=1 at offset 20 B in a 24 B/sample MSAA4 tile) and a
+    * 2-target mixed-MRT MSAA4 resolve shape. */
+   struct agx3_g17p_rt0_eot_program eot = {0};
+   const struct agx3_g17p_rt0_eot_program_desc single_desc = {
+      .program_va = 0x1000000000ULL,
+      .shader_va = 0x1000002000ULL,
+      .pbe_argument_va = 0x1000004000ULL,
+      .imageblock_offset_B = 20,
+      .attachment_count = 1,
+      .mixed_mrt = false,
+      .shader_binary_size = 68,
+      .scratch_size = 0,
+      .nr_gprs = 8,
+      .staging_halfs = 8,
+      .imageblock = {
+         .sample_size_B = 24,
+         .nr_samples = 4,
+         .tile_size_px = tib.tile_size,
+      },
+   };
+   CHECK(agx3_g17p_rt0_eot_program_generate(AGX_CHIP_G16G, &single_desc, &eot));
+   CHECK(eot.length > 0);
+
+   const struct agx3_g17p_rt0_eot_program_desc dual_desc = {
+      .program_va = 0x1000000000ULL,
+      .shader_va = 0x1000002000ULL,
+      .pbe_argument_va = 0x1000004000ULL,
+      .imageblock_offset_B = 0,
+      .imageblock_offset1_B = 20,
+      .attachment_count = 2,
+      .mixed_mrt = true,
+      .shader_binary_size = 32 + 44 * 2,
+      .scratch_size = 0,
+      .nr_gprs = 8,
+      .staging_halfs = 16,
+      .imageblock = {
+         .sample_size_B = 24,
+         .nr_samples = 4,
+         .tile_size_px = tib.tile_size,
+      },
+   };
+   CHECK(agx3_g17p_rt0_eot_program_generate(AGX_CHIP_G16G, &dual_desc, &eot));
+   CHECK(eot.length > 0);
+
+   return 0;
+}
+
+/* The fused end-of-tile store + resolve admits exactly the single-target
+ * final pass that stores its multisample samples and AVERAGE-resolves them
+ * over the whole attachment; every other shape keeps the after-pass resolve. */
+static int
+test_g17p_store_and_resolve(void)
+{
+   const enum pipe_format rgba[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout(rgba, 1, 4, false);
+   CHECK(tib.nr_samples == 4 && !tib.layered && !agx_tilebuffer_spills(&tib));
+
+   const struct hk_agx3_g17p_store_and_resolve_target ok = {
+      .color_attachment_count = 1,
+      .final_store = true,
+      .whole_attachments = true,
+      .store_source = true,
+      .has_resolve_target = true,
+      .average_resolve = true,
+      .source_samples = 4,
+      .resolve_samples = 1,
+      .resolve_format_matches = true,
+      .source_pbe_valid = true,
+      .resolve_pbe_valid = true,
+   };
+   CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   /* The stored half is the admitted multisample store, and the shape is
+    * outside the resolve-only program, which needs storeOp != STORE. */
+   CHECK(hk_agx3_g17p_multisample_store_supported(&tib, 1, true, 4));
+   CHECK(!hk_agx3_g17p_direct_color_resolve_supported(&tib, 1, true, true,
+                                                     true, false));
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(NULL, &ok));
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, NULL));
+
+   /* Every requirement on its own. */
+   struct hk_agx3_g17p_store_and_resolve_target t;
+#define REFUSED_WITH(field, value)                                             \
+   do {                                                                        \
+      t = ok;                                                                  \
+      t.field = value;                                                         \
+      CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));              \
+   } while (0)
+   REFUSED_WITH(color_attachment_count, 2);
+   REFUSED_WITH(color_attachment_count, 0);
+   /* A partial render keeps its samples for the reload. */
+   REFUSED_WITH(final_store, false);
+   /* No background merge outside a partial render area. */
+   REFUSED_WITH(whole_attachments, false);
+   /* Not stored: the resolve-only program's shape. */
+   REFUSED_WITH(store_source, false);
+   REFUSED_WITH(has_resolve_target, false);
+   /* SAMPLE_ZERO, MIN and MAX resolve after the pass. */
+   REFUSED_WITH(average_resolve, false);
+   REFUSED_WITH(source_samples, 2);
+   REFUSED_WITH(source_samples, 1);
+   REFUSED_WITH(resolve_samples, 4);
+   REFUSED_WITH(resolve_samples, 0);
+   REFUSED_WITH(resolve_format_matches, false);
+   REFUSED_WITH(source_pbe_valid, false);
+   REFUSED_WITH(resolve_pbe_valid, false);
+#undef REFUSED_WITH
+
+   /* 2x is admitted; 1x and 8x are not. */
+   tib = agx_build_tilebuffer_layout(rgba, 1, 2, false);
+   t = ok;
+   t.source_samples = 2;
+   CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 1, false);
+   t.source_samples = 1;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 8, false);
+   t.source_samples = 8;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+
+   /* No layered or spilled two-output program is built. */
+   tib = agx_build_tilebuffer_layout(rgba, 1, 4, true);
+   CHECK(tib.layered);
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 4, false);
+   tib.spilled[0] = true;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+
+   /* Formats: those whose lanes the end-of-tile resolve averages. */
+   const struct {
+      enum pipe_format format;
+      bool admitted;
+   } formats[] = {
+      {PIPE_FORMAT_R8G8B8A8_UNORM, true},
+      {PIPE_FORMAT_B8G8R8A8_UNORM, true},
+      /* The caller sets the PBE's linear-resolve transfer bit. */
+      {PIPE_FORMAT_B8G8R8A8_SRGB, true},
+      {PIPE_FORMAT_R8G8B8A8_SRGB, true},
+      {PIPE_FORMAT_R16G16B16A16_FLOAT, true},
+      {PIPE_FORMAT_R10G10B10A2_UNORM, true},
+      /* Raw words: their averages are not the mean of the samples. */
+      {PIPE_FORMAT_R32_FLOAT, false},
+      {PIPE_FORMAT_R9G9B9E5_FLOAT, false},
+      {PIPE_FORMAT_R11G11B10_FLOAT, false},
+      /* Integer formats never AVERAGE. */
+      {PIPE_FORMAT_R8G8B8A8_UINT, false},
+      {PIPE_FORMAT_R16G16_SINT, false},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(formats); ++i) {
+      const enum pipe_format f[AGX_MAX_RENDER_TARGETS] = {formats[i].format};
+      tib = agx_build_tilebuffer_layout(f, 1, 4, false);
+      if (formats[i].admitted) {
+         /* Admitted formats keep a supported multisample tile. */
+         CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
+         CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+      } else {
+         CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+      }
+   }
+
+   /* A colourless tile has nothing to resolve. */
+   const enum pipe_format none[AGX_MAX_RENDER_TARGETS] = {PIPE_FORMAT_NONE};
+   tib = agx_build_tilebuffer_layout(none, 1, 4, false);
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   return 0;
+}
+
 int
 main(void)
 {
@@ -2379,7 +2765,9 @@ main(void)
        test_g17p_combined_sampler_pointers() ||
        test_g17p_root_range() ||
        test_g17p_single_layer_rt0_layout() ||
-       test_stk_advanced_pipeline_framebuffers() || test_alias())
+       test_stk_advanced_pipeline_framebuffers() ||
+       test_g17p_mixed_direct_color_resolve() || test_g17p_store_and_resolve() ||
+       test_alias())
       return 1;
 
    printf("Honeykrisp AGX3 Ioto program core: %u checks passed\n", checks);

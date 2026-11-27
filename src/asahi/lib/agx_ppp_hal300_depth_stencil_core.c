@@ -9,38 +9,14 @@
 #include <string.h>
 
 /*
- * Pack/unpack only the exact six-word HAL300 PPP block recovered from the
- * inspected G17G fixed-layout render-state path:
- *
- *   u32 header = bit 0
- *   u32 fragment control
- *   u32 fragment front face
- *   u32 fragment back face
- *   u32 fragment front stencil
- *   u32 fragment back stencil
- *
- * On G17G the default block is 24 bytes: header bit 0 followed by five
- * depth/stencil payload words.  Dynamic state uses the same five slots in
- * the order above.  On G16 the front stencil word comes before the back
- * face word instead, so the adjacent-word swap is HAL300-only.
- *
- * The three admitted chip identities are the HAL300 G17 GPU classes covered
- * by the G17G/G17X data.  This codec neither emits the surrounding
- * VDM PPP pointer nor admits a device or advertises a feature.
+ * Six-word HAL300 PPP depth/stencil block (24 bytes): header (bit 0),
+ * fragment control, front face, back face, front stencil, back stencil.
+ * Unlike G16, HAL300 places back face before front stencil.
  */
 bool
 agx_ppp_hal300_depth_stencil_core_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_PPP_HAL300_DEPTH_STENCIL);
 }
 
 bool

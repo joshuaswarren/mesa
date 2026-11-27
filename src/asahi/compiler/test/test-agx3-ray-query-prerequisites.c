@@ -119,12 +119,17 @@ test_supported_contracts(void)
    } chips[] = {
       {AGX_CHIP_G15G, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G15S, AGX_ISA_ENCODING_AGX3B, 12, 6},
+      {AGX_CHIP_G15C, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G15D, AGX_ISA_ENCODING_AGX3B, 12, 6},
+      {AGX_CHIP_G16P, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G16G, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G16S, AGX_ISA_ENCODING_AGX3B, 12, 6},
+      {AGX_CHIP_G16C, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G17P, AGX_ISA_ENCODING_AGX3B, 12, 6},
+      {AGX_CHIP_G17A, AGX_ISA_ENCODING_AGX3B, 12, 6},
       {AGX_CHIP_G17G, AGX_ISA_ENCODING_AGX3C, 14, 8},
       {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C, 14, 8},
+      {AGX_CHIP_G17C, AGX_ISA_ENCODING_AGX3C, 14, 8},
    };
 
    for (unsigned c = 0; c < sizeof(chips) / sizeof(chips[0]); ++c) {
@@ -181,8 +186,8 @@ static void
 test_fail_closed_boundaries(void)
 {
    static const enum agx_chip unwitnessed[] = {
-      AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15C, AGX_CHIP_G16P,
-      AGX_CHIP_G16C, AGX_CHIP_G17A, AGX_CHIP_G17C, AGX_CHIP_UNKNOWN,
+      AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G, AGX_CHIP_G14X,
+      AGX_CHIP_G15P, AGX_CHIP_G18G, AGX_CHIP_UNKNOWN,
    };
 
    for (unsigned i = 0; i < sizeof(unwitnessed) / sizeof(unwitnessed[0]); ++i)

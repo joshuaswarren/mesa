@@ -80,6 +80,7 @@ struct vk_meta_copy_buffer_image_key {
    } img;
 
    uint32_t wg_size[3];
+   bool aligned_zero_origin;
 };
 
 struct vk_meta_copy_image_key {
@@ -1050,9 +1051,6 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
       MESA_SHADER_FRAGMENT, NULL, "vk-meta-copy-buffer-to-image-frag");
    nir_builder *b = &builder;
 
-   /* Don't read out of bounds for helpers */
-   nir_terminate_if(b, nir_is_helper_invocation(b, 1));
-
    VkFormat buf_fmt =
       copy_img_buf_format_for_aspect(&key->img.view, key->img.aspect);
 
@@ -1083,22 +1081,26 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
    assert(blk_sz % comp_count == 0);
    unsigned comp_sz = (blk_sz / comp_count) * 8;
 
-   coords = nir_isub(b, coords, img_offs);
+   if (!key->aligned_zero_origin) {
+      coords = nir_isub(b, coords, img_offs);
 
-   /* Helper invocations just outside an unaligned rectangle can have negative
-    * copy-relative coordinates. The unsigned byte offset would then wrap and
-    * fault on hardware without soft faults. This shader has no derivatives;
-    * helpers may safely read the first source texel instead. Keep the address
-    * itself valid, even if the backend speculates the load.
-    */
-   nir_def *extent = nir_vec3(b,
-      load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.x),
-      load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.y),
-      single_layer ? nir_imm_int(b, 1)
-                   : load_info(b, struct vk_meta_copy_buffer_image_info,
-                               copy_id_range.end.z));
-   nir_def *in_bounds = nir_ball(b, nir_ult(b, coords, extent));
-   coords = nir_bcsel(b, in_bounds, coords, nir_imm_ivec3(b, 0, 0, 0));
+      /* Helper invocations just outside an unaligned rectangle can have negative
+       * copy-relative coordinates. The unsigned byte offset would then wrap and
+       * fault on hardware without soft faults. This shader has no derivatives;
+       * helpers may safely read the first source texel instead. Keep the address
+       * itself valid, even if the backend speculates the load. That is all
+       * helpers need: they write nothing, so they are not terminated, which
+       * would cost every invocation a sample-mask update and a branch.
+       */
+      nir_def *extent = nir_vec3(b,
+         load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.x),
+         load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.y),
+         single_layer ? nir_imm_int(b, 1)
+                      : load_info(b, struct vk_meta_copy_buffer_image_info,
+                                  copy_id_range.end.z));
+      nir_def *in_bounds = nir_ball(b, nir_ult(b, coords, extent));
+      coords = nir_bcsel(b, in_bounds, coords, nir_imm_ivec3(b, 0, 0, 0));
+   }
 
    nir_def *texel = nir_load_global(
       b, comp_count, comp_sz, copy_img_buf_addr(b, buf_pfmt, coords),
@@ -1645,6 +1647,14 @@ copy_buffer_to_image_region_gfx(
        vk_image_subresource_layer_count(img, &region->imageSubresource) == 1)
       view_type = VK_IMAGE_VIEW_TYPE_2D;
 
+   const bool aligned_zero_origin =
+      meta->specialize_single_layer_buffer_upload &&
+      view_type == VK_IMAGE_VIEW_TYPE_2D &&
+      region->imageOffset.x == 0 && region->imageOffset.y == 0 &&
+      region->imageExtent.width > 0 && region->imageExtent.height > 0 &&
+      (region->imageExtent.width & 31) == 0 &&
+      (region->imageExtent.height & 31) == 0;
+
    struct vk_meta_copy_buffer_image_key key = {
       .key_type = VK_META_OBJECT_KEY_COPY_BUFFER_TO_IMAGE_GFX,
       .img = {
@@ -1653,6 +1663,7 @@ copy_buffer_to_image_region_gfx(
                                     img_props),
          .aspect = region->imageSubresource.aspectMask,
       },
+      .aligned_zero_origin = aligned_zero_origin,
    };
 
    VkPipelineLayout pipeline_layout;

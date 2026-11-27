@@ -81,7 +81,7 @@ agx3_cf_icmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       fields[n++] = (struct agx3_field_kv)KV(39, wait_mask == 32);
    }
    for (unsigned ep = 0; ep < 2; ++ep)
-      if (agx3_bind_compose(enc, "icmp", ep, base, c ? 6 : 4, fields, n, out,
+      if (agx3_bind_compose(enc, AGX3_MN_icmp, ep, base, c ? 6 : 4, fields, n, out,
                             len))
          return true;
    return false;
@@ -110,37 +110,14 @@ agx3_cf_icmp_width_m5(enum agx3_cf_icond cond, unsigned slot,
       KV(26,hints[1].cache), KV(28,hints[1].discard), KV(29,sign && half[1]),
    };
    for (unsigned ep = 0; ep < 3; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"icmp",ep,base,6,fields,10,out,len))
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_icmp,ep,base,6,fields,10,out,len))
          return true;
    return false;
 }
 
 /*
- * The source fields of every comparison form are HALF-register indices with
- * eight bits, so halves 0..255 -- all 128 architectural 32-bit registers --
- * are addressable.  These entry points used to stop at half 128, which cut
- * the usable 32-bit register file in half for any shader that branches, and
- * nothing about the encoding asked for that.
- *
- * Apple's own applegpu_g17p output, from kernels with ninety simultaneously
- * live loaded values, compares high halves in every shape:
- *
- *   if (x88 >  x89)          0a9722950485                    icmp ep0  f2=150 f17=148
- *   if (x88 <  17u)          0a9922901583                    icmp ep0  f2=152 f16=17
- *   if (x88 != 0u)           0a992380060007830000            icmp ep1  f2=152
- *   if (fx88 <  fx89)        0a9722950385                    fcmp ep0  f2=150 f19=148
- *   if (fx88 < -fx89)        0a972295038d                    fcmp ep0  f32=1 (negate)
- *   if (|fx88| < |fx89|)     0a97239503000305000000200300    fcmp ep2  f14=1 f31=1
- *   if (fx88 == fx89)        0a972395060000850000            fcmp ep1
- *   if (fx88 <  0.0f)        0a9922810383                    fcmp ep0  f2=152
- *   if (fx88 <  1.0f)        0a9922b10383                    fcmp ep0  f18=48
- *
- * and the surrounding loads and multiply-adds in the same kernel write the
- * same field just as high (`lddev` f2=178, `imadd` f2=182), so the index is
- * plainly a half number and not a narrower operand class.  The generated
- * composer -- which comes from the encoder tables -- accepts f2/f17/f19
- * up to 255 and refuses 256, and every value round-trips back through the
- * structural decomposer unchanged.
+ * Comparison source fields are 8-bit half-register indices covering halves
+ * 0..255 (all 128 32-bit architectural registers).
  */
 bool
 agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
@@ -155,7 +132,7 @@ agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                           KV(25, 2), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(17, src1), KV(42, cond),
                                       KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
@@ -172,7 +149,7 @@ agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                            struct agx3_cf_source_hints hint,
                            uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        !icond_ok(cond) || !slot_ok(slot) || src0 >= 256 ||
        (src0 & 1) || uniform >= 256 || (uniform & 1) ||
        (hint.cache && hint.discard) || !out || !len)
@@ -183,7 +160,7 @@ agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                       KV(31, slot), KV(42, cond),
                                       KV(11, hint.cache),
                                       KV(13, hint.discard)};
-   return agx3_bind_compose(enc, "icmp", 1, base, agx3b(enc) ? 4 : 6, ov, 6, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, base, agx3b(enc) ? 4 : 6, ov, 6, out, len);
 }
 
 /* An aligned 32-bit uniform against an 8-bit immediate: Apple's G17P loop
@@ -198,7 +175,7 @@ agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                          unsigned slot, uint16_t uniform, uint8_t imm,
                          uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        !icond_ok(cond) || !slot_ok(slot) || uniform >= 256 ||
        (uniform & 1) || !out || !len)
       return false;
@@ -206,7 +183,7 @@ agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                         KV(25, 1), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(3, uniform), KV(16, imm),
                                       KV(42, cond), KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, base, agx3b(enc) ? 4 : 6, ov, 4, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, base, agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
 bool
@@ -222,7 +199,7 @@ agx3_cf_icmp_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                           KV(25, 1), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(16, imm), KV(42, cond),
                                       KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
@@ -250,7 +227,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       for (unsigned i = 0; i < 8; ++i)
          fields[6+i] = (struct agx3_field_kv)KV(34+i, !!(wait_mask & (1u << i)));
       for (unsigned ep = 0; ep < 3; ++ep)
-         if (agx3_bind_compose(enc,"icmp",ep,base,7,fields,14,out,len))
+         if (agx3_bind_compose(enc,AGX3_MN_icmp,ep,base,7,fields,14,out,len))
             return true;
       return false;
    }
@@ -263,7 +240,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
          KV(2, src), KV(16, imm), KV(42, cond), KV(31, slot),
          KV(39, wait_mask == 32),
       };
-      return agx3_bind_compose(enc, "icmp", 0, base, 4, fields, 5, out,
+      return agx3_bind_compose(enc, AGX3_MN_icmp, 0, base, 4, fields, 5, out,
                                len);
    }
    const struct agx3_field_kv base[] = {
@@ -273,7 +250,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       KV(2,src), KV(16,imm), KV(42,cond), KV(31,slot), KV(11,hint.cache),
       KV(13,hint.discard), KV(39,wait_mask == 32),
    };
-   return agx3_bind_compose(enc,"icmp",1,base,gpu1 ? 7 : 5,fields,7,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_icmp,1,base,gpu1 ? 7 : 5,fields,7,out,len);
 }
 
 /* G18G only: agx3_cf_icmp_imm16_runtime() as the G18G layer emits it on
@@ -315,7 +292,7 @@ agx3_cf_icmp_imm16_runtime_g18g(enum agx_isa_encoding enc,
       KV(2,src), KV(16,imm), KV(42,cond), KV(31,slot), KV(11,hint.cache),
       KV(13,hint.discard), KV(39,wait_mask == 32),
    };
-   return agx3_bind_compose(enc,"icmp",1,base,7,fields,7,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_icmp,1,base,7,fields,7,out,len);
 }
 
 /*
@@ -359,7 +336,7 @@ agx3_cf_fcmp_reg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
       return false;
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(19, src1), KV(46, fcond),
                                       KV(34, or_nan ? 1 : 0), KV(35, slot)};
-   return agx3_bind_compose(enc, "fcmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 5, out, len);
 }
 
@@ -370,7 +347,7 @@ agx3_cf_fcmp_reg_neg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                      const struct agx3_cf_source_hints hints_in[2],
                      uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) || !src_in || !neg_in || !hints_in ||
+   if (!agx_isa_is_agx3(enc) || !src_in || !neg_in || !hints_in ||
        !out || !len || !slot_ok(slot) ||
        (or_nan && enc != AGX_ISA_ENCODING_AGX3C) ||
        (cond != AGX3_CF_FCOND_LT && cond != AGX3_CF_FCOND_GT &&
@@ -411,11 +388,11 @@ agx3_cf_fcmp_reg_neg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
          KV(9,2), KV(10,2), KV(26,2), KV(27,2), KV(36,3), KV(37,69),
       };
       for (unsigned ep=0; ep<4; ep++)
-         if (agx3_bind_compose(enc, "fcmp", ep, m5_base, 6, ov, 10, out, len))
+         if (agx3_bind_compose(enc, AGX3_MN_fcmp, ep, m5_base, 6, ov, 10, out, len))
             return true;
       return false;
    }
-   return agx3_bind_compose(enc, "fcmp", 0, base, 5, ov, 9, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 0, base, 5, ov, 9, out, len);
 }
 
 /*
@@ -468,35 +445,15 @@ agx3_cf_fcmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                                        !!(wait_mask & (1u << wait_slot))};
 
    for (unsigned ep = 0; ep < 4; ++ep) {
-      if (agx3_bind_compose(enc, "fcmp", ep, base, 4, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fcmp, ep, base, 4, ov, n, out, len))
          return true;
    }
    return false;
 }
 
 /*
- * The same register comparison with an ABSOLUTE VALUE on either source.
- *
- * As on `fsel`, ABS is not a bit on the six-byte form: Apple moves to a
- * longer encoding point. Six bytes become fourteen, ep0 becomes ep2, and f14
- * and f31 are the two sources' bits. Grounded with metal-nt -arch
- * applegpu_g17p, one kernel per field. The branch body is a device atomic so
- * that Metal cannot if-convert the compare into an `fsel` and answer a
- * different question:
- *
- *   if (a < b)                  0a013a0303c0                    ep0,  6 B
- *   if (fabs(a) < b)            0a013b0303000300000000800100    ep2, 14 B  f14
- *   if (a < fabs(b))            0a013b0303000300000000800200    ep2, 14 B  f31
- *   if (fabs(a) < fabs(b))      0a013b0303000300000000800300    ep2, 14 B  both
- *   if (fabs(a) > fabs(b))      0a013b0303000200000000800300    f46 = 2
- *   if (fabs(a) == fabs(b))     0a013b0307000000000000800300    f46 absent
- *
- * Every other field keeps its number, so the long form differs from the short
- * one by the endpoint and the two bits alone. Qt Quick's conicalgradient.frag
- * branches on `abs(coord.y) == abs(coord.x)` and failed closed on this.
- *
- * f38..f43 are the six producer wait slots on this form; Apple's kernels
- * above wait on slot 6 because their operands come from a load.
+ * Register float comparison with source ABS modifiers uses the 14-byte ep2
+ * form (f14/f31 for src0/src1 abs, f38..f43 for the six wait slots).
  */
 bool
 agx3_cf_fcmp_width_m5(enum agx3_cf_fcond cond, bool or_nan, unsigned slot,
@@ -535,7 +492,7 @@ agx3_cf_fcmp_width_m5(enum agx3_cf_fcond cond, bool or_nan, unsigned slot,
    for (unsigned i = 0; i < 8; ++i)
       fields[count++] = (struct agx3_field_kv)KV(38 + i, (wait_mask >> i) & 1);
    for (unsigned ep = 0; ep < 4; ++ep) {
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fcmp", ep, base, 4,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fcmp, ep, base, 4,
                            fields, count, out, len))
          return true;
    }
@@ -577,7 +534,7 @@ agx3_cf_fcmp_reg_abs(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
       ov[n++] = (struct agx3_field_kv){38 + wait_slot,
                                        !!(wait_mask & (1u << wait_slot))};
 
-   return agx3_bind_compose(enc, "fcmp", 2, base, 4, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 2, base, 4, ov, n, out, len);
 }
 
 bool
@@ -590,7 +547,7 @@ agx3_cf_cndst(enum agx_isa_encoding enc, unsigned slot, bool invert,
    const struct agx3_field_kv base_c[] = {KV(2, 3), KV(3, 33)};
    const struct agx3_field_kv ov[] = {KV(0, invert ? 1 : 0), KV(1, slot),
                                       KV(12, push_count)};
-   return agx3_bind_compose(enc, "cndst", 0, base_c, agx3b(enc) ? 0 : 2, ov, 3,
+   return agx3_bind_compose(enc, AGX3_MN_cndst, 0, base_c, agx3b(enc) ? 0 : 2, ov, 3,
                             out, len);
 }
 
@@ -603,7 +560,7 @@ agx3_cf_cndlt(enum agx_isa_encoding enc, unsigned slot, bool invert,
    const struct agx3_field_kv base_b[] = {KV(12, 2)};
    const struct agx3_field_kv base_c[] = {KV(2, 3), KV(3, 31), KV(12, 2)};
    const struct agx3_field_kv ov[] = {KV(0, invert ? 1 : 0), KV(1, slot)};
-   return agx3_bind_compose(enc, "cndlt", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndlt, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 1 : 3, ov, 2, out, len);
 }
 
@@ -623,10 +580,10 @@ agx3_cf_cndcf(enum agx_isa_encoding enc, unsigned slot, bool invert,
     * and a wide ep1, and only ep1 carries the larger level counts. Try the
     * compact point first so a shallow break keeps the short encoding. */
    if (agx3b(enc))
-      return agx3_bind_compose(enc, "cndcf", 0, NULL, 0, ov, 3, out, len);
+      return agx3_bind_compose(enc, AGX3_MN_cndcf, 0, NULL, 0, ov, 3, out, len);
 
-   return agx3_bind_compose(enc, "cndcf", 0, base_c, 2, ov, 3, out, len) ||
-          agx3_bind_compose(enc, "cndcf", 1, base_c, 2, ov, 3, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_cndcf, 0, base_c, 2, ov, 3, out, len) ||
+          agx3_bind_compose(enc, AGX3_MN_cndcf, 1, base_c, 2, ov, 3, out, len);
 }
 
 bool
@@ -638,7 +595,7 @@ agx3_cf_cndef(enum agx_isa_encoding enc, uint8_t out[AGX3_CF_MAX_LENGTH],
    const struct agx3_field_kv base_c[] = {KV(1, 6),  KV(2, 3),  KV(3, 29),
                                           KV(12, 1), KV(16, 2), KV(17, 1),
                                           KV(18, 2)};
-   return agx3_bind_compose(enc, "cndef", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndef, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 7, NULL, 0, out, len);
 }
 
@@ -652,7 +609,7 @@ agx3_cf_cndend(enum agx_isa_encoding enc, unsigned pop_count,
    const struct agx3_field_kv base_c[] = {KV(0, 3), KV(1, 30), KV(14, 2),
                                           KV(15, 2), KV(16, 2)};
    const struct agx3_field_kv ov[] = {KV(10, pop_count)};
-   return agx3_bind_compose(enc, "cndend", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndend, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 2 : 5, ov, 1, out, len);
 }
 
@@ -660,7 +617,7 @@ bool
 agx3_cf_branch(enum agx_isa_encoding enc, bool is_bn,
                uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   const char *mnem = is_bn ? "bn" : "b";
+   enum agx3_mnemonic mnem = is_bn ? AGX3_MN_bn : AGX3_MN_b;
    const int ep = agx3b(enc) ? 0 : 1;
    const struct agx3_field_kv base_c[] = {KV(1, 3), KV(2, is_bn ? 21 : 8)};
    return agx3_bind_compose(enc, mnem, ep, base_c, agx3b(enc) ? 0 : 2, NULL, 0,
@@ -722,18 +679,8 @@ agx3_cf_patch_branch(enum agx_isa_encoding enc, bool is_bn, uint8_t *branch,
 }
 
 /*
- * G17G (AGX3c) spells the same compare with its selector constants f36/f37
- * and eight wait slots (f38..f45). Apple's applegpu_g17g branches in
- * test/native/g17g/m5-compare-select-reference.metal, each a register that is
- * not read again (f13), slot 0, chosen smallest first as Apple does:
- *
- *   if (x <  0.5f)    0a012aa10302             f18 = 32, f46 = 1
- *   if (x >  1.0f)    0a012ab10202             f18 = 48, f46 = 2
- *   if (x < -1.0f)    0a013ab10302             f18 = 176
- *   half x < 1.0h     0a002ab10302             f10 = 1
- *   if (x >= 0.0f)    1a012b81060002020000     lt, unordered: f34, f46 = 5
- *   if (x <= 2.0f)    1a012bc1060003020000     gt, unordered: f46 = 6
- *   if (x == 0.0f)    0a012b81060000020000     f46 = 0
+ * AGX3C float-vs-minifloat compare: uses selector constants f36/f37, eight
+ * wait slots (f38..f45), and 10-byte ep1 for ==/ge/le/unordered conditions.
  */
 bool agx3_cf_fcmp_zero_imm(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                         bool or_nan, unsigned slot, uint16_t source, bool source_16,
@@ -753,31 +700,13 @@ bool agx3_cf_fcmp_zero_imm(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
    };
    for(unsigned i=0;i<(m5?8:6);i++)fields[7+i]=(struct agx3_field_kv)KV(38+i,!!(wait_mask&(1u<<i)));
    for(unsigned ep=0;ep<=(m5?3:1);ep++)
-      if(agx3_bind_compose(enc,"fcmp",ep,base,m5?6:4,fields,m5?15:13,out,len))return true;
+      if(agx3_bind_compose(enc,AGX3_MN_fcmp,ep,base,m5?6:4,fields,m5?15:13,out,len))return true;
    return false;
 }
 
 /*
- * The same encoding point comparing against a NON-ZERO constant.
- *
- * f18 is the second operand and it was pinned to zero, so `if (x < 1.0)` --
- * ordinary GLSL, and what dEQP's workgroup-memory tests branch on -- had no
- * encoding. This is the same defect the integer side already carried and
- * fixed: agx3_cf_icmp_zero16_runtime() never set f16, which is what made it a
- * zero compare.
- *
- * Apple's bytes, one kernel per variable, the branch body made a loop so it
- * cannot be if-converted into a select (a trivial `if`/`else` compiles to
- * fsel and emits no fcmp at all, which is why this needs a real branch):
- *
- *   if (v < 0.0f)   0a 03 2a 81 03 c2      f18 absent
- *   if (v < 0.5f)   0a 03 2a a1 03 c2      f18 = 32
- *   if (v < 1.0f)   0a 03 2a b1 03 c2      f18 = 48
- *   if (v < 2.0f)   0a 03 2a c1 03 c2      f18 = 64
- *   if (v > 1.0f)   0a 03 2a b1 02 c2      f18 = 48, relation in f46
- *   half v < 1.0h   0a 02 2a b1 03 c2      f18 = 48, f10 = 1
- *
- * so the constant is the ordinary minifloat this ISA uses everywhere else.
+ * Float comparison against an 8-bit AGX minifloat immediate in f18 (omitted
+ * when 0.0).
  */
 bool agx3_cf_fcmp_zero(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                        bool or_nan, unsigned slot, uint16_t source,

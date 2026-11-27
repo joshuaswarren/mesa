@@ -15,6 +15,7 @@
 #include "vk_object.h"
 
 #include "util/list.h"
+#include "util/u_atomic.h"
 #include "util/vma.h"
 
 struct hk_descriptor_set_layout;
@@ -119,6 +120,13 @@ struct hk_descriptor_pool {
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 
+struct hk_storage_backing {
+   uint64_t address;
+   uint64_t offset;
+   uint32_t size;
+   uint32_t handle;
+};
+
 struct hk_descriptor_set {
    struct vk_object_base base;
 
@@ -129,11 +137,21 @@ struct hk_descriptor_set {
    void *mapped_ptr;
    uint64_t addr;
    uint32_t size;
+   /* Monotonic atomic update counter incremented on every descriptor write or
+    * copy into this set, so command-buffer root retention detects in-place
+    * descriptor updates. */
+   uint32_t update_seq;
    /* mapped_ptr is in a CPU-cached pool BO (hk_descriptor_pool::cpu_cached). */
    bool cpu_cached;
 
+   /* Optional CPU provenance, for ordinary single-element storage bindings. */
+   struct hk_storage_backing *storage_backings;
+
    struct hk_buffer_address dynamic_buffers[];
 };
+
+bool hk_descriptor_set_storage_backing(const struct hk_descriptor_set *set,
+                                       uint32_t binding, struct hk_storage_backing *backing);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_descriptor_set, base, VkDescriptorSet,
                                VK_OBJECT_TYPE_DESCRIPTOR_SET)
@@ -149,8 +167,23 @@ struct hk_push_descriptor_set {
    VkDescriptorSetLayoutCreateFlags layout_flags;
    /* Bytes of data the last update's layout uses */
    uint32_t size;
+   /* Snapshot of the last pool upload for this push set in this command
+    * buffer; populated only when backed by CPU-cached (AGX_BO_WRITEBACK)
+    * command memory so a subsequent flush can compare bytes without reading
+    * write-combined mappings. */
+   uint64_t last_gpu_addr;
+   const void *last_cpu_ptr;
+   uint32_t last_size;
    uint8_t data[HK_PUSH_DESCRIPTOR_SET_SIZE];
 };
+
+static inline void
+hk_push_descriptor_set_reset_upload(struct hk_push_descriptor_set *push_set)
+{
+   push_set->last_gpu_addr = 0;
+   push_set->last_cpu_ptr = NULL;
+   push_set->last_size = 0;
+}
 
 bool hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
                                    struct hk_descriptor_set_layout *layout,

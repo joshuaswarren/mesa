@@ -18,8 +18,10 @@
 static void
 agx3_remove_redundant_physical_copies(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->is_preamble)
+      return;
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       ctx->stage != MESA_SHADER_FRAGMENT)
       return;
 
    uint32_t serial = 0;
@@ -27,9 +29,16 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
       uint32_t value[AGX_NUM_REGS] = {0};
       agx_foreach_instr_in_block_safe(block, I) {
          const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+         /* Texture and image instructions can clobber undeclared physical
+          * scratch GPRs during packing (for example AGX3B cube CEM scratch in
+          * src[6]/+4/+6 and fixed r0/r7/r2 on immediate-descriptor cubes), so
+          * always reset the physical-copy table across them. */
          if (!info->can_eliminate || !info->can_reorder ||
              info->schedule_class != AGX_SCHEDULE_CLASS_NONE ||
-             !I->nr_dests) {
+             !I->nr_dests ||
+             I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             I->op == AGX_OPCODE_TEXTURE_LOAD ||
+             I->op == AGX_OPCODE_IMAGE_LOAD) {
             memset(value, 0, sizeof(value));
             continue;
          }
@@ -99,6 +108,18 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
    }
 }
 
+/* agx_opt_break_if moves a conditional break into the block after its if,
+ * but the edge to the break target stays on the emptied then block. The
+ * target's live-in is live at the break itself. */
+static agx_block *
+fused_break_target(const agx_instr *I)
+{
+   return (I->op == AGX_OPCODE_BREAK_IF_ICMP ||
+           I->op == AGX_OPCODE_BREAK_IF_FCMP)
+             ? I->target
+             : NULL;
+}
+
 static void
 postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
 {
@@ -113,6 +134,31 @@ postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
    }
 }
 
+static bool
+postra_block_gen_kill(agx_block *block, BITSET_WORD *gen, BITSET_WORD *kill)
+{
+   bool has_fused_break = false;
+   agx_foreach_instr_in_block_rev(block, I) {
+      if (fused_break_target(I))
+         has_fused_break = true;
+
+      agx_foreach_reg_dest(I, d) {
+         unsigned reg = I->dest[d].value;
+         unsigned count = agx_index_size_16(I->dest[d]);
+         BITSET_CLEAR_COUNT(gen, reg, count);
+         BITSET_SET_COUNT(kill, reg, count);
+      }
+
+      agx_foreach_reg_src(I, s) {
+         unsigned reg = I->src[s].value;
+         unsigned count = agx_index_size_16(I->src[s]);
+         BITSET_SET_COUNT(gen, reg, count);
+         BITSET_CLEAR_COUNT(kill, reg, count);
+      }
+   }
+   return has_fused_break;
+}
+
 /*
  * Globally, liveness analysis uses a fixed-point algorithm based on a
  * worklist. We initialize a work list with the exit block. We iterate the work
@@ -122,43 +168,285 @@ postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
 static void
 postra_liveness(agx_context *ctx)
 {
+   if (ctx->num_blocks == 1) {
+      agx_block *blk = agx_start_block(ctx);
+      if (!blk->successors[0] && !blk->successors[1]) {
+         BITSET_ZERO(blk->reg_live_out);
+         BITSET_DECLARE(live, AGX_NUM_REGS);
+         BITSET_ZERO(live);
+         agx_foreach_instr_in_block_rev(blk, ins) {
+            assert(!fused_break_target(ins));
+            postra_liveness_ins(live, ins);
+         }
+         memcpy(blk->reg_live_in, live, sizeof(live));
+         return;
+      }
+   }
+
    u_worklist worklist;
    agx_worklist_init(ctx, &worklist);
 
+   const unsigned n = ctx->num_blocks;
+   const unsigned rw = BITSET_WORDS(AGX_NUM_REGS);
+   BITSET_WORD *gen = n ? calloc((size_t)n * rw, sizeof(BITSET_WORD)) : NULL;
+   BITSET_WORD *kill = n ? calloc((size_t)n * rw, sizeof(BITSET_WORD)) : NULL;
+   bool *blk_fused = n ? calloc(n, sizeof(bool)) : NULL;
+   bool *blk_seen = n ? calloc(n, sizeof(bool)) : NULL;
+   bool use_summary = gen && kill && blk_fused && blk_seen;
+
+   bool fused_breaks = false;
    agx_foreach_block(ctx, block) {
       BITSET_ZERO(block->reg_live_in);
       BITSET_ZERO(block->reg_live_out);
 
-      agx_worklist_push_tail(&worklist, block);
-   }
-
-   while (!u_worklist_is_empty(&worklist)) {
-      /* Pop off in reverse order since liveness is backwards */
-      agx_block *blk = agx_worklist_pop_tail(&worklist);
-
-      /* Calculate liveness locally */
-      agx_foreach_successor(blk, succ) {
-         BITSET_OR(blk->reg_live_out, blk->reg_live_out, succ->reg_live_in);
-      }
-
-      BITSET_DECLARE(live, AGX_NUM_REGS);
-      memcpy(live, blk->reg_live_out, sizeof(live));
-
-      agx_foreach_instr_in_block_rev(blk, ins) {
-         postra_liveness_ins(live, ins);
-      }
-
-      if (BITSET_EQUAL(blk->reg_live_in, live))
-         continue;
-
-      /* We made progress, so we need to reprocess the predecessors */
-      memcpy(blk->reg_live_in, live, sizeof(live));
-      agx_foreach_predecessor(blk, pred) {
-         agx_worklist_push_head(&worklist, *pred);
+      if (use_summary && block->index < n && !blk_seen[block->index]) {
+         blk_seen[block->index] = true;
+         bool fb = postra_block_gen_kill(block, gen + (size_t)block->index * rw,
+                                         kill + (size_t)block->index * rw);
+         blk_fused[block->index] = fb;
+         fused_breaks |= fb;
+      } else {
+         use_summary = false;
+         agx_foreach_instr_in_block(block, I)
+            fused_breaks |= fused_break_target(I) != NULL;
       }
    }
+   free(blk_seen);
 
+   /* A fused break's block is not a predecessor of its target, so with
+    * fused breaks the whole analysis repeats until nothing changes. */
+   bool changed;
+   do {
+      changed = false;
+      agx_foreach_block(ctx, block)
+         agx_worklist_push_tail(&worklist, block);
+
+      while (!u_worklist_is_empty(&worklist)) {
+         /* Pop off in reverse order since liveness is backwards */
+         agx_block *blk = agx_worklist_pop_tail(&worklist);
+
+         /* Calculate liveness locally */
+         agx_foreach_successor(blk, succ) {
+            BITSET_OR(blk->reg_live_out, blk->reg_live_out, succ->reg_live_in);
+         }
+
+         BITSET_DECLARE(live, AGX_NUM_REGS);
+         if (use_summary && !blk_fused[blk->index]) {
+            const BITSET_WORD *gb = gen + (size_t)blk->index * rw;
+            const BITSET_WORD *kb = kill + (size_t)blk->index * rw;
+            for (unsigned w = 0; w < rw; ++w)
+               live[w] = (blk->reg_live_out[w] & ~kb[w]) | gb[w];
+         } else {
+            memcpy(live, blk->reg_live_out, sizeof(live));
+
+            agx_foreach_instr_in_block_rev(blk, ins) {
+               agx_block *target = fused_break_target(ins);
+               if (target)
+                  BITSET_OR(live, live, target->reg_live_in);
+
+               postra_liveness_ins(live, ins);
+            }
+         }
+
+         if (BITSET_EQUAL(blk->reg_live_in, live))
+            continue;
+
+         /* We made progress, so we need to reprocess the predecessors */
+         memcpy(blk->reg_live_in, live, sizeof(live));
+         changed = true;
+         agx_foreach_predecessor(blk, pred) {
+            agx_worklist_push_head(&worklist, *pred);
+         }
+      }
+   } while (fused_breaks && changed);
+
+   free(gen);
+   free(kill);
+   free(blk_fused);
    u_worklist_fini(&worklist);
+}
+
+/*
+ * What the whole SIMD-group needs in divergent control flow.
+ *
+ * Divergent control flow runs every side of a branch, and every remaining
+ * loop iteration, in program order with the other threads masked off. A
+ * thread masked off in block B waits at a block that program order has not
+ * reached yet: the target of an edge that jumps over B, or, inside a loop, a
+ * block the loop leaves to and every remaining iteration jumps over. Call these B's pending blocks. Such a thread next
+ * reads what the physical liveness into its pending block says, so B must
+ * keep those registers (B's inactive set): its writes reach only the active
+ * threads and do not end them, and no read in B is their last use.
+ * Everything else in B is liveness as usual. Inactive sets and liveness feed
+ * each other, so both are solved together; they only grow, so the iteration
+ * ends.
+ */
+struct physical_live {
+   unsigned words;              /* BITSET_WORDS(AGX_NUM_REGS) */
+   unsigned *pos;               /* program position by block index */
+   BITSET_WORD *inactive;       /* per position */
+   BITSET_WORD *live_out;       /* per position, inactive set included */
+   BITSET_WORD *live_in;        /* per position */
+};
+
+static void
+physical_live_free(struct physical_live *p)
+{
+   free(p->pos);
+   free(p->inactive);
+   free(p->live_out);
+   free(p->live_in);
+   memset(p, 0, sizeof(*p));
+}
+
+/* Bounds the quadratic pending sets; larger shaders keep no divergent hints. */
+#define PHYSICAL_LIVE_MAX_BLOCKS 4096
+
+static bool
+physical_liveness(agx_context *ctx, struct physical_live *p)
+{
+   const unsigned n = ctx->num_blocks;
+   if (n == 0 || n > PHYSICAL_LIVE_MAX_BLOCKS)
+      return false;
+
+   const unsigned rw = BITSET_WORDS(AGX_NUM_REGS);
+   const unsigned bw = BITSET_WORDS(n);
+   agx_block **order = calloc(n, sizeof(*order));
+   unsigned *loop_end = calloc(n, sizeof(unsigned));
+   BITSET_WORD *pending = calloc((size_t)n * bw, sizeof(BITSET_WORD));
+   BITSET_WORD *live_in = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   BITSET_WORD *gen = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   BITSET_WORD *kill = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   bool *blk_fused = calloc(n, sizeof(bool));
+   p->live_in = live_in;
+   p->words = rw;
+   p->pos = calloc(n, sizeof(unsigned));
+   p->inactive = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   p->live_out = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   bool ok = order && loop_end && pending && live_in && gen && kill &&
+             blk_fused && p->pos && p->inactive && p->live_out;
+
+   unsigned count = 0;
+   if (ok) {
+      agx_foreach_block(ctx, block) {
+         if (block->index >= n) {
+            ok = false;
+            break;
+         }
+         order[count] = block;
+         blk_fused[count] =
+            postra_block_gen_kill(block, gen + (size_t)count * rw,
+                                  kill + (size_t)count * rw);
+         p->pos[block->index] = count++;
+      }
+   }
+
+   if (ok) {
+      /* A loop runs again from its header up to its last back edge. */
+      for (unsigned a = 0; a < count; ++a)
+         loop_end[a] = a;
+      for (unsigned a = 0; a < count; ++a) {
+         agx_foreach_successor(order[a], succ) {
+            const unsigned t = p->pos[succ->index];
+            if (t <= a)
+               loop_end[t] = MAX2(loop_end[t], a);
+         }
+      }
+
+      /* An edge A -> T leaves its threads waiting at T until program order
+       * reaches T: the blocks between them, or, for a back edge, the rest of
+       * the loop before it runs again. */
+      for (unsigned a = 0; a < count; ++a) {
+         agx_foreach_successor(order[a], succ) {
+            const unsigned t = p->pos[succ->index];
+            const unsigned last = t > a ? t - 1 : loop_end[t];
+            for (unsigned b = a + 1; b <= last && b < count; ++b)
+               BITSET_SET(pending + (size_t)b * bw, t);
+         }
+      }
+
+      /* Threads waiting outside a loop keep waiting while it runs again. */
+      bool changed;
+      do {
+         changed = false;
+         for (unsigned h = 0; h < count; ++h) {
+            const unsigned l = loop_end[h];
+            if (l == h)
+               continue;
+            const BITSET_WORD *tail = pending + (size_t)l * bw;
+            unsigned t;
+            BITSET_FOREACH_SET(t, tail, count) {
+               if (t >= h && t <= l)
+                  continue;
+               for (unsigned b = h; b <= l; ++b) {
+                  BITSET_WORD *set = pending + (size_t)b * bw;
+                  if (!BITSET_TEST(set, t)) {
+                     BITSET_SET(set, t);
+                     changed = true;
+                  }
+               }
+            }
+         }
+      } while (changed);
+
+      do {
+         changed = false;
+         for (unsigned a = count; a-- > 0;) {
+            agx_block *block = order[a];
+            BITSET_WORD *inactive = p->inactive + (size_t)a * rw;
+            BITSET_WORD *out = p->live_out + (size_t)a * rw;
+            memset(inactive, 0, rw * sizeof(BITSET_WORD));
+
+            if (block->cf_divergent) {
+               unsigned t;
+               BITSET_FOREACH_SET(t, pending + (size_t)a * bw, count) {
+                  __bitset_or(inactive, inactive, live_in + (size_t)t * rw, rw);
+               }
+            }
+
+            BITSET_DECLARE(live, AGX_NUM_REGS);
+            memcpy(live, inactive, sizeof(live));
+            agx_foreach_successor(block, succ) {
+               __bitset_or(live, live,
+                           live_in + (size_t)p->pos[succ->index] * rw, rw);
+            }
+            memcpy(out, live, sizeof(live));
+
+            if (!blk_fused[a]) {
+               const BITSET_WORD *gb = gen + (size_t)a * rw;
+               const BITSET_WORD *kb = kill + (size_t)a * rw;
+               for (unsigned w = 0; w < rw; ++w)
+                  live[w] = (out[w] & ~kb[w]) | gb[w] | inactive[w];
+            } else {
+               agx_foreach_instr_in_block_rev(block, I) {
+                  agx_block *target = fused_break_target(I);
+                  if (target) {
+                     __bitset_or(live, live,
+                                 live_in + (size_t)p->pos[target->index] * rw, rw);
+                  }
+                  postra_liveness_ins(live, I);
+                  __bitset_or(live, live, inactive, rw);
+               }
+            }
+
+            BITSET_WORD *in = live_in + (size_t)a * rw;
+            if (memcmp(in, live, sizeof(live))) {
+               memcpy(in, live, sizeof(live));
+               changed = true;
+            }
+         }
+      } while (changed);
+   }
+
+   free(order);
+   free(loop_end);
+   free(pending);
+   free(gen);
+   free(kill);
+   free(blk_fused);
+   if (!ok)
+      physical_live_free(p);
+   return ok;
 }
 
 static bool
@@ -174,6 +462,19 @@ writes_reg(const agx_instr *I, unsigned reg)
    return false;
 }
 
+/* Last-use hints in divergent control flow, from physical liveness. On AGX3B
+ * and AGX3C (Dynamic Caching, no declared register count), a source marked
+ * as its last use releases the register for the whole SIMD-group. AGX2's
+ * hint is a register-cache discard only, and AGX3D declares its register
+ * count per dispatch again and has no hardware verification row yet; both
+ * keep the old rule in divergent blocks.
+ */
+static bool
+agx_divergent_last_use(const agx_context *ctx)
+{
+   return agx_isa_is_agx3(ctx->key->dev.encoding) && !ctx->key->dev.emit_agx3d;
+}
+
 /*
  * Mark last-use sources to allow the hardware to discard from the register
  * cache. Last use information follows immediately from (post-RA) liveness
@@ -187,13 +488,47 @@ agx_opt_register_cache(agx_context *ctx)
 {
    agx3_remove_redundant_physical_copies(ctx);
 
+   /* A last-use hint releases the register for the whole SIMD-group (a
+    * wrong one destroys the value), so divergent blocks take their last uses
+    * from physical liveness (physical_liveness()), which knows what
+    * masked-off threads still need. Last uses inside divergent control flow
+    * are then marked as densely as outside it.
+    */
+   struct physical_live phys = {0};
+   bool have_phys = false;
+   if (agx_divergent_last_use(ctx)) {
+      bool any = false;
+      agx_foreach_block(ctx, block)
+         any |= block->cf_divergent;
+
+      have_phys = any && physical_liveness(ctx, &phys);
+   }
+
+   /* agx_lower_divergent_shuffle routes register lane indices through a
+    * scratch register that must read zero in every inactive thread: the
+    * shuffle adds the index up over the whole quad. Never release it. */
+   const bool agx3 = ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
+   const unsigned scratch_lo = agx3 ? 2 : 1, scratch_hi = agx3 ? 3 : 1;
+   const bool keep_scratch = have_phys && ctx->any_quad_divergent_shuffle;
+
    /* Analyze the shader globally */
    postra_liveness(ctx);
 
    agx_foreach_block(ctx, block) {
+      /* Blocks outside divergent control flow keep logical liveness. */
+      const bool physical = have_phys && block->cf_divergent;
+      const BITSET_WORD *inactive =
+         physical ? phys.inactive + (size_t)phys.pos[block->index] * phys.words
+                  : NULL;
+
       /* Live-set at each point in the program */
       BITSET_DECLARE(live, AGX_NUM_REGS);
       memcpy(live, block->reg_live_out, sizeof(live));
+      if (physical) {
+         memcpy(live,
+                phys.live_out + (size_t)phys.pos[block->index] * phys.words,
+                sizeof(live));
+      }
 
       /* Set of registers read "soon" by an ALU instruction. These are
        * candidates for the .cache bit.
@@ -201,6 +536,15 @@ agx_opt_register_cache(agx_context *ctx)
       BITSET_DECLARE(alu_reads, AGX_NUM_REGS) = {0};
 
       agx_foreach_instr_in_block_rev(block, I) {
+         agx_block *target = fused_break_target(I);
+         if (target && physical) {
+            __bitset_or(live, live,
+                        phys.live_in + (size_t)phys.pos[target->index] * phys.words,
+                        phys.words);
+         } else if (target) {
+            BITSET_OR(live, live, target->reg_live_in);
+         }
+
          agx_foreach_reg_dest(I, d) {
             uint64_t reg = I->dest[d].value;
             unsigned nr = agx_index_size_16(I->dest[d]);
@@ -217,17 +561,32 @@ agx_opt_register_cache(agx_context *ctx)
             uint64_t reg = I->src[s].value;
             unsigned nr = agx_index_size_16(I->src[s]);
 
-            /* If the register dead after this instruction, it's the last use.
-             * That includes if the register is overwritten this cycle, but that
-             * won't show up in the liveness analysis.
+            /* If every half of the register is dead after this instruction,
+             * it's the last use. That includes halves overwritten this cycle
+             * (which won't show up in liveness analysis), unless masked-off
+             * threads still need them (the inactive set).
              */
-            bool lu = !BITSET_TEST_COUNT(live, reg, nr) || writes_reg(I, reg);
+            bool lu = true;
+            for (unsigned c = 0; c < nr; ++c) {
+               const unsigned r = reg + c;
+               if (BITSET_TEST(live, r) &&
+                   (!writes_reg(I, r) ||
+                    (inactive && BITSET_TEST(inactive, r)))) {
+                  lu = false;
+                  break;
+               }
+            }
 
-            /* Handling divergent blocks would require physical CFG awareness.
-             * Just bail for now, skipping this pass won't affect correctness.
-             * Subgroup-uniform ifs/loops have no physical divergence.
+            if (keep_scratch && reg <= scratch_hi && reg + nr > scratch_lo)
+               lu = false;
+
+            /* Without physical liveness, divergent blocks get no last-use
+             * hints: another side of the branch, run later with these threads
+             * masked off, may still read the register. Skipping hints never
+             * affects correctness. Subgroup-uniform ifs/loops have no
+             * physical divergence.
              */
-            I->src[s].discard = lu && !block->cf_divergent;
+            I->src[s].discard = lu && (!block->cf_divergent || physical);
 
             /* Mark any source read by an ALU instruction in the same block as
              * wanting a .cache hint. This is better than just marking
@@ -269,8 +628,12 @@ agx_opt_register_cache(agx_context *ctx)
          }
 
          postra_liveness_ins(live, I);
+         if (inactive)
+            __bitset_or(live, live, inactive, BITSET_WORDS(AGX_NUM_REGS));
       }
    }
+
+   physical_live_free(&phys);
 
    /* Apple's G17P fragment loop test keeps
     * its counter operand in the register cache (the f11 hint on the icmp's
@@ -312,7 +675,10 @@ agx_opt_register_cache(agx_context *ctx)
                   read = agx_is_alu(H);
                   break;
                }
-               if (writes_reg(H, reg))
+               bool overwrites = true;
+               for (unsigned c = 0; c < nr; ++c)
+                  overwrites &= writes_reg(H, reg + c);
+               if (overwrites)
                   break;
             }
             I->src[s].cache = read;

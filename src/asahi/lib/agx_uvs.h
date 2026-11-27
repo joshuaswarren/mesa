@@ -30,6 +30,10 @@ enum uvs_group {
  * indeterminate order since we don't yet know the fragment shader interpolation
  * qualifiers.
  */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct agx_unlinked_uvs_layout {
    /* Bit i set <===> components[i] != 0 && i != POS && i != PSIZ. For fast
     * iteration of user varyings.
@@ -53,20 +57,13 @@ struct agx_unlinked_uvs_layout {
 
    bool mesh_primitive_page : 1;
 
-   /* The varyings are written twice in location order, a smooth copy and
-    * then a flat copy of the same size, whatever the fragment shader's
-    * interpolation qualifiers, so the shader writes them at constant UVS
-    * indices: agx_nir_lower_uvs() with canonical, for a shader compiled
-    * without its fragment shader. user_size counts both copies.
-    */
-   bool canonical : 1;
-
-   /* The varyings are too many to be written twice, so the shader is
-    * compiled without its fragment shader with each one at a placeholder
-    * UVS index, the index agx_assign_uvs() gives it with no flat or linear
-    * inputs, and lists those writes (agx_shader_info::agx3_uvs_reloc_count).
-    * Linking it rewrites them for the fragment shader's qualifiers
-    * (agx_uvs_relocation_map()), so no index is computed at run time.
+   /* The shader is compiled without its fragment shader with each varying
+    * at a placeholder UVS index, the index agx_assign_uvs() gives it with no
+    * flat or linear inputs, and lists those writes
+    * (agx_shader_info::agx3_uvs_reloc_count). Linking it rewrites them for
+    * the fragment shader's qualifiers (agx_uvs_relocation_map()), so no index
+    * is computed at run time and each varying sits in the smooth, flat or
+    * linear range the clipper and the coefficients need.
     */
    bool relocatable : 1;
 
@@ -79,11 +76,6 @@ struct agx_unlinked_uvs_layout {
 };
 static_assert(sizeof(struct agx_unlinked_uvs_layout) == 88, "packed");
 
-/* Both copies of a canonical layout's varyings fit the G17P native vertex
- * program's 125 user words (HK_AGX3_G17P_MAX_USER_WORDS).
- */
-#define AGX_UVS_CANONICAL_MAX_WORDS 124
-
 /* Supply the API's default Layer for drivers transporting it as a varying. */
 bool agx_nir_lower_default_layer(struct nir_shader *s);
 
@@ -93,7 +85,7 @@ bool agx_nir_lower_default_layer(struct nir_shader *s);
  */
 bool agx_nir_lower_uvs(struct nir_shader *s,
                        struct agx_unlinked_uvs_layout *layout,
-                       bool layer_as_varying, bool canonical,
+                       bool layer_as_varying, bool relocatable,
                        int layer_zero_root_offset);
 
 /**
@@ -108,11 +100,6 @@ struct agx_varyings_vs {
     * next indices. Otherwise 0, aliasing position.
     */
    unsigned slots[VARYING_SLOT_MAX];
-
-   /* For a canonical layout, the distance from a slot's smooth copy to its
-    * flat copy, which flat CF bindings read. Otherwise 0.
-    */
-   unsigned flat_copy;
 };
 
 void agx_assign_uvs(struct agx_varyings_vs *varyings,
@@ -135,3 +122,14 @@ void agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
                              unsigned provoking_vertex,
                              uint8_t sprite_coord_enable,
                              bool *generate_primitive_id);
+
+/* For a GPU where agx_chip_uses_shade_model_5() holds (HAL300 M5/M6 family),
+ * rewrite the smooth perspective bindings of a table that
+ * agx_link_varyings_vs_fs() linked into out from shade model 7 to 5.
+ */
+void agx_cf_bindings_select_perspective(void *out,
+                                        const struct agx_varyings_fs *fs);
+
+#ifdef __cplusplus
+}
+#endif

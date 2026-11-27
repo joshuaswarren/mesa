@@ -5,6 +5,7 @@
 #include "compiler/libcl/libcl.h"
 #include "compiler/nir/nir_defines.h"
 #include "compiler/shader_enums.h"
+#include "asahi/compiler/agx_nir_texture.h"
 #include "agx_pack.h"
 #include "compression.h"
 #include "libagx_intrinsics.h"
@@ -72,11 +73,17 @@ sample_id(int4 c, uint samples)
       return c.y & 1;
 }
 
+/*
+ * AGX2-only in-place decompression kernel. For multisampled attachments it
+ * calls libagx_image_texel_address() directly, which unpacks the AGX2 PBE
+ * descriptor and its software sideband layout. Callers must guard dispatch
+ * with hk_descriptor_generation_is_agx2().
+ */
 KERNEL(32)
 libagx_decompress(constant struct libagx_decompress_images *images,
                   global uint64_t *metadata, uint64_t tile_uncompressed,
-                  uint32_t metadata_layer_stride_tl, uint16_t metadata_width_tl,
-                  uint16_t metadata_height_tl,
+                  uint32_t metadata_layer_stride_tl, uint32_t layer_stride_sa,
+                  uint16_t metadata_width_tl, uint16_t metadata_height_tl,
                   uint log2_samples__3 /* 1x, 2x, 4x */)
 {
    uint samples = 1 << log2_samples__3;
@@ -117,7 +124,11 @@ libagx_decompress(constant struct libagx_decompress_images *images,
       }
    }
 
-   sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+   /* Wait for all compressed fetches across the tile before overwriting it
+    * in place. A subgroup barrier lowers to nothing on AGX2, allowing the
+    * first store to issue before pending texture scoreboards complete.
+    */
+   barrier(CLK_LOCAL_MEM_FENCE);
 
    /* Now that the whole tile is read, we write without racing. */
    for (uint i = 0; i < 8; ++i) {
@@ -128,18 +139,70 @@ libagx_decompress(constant struct libagx_decompress_images *images,
                                   ACCESS_NON_READABLE, nir_type_uint32);
       } else {
          int4 dec_px = decompose_px(c_sa, samples);
+         /* Multisampled stores address the linear buffer PBE by sample index.
+          * Lowering a formatless layered MS store would divide the byte layer
+          * stride by PIPE_FORMAT_NONE's block size (1), striding layers by
+          * blocksize_B too far; compute the in-layer index and add the exact
+          * sample layer stride here.
+          */
+         uint index_sa =
+            (uint)libagx_image_texel_address(&images->uncompressed,
+                                             convert_uint4(dec_px),
+                                             sample_id(c_sa, samples), 1,
+                                             false, true, false, true) +
+            (layer * layer_stride_sa);
+         int4 coord2d = (int4)(index_sa % AGX_TEXTURE_BUFFER_WIDTH,
+                               index_sa / AGX_TEXTURE_BUFFER_WIDTH, 0, 0);
 
-         nir_bindless_image_store(HANDLE(uncompressed), dec_px,
-                                  sample_id(c_sa, samples), texels[i], 0,
-                                  GLSL_SAMPLER_DIM_MS, true, 0,
+         nir_bindless_image_store(HANDLE(uncompressed), coord2d, 0, texels[i],
+                                  0, GLSL_SAMPLER_DIM_2D, false, 0,
                                   ACCESS_NON_READABLE, nir_type_uint32);
       }
    }
+
+   /* Drain the uncompressed PBE body stores before marking the tile
+    * uncompressed. On G13S, the dispatch-level AGX_BARRIER_ALL | AGX_PREGFX
+    * barrier alone did not order the final decompress dispatch's PBE body
+    * stores before the following render pass without an in-kernel PBE drain.
+    */
+   nir_fence_pbe_to_tex_agx();
 
    /* We've replaced the body buffer. Mark the tile as uncompressed. */
    if (cl_local_id.x == 0) {
       metadata[index_tl] = tile_uncompressed;
    }
+
+   /* Flush the metadata update and invalidate texture caches before the
+    * dispatch completes (the dispatch barrier orders visibility to the
+    * subsequent render pass).
+    */
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
+}
+
+/*
+ * Mark a compressed image's metadata tiles as uncompressed without reading or
+ * rewriting the body buffer. Used before a spilled render pass when the
+ * attachment's previous contents are discarded, avoiding compressed texture
+ * reads of stale or uninitialized metadata and redundant in-place body writes.
+ */
+KERNEL(32)
+libagx_reset_compression_metadata(global uint64_t *metadata,
+                                  uint64_t tile_uncompressed,
+                                  uint32_t metadata_layer_stride_tl,
+                                  uint16_t metadata_width_tl,
+                                  uint16_t metadata_height_tl)
+{
+   if (cl_global_id.x < metadata_width_tl &&
+       cl_global_id.y < metadata_height_tl) {
+      uint index_tl = index_metadata(cl_global_id, metadata_width_tl,
+                                     metadata_height_tl,
+                                     metadata_layer_stride_tl);
+      metadata[index_tl] = tile_uncompressed;
+   }
+
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
 }
 
 static ushort2
@@ -208,7 +271,7 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
                             (libagx_m5_recover_half(v.w) << 16));
    }
 
-   sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+   barrier(CLK_LOCAL_MEM_FENCE);
    for (uint i = 0; i < 8; i++) {
       const int4 sample_coord = (int4)(origin.x + lane.x + i,
                                        origin.y + lane.y, 0, 0);
@@ -221,6 +284,165 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
    }
    if (cl_local_id.x == 0)
       metadata[index_tl] = ~(uint64_t)0;
+}
+
+/*
+ * AGX3 in-place decompression for spilled compressed colour attachments.
+ * Reads each compression tile (16 x tile_height_sa samples; 16x16 on HAL200)
+ * through a canonical compressed native texture descriptor (UINT of the
+ * image's exact channel class, or UNORM for R5G6B5), waits for all fetches
+ * across the tile, writes the raw GPU-tiled body directly, drains the global
+ * stores, and marks the metadata tile uncompressed with a device-scope memory
+ * and image fence.
+ */
+KERNEL(32)
+libagx_agx3_decompress(global void *texture_heap, global void *sampler_heap,
+                       global uint64_t *metadata, global uchar *body,
+                       uint64_t tile_uncompressed,
+                       uint64_t body_layer_stride_B,
+                       uint32_t metadata_layer_stride_tl,
+                       uint32_t aligned_width_px, uint32_t level_width_px,
+                       uint32_t level_height_px, uint16_t metadata_width_tl,
+                       uint16_t metadata_height_tl, uint16_t tile_width_px,
+                       uint16_t tile_height_px, uint16_t tile_height_sa,
+                       uint read_index, uint pack_mode, uint samples_log2__3,
+                       uint layered__2)
+{
+   const uint samples = 1u << samples_log2__3;
+   const uint layer = cl_group_id.z;
+   const uint index_tl = index_metadata(
+      cl_group_id, metadata_width_tl, metadata_height_tl,
+      layered__2 ? metadata_layer_stride_tl : 0u);
+   if (metadata[index_tl] == tile_uncompressed)
+      return;
+
+   const uint handle = nir_bindless_image_agx(read_index, 0);
+   const uint2 origin =
+      (uint2)(cl_group_id.x * 16u, cl_group_id.y * (uint)tile_height_sa);
+   const uint2 lane = (uint2)((cl_local_id.x & 1u) * 8u, cl_local_id.x >> 1);
+   const bool active_row = lane.y < (uint)tile_height_sa;
+
+   uint4 texels[8];
+   if (active_row) {
+      for (uint i = 0; i < 8; ++i) {
+         const int4 c_sa =
+            (int4)(origin.x + lane.x + i, origin.y + lane.y, layer, 0);
+         const int4 px = samples == 1 ? c_sa : decompose_px(c_sa, samples);
+         if ((uint)px.x < level_width_px && (uint)px.y < level_height_px) {
+            if (samples == 1) {
+               if (layered__2) {
+                  texels[i] = nir_bindless_image_load(
+                     handle, px, 0, 0, GLSL_SAMPLER_DIM_2D, true, 0,
+                     ACCESS_IN_BOUNDS, nir_type_uint32);
+               } else {
+                  texels[i] = nir_bindless_image_load(
+                     handle, px, 0, 0, GLSL_SAMPLER_DIM_2D, false, 0,
+                     ACCESS_IN_BOUNDS, nir_type_uint32);
+               }
+            } else {
+               const uint s_id = sample_id(c_sa, samples);
+               if (layered__2) {
+                  texels[i] = nir_bindless_image_load(
+                     handle, px, s_id, 0, GLSL_SAMPLER_DIM_MS, true, 0,
+                     ACCESS_IN_BOUNDS, nir_type_uint32);
+               } else {
+                  texels[i] = nir_bindless_image_load(
+                     handle, px, s_id, 0, GLSL_SAMPLER_DIM_MS, false, 0,
+                     ACCESS_IN_BOUNDS, nir_type_uint32);
+               }
+            }
+         }
+      }
+   }
+
+   /* Wait for all compressed fetches across the tile before overwriting its
+    * body memory in place. */
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   global uchar *layer_body =
+      body + (layered__2 ? (uint64_t)layer * body_layer_stride_B : 0ul);
+
+   if (active_row) {
+      for (uint i = 0; i < 8; ++i) {
+         const int4 c_sa =
+            (int4)(origin.x + lane.x + i, origin.y + lane.y, layer, 0);
+         const int4 px = samples == 1 ? c_sa : decompose_px(c_sa, samples);
+         if ((uint)px.x >= level_width_px || (uint)px.y >= level_height_px)
+            continue;
+
+         const uint offset_px = libagx_twiddle_coordinates(
+            convert_ushort2(px.xy), tile_width_px, tile_height_px,
+            aligned_width_px);
+         const uint64_t elem =
+            samples == 1
+               ? (uint64_t)offset_px
+               : ((uint64_t)offset_px << samples_log2__3) +
+                    sample_id(c_sa, samples);
+         const uint4 v = texels[i];
+
+         switch (pack_mode) {
+         case LIBAGX_AGX3_DECOMPRESS_R8:
+            layer_body[elem] = (uchar)v.x;
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R8G8:
+            ((global ushort *)layer_body)[elem] =
+               (ushort)((v.x & 0xffu) | ((v.y & 0xffu) << 8));
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R16:
+            ((global ushort *)layer_body)[elem] = (ushort)v.x;
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R5G6B5: {
+            const uint r = (uint)(as_float(v.x) * 31.0f + 0.5f);
+            const uint g = (uint)(as_float(v.y) * 63.0f + 0.5f);
+            const uint b = (uint)(as_float(v.z) * 31.0f + 0.5f);
+            ((global ushort *)layer_body)[elem] =
+               (ushort)((r & 0x1fu) | ((g & 0x3fu) << 5) | ((b & 0x1fu) << 11));
+            break;
+         }
+         case LIBAGX_AGX3_DECOMPRESS_R8G8B8A8:
+            ((global uint *)layer_body)[elem] = (v.x & 0xffu) |
+                                                ((v.y & 0xffu) << 8) |
+                                                ((v.z & 0xffu) << 16) |
+                                                ((v.w & 0xffu) << 24);
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R10G10B10A2:
+            ((global uint *)layer_body)[elem] = (v.x & 0x3ffu) |
+                                                ((v.y & 0x3ffu) << 10) |
+                                                ((v.z & 0x3ffu) << 20) |
+                                                ((v.w & 0x3u) << 30);
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R16G16:
+            ((global uint *)layer_body)[elem] = (v.x & 0xffffu) | (v.y << 16);
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R32:
+            ((global uint *)layer_body)[elem] = v.x;
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R16G16B16A16:
+            ((global uint2 *)layer_body)[elem] =
+               (uint2)((v.x & 0xffffu) | (v.y << 16),
+                       (v.z & 0xffffu) | (v.w << 16));
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R32G32:
+            ((global uint2 *)layer_body)[elem] = v.xy;
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R32G32B32A32:
+            ((global uint4 *)layer_body)[elem] = v;
+            break;
+         }
+      }
+   }
+
+   /* Complete all body stores across the tile before marking the tile
+    * uncompressed, then publish the metadata write at device scope. */
+   barrier(CLK_LOCAL_MEM_FENCE);
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acq_rel,
+                          memory_scope_device);
+
+   if (cl_local_id.x == 0)
+      metadata[index_tl] = tile_uncompressed;
+
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
 }
 
 /*

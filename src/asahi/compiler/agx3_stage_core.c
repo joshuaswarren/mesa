@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "agx3_binder.h"
+#include "agx3_native_stats.h"
 #include "agx3_tex_core.h"
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
@@ -95,7 +96,7 @@ stage_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest, uint8_t slot,
    uint8_t best[16], best_len = 0;
    for (unsigned ep = 0; ep <= (m5 ? (fma ? 7 : 5) : fma ? 5 : 3); ++ep) {
       uint8_t bytes[16], size;
-      if (agx3_bind_compose(enc, fma ? "f32fma" : "f32mul", ep,
+      if (agx3_bind_compose(enc, fma ? AGX3_MN_f32fma : AGX3_MN_f32mul, ep,
                            base, 6, fields, n, bytes, &size)) {
          if (!m5) {
             memcpy(out, bytes, size);
@@ -186,7 +187,7 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 {
    const unsigned slots = agx_encoding_is_g17_class(enc) ? 8 : 6;
    if (!out || !len ||
-       (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+       !agx_isa_is_agx3(enc) ||
        (stage_kill && enc != AGX_ISA_ENCODING_AGX3B) ||
        (dest & 1) || (src & 1) || dest >= 256 || src >= 256 ||
        slot < 1 || slot > slots || (wait_mask & ~((1u << slots) - 1)))
@@ -210,8 +211,10 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    }
 
    for (int ep = 0; ep <= 1; ++ep) {
-      if (agx3_bind_compose(enc, "copy", ep, base, nb, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_copy, ep, base, nb, ov, n, out, len)) {
+         agx3_native_stats.staging_copies++;
          return true;
+      }
    }
    return false;
 }
@@ -248,10 +251,11 @@ agx3_stage_copy_kill(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 
    /* The kill bit does not fit the compact form, so Apple escalates to ep1;
     * the composer's first-success order reproduces that. */
-   if (agx3_bind_compose(enc, "copy", 0, base, 4, ov, n, out, len))
+   if (agx3_bind_compose(enc, AGX3_MN_copy, 0, base, 4, ov, n, out, len) ||
+       agx3_bind_compose(enc, AGX3_MN_copy, 1, base, 4, ov, n, out, len)) {
+      agx3_native_stats.staging_copies++;
       return true;
-   if (agx3_bind_compose(enc, "copy", 1, base, 4, ov, n, out, len))
-      return true;
+   }
 
    memset(out, 0, AGX3_STAGE_MAX_LENGTH);
    *len = 0;
@@ -270,7 +274,7 @@ clr_common(enum agx_isa_encoding enc, const struct agx3_field_kv *ov,
    /* Native G17G pressure loops clear high registers with ep1. G18G
     * carries the same destination and selectors in its own CLR form. */
    for (unsigned ep = 0; ep <= (m5 ? 1 : 0); ++ep) {
-      if (agx3_bind_compose(enc, "clr", ep, m5 ? m5_base : base,
+      if (agx3_bind_compose(enc, AGX3_MN_clr, ep, m5 ? m5_base : base,
                            m5 ? 3 : 1, ov, n, out, len))
          return true;
    }

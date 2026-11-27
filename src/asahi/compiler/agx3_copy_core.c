@@ -69,7 +69,7 @@ agx3_copy_encode_reg16(enum agx_isa_encoding encoding, uint16_t dest_half,
    }
    for (int ep = dest_half >= AGX3_COPY_REG16_DEST_HALVES ? 1 : 0;
         ep <= (agx3c ? 1 : 0); ++ep) {
-      if (agx3_bind_compose(encoding, "copy", ep,
+      if (agx3_bind_compose(encoding, AGX3_MN_copy, ep,
                             agx3c ? baseline_c : baseline_b,
                             agx3c ? AGX3_COPY_ARRAY_SIZE(baseline_c)
                                   : AGX3_COPY_ARRAY_SIZE(baseline_b),
@@ -106,7 +106,7 @@ agx3_copy_encode_reg32(enum agx_isa_encoding encoding, uint16_t dest_half,
       if (wait_mask & (1u << i))
          overrides[n++] = (struct agx3_field_kv)KV(30 + i, 1);
    }
-   return agx3_bind_compose(encoding, "copy", 0, baseline,
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 0, baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides, n,
                             out, len);
 }
@@ -132,7 +132,7 @@ agx3_copy_encode_reg_to_uniform(enum agx_isa_encoding encoding,
          KV(23, 2), KV(24, 2), KV(27, kill), KV(28, 1), KV(29, 35),
       };
       for (unsigned ep = 0; ep <= 1; ++ep) {
-         if (agx3_bind_compose(encoding, "copy", ep, NULL, 0, fields,
+         if (agx3_bind_compose(encoding, AGX3_MN_copy, ep, NULL, 0, fields,
                               AGX3_COPY_ARRAY_SIZE(fields), out, len))
             return true;
       }
@@ -225,7 +225,7 @@ agx3_copy_encode_reg_to_uniform_g18g(enum agx_isa_encoding encoding,
       if (wait_mask & (1u << i))
          overrides[n++] = (struct agx3_field_kv)KV(30 + i, 1);
    }
-   return agx3_bind_compose(encoding, "copy", 1, baseline,
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 1, baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides, n,
                             out, len);
 }
@@ -255,7 +255,7 @@ agx3_copy_encode_uniform_to_reg16(enum agx_isa_encoding encoding,
       KV(28, m5 ? 3 : 0), KV(29, m5 ? 35 : 0),
    };
 
-   return agx3_bind_compose(encoding, "copy",
+   return agx3_bind_compose(encoding, AGX3_MN_copy,
                             dest_half >= AGX3_COPY_REG16_DEST_HALVES ? 1 : 0,
                             baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides,
@@ -305,41 +305,14 @@ agx3_copy_encode_uniform_to_reg32(enum agx_isa_encoding encoding,
    };
 
    if (dest_half < AGX3_COPY_REG16_DEST_HALVES)
-      return agx3_bind_compose(encoding, "copy", agx3_bind_ep(encoding, 0),
+      return agx3_bind_compose(encoding, AGX3_MN_copy, agx3_bind_ep(encoding, 0),
                                baseline, nbaseline, overrides,
                                AGX3_COPY_ARRAY_SIZE(overrides), out, len);
 
-   /* The compact four-byte copy carries its destination in a seven-bit f2 and
-    * truncates at half 127; only the destination is narrow there, as the
-    * source witnesses below show. Apple's answer is the ten-byte ep1, which
-    * deposits f2's eighth bit -- the same widening agx3_copy_encode_reg_to_
-    * uniform() already uses for f3, and NOT the f39 suffix that form needs
-    * (these carry f39 = 0).
-    *
-    * Witnessed with metal-nt -arch applegpu_g17p on MSL written for this,
-    * a 100-value loop-carried register rotation (`rotate_pressure`) and a
-    * uniform-chain readback under the same pressure (`uni_readback`). Both
-    * split at exactly half 128, and neither ever widens for a high source:
-    *
-    *   ep0 (4 B)   destinations  18..126, sources up to 148
-    *   ep1 (10 B)  destinations 128..190, sources 18..178
-    *
-    *   copy r66, r9.kill   2b 13 0f 00 02 10 00 00 00 00   f2=132 f16=18
-    *   copy r67, r10.kill  3b 15 0f 00 02 10 00 00 00 00   f2=134 f16=20
-    *   copy r95, r59.kill  fb 77 4f 00 02 10 00 00 00 00   f2=190 f16=118
-    *
-    * Byte 0 and byte 5 bit 4 carry the destination identically under the
-    * uniform source selector, which is why only the encoding point moves
-    * here. Ray-query shaders reach this: agx_lower_uniform_sources()
-    * materializes every generic-ALU uniform source, and under their register
-    * pressure register allocation placed those destinations at halves
-    * 134-154, refusing the whole shader.
-    *
-    * AGX3c carries the same high destination bit in its eight-byte ep1.
-    * The source kind and index fields are independent of that destination
-    * extension, as with the corresponding extended half-register copy.
-    */
-   return agx3_bind_compose(encoding, "copy", 1, baseline, nbaseline,
+   /* Compact 4-byte ep0 carries a 7-bit destination in f2 (halves 0..127);
+    * destinations >= 128 move to ep1 (10-byte on AGX3B with f39=0, 8-byte on
+    * AGX3C) to deposit bit 7. High sources stay in ep0. */
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 1, baseline, nbaseline,
                             overrides,
                             AGX3_COPY_ARRAY_SIZE(overrides), out, len);
 }

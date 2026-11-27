@@ -65,8 +65,11 @@ extern "C" {
 #include "program/program.h"
 }
 
-static void
-compile_shaders(struct gl_context *ctx, struct gl_shader_program *prog) {
+/** Compile the attached shaders whose compile a shader cache hit skipped. */
+void
+shader_cache_compile_shaders(struct gl_context *ctx,
+                             struct gl_shader_program *prog)
+{
    for (unsigned i = 0; i < prog->NumShaders; i++) {
       _mesa_glsl_compile_shader(ctx, prog->Shaders[i], NULL,
                                 false, false, true);
@@ -83,7 +86,8 @@ create_binding_str(const char *key, unsigned value, void *closure)
 void
 shader_cache_write_program_metadata(struct gl_context *ctx,
                                     struct gl_shader_program *prog,
-                                    const cache_key *shader_keys)
+                                    const cache_key *shader_keys,
+                                    unsigned num_shader_keys)
 {
    struct disk_cache *cache = ctx->Cache;
    if (!cache)
@@ -115,13 +119,13 @@ shader_cache_write_program_metadata(struct gl_context *ctx,
    struct cache_item_metadata cache_item_metadata;
    cache_item_metadata.type = CACHE_ITEM_TYPE_GLSL;
    cache_item_metadata.keys =
-      (cache_key *) malloc(prog->NumShaders * sizeof(cache_key));
-   cache_item_metadata.num_keys = prog->NumShaders;
+      (cache_key *) malloc(num_shader_keys * sizeof(cache_key));
+   cache_item_metadata.num_keys = num_shader_keys;
 
    if (!cache_item_metadata.keys)
       goto fail;
 
-   for (unsigned i = 0; i < prog->NumShaders; i++)
+   for (unsigned i = 0; i < num_shader_keys; i++)
       memcpy(cache_item_metadata.keys[i], shader_keys[i], sizeof(cache_key));
 
    disk_cache_put(cache, prog->data->blake3, metadata.data, metadata.size,
@@ -221,7 +225,7 @@ shader_cache_read_program_metadata(struct gl_context *ctx,
        * changed since the last compile so for now we just recompile
        * everything.
        */
-      compile_shaders(ctx, prog);
+      shader_cache_compile_shaders(ctx, prog);
       return false;
    }
 
@@ -248,7 +252,7 @@ shader_cache_read_program_metadata(struct gl_context *ctx,
       }
 
       disk_cache_remove(cache, prog->data->blake3);
-      compile_shaders(ctx, prog);
+      shader_cache_compile_shaders(ctx, prog);
       free(buffer);
       return false;
    }

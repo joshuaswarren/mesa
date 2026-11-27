@@ -44,8 +44,10 @@ extern "C" {
 /*
  * The megakernel is one compute shader.  Its workgroup is one AGX subgroup
  * wide so that a ray-generation shader's divergence costs at most one
- * subgroup, and flat in Y/Z so the launch index arithmetic is a pure
- * decomposition of the compute global invocation id.
+ * subgroup.  For 2D/3D launches (height > 1), each 32-lane workgroup is
+ * remapped in the shader to an 8x4 2D tile for spatial ray coherence and
+ * G-buffer locality; 1D launches (height <= 1) keep a flat 32x1 strip so no
+ * lanes are wasted on empty rows.
  */
 /*
  * maxRayRecursionDepth.  Recursion is unrolled into the megakernel at compile
@@ -66,6 +68,11 @@ extern "C" {
 #define HK_RT_WORKGROUP_SIZE_X_LOG2 5
 #define HK_RT_WORKGROUP_SIZE_Y 1
 #define HK_RT_WORKGROUP_SIZE_Z 1
+
+#define HK_RT_TILE_2D_X      8
+#define HK_RT_TILE_2D_X_LOG2 3
+#define HK_RT_TILE_2D_Y      4
+#define HK_RT_TILE_2D_Y_LOG2 2
 
 struct hk_ray_tracing_group_handle {
    uint32_t index;
@@ -99,6 +106,27 @@ bool hk_rt_group_from_create_info(struct hk_ray_tracing_group *out,
                                   uint32_t closest_hit_shader,
                                   uint32_t any_hit_shader,
                                   uint32_t intersection_shader);
+
+/*
+ * Whether every stage index of a group is VK_SHADER_UNUSED_KHR or names one of
+ * the pipeline's stage_count stages.  Creation holds the groups it builds to
+ * this; a pipeline loaded from a binary or a cache holds the stored groups to
+ * it too.
+ */
+bool hk_rt_group_indices_valid(const struct hk_ray_tracing_group *group,
+                               uint32_t stage_count);
+
+/*
+ * Whether a group's indices are valid and each names a shader of a stage its
+ * slot takes: a ray generation, miss, callable or closest-hit shader as the
+ * recursive shader, an any-hit shader and an intersection shader in those
+ * slots.  stages[i] is the stage of shader i.  Groups built from create info
+ * satisfy this by the API's valid usage; groups read back from stored data
+ * are checked.
+ */
+bool hk_rt_group_stages_valid(const struct hk_ray_tracing_group *group,
+                              uint32_t stage_count,
+                              const VkShaderStageFlagBits *stages);
 
 /*
  * Rebase one group of an imported pipeline library onto the importing

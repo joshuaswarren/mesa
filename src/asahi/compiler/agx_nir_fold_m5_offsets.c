@@ -219,7 +219,8 @@ ends_invocation(nir_instr *instr)
 }
 
 static bool
-fold_block(nir_builder *b, nir_block *block, struct util_dynarray *list)
+fold_block(nir_builder *b, nir_block *block, struct util_dynarray *list,
+           bool soft_fault)
 {
    bool progress = false;
    util_dynarray_clear(list);
@@ -242,9 +243,16 @@ fold_block(nir_builder *b, nir_block *block, struct util_dynarray *list)
           intr->intrinsic != nir_intrinsic_store_global)
          continue;
 
-      /* A speculatable access may have been hoisted out of the code that
-       * guarded it, so its offset need not be one the program accesses. */
-      if (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE)
+      /* Without soft faults, a speculatable access may have been hoisted out
+       * of the code that guarded it, so its offset need not be one the
+       * program accesses. With soft faults (and unchecked offsets),
+       * set_speculate() marks every access ACCESS_CAN_SPECULATE; folding
+       * stays sound when byte-sibling groups sign-extend their shared index
+       * (valid M5 buffer offsets lie in [0, 2^31), so
+       * sext(X + cmin) + (c - cmin) == zext(X + c) for every executed lane
+       * even if an earlier sibling was hoisted from a guard, while soft
+       * faults absorb out-of-bounds reads on discarded lanes). */
+      if (!soft_fault && (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE))
          continue;
 
       struct access a = {.intr = intr};
@@ -332,14 +340,21 @@ fold_block(nir_builder *b, nir_block *block, struct util_dynarray *list)
       }
 
       /* The shared index X + cmin, computed at the first access (i): its
-       * offset value dominates every later one in the block. */
+       * offset value dominates every later one in the block. Sign-extend the
+       * shared index when any member is speculatable so a hoisted earlier
+       * sibling (e.g. X = -1 while X + 1 = 0 executes) cannot wrap the
+       * executed lane past 2^32. */
+      bool any_speculative = false;
+      for (unsigned k = 0; k < m; ++k)
+         any_speculative |=
+            (nir_intrinsic_access(acc[members[k]].intr) & ACCESS_CAN_SPECULATE) != 0;
       b->cursor = nir_before_instr(&acc[i].intr->instr);
       nir_def *index = nir_iadd_imm(b, acc[i].offset,
                                     (uint32_t)(cmin - acc[i].lin.constant));
       for (unsigned k = 0; k < m; ++k) {
          struct access *a = &acc[members[k]];
          emit_native(b, a->intr, a->base, index, 0,
-                     (int32_t)(a->lin.constant - cmin), false);
+                     (int32_t)(a->lin.constant - cmin), any_speculative);
       }
       progress = true;
    }
@@ -350,7 +365,7 @@ fold_block(nir_builder *b, nir_block *block, struct util_dynarray *list)
 }
 
 bool
-agx_nir_fold_m5_offsets(nir_shader *shader)
+agx_nir_fold_m5_offsets(nir_shader *shader, bool soft_fault)
 {
    bool any = false;
    struct util_dynarray list;
@@ -361,7 +376,7 @@ agx_nir_fold_m5_offsets(nir_shader *shader)
       nir_builder b = nir_builder_create(impl);
       bool progress = false;
       nir_foreach_block(block, impl)
-         progress |= fold_block(&b, block, &list);
+         progress |= fold_block(&b, block, &list, soft_fault);
       any |= nir_progress(progress, impl, nir_metadata_control_flow);
    }
 

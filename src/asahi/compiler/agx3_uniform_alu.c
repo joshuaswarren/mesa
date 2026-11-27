@@ -17,21 +17,11 @@ uniform_float_encode(enum agx_isa_encoding encoding,
        (!half && (dest & 1)) || wait_mask > (m5 ? 0xff : 0x3f))
       return false;
 
-   /* Retained native G17G shaders witness, for a GPR result:
-    *   MUL R*U and U*R (also saturated);
-    *   ADD R+U and U+R, the uniform optionally negated;
-    *   FMA R*U+R, R*U+U and U*R+U, and R*U+imm, the uniform multiplicand
-    *   optionally negated and a register multiplicand negated in U*R+U;
-    *   FMA R*U-R with plain multiplicands (a native compiler probe of
-    *   fma(x, u, -y): 0993060511a00202);
-    *   FMA R*R+U with nothing negated (the agx3-diff-corpus fragments);
-    * and for a uniform result in a constant program:
-    *   FMA R*R+R and MUL imm*R.
-    * Native Minecraft terrain/entity/sky pipelines compiled natively for
-    * G17G (vertex constant programs: 48 U=RRR FMAs, fragment
-    * constant programs: 12 U=IR MULs; mains: 39 ADDs, 29 U-addend FMAs and 5
-    * R*U+imm FMAs) are asserted byte for byte in test-agx3-uniform-alu.cpp.
-    * Half arithmetic stays outside this admission. */
+   /* Admitted AGX3C f32 uniform-ALU forms (half arithmetic stays closed):
+    *   GPR dest: MUL R*U / U*R (optional sat); ADD R+U / U+R (optional neg on
+    *     uniform); FMA R*U+R, R*U+U, U*R+U, R*U+imm (optional neg on uniform
+    *     multiplicand or U*R+U reg multiplicand), plain R*U-R, plain R*R+U.
+    *   Uniform dest (constant program): FMA R*R+R and MUL imm*R. */
    if (m5) {
       const unsigned count = op == AGX3_UNIFORM_FMA ? 3 : 2;
       unsigned regs = 0, uniforms = 0, immediates = 0;
@@ -168,12 +158,12 @@ uniform_float_encode(enum agx_isa_encoding encoding,
    /* Apple G17P/G16G uniform_repeat: 09010e0d210e02c2. Domain 3 selects
     * uniform f36/f53 instead of register f35/f52. ADD and MUL use the same
     * first two operand records. */
-   const char *mnemonic = half ? (op == AGX3_UNIFORM_FADD   ? "f16add"
-                                  : op == AGX3_UNIFORM_FMUL ? "f16mul"
-                                                            : "f16fma")
-                               : (op == AGX3_UNIFORM_FADD   ? "f32add"
-                                  : op == AGX3_UNIFORM_FMUL ? "f32mul"
-                                                            : "f32fma");
+   enum agx3_mnemonic mnemonic = half ? (op == AGX3_UNIFORM_FADD   ? AGX3_MN_f16add
+                                  : op == AGX3_UNIFORM_FMUL ? AGX3_MN_f16mul
+                                                            : AGX3_MN_f16fma)
+                               : (op == AGX3_UNIFORM_FADD   ? AGX3_MN_f32add
+                                  : op == AGX3_UNIFORM_FMUL ? AGX3_MN_f32mul
+                                                            : AGX3_MN_f32fma);
    uint8_t best[16], best_length = 0;
    for (unsigned swap = 0; swap < 2; ++swap) {
       /* M5 places an FMA's uniform multiplicand in the second operand
@@ -342,7 +332,7 @@ agx3_uniform_minmax_encode(enum agx_isa_encoding encoding, uint16_t dest,
       fields[n++] = (struct agx3_field_kv){102 + i, (wait_mask >> i) & 1};
    for (unsigned ep = half ? 5 : 7; ep < 28; ++ep) {
       uint8_t candidate[16], size;
-      if (agx3_bind_compose(encoding, "fsel", ep, NULL, 0, fields, n, candidate,
+      if (agx3_bind_compose(encoding, AGX3_MN_fsel, ep, NULL, 0, fields, n, candidate,
                             &size)) {
          memcpy(output, candidate, size);
          *length = size;

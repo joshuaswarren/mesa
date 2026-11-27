@@ -16,6 +16,8 @@
 #include "util/u_qsort.h"
 #include "util/u_debug.h"
 
+#include "asahi/lib/agx_chip_caps.h"
+#include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
@@ -24,17 +26,18 @@
 #include "agx_opcodes.h"
 #include "shader_enums.h"
 
-/* The eight scalars collected into an operand of a 16x16x16 matrix
- * multiply-accumulate, as the phi webs they belong to. The instruction takes
- * each operand from an aligned run of registers, so the webs want consecutive
- * registers of one such run: then the collect, the phis around it and the
- * copy into the accumulator the instruction overwrites are all in place.
+/* The scalars collected into an operand of an AGX3 matrix multiply-accumulate
+ * (8 for matmad16, 2 for matmad8), as the phi webs they belong to. The
+ * instruction takes each operand from an aligned run of registers, so the webs
+ * want consecutive registers of one such run: then the collect, the phis around
+ * it and the accumulator overwrite are all in place.
  */
 struct matrix_group {
    uint32_t root[8];
 
-   /* Registers (16-bit halves) of each member */
+   /* Registers (16-bit halves) of each member, and number of members (2 or 8) */
    uint8_t size;
+   uint8_t count;
 };
 
 /* SSA-based register allocator */
@@ -96,11 +99,21 @@ phi_web_union(struct phi_web_node *web, unsigned x, unsigned y)
    }
 }
 
+#define G17P_MAX_COREAD_PARTNERS 12u
+
+struct g17p_coread_entry {
+   uint32_t partners[G17P_MAX_COREAD_PARTNERS];
+   uint16_t weights[G17P_MAX_COREAD_PARTNERS];
+   uint8_t offsets[G17P_MAX_COREAD_PARTNERS];
+   uint8_t nr;
+};
+
 struct ra_ctx {
    agx_context *shader;
    agx_block *block;
    agx_instr *instr;
    uint16_t *ssa_to_reg;
+   uint16_t *pred_ssa_to_reg;
    uint8_t *ncomps;
    uint8_t *ncomps_unrounded;
    enum agx_size *sizes;
@@ -126,6 +139,15 @@ struct ra_ctx {
    agx_instr **src_to_collect_phi;
    BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
+
+   /* Optional loop-header phi target for back-edge sources and RMW chains. */
+   agx_instr *const *rmw_phi;
+
+   /* Registers owned by enclosing loop-header phis for the current block;
+    * avoid stealing them for unrelated temps or bank-conflict detours. */
+   const BITSET_WORD *loop_phi_targets;
+   /* Per-header output bitset populated after assigning phis in a loop header. */
+   BITSET_WORD *loop_header_phi_out;
 
    /* Matrix operand groups, and for each phi web root its group plus one
     * (zero for none).
@@ -162,6 +184,11 @@ struct ra_ctx {
     * cube-array sample with a register LOD (the fused layer/face/LOD
     * PACK_SMPIR operand carries a seven-bit layer register). */
    BITSET_WORD *tex_low128;
+
+   /* G17P mod-3 register-bank co-read partner table and occupancy tier cap. */
+   const struct g17p_coread_entry *g17p_coread;
+   unsigned g17p_tier_cap;
+   bool g17p_has_loop;
 };
 
 /*
@@ -266,9 +293,18 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
       agx_print_shader(ctx, stdout);
    }
 
-   uint8_t *widths = calloc(ctx->alloc, sizeof(uint8_t));
-   enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
-   BITSET_WORD *dest_read = agx_values_read(ctx);
+   static_assert(RA_CLASSES <= UINT8_MAX, "ra_class fits in uint8_t");
+   uint8_t stack_widths[1024];
+   uint8_t stack_classes[1024];
+   uint8_t *widths =
+      ctx->alloc <= 1024 ? stack_widths : calloc(ctx->alloc, sizeof(uint8_t));
+   uint8_t *classes =
+      ctx->alloc <= 1024 ? stack_classes : calloc(ctx->alloc, sizeof(uint8_t));
+   if (ctx->alloc <= 1024) {
+      memset(widths, 0, ctx->alloc * sizeof(uint8_t));
+      memset(classes, 0, ctx->alloc * sizeof(uint8_t));
+   }
+   BITSET_WORD *dest_read = NULL;
 
    agx_foreach_instr_global(ctx, I) {
       if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
@@ -375,8 +411,12 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
             late_kill_count += (pot_width - real_width);
 
             /* An unread M5 query-entry result dies right after its write. */
-            if (I->op == AGX_OPCODE_ENTER_QUERY_M5 && !BITSET_TEST(dest_read, I->dest[d].value))
-               late_kill_count += real_width;
+            if (I->op == AGX_OPCODE_ENTER_QUERY_M5) {
+               if (!dest_read)
+                  dest_read = agx_values_read(ctx);
+               if (!BITSET_TEST(dest_read, I->dest[d].value))
+                  late_kill_count += real_width;
+            }
          }
 
          max_demand = MAX2(demand, max_demand);
@@ -386,9 +426,95 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    }
 
    free(dest_read);
-   free(widths);
-   free(classes);
+   if (widths != stack_widths)
+      free(widths);
+   if (classes != stack_classes)
+      free(classes);
    return max_demand;
+}
+
+bool
+agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
+                        unsigned align, unsigned minimum, unsigned limit,
+                        unsigned *out)
+{
+   const unsigned start = ALIGN_POT(minimum, align);
+   if (start + count > limit)
+      return false;
+
+   bool found = false;
+   unsigned result = 0;
+
+   if (BITSET_WORDBITS == 32 && count == align &&
+       (align == 1 || align == 2 || align == 4 || align == 8 || align == 16)) {
+      const unsigned last_reg = limit - count;
+      const unsigned first_word = start >> 5;
+      const unsigned last_word = last_reg >> 5;
+
+      for (unsigned wi = first_word; wi <= last_word; ++wi) {
+         const uint32_t w = used[wi];
+         if (w == ~0u)
+            continue;
+
+         uint32_t free_slots;
+         if (align == 1) {
+            free_slots = ~w;
+         } else if (align == 2) {
+            free_slots = (~(w | (w >> 1))) & 0x55555555u;
+         } else if (align == 4) {
+            uint32_t b = w | (w >> 1);
+            free_slots = (~(b | (b >> 2))) & 0x11111111u;
+         } else if (align == 8) {
+            uint32_t b = w | (w >> 1);
+            b |= b >> 2;
+            free_slots = (~(b | (b >> 4))) & 0x01010101u;
+         } else {
+            free_slots = ((w & 0xffffu) ? 0u : 1u) |
+                         ((w >> 16) ? 0u : (1u << 16));
+         }
+
+         if (wi == first_word && (start & 31))
+            free_slots &= ~0u << (start & 31);
+         if (wi == last_word && (last_reg & 31) != 31)
+            free_slots &= (2u << (last_reg & 31)) - 1u;
+
+         if (free_slots) {
+            result = (wi << 5) + (unsigned)(ffs(free_slots) - 1);
+            found = true;
+            break;
+         }
+      }
+   } else {
+      for (unsigned reg = start; reg + count <= limit;) {
+         if (BITSET_WORDBITS == 32 && used[reg >> 5] == ~0u) {
+            reg = ALIGN_POT((reg | 31u) + 1u, align);
+            continue;
+         }
+         if (!BITSET_TEST_COUNT(used, reg, count)) {
+            result = reg;
+            found = true;
+            break;
+         }
+         reg += align;
+      }
+   }
+
+#ifndef NDEBUG
+   bool ref_found = false;
+   unsigned ref_reg = 0;
+   for (unsigned reg = start; reg + count <= limit; reg += align) {
+      if (!BITSET_TEST_COUNT(used, reg, count)) {
+         ref_reg = reg;
+         ref_found = true;
+         break;
+      }
+   }
+   assert(found == ref_found && (!found || result == ref_reg));
+#endif
+
+   if (found)
+      *out = result;
+   return found;
 }
 
 static bool
@@ -396,14 +522,19 @@ find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
                  unsigned align, unsigned minimum, unsigned limit,
                  unsigned *out)
 {
-   for (unsigned reg = ALIGN_POT(minimum, align); reg + count <= limit;
-        reg += align) {
-      if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
-         *out = reg;
-         return true;
-      }
-   }
+   return agx_ra_find_regs_simple(rctx->used_regs[cls], count, align, minimum,
+                                  limit, out);
+}
 
+/* A phi reading the uniform file becomes a move from it on that incoming edge
+ * (agx_insert_parallel_copies()), which writes the phi's register. */
+static bool
+phi_reads_uniform(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_UNIFORM)
+         return true;
+   }
    return false;
 }
 
@@ -429,6 +560,14 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&rctx->shader->key->dev)) &&
        I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM)
+      limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
+   /* So does the move a phi reading the uniform file becomes on that edge.
+    * G17P's 32-bit uniform copy also names the upper registers; its 16-bit
+    * one, like G18G's at both widths, does not. */
+   if (I->op == AGX_OPCODE_PHI && phi_reads_uniform(I) &&
+       (agx_is_g18g(&rctx->shader->key->dev) ||
+        (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->dest[d].size == AGX_SIZE_16)))
       limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        BITSET_TEST(rctx->low_gpr, I->dest[d].value))
@@ -469,11 +608,16 @@ dest_minimum(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    return 0;
 }
 
+static unsigned
+ssa_texture_gpr_limit(const struct ra_ctx *rctx)
+{
+   return agx_is_g18g(&rctx->shader->key->dev) ? 64 : 128;
+}
+
 static bool
 ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 {
-   if (rctx->shader->key->dev.chip != AGX_CHIP_G17P ||
-       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+   if (!agx_isa_is_agx3(rctx->shader->key->dev.encoding))
       return BITSET_TEST(rctx->low_gpr, ssa) ||
              BITSET_TEST(rctx->texture_gpr, ssa) ||
              BITSET_TEST(rctx->log2_gpr, ssa) ||
@@ -482,13 +626,17 @@ ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
    /* A bank restriction cannot prevent relocation when the complete register
     * file fits inside that bank. In particular, pinning a texture coordinate
     * in a 112-half allocation can strand the only partly free eight-half
-    * region, even though every possible new home satisfies its 128-half
-    * encoding limit. Keep the restriction for genuinely narrower banks.
+    * region, even though every possible new home satisfies its encoding limit.
+    * Keep the restriction for genuinely narrower banks.
     */
+   const bool agx3b =
+      rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    const unsigned bound = rctx->bound[RA_GPR];
-   return (BITSET_TEST(rctx->low_gpr, ssa) && bound > rctx->tile_gpr_limit) ||
-          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
-          (BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
+   return (agx3b && BITSET_TEST(rctx->low_gpr, ssa) &&
+           bound > rctx->tile_gpr_limit) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) &&
+           bound > ssa_texture_gpr_limit(rctx)) ||
+          (agx3b && BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
           BITSET_TEST(rctx->high_gpr, ssa);
 }
 
@@ -505,16 +653,14 @@ ssa_bank_range(const struct ra_ctx *rctx, unsigned ssa, unsigned *floor,
    if (agx3b && BITSET_TEST(rctx->low_gpr, ssa))
       *limit = MIN2(*limit, rctx->tile_gpr_limit);
    if (BITSET_TEST(rctx->texture_gpr, ssa))
-      *limit = MIN2(*limit, 128);
+      *limit = MIN2(*limit, ssa_texture_gpr_limit(rctx));
    if (agx3b && BITSET_TEST(rctx->log2_gpr, ssa))
       *limit = MIN2(*limit, 192);
 }
 
 /* Whether a value's bank limit narrows the current register file, mirroring
- * dest_limit(): the low-bank and log2 bounds are G17P (AGX3B) encodings, and
- * the seven-bit texture/COPY bound means nothing in a file of 128 halves or
- * fewer, which is what compute shaders get once the workgroup bounds their
- * registers. */
+ * dest_limit(): the low-bank and log2 bounds are AGX3B encodings, and
+ * the texture/COPY bound means nothing when the register file fits inside it. */
 static bool
 ssa_has_binding_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 {
@@ -524,7 +670,8 @@ ssa_has_binding_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 
    return (agx3b && BITSET_TEST(rctx->low_gpr, ssa) &&
            bound > rctx->tile_gpr_limit) ||
-          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) &&
+           bound > ssa_texture_gpr_limit(rctx)) ||
           (agx3b && BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
           BITSET_TEST(rctx->high_gpr, ssa);
 }
@@ -681,7 +828,7 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
    }
 
    /* Every region was already evicted for this value: there is nothing left
-    * to finish the allocation with. Leave RA now (agx_ra_impl() frees its
+    * to finish the allocation with. Leave RA now (agx_ra() frees its
     * state); the caller sees ra_failed and recompiles with a smaller spill
     * budget. Continuing used to assert here in debug builds and index out of
     * bounds in release builds (geometry shader of
@@ -707,6 +854,8 @@ set_ssa_to_reg(struct ra_ctx *rctx, unsigned ssa, unsigned reg)
 
    if (cls == RA_GPR) {
       rctx->reg_to_ssa[reg] = ssa;
+      for (unsigned k = 1; k < rctx->ncomps[ssa]; ++k)
+         rctx->reg_to_ssa[reg + k] = UINT32_MAX;
    }
 }
 
@@ -884,6 +1033,8 @@ assign_regs_by_copying(struct ra_ctx *rctx, agx_index dest, const agx_instr *I,
          assert(nr_blocked < ARRAY_SIZE(blocked_vars));
          blocked_vars[nr_blocked++] = ssa;
          BITSET_CLEAR_COUNT(rctx->used_regs[RA_GPR], reg, width);
+         for (unsigned k = 0; k < width; ++k)
+            rctx->reg_to_ssa[reg + k] = UINT32_MAX;
          reg += width;
       }
       /* Only reserve the actual result. Freed excess halves of a larger
@@ -1144,19 +1295,12 @@ pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  */
 #define G17P_LOW_BANK_HALVES 128
 
-/* Register budget, in halves, of M5 compute kernels that use native ray
- * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
- * M5 hardware with the full-resolution RT workload: 160 halves was faster
- * than 128 and 192. Not derived; the snapshot records no numbers.
- */
-#define AGX_M5_RT_REGISTER_BUDGET 160u
-
 static bool
 prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
                  enum ra_class cls, unsigned minimum, unsigned limit)
 {
    const enum agx_chip chip = rctx->shader->key->dev.chip;
-   if ((chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_g17p_or_m5(chip) ||
        !rctx->shader->has_spill_pcopy_reserved || cls != RA_GPR ||
        minimum != 0 || limit != rctx->bound[cls] ||
        limit <= G17P_LOW_BANK_HALVES ||
@@ -1167,6 +1311,411 @@ prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
    const agx_instr *use = rctx->src_to_collect_phi[I->dest[d].value];
    return !use || use->op != AGX_OPCODE_COLLECT ||
           dest_limit(rctx, use, 0) > G17P_LOW_BANK_HALVES;
+}
+
+static void
+g17p_coread_add_edge(struct g17p_coread_entry *table, unsigned ssa,
+                     unsigned partner, uint8_t offset_halves, uint16_t weight)
+{
+   if (ssa == partner || weight == 0)
+      return;
+
+   struct g17p_coread_entry *e = &table[ssa];
+   for (unsigned i = 0; i < e->nr; ++i) {
+      if (e->partners[i] == partner && e->offsets[i] == offset_halves) {
+         uint32_t sum = (uint32_t)e->weights[i] + weight;
+         e->weights[i] = sum > UINT16_MAX ? UINT16_MAX : (uint16_t)sum;
+         return;
+      }
+   }
+
+   if (e->nr < G17P_MAX_COREAD_PARTNERS) {
+      unsigned slot = e->nr++;
+      e->partners[slot] = partner;
+      e->weights[slot] = weight;
+      e->offsets[slot] = offset_halves;
+      return;
+   }
+
+   /* Replace the weakest recorded partner if this edge is heavier. */
+   unsigned min_idx = 0;
+   for (unsigned i = 1; i < G17P_MAX_COREAD_PARTNERS; ++i) {
+      if (e->weights[i] < e->weights[min_idx])
+         min_idx = i;
+   }
+   if (weight > e->weights[min_idx]) {
+      e->partners[min_idx] = partner;
+      e->weights[min_idx] = weight;
+      e->offsets[min_idx] = offset_halves;
+   }
+}
+
+/*
+ * On G17P (AGX3B), ALU instructions that co-read two distinct 32-bit physical
+ * registers sharing the same bank (`(reg / 2) % 3`) suffer an operand-cache /
+ * bank conflict (~30% ALU throughput penalty when both operands are re-read).
+ * Build a lightweight loop-weighted, cached-operand-prioritized co-read partner
+ * graph over GPR SSA values so RA can pick conflict-free free registers within
+ * the shader's existing occupancy tier.
+ */
+static struct g17p_coread_entry *
+g17p_build_coread_table(agx_context *ctx, const uint8_t *ncomps,
+                        const enum ra_class *classes, bool *has_loop_out)
+{
+   if (has_loop_out)
+      *has_loop_out = false;
+   if (!agx_chip_has_cap(ctx->key->dev.chip, AGX_CAP_MOD3_REG_BANK_RA) ||
+       ctx->is_preamble || ctx->alloc == 0)
+      return NULL;
+
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+
+   bool *in_loop = calloc(MAX2(nr_blocks, 1u), sizeof(bool));
+   uint16_t *alu_uses = calloc(ctx->alloc, sizeof(uint16_t));
+   uint32_t *split_parent = malloc(ctx->alloc * sizeof(uint32_t));
+   uint8_t *split_offset = calloc(ctx->alloc, sizeof(uint8_t));
+   uint32_t *phi_init = malloc(ctx->alloc * sizeof(uint32_t));
+   struct g17p_coread_entry *table =
+      calloc(ctx->alloc, sizeof(struct g17p_coread_entry));
+   if (!in_loop || !alu_uses || !split_parent || !split_offset || !phi_init ||
+       !table) {
+      free(in_loop);
+      free(alu_uses);
+      free(split_parent);
+      free(split_offset);
+      free(phi_init);
+      free(table);
+      return NULL;
+   }
+
+   for (unsigned i = 0; i < ctx->alloc; ++i) {
+      split_parent[i] = UINT32_MAX;
+      phi_init[i] = UINT32_MAX;
+   }
+
+   bool any_loop = false;
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index) {
+            any_loop = true;
+            for (unsigned i = succ->index; i <= block->index && i < nr_blocks; ++i)
+               in_loop[i] = true;
+         }
+      }
+      if (block->loop_header) {
+         agx_foreach_phi_in_block(block, phi) {
+            if (phi->dest[0].type != AGX_INDEX_NORMAL || phi->dest[0].memory ||
+                classes[phi->dest[0].value] != RA_GPR)
+               continue;
+            unsigned pred_idx = 0;
+            agx_foreach_predecessor(block, pred) {
+               if ((*pred)->index < block->index && pred_idx < phi->nr_srcs) {
+                  agx_index s = phi->src[pred_idx];
+                  if (s.type == AGX_INDEX_NORMAL && !s.memory &&
+                      classes[s.value] == RA_GPR &&
+                      ncomps[s.value] == ncomps[phi->dest[0].value]) {
+                     phi_init[phi->dest[0].value] = s.value;
+                     break;
+                  }
+               }
+               pred_idx++;
+            }
+         }
+      }
+   }
+   if (has_loop_out)
+      *has_loop_out = any_loop;
+
+   /* Count ALU reads per SSA (re-read operands carry the highest conflict cost)
+    * and map SPLIT destinations back to their vector producer + half offset. */
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_SPLIT &&
+          I->src[0].type == AGX_INDEX_NORMAL && !I->src[0].memory &&
+          classes[I->src[0].value] == RA_GPR) {
+         unsigned width = agx_size_align_16(agx_split_width(I));
+         agx_foreach_ssa_dest(I, d) {
+            unsigned v = I->dest[d].value;
+            if (d * width < 16) {
+               split_parent[v] = I->src[0].value;
+               split_offset[v] = (uint8_t)(d * width);
+            }
+         }
+      }
+
+      if (!agx_is_alu(I))
+         continue;
+      agx_foreach_ssa_src(I, s) {
+         if (I->src[s].memory)
+            continue;
+         unsigned v = I->src[s].value;
+         if (alu_uses[v] < UINT16_MAX)
+            alu_uses[v]++;
+      }
+   }
+
+   agx_foreach_block(ctx, block) {
+      const bool block_in_loop = block->index < nr_blocks && in_loop[block->index];
+      const uint16_t base_w = block_in_loop ? 8u : 1u;
+      unsigned prev_dst = UINT32_MAX;
+      unsigned prev_acc = UINT32_MAX;
+
+      agx_foreach_instr_in_block(block, I) {
+         if (!agx_is_alu(I)) {
+            prev_dst = UINT32_MAX;
+            prev_acc = UINT32_MAX;
+            continue;
+         }
+
+         /* Avoid clustering consecutive independent 3-source ALU streams
+          * (e.g. ffma/imad accumulator chains) into the same mod-3 register
+          * bank, which serializes back-to-back bank ports on pipelined G17/M5
+          * hardware. Leave 1/2-source address/index ALU temps untouched so
+          * they do not scatter into vector-aligned slots. */
+         unsigned curr_dst = UINT32_MAX;
+         unsigned curr_acc = UINT32_MAX;
+         if (I->nr_srcs >= 3) {
+            if (I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+                !I->dest[0].memory && classes[I->dest[0].value] == RA_GPR &&
+                ncomps[I->dest[0].value] <= 2) {
+               curr_dst = I->dest[0].value;
+            }
+            if (I->src[2].type == AGX_INDEX_NORMAL && !I->src[2].memory &&
+                classes[I->src[2].value] == RA_GPR &&
+                ncomps[I->src[2].value] <= 2) {
+               curr_acc = I->src[2].value;
+            }
+         }
+         if (curr_dst != UINT32_MAX && prev_dst != UINT32_MAX &&
+             prev_dst != curr_dst) {
+            bool depends = false;
+            agx_foreach_ssa_src(I, s) {
+               if (I->src[s].value == prev_dst) {
+                  depends = true;
+                  break;
+               }
+            }
+            if (!depends) {
+               uint16_t aw = block_in_loop ? (base_w * 2u) : 2u;
+               g17p_coread_add_edge(table, prev_dst, curr_dst, 0, aw);
+               g17p_coread_add_edge(table, curr_dst, prev_dst, 0, aw);
+            }
+         }
+         if (block_in_loop && curr_acc != UINT32_MAX &&
+             prev_acc != UINT32_MAX && prev_acc != curr_acc) {
+            unsigned a = phi_init[prev_acc] != UINT32_MAX ? phi_init[prev_acc]
+                                                          : prev_acc;
+            unsigned b = phi_init[curr_acc] != UINT32_MAX ? phi_init[curr_acc]
+                                                          : curr_acc;
+            if (a != b) {
+               uint16_t aw = base_w * 2u;
+               g17p_coread_add_edge(table, a, b, 0, aw);
+               g17p_coread_add_edge(table, b, a, 0, aw);
+            }
+         }
+         if (I->nr_srcs >= 3) {
+            prev_dst = curr_dst;
+            prev_acc = curr_acc;
+         } else {
+            prev_dst = UINT32_MAX;
+            prev_acc = UINT32_MAX;
+         }
+
+         if (I->nr_srcs < 2)
+            continue;
+
+         unsigned gpr_srcs[6];
+         unsigned nr_srcs = 0;
+         agx_foreach_ssa_src(I, s) {
+            if (I->src[s].memory)
+               continue;
+            unsigned v = I->src[s].value;
+            if (classes[v] != RA_GPR || ncomps[v] > 2)
+               continue;
+            bool dup = false;
+            for (unsigned j = 0; j < nr_srcs; ++j) {
+               if (gpr_srcs[j] == v) {
+                  dup = true;
+                  break;
+               }
+            }
+            if (!dup && nr_srcs < ARRAY_SIZE(gpr_srcs))
+               gpr_srcs[nr_srcs++] = v;
+         }
+
+         for (unsigned i = 0; i < nr_srcs; ++i) {
+            for (unsigned j = i + 1; j < nr_srcs; ++j) {
+               unsigned a = gpr_srcs[i];
+               unsigned b = gpr_srcs[j];
+               uint16_t w = base_w;
+               if (alu_uses[a] >= 2 && alu_uses[b] >= 2)
+                  w = base_w * 4u;
+               else if (alu_uses[a] >= 2 || alu_uses[b] >= 2)
+                  w = base_w * 2u;
+
+               g17p_coread_add_edge(table, a, b, 0, w);
+               g17p_coread_add_edge(table, b, a, 0, w);
+
+               /* Propagate to vector producers of SPLIT lanes so multi-word
+                * loads (e.g. vec4 weights) choose non-conflicting alignments. */
+               if (split_parent[a] != UINT32_MAX)
+                  g17p_coread_add_edge(table, split_parent[a], b,
+                                       split_offset[a], w);
+               if (split_parent[b] != UINT32_MAX)
+                  g17p_coread_add_edge(table, split_parent[b], a,
+                                       split_offset[b], w);
+            }
+         }
+      }
+   }
+
+   free(in_loop);
+   free(alu_uses);
+   free(split_parent);
+   free(split_offset);
+   free(phi_init);
+   return table;
+}
+
+static uint32_t
+g17p_coread_bank_cost(const struct ra_ctx *rctx, unsigned ssa, unsigned cand)
+{
+   const struct g17p_coread_entry *e = &rctx->g17p_coread[ssa];
+   const unsigned bound = rctx->bound[RA_GPR];
+   uint32_t cost = 0;
+
+   for (unsigned i = 0; i < e->nr; ++i) {
+      unsigned p = e->partners[i];
+      if (!BITSET_TEST(rctx->visited, p))
+         continue;
+      unsigned p_reg = rctx->ssa_to_reg[p];
+      if (p_reg >= bound || !BITSET_TEST(rctx->used_regs[RA_GPR], p_reg) ||
+          rctx->reg_to_ssa[p_reg] != p)
+         continue;
+
+      unsigned my_r = (cand + e->offsets[i]) >> 1;
+      unsigned p_r = p_reg >> 1;
+      if (my_r != p_r && (my_r % 3u) == (p_r % 3u))
+         cost += e->weights[i];
+   }
+   return cost;
+}
+
+/*
+ * Tie-break free GPR candidates in [lo, limit) to minimize G17P mod-3 co-read
+ * register bank conflicts against already-live partners. Searches below the
+ * current high-water mark first (zero register growth); only if a conflict
+ * remains in a loop, checks at most two additional aligned slots strictly
+ * within the shader's Dynamic Caching occupancy tier.
+ */
+static bool
+g17p_align8_block_is_empty(const struct ra_ctx *rctx, unsigned reg)
+{
+   unsigned base = reg & ~7u;
+   if (base + 8u > rctx->bound[RA_GPR])
+      return false;
+   return !BITSET_TEST_COUNT(rctx->used_regs[RA_GPR], base, 8u);
+}
+
+static unsigned
+g17p_pick_bank_free_reg(const struct ra_ctx *rctx, unsigned ssa,
+                        unsigned count, unsigned align, unsigned lo,
+                        unsigned limit, unsigned first_reg,
+                        const BITSET_WORD *avoid_mask, bool avoid_loop_phis)
+{
+   const BITSET_WORD *phi_targets =
+      avoid_loop_phis ? rctx->loop_phi_targets : NULL;
+   const bool check_phi_targets =
+      phi_targets && BITSET_TEST_COUNT(phi_targets, first_reg, count);
+   const bool has_coread = rctx->g17p_coread && rctx->g17p_coread[ssa].nr > 0;
+   if (!has_coread && !check_phi_targets)
+      return first_reg;
+
+   uint32_t best_cost =
+      has_coread ? g17p_coread_bank_cost(rctx, ssa, first_reg) : 0;
+   bool best_hits_phi = check_phi_targets;
+   if (best_cost == 0 && !best_hits_phi)
+      return first_reg;
+
+   unsigned best_reg = first_reg;
+   bool best_splits_vec4 = count <= 4 && g17p_align8_block_is_empty(rctx, first_reg);
+   const unsigned start = ALIGN_POT(lo, align);
+   const unsigned hwm_limit = MIN2(limit, *rctx->count[RA_GPR]);
+
+   for (unsigned cand = start; cand + count <= hwm_limit; cand += align) {
+      if (cand == first_reg ||
+          BITSET_TEST_COUNT(rctx->used_regs[RA_GPR], cand, count) ||
+          (avoid_mask && BITSET_TEST_COUNT(avoid_mask, cand, count)))
+         continue;
+      uint32_t c = has_coread ? g17p_coread_bank_cost(rctx, ssa, cand) : 0;
+      bool hits_phi = phi_targets && BITSET_TEST_COUNT(phi_targets, cand, count);
+      bool splits_vec4 = count <= 4 && g17p_align8_block_is_empty(rctx, cand);
+      /* Never steal an enclosing loop-header phi target for a bank-conflict
+       * detour: breaking loop-phi coalescing inserts permanent mov1 copies on
+       * every loop iteration. */
+      if ((best_hits_phi && !hits_phi) ||
+          (hits_phi == best_hits_phi &&
+           (c < best_cost ||
+            (c == best_cost && best_splits_vec4 && !splits_vec4)))) {
+         best_cost = c;
+         best_reg = cand;
+         best_hits_phi = hits_phi;
+         best_splits_vec4 = splits_vec4;
+         if (best_cost == 0 && !best_hits_phi && !best_splits_vec4)
+            return best_reg;
+      }
+   }
+
+   if (best_cost == 0 && !best_hits_phi)
+      return best_reg;
+
+   /* In straight-line shaders with no loops, or for low-weight outside-loop
+    * conflicts, keep bank-free tie-breaking within the existing high-water
+    * mark above without growing the shader's GPR footprint. */
+   if (!rctx->g17p_has_loop || best_cost < 8u)
+      return best_reg;
+
+   /* Still conflicted in a hot loop: allow at most 2 extra aligned steps
+    * (up to 4 halves for scalars) strictly inside the Dynamic Caching
+    * headroom tier (96 or 128 halves). G17P Dynamic Caching has no hard
+    * 64-half occupancy cliff, so loop bank-conflict avoidance is free to use
+    * the 96-half tier without forcing artificial packing at 64 halves. */
+   const unsigned cur_hwm = MAX2(*rctx->count[RA_GPR], first_reg + count);
+   const unsigned dyn_tier_cap =
+      cur_hwm <= 96u  ? MIN2(96u, rctx->g17p_tier_cap) :
+      cur_hwm <= 128u ? MIN2(128u, rctx->g17p_tier_cap) :
+                        rctx->g17p_tier_cap;
+   const unsigned step_room = 2u * MAX2(align, 2u);
+   const unsigned tier_limit =
+      MIN2(limit, MIN2(dyn_tier_cap, cur_hwm + step_room));
+   /* First aligned candidate whose end crosses hwm_limit, so a slot straddling
+    * an unaligned high-water mark is not skipped between the two loops. */
+   const unsigned above_start =
+      MAX2(start, hwm_limit >= count ? ALIGN_POT(hwm_limit - count + 1u, align)
+                                     : start);
+   for (unsigned cand = above_start; cand + count <= tier_limit; cand += align) {
+      if (cand == first_reg ||
+          BITSET_TEST_COUNT(rctx->used_regs[RA_GPR], cand, count) ||
+          (avoid_mask && BITSET_TEST_COUNT(avoid_mask, cand, count)))
+         continue;
+      uint32_t c = has_coread ? g17p_coread_bank_cost(rctx, ssa, cand) : 0;
+      bool hits_phi = phi_targets && BITSET_TEST_COUNT(phi_targets, cand, count);
+      bool splits_vec4 = count <= 4 && g17p_align8_block_is_empty(rctx, cand);
+      if ((best_hits_phi && !hits_phi) ||
+          (hits_phi == best_hits_phi &&
+           (c < best_cost ||
+            (c == best_cost && best_splits_vec4 && !splits_vec4)))) {
+         best_cost = c;
+         best_reg = cand;
+         best_hits_phi = hits_phi;
+         best_splits_vec4 = splits_vec4;
+         if (best_cost == 0 && !best_hits_phi && !best_splits_vec4)
+            return best_reg;
+      }
+   }
+
+   return best_reg;
 }
 
 static unsigned
@@ -1180,11 +1729,14 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    unsigned minimum = dest_minimum(rctx, I, dest_idx);
    unsigned limit = dest_limit(rctx, I, dest_idx);
 
+   bool high_bank = false;
    bool simple = prefer_high_bank(rctx, I, dest_idx, cls, minimum, limit) &&
                  find_regs_simple(rctx, cls, count, align,
                                   G17P_LOW_BANK_HALVES,
                                   MIN2(*rctx->count[cls], limit), &reg);
-   if (!simple)
+   if (simple)
+      high_bank = true;
+   else
       simple = find_regs_simple(rctx, cls, count, align, minimum, limit, &reg);
    unsigned transient;
    if (pick_transient_texture_region(rctx, I, dest_idx, count,
@@ -1193,7 +1745,24 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
       return transient;
    }
    if (simple) {
+      if (cls == RA_GPR && (rctx->g17p_coread || rctx->loop_phi_targets)) {
+         const unsigned lo = high_bank ? G17P_LOW_BANK_HALVES : minimum;
+         const unsigned hi =
+            high_bank ? MIN2(*rctx->count[cls], limit) : limit;
+         reg = g17p_pick_bank_free_reg(rctx, I->dest[dest_idx].value, count,
+                                       align, lo, hi, reg, NULL,
+                                       I->op != AGX_OPCODE_PHI);
+      }
       return reg;
+   } else if (cls != RA_GPR) {
+      /* Spill slots cannot live-range split: fail closed instead of falling
+       * through into GPR eviction (which corrupts used_regs[RA_GPR] in
+       * NDEBUG builds). */
+      rctx->shader->ra_failed = true;
+      rctx->shader->ra_mem_exhausted = true;
+      if (rctx->shader->ra_abort)
+         longjmp(*(jmp_buf *)rctx->shader->ra_abort, 1);
+      return 0;
    } else {
       assert(!rctx->early_killed && "no live range splits with early kill");
       assert(cls == RA_GPR && "no memory live range splits");
@@ -1225,18 +1794,6 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    }
 }
 
-static uint32_t
-search_ssa_to_reg_out(struct ra_ctx *ctx, struct agx_block *blk,
-                      enum ra_class cls, unsigned ssa)
-{
-   for (unsigned reg = 0; reg < ctx->bound[cls]; ++reg) {
-      if (blk->reg_to_ssa_out[cls][reg] == ssa)
-         return reg;
-   }
-
-   UNREACHABLE("variable not defined in block");
-}
-
 /*
  * Loop over live-in values at the start of the block and mark their registers
  * as in-use. We process blocks in dominance order, so this handles everything
@@ -1255,15 +1812,56 @@ reserve_live_in(struct ra_ctx *rctx)
    if (nr_preds == 0)
       return;
 
+   if (nr_preds == 1) {
+      /* If we don't emit a phi, there is already a unique register. Scan the
+       * predecessor's register map once instead of searching it per live-in.
+       */
+      agx_block **pred = util_dynarray_begin(&rctx->block->predecessors);
+#ifndef NDEBUG
+      unsigned found = 0;
+#endif
+
+      for (unsigned cls = 0; cls < RA_CLASSES; ++cls) {
+         const uint32_t *out = (*pred)->reg_to_ssa_out[cls];
+         if (!out)
+            continue;
+
+         const unsigned bound = rctx->bound[cls];
+         for (unsigned reg = 0; reg < bound; ++reg) {
+            const uint32_t i = out[reg];
+            if (i == ~0u || !BITSET_TEST(rctx->visited, i) ||
+                !u_sparse_bitset_test(&rctx->block->live_in, i))
+               continue;
+
+            assert(rctx->classes[i] == cls);
+            set_ssa_to_reg(rctx, i, reg);
+            BITSET_SET_COUNT(rctx->used_regs[cls], reg, rctx->ncomps[i]);
+#ifndef NDEBUG
+            found++;
+#endif
+         }
+      }
+
+#ifndef NDEBUG
+      unsigned expected = 0;
+      U_SPARSE_BITSET_FOREACH_SET(&rctx->block->live_in, i) {
+         if (BITSET_TEST(rctx->visited, i))
+            expected++;
+      }
+      assert(found == expected && "variable not defined in block");
+#endif
+      return;
+   }
+
    agx_builder b =
       agx_init_builder(rctx->shader, agx_before_block(rctx->block));
+   struct list_head *first_old = rctx->block->instructions.next;
 
    U_SPARSE_BITSET_FOREACH_SET(&rctx->block->live_in, i) {
       /* Skip values defined in loops when processing the loop header */
       if (!BITSET_TEST(rctx->visited, i))
          continue;
 
-      unsigned base;
       enum ra_class cls = rctx->classes[i];
       enum agx_size size = rctx->sizes[i];
 
@@ -1276,58 +1874,86 @@ reserve_live_in(struct ra_ctx *rctx)
        * the end of each predecessor. Join them together with a phi inserted at
        * the start of the block.
        */
-      if (nr_preds > 1) {
-         /* We'll fill in the destination after, to coalesce one of the moves */
-         agx_instr *phi = agx_phi_to(&b, agx_null(), nr_preds);
+      /* We'll fill in the destination after, to coalesce one of the moves */
+      agx_instr *phi = agx_phi_to(&b, agx_null(), nr_preds);
+      agx_index src = agx_get_vec_index(i, size, channels);
+      src.memory = cls == RA_MEM;
 
-         agx_foreach_predecessor(rctx->block, pred) {
-            unsigned pred_idx = agx_predecessor_index(rctx->block, *pred);
+      for (unsigned pred_idx = 0; pred_idx < nr_preds; ++pred_idx)
+         phi->src[pred_idx] = src;
+   }
 
-            phi->src[pred_idx] = agx_get_vec_index(i, size, channels);
-            phi->src[pred_idx].memory = cls == RA_MEM;
+   if (rctx->block->instructions.next == first_old)
+      return;
 
-            if ((*pred)->reg_to_ssa_out[cls] == NULL) {
-               /* If this is a loop header, we don't know where the register
-                * will end up. So, we create a phi conservatively but don't fill
-                * it in until the end of the loop. Stash in the information
-                * we'll need to fill in the real register later.
-                */
-               assert(rctx->block->loop_header);
-            } else {
-               /* Otherwise, we can build the phi now */
-               phi->src[pred_idx].reg =
-                  search_ssa_to_reg_out(rctx, *pred, cls, i);
-               phi->src[pred_idx].has_reg = true;
-            }
-         }
+   /* Invert each already-allocated predecessor's reg_to_ssa_out once instead
+    * of scanning it for every live-in phi.
+    */
+   agx_foreach_predecessor(rctx->block, pred) {
+      unsigned pred_idx = agx_predecessor_index(rctx->block, *pred);
 
-         /* Pick the phi destination to coalesce a move. Predecessor ordering is
-          * stable, so this means all live-in values get their registers from a
-          * particular predecessor. That means that such a register allocation
-          * is valid here, because it was valid in the predecessor.
+      /* RA_GPR bound is always non-zero, so reg_to_ssa_out[RA_GPR] == NULL iff
+       * this predecessor has not been allocated yet (loop back-edge).
+       */
+      if ((*pred)->reg_to_ssa_out[RA_GPR] == NULL) {
+         /* If this is a loop header, we don't know where the register will end
+          * up. So, we create a phi conservatively but don't fill it in until
+          * the end of the loop. Stash in the information we'll need to fill in
+          * the real register later.
           */
-         assert(phi->src[0].has_reg && "not loop source");
-         phi->dest[0] = phi->src[0];
-         base = phi->dest[0].reg;
-      } else {
-         /* If we don't emit a phi, there is already a unique register */
-         assert(nr_preds == 1);
-
-         agx_block **pred = util_dynarray_begin(&rctx->block->predecessors);
-         /* TODO: Flip logic to eliminate the search */
-         base = search_ssa_to_reg_out(rctx, *pred, cls, i);
+         assert(rctx->block->loop_header);
+         continue;
       }
+
+      for (unsigned cls = 0; cls < RA_CLASSES; ++cls) {
+         const uint32_t *out = (*pred)->reg_to_ssa_out[cls];
+         if (!out)
+            continue;
+
+         const unsigned bound = rctx->bound[cls];
+         for (unsigned reg = 0; reg < bound; ++reg) {
+            const uint32_t ssa = out[reg];
+            if (ssa != ~0u)
+               rctx->pred_ssa_to_reg[ssa] = reg;
+         }
+      }
+
+      for (struct list_head *n = rctx->block->instructions.next; n != first_old;
+           n = n->next) {
+         agx_instr *phi = list_entry(n, agx_instr, link);
+         unsigned i = phi->src[pred_idx].value;
+         enum ra_class cls = rctx->classes[i];
+         unsigned reg = rctx->pred_ssa_to_reg[i];
+         assert((*pred)->reg_to_ssa_out[cls] != NULL &&
+                reg < rctx->bound[cls] &&
+                (*pred)->reg_to_ssa_out[cls][reg] == i &&
+                "variable not defined in block");
+         phi->src[pred_idx].reg = reg;
+         phi->src[pred_idx].has_reg = true;
+      }
+   }
+
+   /* Pick the phi destination to coalesce a move. Predecessor ordering is
+    * stable, so this means all live-in values get their registers from a
+    * particular predecessor. That means that such a register allocation
+    * is valid here, because it was valid in the predecessor.
+    */
+   for (struct list_head *n = rctx->block->instructions.next; n != first_old;
+        n = n->next) {
+      agx_instr *phi = list_entry(n, agx_instr, link);
+      assert(phi->src[0].has_reg && "not loop source");
+      phi->dest[0] = phi->src[0];
+      unsigned i = phi->dest[0].value;
+      unsigned base = phi->dest[0].reg;
+      enum ra_class cls = rctx->classes[i];
 
       set_ssa_to_reg(rctx, i, base);
-
-      for (unsigned j = 0; j < rctx->ncomps[i]; ++j) {
-         BITSET_SET(rctx->used_regs[cls], base + j);
-      }
+      BITSET_SET_COUNT(rctx->used_regs[cls], base, rctx->ncomps[i]);
    }
 }
 
 /* The first web of a matrix operand to get a register picks the run of
- * registers for all eight (see struct matrix_group).
+ * registers for all members (see struct matrix_group).
  */
 static void
 place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
@@ -1339,13 +1965,13 @@ place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
 
    const struct matrix_group *group =
       &rctx->matrix_groups[rctx->web_matrix_group[root] - 1];
-   const unsigned run = 8 * group->size;
+   const unsigned run = group->count * group->size;
    unsigned base;
 
    if (!find_regs_simple(rctx, RA_GPR, run, run, minimum, limit, &base))
       return;
 
-   for (unsigned k = 0; k < 8; ++k) {
+   for (unsigned k = 0; k < group->count; ++k) {
       struct phi_web_node *node = &rctx->phi_web[group->root[k]];
       if (!node->assigned) {
          node->reg = base + k * group->size;
@@ -1621,8 +2247,7 @@ static bool
 pick_phi_source_agreement(struct ra_ctx *rctx, agx_instr *I, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[0]);
@@ -1659,12 +2284,15 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                    unsigned count, unsigned align, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[d]);
-   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS) = {0};
+   if (rctx->bound[cls] == 0)
+      return false;
+
+   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS);
+   memset(claimed, 0, BITSET_WORDS(rctx->bound[cls]) * sizeof(BITSET_WORD));
    bool any = false;
 
    agx_foreach_phi_in_block(rctx->block, other) {
@@ -1684,10 +2312,17 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
    if (!any)
       return false;
 
-   for (unsigned reg = ALIGN_POT(dest_minimum(rctx, I, d), align);
-        reg + count <= dest_limit(rctx, I, d); reg += align) {
+   const unsigned minimum = dest_minimum(rctx, I, d);
+   const unsigned limit = dest_limit(rctx, I, d);
+   for (unsigned reg = ALIGN_POT(minimum, align);
+        reg + count <= limit; reg += align) {
       if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count) &&
           !BITSET_TEST_COUNT(claimed, reg, count)) {
+         if (cls == RA_GPR && rctx->g17p_coread) {
+            reg = g17p_pick_bank_free_reg(rctx, I->dest[d].value, count,
+                                          align, minimum, limit, reg, claimed,
+                                          false);
+         }
          *out = reg;
          return true;
       }
@@ -1750,9 +2385,24 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
                          dest_limit(rctx, I, d));
    }
 
+   /* For a loop-header phi back-edge source or intermediate RMW chain node,
+    * stay in the loop-header phi's actual assigned register whenever it is
+    * free so loop-carried values coalesce cleanly across the back edge
+    * without permutation copies (even when the pre-header source remains live
+    * across the loop so phi_web[root].reg points elsewhere). */
+   if (cls == RA_GPR && rctx->rmw_phi && rctx->rmw_phi[idx.value]) {
+      const agx_instr *hdr_phi = rctx->rmw_phi[idx.value];
+      if (hdr_phi->dest[0].has_reg) {
+         unsigned reg = hdr_phi->dest[0].reg;
+         if ((reg % align) == 0 && reg + count <= rctx->bound[cls] &&
+             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
+            return reg;
+      }
+   }
+
    if (rctx->phi_web[phi_idx].assigned) {
       unsigned reg = rctx->phi_web[phi_idx].reg;
-      if ((reg % align) == 0 && reg + align < rctx->bound[cls] &&
+      if ((reg % align) == 0 && reg + align <= rctx->bound[cls] &&
           !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align))
          return reg;
    }
@@ -1764,6 +2414,19 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
       unsigned out;
       if (try_coalesce_with(rctx, I->src[0], count, false, &out))
+         return out;
+   }
+
+   /* Accumulate matmad8_agx3 in place when its accumulator source (src[2]) is
+    * dead after this instruction (early-killed above), avoiding register
+    * fragmentation and loop back-edge parallel copies on unrolled K-slices. */
+   if (I->op == AGX_OPCODE_MATMAD8_AGX3 && d == 0 &&
+       I->src[2].type == AGX_INDEX_NORMAL &&
+       I->src[2].memory == idx.memory &&
+       I->src[2].size == idx.size &&
+       rctx->ncomps[I->src[2].value] == count) {
+      unsigned out;
+      if (try_coalesce_with(rctx, I->src[2], count, false, &out))
          return out;
    }
 
@@ -1876,6 +2539,33 @@ kill_source(struct ra_ctx *rctx, const agx_instr *I, unsigned s)
    assert(count >= 1);
 
    BITSET_CLEAR_COUNT(rctx->used_regs[cls], reg, count);
+
+   if (cls == RA_GPR) {
+      unsigned reserved = reserved_size(rctx->shader);
+      for (unsigned k = 0; k < count; ++k)
+         rctx->reg_to_ssa[reg + k] = UINT32_MAX;
+      if (reg < reserved) {
+         BITSET_SET_COUNT(rctx->used_regs[RA_GPR], reg,
+                          MIN2(count, reserved - reg));
+      }
+   }
+}
+
+/* Apple G13/G14 simd_matrix_fmadd reads A and B after partial writes to D, or
+ * zeroes D when D aliases A or B; D == C is allowed, so keep A and B live
+ * until D is placed. */
+static bool
+early_killable(const agx_instr *I, unsigned s)
+{
+   if (!I->src[s].kill || I->src[s].memory)
+      return false;
+
+   if ((I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+        I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16) &&
+       s < 2)
+      return false;
+
+   return true;
 }
 
 static void
@@ -1895,11 +2585,11 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
        dest_end > dest_limit(rctx, I, 0) ||
        (rctx->ssa_to_reg[I->src[first_source].value] & (dest_size - 1)) ||
        ((region_end < dest_end) &&
-        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end)))
+        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end - 1)))
       return;
 
    for (unsigned s = first_source; s <= last_source; ++s) {
-      if (I->src[s].kill && !I->src[s].memory) {
+      if (early_killable(I, s)) {
          kill_source(rctx, I, s);
          rctx->early_killed = true;
          I->src[s].kill = false;
@@ -2284,13 +2974,25 @@ static void
 agx_ra_assign_local(struct ra_ctx *rctx)
 {
    BITSET_DECLARE(used_regs_gpr, AGX_NUM_REGS) = {0};
-   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS) = {0};
-   uint16_t *ssa_to_reg = calloc(rctx->shader->alloc, sizeof(uint16_t));
+   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS);
+   BITSET_DECLARE(loop_phi_targets, AGX_NUM_REGS) = {0};
+   if (rctx->bound[RA_MEM] > 0) {
+      memset(used_regs_mem, 0,
+             BITSET_WORDS(rctx->bound[RA_MEM]) * sizeof(BITSET_WORD));
+   }
+   uint16_t *ssa_to_reg = rctx->ssa_to_reg;
 
    agx_block *block = rctx->block;
+   if (block != agx_start_block(rctx->shader))
+      memset(ssa_to_reg, 0, rctx->shader->alloc * sizeof(uint16_t));
    rctx->used_regs[RA_GPR] = used_regs_gpr;
    rctx->used_regs[RA_MEM] = used_regs_mem;
-   rctx->ssa_to_reg = ssa_to_reg;
+   bool recorded_header_phis = false;
+   if (rctx->loop_phi_targets) {
+      memcpy(loop_phi_targets, rctx->loop_phi_targets, sizeof(loop_phi_targets));
+      rctx->loop_phi_targets = loop_phi_targets;
+   }
+   memset(rctx->reg_to_ssa, 0xFF, sizeof(rctx->reg_to_ssa));
 
    reserve_live_in(rctx);
 
@@ -2359,6 +3061,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          assert(ra_class_for_index(I->src[0]) == RA_GPR);
          unsigned reg = ssa_to_reg[I->src[0].value];
          unsigned width = agx_size_align_16(agx_split_width(I));
+         for (unsigned k = 0; k < rctx->ncomps[I->src[0].value]; ++k)
+            rctx->reg_to_ssa[reg + k] = UINT32_MAX;
 
          agx_foreach_dest(I, d) {
             assert(ra_class_for_index(I->dest[0]) == RA_GPR);
@@ -2383,13 +3087,17 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          assert(I->dest[0].size == I->src[0].size);
          assert(I->src[0].type == AGX_INDEX_REGISTER);
 
-         /* r1l specifically is a preloaded register. It is reserved during
-          * demand calculations to ensure we don't need live range shuffling of
-          * spilling temporaries. But we can still preload to it. So if it's
-          * reserved, just free it. It'll be fine.
+         /* Preloaded registers may fall inside the shader-wide reserved prefix
+          * (such as r1l during spilling or r4..r7 before CEM eviction moves
+          * them out of the low scratch bank). Clear the reserved bits so the
+          * preload can occupy its fixed ABI register until killed.
           */
-         if (I->src[0].value == 2) {
-            BITSET_CLEAR(rctx->used_regs[RA_GPR], 2);
+         unsigned preload_reg = I->src[0].value;
+         unsigned preload_nr = agx_index_size_16(I->src[0]);
+         unsigned reserved = reserved_size(rctx->shader);
+         if (preload_reg < reserved) {
+            BITSET_CLEAR_COUNT(rctx->used_regs[RA_GPR], preload_reg,
+                               MIN2(preload_nr, reserved - preload_reg));
          }
 
          assign_regs(rctx, I->dest[0], I->src[0].value);
@@ -2435,8 +3143,10 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          }
          for (unsigned n = 0; n < nr_released; ++n) {
             unsigned src = released[n];
-            BITSET_SET_COUNT(used_regs_gpr, ssa_to_reg[I->src[src].value],
-                             rctx->ncomps[I->src[src].value]);
+            unsigned v = I->src[src].value;
+            unsigned base = ssa_to_reg[v];
+            BITSET_SET_COUNT(used_regs_gpr, base, rctx->ncomps[v]);
+            rctx->reg_to_ssa[base] = v;
          }
       }
 
@@ -2485,6 +3195,32 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          agx_set_sources(rctx, I);
          agx_set_dests(rctx, I);
          continue;
+      }
+
+      /* Accumulate matmad8_agx3 in place when its accumulator source (src[2])
+       * dies here and matches the destination width and bounds. Handling this
+       * directly ensures a dead accumulator is always reused instead of
+       * drifting into a lower free hole or failing early-kill next to a
+       * narrower f16 A/B source. */
+      if (I->op == AGX_OPCODE_MATMAD8_AGX3 && I->nr_dests == 1 &&
+          !agx_is_null(I->dest[0]) && !I->dest[0].memory && I->nr_srcs == 3 &&
+          I->src[2].type == AGX_INDEX_NORMAL && !I->src[2].memory &&
+          I->src[2].kill && I->src[2].size == I->dest[0].size &&
+          rctx->ncomps[I->src[2].value] == rctx->ncomps[I->dest[0].value]) {
+         const unsigned count = rctx->ncomps[I->dest[0].value];
+         const unsigned reg = ssa_to_reg[I->src[2].value];
+         if ((reg % count) == 0 && reg >= dest_minimum(rctx, I, 0) &&
+             reg + count <= dest_limit(rctx, I, 0)) {
+            kill_source(rctx, I, 2);
+            assign_regs(rctx, I->dest[0], reg);
+            for (unsigned s = 0; s < 2; ++s) {
+               if (I->src[s].type == AGX_INDEX_NORMAL && I->src[s].kill)
+                  kill_source(rctx, I, s);
+            }
+            agx_set_sources(rctx, I);
+            agx_set_dests(rctx, I);
+            continue;
+         }
       }
 
       /* Search for regions of contiguous killed sources to early-kill. */
@@ -2536,7 +3272,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
-      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) &&
+      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) && !I->dest[0].memory &&
           !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
@@ -2544,7 +3280,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          unsigned start = 0;
 
          agx_foreach_ssa_src(I, s) {
-            if (I->src[s].kill && !I->src[s].memory) {
+            if (early_killable(I, s)) {
                unsigned reg = rctx->ssa_to_reg[I->src[s].value];
 
                if (start == end || end != reg) {
@@ -2563,6 +3299,27 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       /* Next, assign destinations one at a time. This is always legal
        * because of the SSA form.
        */
+      if (I->op != AGX_OPCODE_PHI && block->loop_header &&
+          rctx->g17p_coread && !recorded_header_phis) {
+         recorded_header_phis = true;
+         bool any_phi_target = false;
+         agx_foreach_phi_in_block(block, phi) {
+            if (phi->dest[0].type == AGX_INDEX_NORMAL && !phi->dest[0].memory &&
+                phi->dest[0].has_reg) {
+               unsigned reg = phi->dest[0].reg;
+               unsigned nr = rctx->ncomps[phi->dest[0].value];
+               if (reg + nr <= AGX_NUM_REGS) {
+                  BITSET_SET_COUNT(loop_phi_targets, reg, nr);
+                  if (rctx->loop_header_phi_out)
+                     BITSET_SET_COUNT(rctx->loop_header_phi_out, reg, nr);
+                  any_phi_target = true;
+               }
+            }
+         }
+         if (any_phi_target)
+            rctx->loop_phi_targets = loop_phi_targets;
+      }
+
       agx_foreach_ssa_dest(I, d) {
          if (I->op == AGX_OPCODE_PHI && I->dest[d].has_reg)
             continue;
@@ -2577,9 +3334,13 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       if (I->op == AGX_OPCODE_ENTER_QUERY_M5 && I->nr_dests == 1 &&
           !BITSET_TEST(rctx->dest_read, I->dest[0].value)) {
          enum ra_class cls = ra_class_for_index(I->dest[0]);
-         BITSET_CLEAR_COUNT(rctx->used_regs[cls],
-                            rctx->ssa_to_reg[I->dest[0].value],
-                            rctx->ncomps[I->dest[0].value]);
+         unsigned reg = rctx->ssa_to_reg[I->dest[0].value];
+         unsigned nr = rctx->ncomps[I->dest[0].value];
+         BITSET_CLEAR_COUNT(rctx->used_regs[cls], reg, nr);
+         if (cls == RA_GPR) {
+            for (unsigned k = 0; k < nr; ++k)
+               rctx->reg_to_ssa[reg + k] = UINT32_MAX;
+         }
       }
 
       /* Free late-killed sources */
@@ -2597,6 +3358,11 @@ agx_ra_assign_local(struct ra_ctx *rctx)
    }
 
    for (unsigned i = 0; i < RA_CLASSES; ++i) {
+      if (rctx->bound[i] == 0) {
+         block->reg_to_ssa_out[i] = NULL;
+         continue;
+      }
+
       block->reg_to_ssa_out[i] =
          malloc(rctx->bound[i] * sizeof(*block->reg_to_ssa_out[i]));
 
@@ -2607,6 +3373,20 @@ agx_ra_assign_local(struct ra_ctx *rctx)
 
    U_SPARSE_BITSET_FOREACH_SET(&block->live_out, i) {
       block->reg_to_ssa_out[rctx->classes[i]][rctx->ssa_to_reg[i]] = i;
+   }
+
+   /* Also record phi targets if a loop header contained only phis. */
+   if (block->loop_header && rctx->g17p_coread && !recorded_header_phis &&
+       rctx->loop_header_phi_out) {
+      agx_foreach_phi_in_block(block, phi) {
+         if (phi->dest[0].type == AGX_INDEX_NORMAL && !phi->dest[0].memory &&
+             phi->dest[0].has_reg) {
+            unsigned reg = phi->dest[0].reg;
+            unsigned nr = rctx->ncomps[phi->dest[0].value];
+            if (reg + nr <= AGX_NUM_REGS)
+               BITSET_SET_COUNT(rctx->loop_header_phi_out, reg, nr);
+         }
+      }
    }
 
    /* Also set the sources for the phis in our successors, since that logically
@@ -2625,8 +3405,6 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          }
       }
    }
-
-   free(rctx->ssa_to_reg);
 }
 
 /*
@@ -2873,8 +3651,9 @@ agx3_tile_store_bank(agx_context *ctx)
     * So size the bank by what the stores actually need, prefix included, and
     * widen to the same halves 0..63 the plain MRT bank below already uses past
     * four targets rather than inventing a third bank. */
-   if (ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
-       list_length(&ctx->blocks) > 1) {
+   if ((ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
+        list_length(&ctx->blocks) > 1) ||
+       ctx->agx3_local_read_tile_ops) {
       const unsigned prefix = ALIGN_POT(reserved_size(ctx), payload_align);
       return prefix + payload_halves > 32 ? 64 : 32;
    }
@@ -2930,8 +3709,9 @@ agx3_cube_register_budget(agx_context *ctx)
       const bool own_scratch = !I->agx3_cube_scalar_coords && I->nr_srcs == 7;
       budget = MIN2(budget,
                     ((I->dim == AGX_DIM_CUBE_ARRAY && !own_scratch) || bias_min)
-                       ? 112 : own_scratch ? AGX3B_NUM_REGS - 16
-                                           : AGX3B_NUM_REGS - 8);
+                       ? AGX3B_CUBE_ARRAY_MAX_REGS
+                       : own_scratch ? AGX3B_NUM_REGS - 16
+                                     : AGX3B_CUBE_MAX_REGS);
       shared_cem |= !own_scratch;
       packed_layer |= own_scratch && I->src[1].type != AGX_INDEX_IMMEDIATE &&
                       (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
@@ -3017,106 +3797,15 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
-static void
-agx_ra_impl(agx_context *ctx, bool disable_remat)
+/* Physical allocation limits shared with the ILP scheduler. */
+unsigned
+agx3_register_budget(agx_context *ctx)
 {
-   ctx->uniforms_written = agx_has_uniform_store(ctx);
-   agx_lower_agx3b_atomic_returns(ctx);
-
-   /* CEM has narrower destination fields than the M5 general register file.
-    * Own its four words (magnitude/face and two coordinates) in the low bank,
-    * reusing an axis word for packed array/LOD after the finalizers.
-    * Do not cap unrelated live values at 192:
-    * they remain eligible for all 252 usable halves. The bank starts beyond
-    * the eight halves used by CF, shuffle and spill parallel-copy lowering.
-    * Register allocation and the rematerializing spiller both reserve it. */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      agx_foreach_instr_global(ctx, I) {
-         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
-             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY))
-            ctx->agx3_cem_low_scratch = true;
-      }
-   }
-
-   bool force_spilling =
-      (agx_compiler_debug & AGX_DBG_SPILL) && ctx->key->has_scratch;
-
-   /* Determine maximum possible registers. We won't exceed this! */
-   unsigned max_possible_regs = AGX_NUM_REGS;
-
-   /* Compute shaders need to have their entire workgroup together, so our
-    * register usage is bounded by the workgroup size.
-    */
-   if (mesa_shader_stage_is_compute(ctx->stage)) {
-      unsigned threads_per_workgroup;
-
-      /* If we don't know the workgroup size, worst case it. TODO: Optimize
-       * this, since it'll decimate opencl perf.
-       */
-      if (ctx->nir->info.workgroup_size_variable) {
-         threads_per_workgroup = 1024;
-      } else {
-         threads_per_workgroup = ctx->nir->info.workgroup_size[0] *
-                                 ctx->nir->info.workgroup_size[1] *
-                                 ctx->nir->info.workgroup_size[2];
-      }
-
-      max_possible_regs =
-         agx_max_registers_for_occupancy(threads_per_workgroup);
-   }
-
-   /* G17P's register file is 192 halves. Halves 192..255 still fit its
-    * 8-bit register fields but are not general registers: a copy into half
-    * 204 crashed the GPU co-processor. applegpu_g17p holding 60 live float4
-    * or uint4 temporaries never names a register above half 191 and spills
-    * the rest to thread-private storage, so bound the file there and spill
-    * the same way.
-    */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
-      max_possible_regs = MIN2(max_possible_regs, AGX3B_NUM_REGS);
-
-   /* G18G's eight-bit operand fields also encode r126/r127, but those names
-    * do not behave as ordinary data registers. Physical scalar readbacks
-    * from r124/r125 succeed while stores from r126/r127 leave their output
-    * untouched; a vec4 spanning them loses the entire store. Native G18G
-    * pressure kernels reach r125 and spill the remaining live values.
-    * Keep the unavailable halves out of allocation, including spill temps.
-    * G18G uses the G17G allocator before the final AGX3D transcode.
-    */
-   if (ctx->key->dev.emit_agx3d) {
-      /* Round before deciding whether to spill. Rounding only at assignment
-       * could leave demand above the aligned file after the spill pass. */
-      max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3D_NUM_REGS,
-                                             ra_file_alignment(ctx)));
-   }
-
-   /* Native G17G pressure shaders spill at 126 dwords. Direct M5 tests of
-    * IADD/EXTR followed by STDEV agree: pair 250 works, pair 252 does not.
-    * Align the usable file before spilling as live-range splitting requires
-    * whole vector slots; rounding only at final assignment is too late.
-    */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3C_NUM_REGS,
-                                             ra_file_alignment(ctx)));
-   }
-
-   /* Large native-query kernels benefit from leaving registers available for
-    * more resident work, even when this introduces ordinary scratch spills.
-    * Ordinary compute, helpers, preambles and AGX3B retain their existing
-    * budgets.
-    */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
-       !ctx->key->is_helper && ctx->out->uses_ray_traversal) {
-      max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
-   }
-
-   /* Match the CEM scratch extent reserved by agx3_pack_binary. */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
-      max_possible_regs = MIN2(max_possible_regs,
-                               agx3_cube_register_budget(ctx));
+   const bool narrow_file = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   unsigned budget = narrow_file
+      ? agx3_cube_register_budget(ctx)
+      : ROUND_DOWN_TO(ctx->key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS,
+                      ra_file_alignment(ctx));
 
    /* A multisample-array read packs its normalized layer beside another
     * operand, and the packer reserves one transient word for it immediately
@@ -3140,10 +3829,217 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          if ((I->op == AGX_OPCODE_TEXTURE_LOAD ||
               I->op == AGX_OPCODE_IMAGE_LOAD) &&
              I->dim == AGX_DIM_2D_MS_ARRAY) {
-            max_possible_regs = MIN2(max_possible_regs, 184);
+            budget = MIN2(budget, 184);
             break;
          }
       }
+   }
+
+   return budget;
+}
+
+/* The registers assignment uses for a program with the given demand: as many
+ * as it can without affecting occupancy, which reduces live range splitting.
+ */
+static unsigned
+assignment_file(const agx_context *ctx, unsigned demand, unsigned alignment,
+                unsigned max_possible_regs, bool force_spilling)
+{
+   unsigned regs =
+      agx_occupancy_for_register_count(ALIGN_POT(demand, alignment))
+         .max_registers;
+   if (ctx->key->is_helper || force_spilling)
+      regs = max_possible_regs;
+
+   /* Occupancy rounding must not reach past a smaller register file. */
+   return ROUND_DOWN_TO(MIN2(regs, max_possible_regs), alignment);
+}
+
+/* AGX2 declares a register count with every program, and the hardware splits
+ * its register file statically: how many threads fit follows from that count
+ * (agx_occupancy_for_register_count). The AGX3B and AGX3C encodings declare no
+ * register count, in the program or its launch; their on-chip storage is
+ * allocated as threads use it. Spending registers there costs no fixed
+ * occupancy step, so the budget is the register file alone. AGX3D programs
+ * declare their register count per dispatch again (registers_16 in the G18
+ * dispatch and render resources) and keep the split.
+ */
+static bool
+agx_has_static_register_split(const agx_context *ctx)
+{
+   return !agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->key->dev.emit_agx3d;
+}
+
+static unsigned
+agx_ra_mem_bound(agx_context *ctx)
+{
+   /* AGX2 keeps the original 2048-half (4 KiB) spill-slot bound so
+    * agx_scratch memory sizing stays unchanged. */
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
+      return AGX2_MAX_SPILL_SLOTS;
+
+   unsigned avail_B = ctx->key->max_scratch_B ? ctx->key->max_scratch_B
+                                              : AGX3_G17P_MAX_SPILL_B;
+
+   /* Reserve the 16-byte AGX3B atomic-return scratch word placed directly
+    * above align(scratch_size_B, 4) in agx_compile_function_nir(). */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+      bool has_atomic_return = false;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_ATOMIC && I->nr_dests == 1 &&
+             !agx_is_null(I->dest[0])) {
+            has_atomic_return = true;
+            break;
+         }
+      }
+      if (has_atomic_return)
+         avail_B = avail_B > 16 ? ((avail_B - 16) & ~3u) : 0;
+   }
+
+   /* Account for post-RA TPS frame alignment so RA cannot allocate a spill
+    * frame whose aligned published size exceeds the target limit. */
+   if (agx_is_g18g(&ctx->key->dev))
+      avail_B &= ~15u;
+   else
+      avail_B &= ~3u;
+
+   if (ctx->spill_base_B >= avail_B)
+      return 0;
+
+   return MIN2((avail_B - ctx->spill_base_B) / 2,
+               (unsigned)AGX_NUM_MODELED_REGS);
+}
+
+/* The register demand loop-invariant motion may raise a fitting program to
+ * (agx_opt_licm()). With a static register split that is the demand itself,
+ * so the occupancy step holds. Without one (AGX3B/AGX3C) there is no step to
+ * protect, but assignment still sizes its file from the demand rounded up to
+ * the file alignment, and that must fit max_possible_regs. A hoist may use
+ * only the halves below the next alignment boundary, which the file reserves
+ * anyway, so the aligned demand that assignment and the checks after it were
+ * sized for stays the same. A flat headroom past the boundary changed it and
+ * miscompiled programs near the top of the AGX3C file.
+ */
+unsigned
+agx_licm_demand_bound(agx_context *ctx, unsigned demand,
+                      unsigned max_possible_regs)
+{
+   if (agx_has_static_register_split(ctx))
+      return demand;
+
+   return MIN2(max_possible_regs, ALIGN_POT(demand, ra_file_alignment(ctx)));
+}
+
+void
+agx_ra(agx_context *ctx)
+{
+   ctx->uniforms_written = agx_has_uniform_store(ctx);
+   agx_lower_agx3b_atomic_returns(ctx);
+
+   /* CEM has narrower destination fields than the M5 general register file.
+    * Own its four words (magnitude/face and two coordinates) in the low bank,
+    * reusing an axis word for packed array/LOD after the finalizers.
+    * Do not cap unrelated live values at 192:
+    * they remain eligible for all 252 usable halves. The bank starts beyond
+    * the eight halves used by CF, shuffle and spill parallel-copy lowering.
+    * Register allocation and the rematerializing spiller both reserve it. */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY)) {
+            ctx->agx3_cem_low_scratch = true;
+            break;
+         }
+      }
+   }
+
+   /* Linked shaders may preload ABI inputs into the AGX3C low CEM scratch
+    * bank. Evict those preloads out of the bank at shader entry so cube
+    * sampling cannot clobber live ABI values. */
+   if (ctx->agx3_cem_low_scratch) {
+      agx_block *entry = agx_start_block(ctx);
+      agx_instr *last_preload = NULL;
+      bool saw_non_preload = false;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_PRELOAD) {
+            assert(!saw_non_preload && "PRELOAD must precede non-PRELOAD ops");
+            last_preload = I;
+         } else {
+            saw_non_preload = true;
+         }
+      }
+      if (last_preload) {
+         agx_builder b = agx_init_builder(ctx, agx_after_instr(last_preload));
+         agx_foreach_instr_in_block(entry, I) {
+            if (I->op != AGX_OPCODE_PRELOAD)
+               break;
+            unsigned reg = I->src[0].value;
+            unsigned nr = agx_index_size_16(I->src[0]);
+            if (reg >= AGX3C_CEM_LOW_SCRATCH_END ||
+                reg + nr <= AGX3C_CEM_LOW_SCRATCH_BASE)
+               continue;
+            agx_index orig = I->dest[0];
+            agx_index tmp = agx_vec_temp(ctx, orig.size, agx_channels(orig));
+            I->dest[0] = tmp;
+            if (agx_channels(orig) == 1) {
+               agx_mov_to(&b, orig, tmp);
+            } else {
+               unsigned comps = agx_channels(orig);
+               agx_instr *split = agx_split(&b, comps, tmp);
+               agx_instr *collect = agx_collect_to(&b, orig, comps);
+               for (unsigned c = 0; c < comps; ++c) {
+                  agx_index elem = agx_temp(ctx, orig.size);
+                  split->dest[c] = elem;
+                  collect->src[c] = elem;
+               }
+            }
+         }
+      }
+   }
+
+   bool force_spilling =
+      (agx_compiler_debug & AGX_DBG_SPILL) && ctx->key->has_scratch;
+
+   /* Determine maximum possible registers. We won't exceed this! */
+   unsigned max_possible_regs = AGX_NUM_REGS;
+
+   /* Compute shaders need to have their entire workgroup together, so with a
+    * static register split our register usage is bounded by the workgroup
+    * size. Without one, a 1024-thread workgroup using the whole file runs
+    * correctly, with its barriers, and faster than one spilling to fit an
+    * occupancy step.
+    */
+   if (mesa_shader_stage_is_compute(ctx->stage) &&
+       agx_has_static_register_split(ctx)) {
+      unsigned threads_per_workgroup;
+
+      /* If we don't know the workgroup size, worst case it. TODO: Optimize
+       * this, since it'll decimate opencl perf.
+       */
+      if (ctx->nir->info.workgroup_size_variable) {
+         threads_per_workgroup = 1024;
+      } else {
+         threads_per_workgroup = ctx->nir->info.workgroup_size[0] *
+                                 ctx->nir->info.workgroup_size[1] *
+                                 ctx->nir->info.workgroup_size[2];
+      }
+
+      max_possible_regs =
+         agx_max_registers_for_occupancy(threads_per_workgroup);
+   }
+
+   if (agx_isa_is_agx3(ctx->key->dev.encoding))
+      max_possible_regs = MIN2(max_possible_regs, agx3_register_budget(ctx));
+
+   /* Large native-query kernels benefit from leaving registers available for
+    * more resident work, even when this introduces ordinary scratch spills.
+    * Ordinary compute, helpers, preambles and AGX3B retain their existing
+    * budgets.
+    */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+       !ctx->key->is_helper && ctx->out->uses_ray_traversal) {
+      max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
    if (force_spilling) {
@@ -3197,13 +4093,29 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    agx_compute_liveness(ctx);
    unsigned effective_demand = agx_calc_register_demand(ctx, false);
    bool spilling = (effective_demand > max_possible_regs);
+
+   /* A program that fits can keep loop-invariant operands out of its loops,
+    * as long as its demand, and so every decision below, stays the same and
+    * the registers assignment will use keep room for each loop's values
+    * (agx_licm_demand_bound()). */
+   const unsigned licm_demand =
+      agx_licm_demand_bound(ctx, effective_demand, max_possible_regs);
+   if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
+       agx_opt_licm(ctx, licm_demand,
+                    assignment_file(ctx, licm_demand,
+                                    ra_file_alignment(ctx), max_possible_regs,
+                                    force_spilling)))
+      effective_demand = agx_calc_register_demand(ctx, false);
+
    bool remat = false;
    const unsigned full_budget = max_possible_regs;
 
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
+    * Without a static register split there is no wave to save.
     */
-   if (!disable_remat && effective_demand > agx_round_registers(1) && !spilling) {
+   if (agx_has_static_register_split(ctx) &&
+       effective_demand > agx_round_registers(1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
@@ -3238,52 +4150,48 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    const bool ssa_renumbered = spilling || remat;
    if (spilling || remat) {
-      assert((remat || ctx->key->has_scratch) &&
-             "internal shaders are unspillable");
+      if (!remat && !ctx->key->has_scratch) {
+         ctx->ra_failed = true;
+         return;
+      }
 
       agx_spill(ctx, max_possible_regs, remat);
+      if (ctx->ra_failed)
+         return;
 
-      if (agx_is_g18g(&ctx->key->dev)) {
-         /* Rematerialization changes instruction lifetimes. Measure the
-          * actual result before deciding whether the optional wave-saving
-          * budget held.
+      /* Rematerialization changes instruction lifetimes. Measure the actual
+       * result before deciding whether the optional wave-saving budget held.
+       */
+      agx_compute_liveness(ctx);
+      effective_demand = agx_calc_register_demand(ctx, false);
+
+      if (remat && (ctx->remat_fallback_spilled ||
+                    effective_demand > max_possible_regs)) {
+         /* The reduced budget is only an occupancy optimization. The
+          * remat-only pass keeps every value it cannot rematerialize in a
+          * register (agx_spill.c keep_in_registers()), so it can miss that
+          * estimate but never adds scratch traffic, and its result is no
+          * larger than the original program, which fit the full budget.
+          * Retain the rematerialized program and allocate it under the
+          * original hardware budget. This used to recompile fragment
+          * preambles without rematerialization once the remat-only pass had
+          * spilled to scratch.
           */
-         agx_compute_liveness(ctx);
-         effective_demand = agx_calc_register_demand(ctx, false);
-
-         if (remat && (ctx->remat_fallback_spilled ||
-                       effective_demand > max_possible_regs)) {
-            /* The reduced budget is only an occupancy optimization.
-             * Constants reintroduced at their uses can exceed that estimate
-             * even without a scratch spill. Retain the rematerialized
-             * program and allocate under the original hardware budget,
-             * spilling only if needed.
-             */
-            max_possible_regs = full_budget;
-            remat = false;
-            spilling = ctx->remat_fallback_spilled ||
-                       effective_demand > max_possible_regs;
-            if (effective_demand > max_possible_regs) {
-               agx_spill(ctx, max_possible_regs, false);
-               agx_compute_liveness(ctx);
-               effective_demand = agx_calc_register_demand(ctx, false);
+         max_possible_regs = full_budget;
+         remat = false;
+         spilling = ctx->remat_fallback_spilled ||
+                    effective_demand > max_possible_regs;
+         if (effective_demand > max_possible_regs) {
+            if (!ctx->key->has_scratch) {
+               ctx->ra_failed = true;
+               return;
             }
-         }
-      } else {
-         if (remat && ctx->remat_fallback_spilled) {
-            /* The wave-saving remat-only pass could not meet its estimated
-             * budget and spilled to scratch; finish under the full budget. */
-            max_possible_regs = full_budget;
-            remat = false;
-            spilling = true;
+            agx_spill(ctx, max_possible_regs, false);
+            if (ctx->ra_failed)
+               return;
             agx_compute_liveness(ctx);
-            if (agx_calc_register_demand(ctx, false) > max_possible_regs)
-               agx_spill(ctx, max_possible_regs, false);
+            effective_demand = agx_calc_register_demand(ctx, false);
          }
-
-         /* After spilling, recalculate liveness and demand */
-         agx_compute_liveness(ctx);
-         effective_demand = agx_calc_register_demand(ctx, false);
       }
 
       /* The resulting program can now be assigned registers */
@@ -3320,19 +4228,266 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* Record all phi webs. First initialize the union-find data structure with
     * all SSA defs in their own singletons, then union together anything related
-    * by a phi. The resulting union-find structure will be the webs.
+    * by a phi. Skip sources shared by multiple phis on the same predecessor
+    * edge of a block (such as a CSE'd 0.0f constant initializing multiple loop
+    * accumulators): those phis are simultaneously live at block entry and must
+    * not be merged into one web.
     */
    struct phi_web_node *phi_web = calloc(ctx->alloc, sizeof(*phi_web));
    for (unsigned i = 0; i < ctx->alloc; ++i) {
       phi_web[i].parent = i;
    }
 
+   uint32_t *phi_edge_owner = calloc(ctx->alloc, sizeof(*phi_edge_owner));
    agx_foreach_block(ctx, block) {
-      agx_foreach_phi_in_block(block, phi) {
-         agx_foreach_ssa_src(phi, s) {
-            phi_web_union(phi_web, phi->dest[0].value, phi->src[s].value);
+      unsigned max_srcs = 0;
+      agx_foreach_phi_in_block(block, phi)
+         max_srcs = MAX2(max_srcs, phi->nr_srcs);
+
+      for (unsigned s = 0; s < max_srcs; ++s) {
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            const uint32_t owner = phi->dest[0].value + 1;
+            const unsigned v = phi->src[s].value;
+            if (phi_edge_owner[v] == 0)
+               phi_edge_owner[v] = owner;
+            else if (phi_edge_owner[v] != owner)
+               phi_edge_owner[v] = UINT32_MAX;
+         }
+
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            const unsigned v = phi->src[s].value;
+            if (phi_edge_owner[v] != UINT32_MAX)
+               phi_web_union(phi_web, phi->dest[0].value, v);
+         }
+
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            phi_edge_owner[phi->src[s].value] = 0;
          }
       }
+   }
+   free(phi_edge_owner);
+
+   /* Record single-use read-modify-write ALU accumulator chains inside loops
+    * so intermediate results stay in their loop-header phi's register when
+    * conflict-free, without forcing mod-3 bank conflicts. */
+   unsigned nr_blocks = 0;
+   bool any_loop_header = false;
+   if (ctx->alloc > 0 &&
+       agx_chip_has_cap(ctx->key->dev.chip, AGX_CAP_MOD3_REG_BANK_RA) &&
+       !ctx->is_preamble) {
+      agx_foreach_block(ctx, block) {
+         nr_blocks = MAX2(nr_blocks, block->index + 1);
+         if (block->loop_header)
+            any_loop_header = true;
+      }
+   }
+
+   agx_instr **rmw_phi = NULL;
+   unsigned *loop_last = NULL;
+   if (any_loop_header) {
+      rmw_phi = calloc(ctx->alloc, sizeof(*rmw_phi));
+      loop_last = calloc(MAX2(nr_blocks, 1u), sizeof(unsigned));
+      int32_t *innermost_hdr = malloc(MAX2(nr_blocks, 1u) * sizeof(int32_t));
+      unsigned *innermost_span = malloc(MAX2(nr_blocks, 1u) * sizeof(unsigned));
+      agx_instr **rmw_defs = calloc(ctx->alloc, sizeof(*rmw_defs));
+      unsigned *def_blk = calloc(ctx->alloc, sizeof(unsigned));
+      uint32_t *use_cnt = calloc(ctx->alloc, sizeof(uint32_t));
+      uint32_t *in_loop_use_cnt = calloc(ctx->alloc, sizeof(uint32_t));
+      if (rmw_phi && loop_last && innermost_hdr && innermost_span && rmw_defs &&
+          def_blk && use_cnt && in_loop_use_cnt) {
+         for (unsigned i = 0; i < MAX2(nr_blocks, 1u); ++i) {
+            innermost_hdr[i] = -1;
+            innermost_span[i] = UINT_MAX;
+         }
+         agx_foreach_block(ctx, header) {
+            if (!header->loop_header)
+               continue;
+            unsigned last = 0;
+            bool has_back = false;
+            agx_foreach_predecessor(header, pred) {
+               if ((*pred)->index >= header->index) {
+                  last = MAX2(last, (*pred)->index);
+                  has_back = true;
+               }
+            }
+            if (!has_back)
+               continue;
+            if (header->index < nr_blocks)
+               loop_last[header->index] = last;
+            unsigned span = last - header->index;
+            for (unsigned i = header->index; i <= last && i < nr_blocks; ++i) {
+               if (span < innermost_span[i]) {
+                  innermost_span[i] = span;
+                  innermost_hdr[i] = (int32_t)header->index;
+               }
+            }
+         }
+
+         agx_foreach_block(ctx, block) {
+            agx_foreach_instr_in_block(block, I) {
+               agx_foreach_ssa_dest(I, d) {
+                  unsigned v = I->dest[d].value;
+                  rmw_defs[v] = I;
+                  def_blk[v] = block->index;
+               }
+               /* Count distinct instructions reading each SSA value. */
+               unsigned seen[8];
+               unsigned nr_seen = 0;
+               agx_foreach_ssa_src(I, s) {
+                  unsigned v = I->src[s].value;
+                  bool dup = false;
+                  for (unsigned j = 0; j < nr_seen; ++j) {
+                     if (seen[j] == v) {
+                        dup = true;
+                        break;
+                     }
+                  }
+                  if (!dup) {
+                     if (nr_seen < ARRAY_SIZE(seen))
+                        seen[nr_seen++] = v;
+                     use_cnt[v]++;
+                     if (rmw_defs[v] && rmw_defs[v]->op == AGX_OPCODE_PHI) {
+                        unsigned h = def_blk[v];
+                        if (h < nr_blocks && block->index >= h &&
+                            block->index <= loop_last[h])
+                           in_loop_use_cnt[v]++;
+                     }
+                  }
+               }
+            }
+         }
+
+         agx_foreach_block(ctx, header) {
+            if (!header->loop_header)
+               continue;
+            agx_foreach_phi_in_block(header, phi) {
+               agx_index pd = phi->dest[0];
+               if (pd.type != AGX_INDEX_NORMAL || pd.memory)
+                  continue;
+
+               unsigned pred_idx = 0;
+               agx_foreach_predecessor(header, pred) {
+                  if ((*pred)->index >= header->index &&
+                      pred_idx < phi->nr_srcs) {
+                     agx_index back = phi->src[pred_idx];
+                     if (back.type == AGX_INDEX_NORMAL && !back.memory &&
+                         back.size == pd.size &&
+                         agx_channels(back) == agx_channels(pd) &&
+                         back.value != pd.value) {
+                        if (!rmw_phi[back.value] ||
+                            (def_blk[back.value] < nr_blocks &&
+                             innermost_hdr[def_blk[back.value]] ==
+                                (int32_t)header->index))
+                           rmw_phi[back.value] = phi;
+
+                        if (agx_channels(pd) != 1 ||
+                            in_loop_use_cnt[pd.value] != 1) {
+                           pred_idx++;
+                           continue;
+                        }
+                        /* Walk the unique 1-use tree backwards from `back` to
+                         * `pd.value` within this loop's direct blocks. */
+                        unsigned stack_ssa[64];
+                        unsigned stack_src[64];
+                        unsigned sp = 0;
+                        stack_ssa[0] = back.value;
+                        stack_src[0] = 0;
+                        unsigned visits = 0;
+                        bool found = false;
+
+                        while (visits < 64) {
+                           unsigned cur = stack_ssa[sp];
+                           agx_instr *def = rmw_defs[cur];
+                           bool ok =
+                              def && def_blk[cur] < nr_blocks &&
+                              innermost_hdr[def_blk[cur]] ==
+                                 (int32_t)header->index &&
+                              def->nr_dests == 1 && !def->dest[0].memory &&
+                              def->dest[0].size == pd.size &&
+                              agx_channels(def->dest[0]) == 1 &&
+                              agx_is_alu(def);
+                           /* Exclude AGX3 ops that suppress early-kill. */
+                           if (ok && agx_isa_is_agx3(ctx->key->dev.encoding)) {
+                              if (def->op == AGX_OPCODE_FFS ||
+                                  (def->op == AGX_OPCODE_BFEIL &&
+                                   def->nr_srcs == 3 &&
+                                   def->src[2].type == AGX_INDEX_NORMAL) ||
+                                  (def->op == AGX_OPCODE_BITOP &&
+                                   def->nr_srcs == 2 &&
+                                   (def->truth_table & 0xfu) == 0x8u &&
+                                   def->src[0].type == AGX_INDEX_NORMAL &&
+                                   def->src[1].type == AGX_INDEX_NORMAL) ||
+                                  (ctx->key->dev.encoding ==
+                                      AGX_ISA_ENCODING_AGX3B &&
+                                   def->op == AGX_OPCODE_IADD &&
+                                   def->nr_srcs == 2 && def->shift == 0 &&
+                                   def->src[0].type == AGX_INDEX_NORMAL &&
+                                   def->src[1].type == AGX_INDEX_NORMAL &&
+                                   !def->src[0].abs && !def->src[0].neg &&
+                                   !def->src[1].abs && def->src[1].neg))
+                                 ok = false;
+                           }
+
+                           bool pushed = false;
+                           if (ok) {
+                              for (unsigned s = stack_src[sp]; s < def->nr_srcs;
+                                   ++s) {
+                                 agx_index src = def->src[s];
+                                 if (src.type != AGX_INDEX_NORMAL ||
+                                     src.memory || src.size != pd.size ||
+                                     agx_channels(src) != 1 ||
+                                     (src.value == pd.value
+                                         ? in_loop_use_cnt[src.value] != 1
+                                         : use_cnt[src.value] != 1))
+                                    continue;
+                                 stack_src[sp] = s + 1;
+                                 if (src.value == pd.value) {
+                                    found = true;
+                                    break;
+                                 }
+                                 if (sp + 1 < ARRAY_SIZE(stack_ssa)) {
+                                    ++sp;
+                                    stack_ssa[sp] = src.value;
+                                    stack_src[sp] = 0;
+                                    visits++;
+                                    pushed = true;
+                                    break;
+                                 }
+                              }
+                           }
+
+                           if (found)
+                              break;
+                           if (pushed)
+                              continue;
+                           if (sp == 0)
+                              break;
+                           --sp;
+                        }
+
+                        if (found && sp >= 1 && rmw_phi) {
+                           for (unsigned k = 1; k <= sp; ++k)
+                              rmw_phi[stack_ssa[k]] = phi;
+                        }
+                     }
+                  }
+                  pred_idx++;
+               }
+            }
+         }
+      }
+      free(innermost_hdr);
+      free(innermost_span);
+      free(rmw_defs);
+      free(def_blk);
+      free(use_cnt);
+      free(in_loop_use_cnt);
    }
 
    /* Group the phi webs that make up the operands of matrix multiplies */
@@ -3341,7 +4496,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    uint16_t *web_matrix_group = NULL;
    bool any_matrix = false;
    agx_foreach_instr_global(ctx, I)
-      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3;
+      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+                    I->op == AGX_OPCODE_MATMAD8_AGX3;
 
    if (any_matrix) {
       agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
@@ -3353,7 +4509,10 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       }
 
       agx_foreach_instr_global(ctx, I) {
-         if (I->op != AGX_OPCODE_MATMAD16_AGX3)
+         const unsigned mat_comps =
+            I->op == AGX_OPCODE_MATMAD16_AGX3 ? 8 :
+            I->op == AGX_OPCODE_MATMAD8_AGX3 ? 2 : 0;
+         if (!mat_comps)
             continue;
 
          agx_foreach_ssa_src(I, s) {
@@ -3363,12 +4522,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                 def->src[0].type == AGX_INDEX_NORMAL)
                def = defs[def->src[0].value];
 
-            if (!def || def->op != AGX_OPCODE_COLLECT || def->nr_srcs != 8)
+            if (!def || def->op != AGX_OPCODE_COLLECT ||
+                def->nr_srcs != mat_comps)
                continue;
 
             struct matrix_group group = {0};
             bool valid = true;
-            for (unsigned k = 0; k < 8 && valid; ++k) {
+            for (unsigned k = 0; k < mat_comps && valid; ++k) {
                const agx_index src = def->src[k];
                valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
                        agx_channels(src) == 1 &&
@@ -3386,6 +4546,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                continue;
 
             group.size = agx_size_align_16(def->src[0].size);
+            group.count = mat_comps;
             util_dynarray_append(&matrix_groups, group);
             const unsigned id = util_dynarray_num_elements(
                &matrix_groups, struct matrix_group);
@@ -3393,7 +4554,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
                continue;
             }
-            for (unsigned k = 0; k < 8; ++k)
+            for (unsigned k = 0; k < mat_comps; ++k)
                web_matrix_group[group.root[k]] = id;
          }
       }
@@ -3418,11 +4579,15 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    BITSET_WORD *early_scalar_export = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *effectful_use = BITSET_CALLOC(ctx->alloc);
    unsigned instruction_order = 0;
+   bool any_enter_query_m5 = false;
+   bool any_mem = false;
 
    const unsigned tile_gpr_limit = agx3_tile_store_bank(ctx);
 
    agx_foreach_instr_global(ctx, I) {
       instruction_order++;
+      if (I->op == AGX_OPCODE_ENTER_QUERY_M5)
+         any_enter_query_m5 = true;
       const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
       if (!info->can_reorder || !info->can_eliminate ||
           info->schedule_class != AGX_SCHEDULE_CLASS_NONE) {
@@ -3604,6 +4769,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          sizes[v] = I->dest[d].size;
          definition_order[v] = instruction_order;
          classes[v] = ra_class_for_index(I->dest[d]);
+         if (classes[v] == RA_MEM)
+            any_mem = true;
 
          max_ncomps = MAX2(max_ncomps, ncomps[v]);
       }
@@ -3699,17 +4866,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    unsigned demand = ALIGN_POT(effective_demand, reg_file_alignment);
    assert(demand <= max_possible_regs && "Invariant");
 
-   /* Round up the demand to the maximum number of registers we can use without
-    * affecting occupancy. This reduces live range splitting.
-    */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
-   if (ctx->key->is_helper || force_spilling)
-      max_regs = max_possible_regs;
-
-   /* Occupancy rounding must not reach past a smaller register file. */
-   max_regs = MIN2(max_regs, max_possible_regs);
-
-   max_regs = ROUND_DOWN_TO(max_regs, reg_file_alignment);
+   unsigned max_regs =
+      assignment_file(ctx, effective_demand, reg_file_alignment,
+                      max_possible_regs, force_spilling);
 
    /* Or, we can bound tightly for debugging */
    if (agx_compiler_debug & AGX_DBG_DEMAND)
@@ -3722,10 +4881,30 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    unsigned reg_count = 0, mem_slot_count = 0;
 
+   bool g17p_has_loop = false;
+   struct g17p_coread_entry *g17p_coread =
+      g17p_build_coread_table(ctx, ncomps, classes, &g17p_has_loop);
+   unsigned g17p_tier_cap = max_regs;
+   if (g17p_coread) {
+      if (demand <= 96)
+         g17p_tier_cap = MIN2(96u, max_regs);
+      else if (demand <= 128)
+         g17p_tier_cap = MIN2(128u, max_regs);
+   }
+
    /* Assign registers in dominance-order. This coincides with source-order due
     * to a NIR invariant, so we do not need special handling for this.
     */
-   BITSET_WORD *dest_read = agx_values_read(ctx);
+   BITSET_WORD *dest_read = any_enter_query_m5 ? agx_values_read(ctx) : NULL;
+   uint16_t *ssa_to_reg = calloc(ctx->alloc, sizeof(uint16_t));
+   uint16_t *pred_ssa_to_reg =
+      list_length(&ctx->blocks) > 1 ? malloc(ctx->alloc * sizeof(uint16_t))
+                                    : NULL;
+   BITSET_WORD *hdr_phi_targets =
+      (any_loop_header && g17p_coread && loop_last && nr_blocks)
+         ? calloc((size_t)nr_blocks * BITSET_WORDS(AGX_NUM_REGS),
+                  sizeof(BITSET_WORD))
+         : NULL;
 
    /* Everything assign_local reads below was allocated above, and nothing the
     * cleanup reads is changed after this point, so it survives a longjmp. */
@@ -3737,14 +4916,40 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
    ctx->ra_abort = &ra_abort;
 
+   const unsigned mem_bound = any_mem ? agx_ra_mem_bound(ctx) : 0;
+
    agx_foreach_block(ctx, block) {
+      BITSET_DECLARE(enclosing_phi_targets, AGX_NUM_REGS) = {0};
+      bool has_enclosing_phis = false;
+      if (hdr_phi_targets && block->index < nr_blocks) {
+         for (unsigned h = 0; h < block->index; ++h) {
+            if (loop_last[h] >= block->index) {
+               const BITSET_WORD *src =
+                  &hdr_phi_targets[(size_t)h * BITSET_WORDS(AGX_NUM_REGS)];
+               for (unsigned w = 0; w < BITSET_WORDS(AGX_NUM_REGS); ++w) {
+                  enclosing_phi_targets[w] |= src[w];
+                  if (src[w])
+                     has_enclosing_phis = true;
+               }
+            }
+         }
+      }
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
          .block = block,
+         .ssa_to_reg = ssa_to_reg,
+         .pred_ssa_to_reg = pred_ssa_to_reg,
          .dest_read = dest_read,
          .src_to_collect_phi = src_to_collect_phi,
          .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
+         .rmw_phi = rmw_phi,
+         .loop_phi_targets = has_enclosing_phis ? enclosing_phi_targets : NULL,
+         .loop_header_phi_out =
+            (hdr_phi_targets && block->loop_header && block->index < nr_blocks)
+               ? &hdr_phi_targets[(size_t)block->index *
+                                  BITSET_WORDS(AGX_NUM_REGS)]
+               : NULL,
          .matrix_groups = matrix_groups.data,
          .web_matrix_group = web_matrix_group,
          .ncomps = ncomps,
@@ -3758,8 +4963,11 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          .log2_gpr = log2_gpr,
          .high_gpr = high_gpr,
          .tex_low128 = tex_low128,
+         .g17p_coread = g17p_coread,
+         .g17p_tier_cap = g17p_tier_cap,
+         .g17p_has_loop = g17p_has_loop,
          .bound[RA_GPR] = max_regs,
-         .bound[RA_MEM] = AGX_NUM_MODELED_REGS,
+         .bound[RA_MEM] = mem_bound,
          .count[RA_GPR] = &reg_count,
          .count[RA_MEM] = &mem_slot_count,
       });
@@ -3919,7 +5127,13 @@ cleanup:
       }
    }
 
+   free(ssa_to_reg);
+   free(pred_ssa_to_reg);
    free(phi_web);
+   free(rmw_phi);
+   free(loop_last);
+   free(hdr_phi_targets);
+   free(g17p_coread);
    util_dynarray_fini(&matrix_groups);
    free(web_matrix_group);
    free(low_gpr);
@@ -3937,17 +5151,4 @@ cleanup:
    free(sizes);
    free(classes);
    free(visited);
-}
-
-void
-agx_ra(agx_context *ctx)
-{
-   agx_ra_impl(ctx, false);
-}
-
-/* Retry from a fresh compiler context, retaining the original full budget. */
-void
-agx_ra_without_remat(agx_context *ctx)
-{
-   agx_ra_impl(ctx, true);
 }

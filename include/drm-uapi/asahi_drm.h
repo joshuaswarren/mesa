@@ -448,11 +448,29 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_USERPTR ((1ULL) << 37)
 
 /*
+ * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK: DRM_IOCTL_ASAHI_GEM_USERPTR does not
+ * charge its pins to the caller's RLIMIT_MEMLOCK; only the GPU memory limits
+ * bound them. Kernels that report DRM_ASAHI_FEATURE_USERPTR without it refuse
+ * with ENOMEM a range that exceeds that limit, unless the caller has
+ * CAP_IPC_LOCK. A feature bit like those of enum drm_asahi_feature, defined
+ * here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
+
+/*
  * DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT: render commands accept
  * DRM_ASAHI_RENDER_MESH_OUTPUT. A feature bit like those of enum
  * drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
+
+/*
+ * DRM_ASAHI_FEATURE_ASYNC_SUBMIT: QUEUE_CREATE accepts
+ * DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT. Reported by GPUs whose submissions
+ * otherwise return only once they have retired (G18). A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ASYNC_SUBMIT ((1ULL) << 39)
 
 /*
  * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
@@ -462,6 +480,15 @@ enum drm_asahi_feature {
  * defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
+
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
+ * independent compute commands of one queue on several firmware compute
+ * queues of its context, so that they overlap. Userspace needs no further
+ * queues of its own for that. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
@@ -654,12 +681,15 @@ struct drm_asahi_gem_create {
  * object stays the parent's memory. The CPU and GPU views are coherent
  * without cache maintenance.
  *
- * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
- * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
- * and their size against the client and device limits of
+ * The size of the object counts against the client and device limits of
  * drm_asahi_params_global::client_memory_limit and
- * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
- * memory-pressure reclaim.
+ * drm_asahi_params_global::memory_limit (ENOMEM), as that of a
+ * DRM_IOCTL_ASAHI_GEM_CREATE object does. With
+ * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK, the pinned pages are shown in the
+ * caller's VmPin but are not limited by its RLIMIT_MEMLOCK. Without it, they
+ * also count against that limit, together with the caller's other long-term
+ * pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise). They are never
+ * released by memory-pressure reclaim.
  *
  * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
  * writable, and not be a shared mapping of a file whose filesystem tracks
@@ -1053,12 +1083,32 @@ enum drm_asahi_priority {
 	DRM_ASAHI_PRIORITY_REALTIME = 3,
 };
 
+/** Queue creation flags. */
+enum drm_asahi_queue_create_flags {
+	/**
+	 * @DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT: A submission to this queue
+	 * with at least one output sync returns once it is accepted, before
+	 * it runs; its output syncs signal when it retires, and userspace
+	 * waits for them before it reads anything the submission writes. A
+	 * submission without output syncs still returns only once it and
+	 * every earlier submission of the queue have retired. An accepted
+	 * submission that fails later signals its outputs with the error,
+	 * and the queue's next submission fails with it; a client that does
+	 * not submit again learns of it only from its outputs, so it checks
+	 * their error before it reads what the submission wrote. Requires
+	 * DRM_ASAHI_FEATURE_ASYNC_SUBMIT. On a GPU that reports it, a
+	 * submission to a queue without the flag returns only once it has
+	 * retired.
+	 */
+	DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT = (1U << 0),
+};
+
 /**
  * struct drm_asahi_queue_create - Arguments passed to
  * DRM_IOCTL_ASAHI_QUEUE_CREATE
  */
 struct drm_asahi_queue_create {
-	/** @flags: MBZ */
+	/** @flags: Zero or more of drm_asahi_queue_create_flags */
 	__u32 flags;
 
 	/** @vm_id: The ID of the VM this queue is bound to */

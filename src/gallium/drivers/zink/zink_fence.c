@@ -40,9 +40,20 @@
 static void
 destroy_fence(struct zink_screen *screen, struct zink_tc_fence *mfence)
 {
-   if (mfence->fence)
-      util_dynarray_delete_unordered(&mfence->fence->mfences, struct zink_tc_fence *, mfence);
-   mfence->fence = NULL;
+   /* Fast path: if reset_batch_state_internal() or zink_batch_state_destroy()
+    * already detached this fence (release store of NULL under mfences_lock),
+    * the acquire load here synchronizes with it and no further dereference of
+    * mfence can occur.
+    */
+   if (p_atomic_read(&mfence->fence)) {
+      simple_mtx_lock(&screen->mfences_lock);
+      struct zink_fence *fence = p_atomic_read(&mfence->fence);
+      if (fence) {
+         util_dynarray_delete_unordered(&fence->mfences, struct zink_tc_fence *, mfence);
+         p_atomic_set(&mfence->fence, NULL);
+      }
+      simple_mtx_unlock(&screen->mfences_lock);
+   }
    tc_unflushed_batch_token_reference(&mfence->tc_token, NULL);
    if (mfence->sem)
       VKSCR(DestroySemaphore)(screen->dev, mfence->sem, NULL);
@@ -92,11 +103,11 @@ fence_reference(struct pipe_screen *pscreen,
 }
 
 static bool
-tc_fence_finish(struct zink_context *ctx, struct zink_tc_fence *mfence, uint64_t *timeout_ns)
+tc_fence_finish(struct pipe_context *pctx, struct zink_tc_fence *mfence, uint64_t *timeout_ns)
 {
    if (!util_queue_fence_is_signalled(&mfence->ready)) {
       int64_t abs_timeout = os_time_get_absolute_timeout(*timeout_ns);
-      if (mfence->tc_token) {
+      if (pctx && mfence->tc_token) {
          /* Ensure that zink_flush will be called for
           * this mfence, but only if we're in the API thread
           * where the context is current.
@@ -105,7 +116,7 @@ tc_fence_finish(struct zink_context *ctx, struct zink_tc_fence *mfence, uint64_t
           * be in flight in the driver thread, so the mfence
           * may not be ready yet when this call returns.
           */
-         threaded_context_flush(&ctx->base, mfence->tc_token, *timeout_ns == 0);
+         threaded_context_flush(pctx, mfence->tc_token, *timeout_ns == 0);
       }
 
       /* this is a tc mfence, so we're just waiting on the queue mfence to complete
@@ -126,31 +137,101 @@ tc_fence_finish(struct zink_context *ctx, struct zink_tc_fence *mfence, uint64_t
    return true;
 }
 
-static bool
-fence_wait(struct zink_screen *screen, struct zink_fence *fence, uint64_t timeout_ns)
+static inline bool
+batch_state_target_flushed(const struct zink_batch_state *bs, uint32_t target_flush_id)
 {
+   return (int32_t)(p_atomic_read(&bs->flush_id) - target_flush_id) >= 0;
+}
+
+static inline bool
+batch_state_target_completed(const struct zink_batch_state *bs, uint32_t target_flush_id)
+{
+   return (int32_t)(p_atomic_read(&bs->reset_id) - target_flush_id) >= 0;
+}
+
+static bool
+wait_for_target_flush(struct zink_screen *screen, struct zink_batch_state *bs,
+                      uint32_t target_flush_id, uint64_t *timeout_ns)
+{
+   if (batch_state_target_flushed(bs, target_flush_id))
+      return true;
+   if (!*timeout_ns)
+      return false;
+
+   int64_t abs_timeout = os_time_get_absolute_timeout(*timeout_ns);
+   mtx_lock(&bs->usage.mtx);
+   while (!screen->device_lost && !batch_state_target_flushed(bs, target_flush_id)) {
+      int64_t wait_ns = 1000000; /* 1ms cap avoids missing flush_id update after submit_queue broadcast */
+      if (*timeout_ns != OS_TIMEOUT_INFINITE) {
+         int64_t now = os_time_get_nano();
+         if (now >= abs_timeout) {
+            mtx_unlock(&bs->usage.mtx);
+            return false;
+         }
+         int64_t rem = abs_timeout - now;
+         if (rem < wait_ns)
+            wait_ns = rem;
+      }
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+      ts.tv_nsec += wait_ns;
+      if (ts.tv_nsec >= 1000000000) {
+         ts.tv_sec += ts.tv_nsec / 1000000000;
+         ts.tv_nsec %= 1000000000;
+      }
+      cnd_timedwait(&bs->usage.flush, &bs->usage.mtx, &ts);
+   }
+   mtx_unlock(&bs->usage.mtx);
+
+   if (*timeout_ns != OS_TIMEOUT_INFINITE) {
+      int64_t now = os_time_get_nano();
+      *timeout_ns = abs_timeout > now ? abs_timeout - now : 0;
+   }
+   return true;
+}
+
+static bool
+fence_wait(struct zink_screen *screen, struct zink_tc_fence *mfence, uint64_t timeout_ns)
+{
+   struct zink_fence *fence = p_atomic_read(&mfence->fence);
+   if (!fence || screen->device_lost)
+      return true;
    struct zink_batch_state *bs = zink_batch_state(fence);
-   if (screen->device_lost)
-      return true;
-   if (fence->completed)
+   bool submitted = p_atomic_read(&fence->submitted);
+   if (batch_state_target_completed(bs, mfence->target_flush_id))
       return true;
 
-   if (screen->threaded_submit) {
+   if (screen->threaded_submit && !submitted) {
       int64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
-      if (!util_queue_fence_wait_timeout(&bs->flush_completed, abs_timeout))
+      if (!util_queue_fence_wait_timeout(&bs->flush_completed, abs_timeout)) {
+         if (screen->device_lost || batch_state_target_completed(bs, mfence->target_flush_id))
+            return true;
          return false;
+      }
+      if (screen->device_lost || batch_state_target_completed(bs, mfence->target_flush_id))
+         return true;
+      if (timeout_ns && timeout_ns != OS_TIMEOUT_INFINITE) {
+         int64_t time_ns = os_time_get_nano();
+         timeout_ns = abs_timeout > time_ns ? abs_timeout - time_ns : 0;
+      }
    }
 
-   assert(fence->batch_id);
-   assert(fence->submitted);
+   submitted = p_atomic_read(&fence->submitted);
+   uint64_t batch_id = p_atomic_read(&fence->batch_id);
+   if (screen->device_lost || batch_state_target_completed(bs, mfence->target_flush_id))
+      return true;
 
-   bool success = zink_screen_timeline_wait(screen, fence->batch_id, timeout_ns);
+   assert(submitted && batch_id);
+   if (!submitted || !batch_id)
+      return true;
 
-   if (success) {
-      fence->completed = true;
-      bs->usage.usage = 0;
-      zink_screen_update_last_finished(screen, fence->batch_id);
-   }
+   if (zink_screen_check_last_finished(screen, batch_id))
+      return true;
+
+   bool success = zink_screen_timeline_wait(screen, batch_id, timeout_ns);
+
+   if (success)
+      zink_screen_update_last_finished(screen, batch_id);
    return success;
 }
 
@@ -158,49 +239,56 @@ static bool
 zink_fence_finish(struct zink_screen *screen, struct pipe_context *pctx, struct zink_tc_fence *mfence,
                   uint64_t timeout_ns)
 {
-   pctx = threaded_context_unwrap_sync(pctx);
-   struct zink_context *ctx = zink_context(pctx);
-
    if (screen->device_lost)
       return true;
 
-   if (pctx && mfence->deferred_ctx == pctx) {
-      if (mfence->fence == ctx->deferred_fence) {
-         zink_context(pctx)->bs->has_work = true;
+   /* need to ensure the tc mfence has been flushed before we wait */
+   bool tc_finish = tc_fence_finish(pctx, mfence, &timeout_ns);
+   /* the submit thread hasn't finished yet */
+   if (!tc_finish)
+      return false;
+   /* this was an invalid flush, just return completed */
+   struct zink_fence *fence = p_atomic_read(&mfence->fence);
+   if (!fence)
+      return true;
+
+   struct zink_batch_state *bs = zink_batch_state(fence);
+   if (pctx && p_atomic_read(&mfence->deferred_ctx) &&
+       !batch_state_target_flushed(bs, mfence->target_flush_id)) {
+      pctx = threaded_context_unwrap_sync(pctx);
+      struct zink_context *ctx = zink_context(pctx);
+      if (p_atomic_read(&mfence->deferred_ctx) == pctx &&
+          p_atomic_read(&mfence->fence) == ctx->deferred_fence) {
+         ctx->bs->has_work = true;
          /* this must be the current batch */
          pctx->flush(pctx, NULL, !timeout_ns ? PIPE_FLUSH_ASYNC : 0);
          if (!timeout_ns)
             return false;
       }
+      fence = p_atomic_read(&mfence->fence);
+      if (!fence)
+         return true;
+      bs = zink_batch_state(fence);
    }
 
-   /* need to ensure the tc mfence has been flushed before we wait */
-   bool tc_finish = tc_fence_finish(ctx, mfence, &timeout_ns);
-   /* the submit thread hasn't finished yet */
-   if (!tc_finish)
+   if (!wait_for_target_flush(screen, bs, mfence->target_flush_id, &timeout_ns))
       return false;
-   /* this was an invalid flush, just return completed */
-   if (!mfence->fence)
+
+   if (screen->device_lost || batch_state_target_completed(bs, mfence->target_flush_id))
       return true;
 
-   struct zink_fence *fence = mfence->fence;
-
-   unsigned submit_diff = zink_batch_submit_count_diff(zink_batch_state(mfence->fence)->usage.submit_count, mfence->submit_count);
-   /* this batch is known to have finished because it has been submitted more than 1 time
-    * since the tc fence last saw it
+   /* Read submitted/batch_id before re-checking reset_id so acquire-release
+    * ordering guarantees both values belong to target_flush_id whenever
+    * reset_id < target_flush_id.
     */
-   if (submit_diff > 1)
+   bool submitted = p_atomic_read(&fence->submitted);
+   uint64_t batch_id = p_atomic_read(&fence->batch_id);
+   if (batch_state_target_completed(bs, mfence->target_flush_id))
+      return true;
+   if (submitted && batch_id && zink_screen_check_last_finished(screen, batch_id))
       return true;
 
-   /* - if fence is submitted, batch_id is nonzero and can be checked
-    * - if fence is not submitted here, it must be reset; batch_id will be 0 and submitted is false
-    * in either case, the fence has finished
-    */
-   if ((fence->submitted && zink_screen_check_last_finished(screen, fence->batch_id)) ||
-       (!fence->submitted && submit_diff))
-      return true;
-
-   return fence_wait(screen, fence, timeout_ns);
+   return fence_wait(screen, mfence, timeout_ns);
 }
 
 static bool
@@ -265,7 +353,7 @@ zink_fence_server_sync(struct pipe_context *pctx, struct pipe_fence_handle *pfen
    if (mfence->deferred_ctx == pctx || !mfence->sem)
       return;
 
-   mfence->deferred_ctx = pctx;
+   p_atomic_set(&mfence->deferred_ctx, pctx);
    /* this will be applied on the next submit */
    VkPipelineStageFlags flag = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
    util_dynarray_append(&ctx->bs->wait_semaphores, mfence->sem);

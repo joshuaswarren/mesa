@@ -58,7 +58,7 @@ agx3_shift_add16_encode(enum agx_isa_encoding enc,
       if (d->wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(45 + i, 1);
 
-   if (agx3_bind_compose(enc, "iadd", 0, base, 5, ov, n, out, len))
+   if (agx3_bind_compose(enc, AGX3_MN_iadd, 0, base, 5, ov, n, out, len))
       return true;
 
    memset(out, 0, AGX3_WRITEOUT_MAX_LENGTH);

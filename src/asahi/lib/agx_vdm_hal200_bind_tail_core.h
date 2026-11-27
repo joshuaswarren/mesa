@@ -59,8 +59,6 @@ bool agx_vdm_hal200_bind_tail_unpack(
 /* The pair 4 control for a viewport payload of the given length, or zero. */
 uint32_t agx_vdm_hal200_bind_viewport_control(size_t viewport_bytes);
 
-bool agx_vdm_hal200_bind_control_valid(unsigned pair, uint32_t control);
-
 #ifdef __cplusplus
 }
 #endif
