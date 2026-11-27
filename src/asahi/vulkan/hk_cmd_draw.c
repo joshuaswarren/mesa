@@ -5027,6 +5027,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             res_iview->vk.base_array_layer + MAX2(pass_layers, 1),
             u_minify(res_iview->vk.image->extent.width, level),
             u_minify(res_iview->vk.image->extent.height, level), render->area,
+            render->view_mask &&
+               render->view_mask != BITFIELD64_MASK(pass_layers),
             false);
       }
    }
