@@ -13627,7 +13627,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     */
    bool g17p_blend_protocol =
       (enc == AGX_ISA_ENCODING_AGX3B ||
-       (enc == AGX_ISA_ENCODING_AGX3C && ctx->key->m5_uniform_blend &&
+       (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+        (ctx->key->m5_uniform_blend ||
+         (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND)) &&
         !ctx->key->secondary && !ctx->key->no_stop &&
         ctx->key->fs.nr_samples == 1)) &&
       ctx->stage == MESA_SHADER_FRAGMENT &&
@@ -13664,8 +13666,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             } else if (P->op == AGX_OPCODE_LD_TILE ||
                        P->op == AGX_OPCODE_ST_TILE) {
                const bool load = P->op == AGX_OPCODE_LD_TILE;
+               const bool m5_inline_format =
+                  enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+                  !ctx->key->m5_uniform_blend &&
+                  agx3_tile_format_width(P->format) >= 0 &&
+                  P->mask >= 1 && P->mask <= 15;
                if (phase != (load ? 1 : 3) ||
-                   !((agx3_g17p_8norm_format(P->format) &&
+                   !(m5_inline_format ||
+                     (agx3_g17p_8norm_format(P->format) &&
                       (P->mask == 3 || P->mask == 15)) ||
                      ((P->format == AGX_FORMAT_RGB10A2 ||
                        P->format == AGX_FORMAT_RGB9E5) && P->mask == 1)) ||

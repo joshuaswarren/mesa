@@ -15,7 +15,6 @@
 
 #include "asahi/lib/agx_bo.h"
 #include "util/u_atomic.h"
-#include "util/u_debug.h"
 #include "vk_common_entrypoints.h"
 
 #include "asahi/lib/agx_device.h"
@@ -279,8 +278,14 @@ hk_GetMemoryHostPointerPropertiesEXT(
    return VK_SUCCESS;
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
-                           false)
+/* Track host-pointer imports per import on every chip except M5 when the
+ * static per-device rule is active (ASAHI_M5_HOST_ALIAS_STATIC=1 or no
+ * aliasing-capable features). */
+static inline bool
+hk_host_import_tracks_alias(const struct hk_device *dev)
+{
+   return !agx_chip_g17_m5(dev->dev.chip) || dev->host_alias.dynamic;
+}
 
 /* The class of the mappings over [pointer, pointer + size) in
  * /proc/self/maps (hk_host_maps_classify_fd()); HK_HOST_MAP_OTHER when the
@@ -301,33 +306,33 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
    return cls;
 }
 
-/* M5 with host_alias.dynamic: enter a host import into the device's set, so
- * hk_cdm_alias_scope() asks for memory scope while it may alias
- * (hk_host_import_aliases()). A GPU-writable import of pages that are all
- * private anonymous memory of this process (/proc/self/maps), and that no
- * other live import overlaps, has its pages at no other GPU address. A
- * read-only one needs only private mappings: the GPU writes none of its
- * pages through it, and writes them through another address only through a
- * writable import of a shared mapping, which aliases itself, or of the same
- * pages, which overlaps it. An import whose maps cannot be read aliases.
- * The mappings are read before the kernel pins the pages (before_pin) and
- * again now, and the worse of the two counts, so an application that
- * replaces the mapping meanwhile is not taken at its word. What the maps
- * cannot show: pages a private mapping holds that are pinned already, see
- * hk_host_alias.h on mremap.
+/* Enter a host import into the device's set so va_alias_resources (and
+ * alias_live on M5 with host_alias.dynamic) only counts imports that may
+ * alias another GPU virtual address (hk_host_import_aliases()). A
+ * GPU-writable import of pages that are all private anonymous memory of this
+ * process (/proc/self/maps), and that no other live import overlaps, has its
+ * pages at no other GPU address. A read-only one needs only private mappings:
+ * the GPU writes none of its pages through it, and writes them through
+ * another address only through a writable import of a shared mapping, which
+ * aliases itself, or of the same pages, which overlaps it. An import whose
+ * maps cannot be read aliases. The mappings are read before the kernel pins
+ * the pages (before_pin) and again now, and the worse of the two counts, so
+ * an application that replaces the mapping meanwhile is not taken at its
+ * word. What the maps cannot show: pages a private mapping holds that are
+ * pinned already, see hk_host_alias.h on mremap.
  *
  * Costs two reads of /proc/self/maps up to the lines that cover the range.
- * The imports that began to alias count in alias_live (hk_device_alias_add()),
- * before the import is returned. */
+ * The imports that began to alias count in va_alias_resources (and
+ * alias_live via hk_device_alias_add() on M5) before the import is returned. */
 static VkResult
 hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
                      const void *pointer, uint64_t size,
                      enum hk_host_map_class before_pin)
 {
-   if (!dev->host_alias.dynamic) {
+   if (!hk_host_import_tracks_alias(dev)) {
       /* Under the per-device rule nothing is tracked; say the import
        * happened, so a trace shows whether an application imports at all. */
-      if (agx_chip_g17_m5(dev->dev.chip) && debug_get_option_m5_host_alias_trace())
+      if (dev->host_alias.trace)
          fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " (per-device rule)\n",
                  pointer, size);
       return VK_SUCCESS;
@@ -348,12 +353,16 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
       .maps_alias = hk_host_import_maps_alias(gpu_writes, cls),
    };
 
-   /* The count changes with the set, under its lock, so a free of an
+   /* The counts change with the set, under its lock, so a free of an
     * overlapping import never subtracts ahead of this add
     * (hk_device_alias_add()). The patch runs after the lock is released. */
    simple_mtx_lock(&dev->host_alias.lock);
    const int began = hk_host_imports_add(&dev->host_alias.imports, &import);
-   const bool first = began > 0 && hk_device_alias_add(dev, (uint32_t)began);
+   bool first = false;
+   if (began > 0) {
+      p_atomic_add(&dev->va_alias_resources, (int32_t)began);
+      first = hk_device_alias_add(dev, (uint32_t)began);
+   }
    simple_mtx_unlock(&dev->host_alias.lock);
    if (began < 0)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -362,7 +371,7 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
    if (first)
       hk_device_alias_began(dev, HK_ALIAS_CAUSE_IMPORT);
 
-   if (debug_get_option_m5_host_alias_trace())
+   if (dev->host_alias.trace)
       fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "
               "began=%d live=%u\n", pointer, size, gpu_writes, (unsigned)cls,
               began, p_atomic_read(&dev->alias_live));
@@ -378,11 +387,14 @@ hk_host_import_untrack(struct hk_device *dev, struct hk_device_memory *mem)
    simple_mtx_lock(&dev->host_alias.lock);
    const unsigned stopped =
       hk_host_imports_remove(&dev->host_alias.imports, mem);
-   hk_device_alias_put(dev, stopped);
+   if (stopped > 0) {
+      p_atomic_add(&dev->va_alias_resources, -(int32_t)stopped);
+      hk_device_alias_put(dev, stopped);
+   }
    simple_mtx_unlock(&dev->host_alias.lock);
    mem->host_alias_tracked = false;
 
-   if (debug_get_option_m5_host_alias_trace())
+   if (dev->host_alias.trace)
       fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
               (void *)mem, stopped, p_atomic_read(&dev->alias_live));
 }
@@ -534,7 +546,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * hk_host_memory_read_only. With hk_host_memory_import_read_only only
        * such a range is taken, and a range the kernel can pin for writing is
        * refused, also with hk_host_memory_read_only: the GPU then writes
-       * through no host import (hk_cdm_alias_scope()). Otherwise, on M5,
+       * through no host import (hk_cdm_alias_scope()). Otherwise,
        * hk_host_import_track() decides below whether this import may alias.
        */
       assert(host_info->handleType ==
@@ -545,7 +557,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             ? AGX_HOST_PTR_READ_ONLY
          : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
                                                        : AGX_HOST_PTR_WRITABLE;
-      if (dev->host_alias.dynamic)
+      if (hk_host_import_tracks_alias(dev))
          host_maps_before_pin = hk_host_maps_classify_self(
             host_info->pHostPointer, pAllocateInfo->allocationSize);
       mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
@@ -560,7 +572,8 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                             host_info->pHostPointer, strerror(err));
          goto fail_alloc;
       }
-      mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
+      if (!hk_host_import_tracks_alias(dev))
+         mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
@@ -606,16 +619,20 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        dev->dev.replay_heap_initialized) {
       const uint64_t fixed_addr =
          capture_info ? capture_info->opaqueCaptureAddress : 0;
+      /* The range follows the requested size, not the BO's: a BO from the
+       * cache can be up to twice as large, so its size differs between
+       * capture and replay, and a larger replayed range would cover the next
+       * captured address. Bindings only reach offsets below that size. */
       mem->replay_va = agx_va_alloc(
-         &dev->dev, mem->bo->size, 64 * 1024,
+         &dev->dev, aligned_size, 64 * 1024,
          AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
       if (mem->replay_va &&
           (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
-                       mem->bo->size, 0,
+                       aligned_size, 0,
                        DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
            agx_bo_bind(&dev->dev, mem->bo,
                        agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
-                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+                       aligned_size, 0, DRM_ASAHI_BIND_READ))) {
          agx_va_free(&dev->dev, mem->replay_va, true);
          mem->replay_va = NULL;
          agx_bo_unreference(&dev->dev, mem->bo);

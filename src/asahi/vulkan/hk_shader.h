@@ -735,6 +735,8 @@ void hk_prelink_pipeline_fragment(struct hk_device *dev,
 void hk_prelink_object_fragment(struct hk_device *dev,
                                 struct hk_api_shader *fs);
 void hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs,
+                       const struct hk_api_shader *fs,
+                       const struct vk_graphics_pipeline_state *state,
                        bool hw_program, bool sw_program);
 
 static inline struct hk_shader *

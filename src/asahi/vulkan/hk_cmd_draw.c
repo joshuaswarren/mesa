@@ -5739,18 +5739,18 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                                 incomplete_render_area, true);
    }
 
-   /* A depth-only pass that stores depth may learn later that the store is
-    * dead (hk_take_pending_z_store()); keep the word without it. */
-   render->no_z_store_ok =
-      render->zls_precise && attach_z && attach_z->imageView &&
-      attach_z->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
-      attach_z->resolveMode == VK_RESOLVE_MODE_NONE && s_layout == NULL;
-   if (render->no_z_store_ok) {
-      VkRenderingAttachmentInfo z_no_store = *attach_z;
-      z_no_store.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-      hk_pack_zls_control_final(&render->zls_control_only_no_z_store,
-                                z_layout, NULL, &z_no_store, NULL,
-                                incomplete_render_area, false);
+   /* A single-stream pass that stores depth and/or stencil may learn later
+    * that one or both stores are dead (hk_take_pending_z_store()). */
+   render->pending_zs_store_mask = 0;
+   if (render->zls_precise) {
+      if (z_layout && attach_z && attach_z->imageView &&
+          attach_z->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+          attach_z->resolveMode == VK_RESOLVE_MODE_NONE)
+         render->pending_zs_store_mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (s_layout && attach_s && attach_s->imageView &&
+          attach_s->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+          attach_s->resolveMode == VK_RESOLVE_MODE_NONE)
+         render->pending_zs_store_mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
    }
 
    /* If multiview is disabled, always read 0. If multiview is enabled,
@@ -6117,8 +6117,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       loaded_resolve |= render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_LOAD;
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
-   render->process_empty_tiles_without_z =
-      resolved_clear || resolved_clear_s || loaded_resolve;
+   render->empty_tiles_other = resolved_clear || loaded_resolve;
+   render->empty_tiles_z = resolved_clear_z;
+   render->empty_tiles_s = resolved_clear_s;
    cs->cr.process_empty_tiles = process_empty_tiles;
    if (unlikely(dev->frame_anatomy) && incomplete_render_area)
       cs->anatomy_area = render->area;
@@ -6139,11 +6140,12 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
        * a resolve of loaded samples (or Z/S clears left to ZLS when the clear
        * draw is colour-only) still writes its destination from empty tiles. */
       if (agx_chip_agx3_path(dev->dev.chip)) {
-         render->process_empty_tiles_without_z =
-            loaded_resolve || (clear_draw_skips_zs && resolved_clear_s);
+         render->empty_tiles_other = loaded_resolve;
+         render->empty_tiles_z = clear_draw_skips_zs && resolved_clear_z;
+         render->empty_tiles_s = clear_draw_skips_zs && resolved_clear_s;
          cs->cr.process_empty_tiles =
-            loaded_resolve ||
-            (clear_draw_skips_zs && (resolved_clear_z || resolved_clear_s));
+            render->empty_tiles_other || render->empty_tiles_z ||
+            render->empty_tiles_s;
       }
 
       cmd->in_begin_rendering_clear = true;
@@ -6242,35 +6244,54 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                                  ? render->zls_control_only
                                  : render->zls_control_last;
       }
-
-      /* The depth store of a single-stream pass on a whole depth-only image
-       * may turn out dead; see hk_take_pending_z_store(). */
-      const struct hk_image_view *z_view = render->depth_att.iview;
-      const struct hk_image *z_image =
-         z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
-      if (render->no_z_store_ok &&
-          !(zls_elided & VK_IMAGE_ASPECT_DEPTH_BIT) && !cmd->in_meta &&
-          cs == render->zls_first_cs && cs->stats.cmds > 0 &&
-          !render->view_mask &&
-          !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                             VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
-          z_image && z_image->vk.aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
-          z_image->vk.image_type == VK_IMAGE_TYPE_2D &&
-          z_image->vk.mip_levels == 1 && z_image->vk.array_layers == 1) {
-         z_pending = (struct hk_pending_z_store){
-            .cs = cs,
-            .image = z_image,
-            .zls_control = render->zls_control_only_no_z_store,
-            .process_empty_tiles = render->process_empty_tiles_without_z,
-         };
-      }
    }
 
    /* Apply after the final control word, including already closed streams. */
+   const VkImageAspectFlags zls_elided_store =
+      render->g17p_zls_elide_mask & render->g17p_zls_touched &
+      ~render->g17p_zls_written;
    hk_g17p_zls_elide(cmd, zls_elided);
-   hk_g17p_zls_elide_store(cmd, render->g17p_zls_elide_mask &
-                                   render->g17p_zls_touched &
-                                   ~render->g17p_zls_written);
+   hk_g17p_zls_elide_store(cmd, zls_elided_store);
+
+   /* Depth/stencil stores of a single-stream pass on a whole 2D single-mip
+    * single-layer image (depth-only, stencil-only, or combined D32S8/D24S8)
+    * may turn out dead; see hk_take_pending_z_store(). */
+   if (cs && !cmd->in_meta && cs == render->zls_first_cs &&
+       cs->stats.cmds > 0 && !render->view_mask &&
+       !(render->flags &
+         (VK_RENDERING_SUSPENDING_BIT |
+          VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))) {
+      const VkImageAspectFlags pending_aspects =
+         render->pending_zs_store_mask & ~(zls_elided | zls_elided_store);
+      const struct hk_image_view *z_view =
+         (pending_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? render->depth_att.iview
+                                                       : NULL;
+      const struct hk_image_view *s_view =
+         (pending_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+            ? render->stencil_att.iview
+            : NULL;
+      const struct hk_image *z_image =
+         z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
+      const struct hk_image *s_image =
+         s_view ? container_of(s_view->vk.image, struct hk_image, vk) : NULL;
+      const struct hk_image *zs_image = z_image ? z_image : s_image;
+      if (pending_aspects && zs_image && (!z_image || !s_image || z_image == s_image) &&
+          zs_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+          zs_image->vk.mip_levels == 1 && zs_image->vk.array_layers == 1) {
+         z_pending = (struct hk_pending_z_store){
+            .cs = cs,
+            .image = zs_image,
+            .aspects = pending_aspects,
+            .empty_tiles_other = render->empty_tiles_other,
+            .empty_tiles_z =
+               render->empty_tiles_z &&
+               (pending_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0,
+            .empty_tiles_s =
+               render->empty_tiles_s &&
+               (pending_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0,
+         };
+      }
+   }
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
@@ -6405,26 +6426,43 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       hk_sync_resolve_begin(cmd);
       hk_meta_resolve_rendering(cmd, &vk_render);
       hk_sync_resolve_end(cmd);
+      z_pending.cs = NULL;
    }
 
    cmd->state.pending_z_store = z_pending;
 }
 
+static bool
+hk_pending_zs_att_overwrites(const VkRenderingAttachmentInfo *att,
+                             const struct hk_image *image)
+{
+   if (!att || att->imageView == VK_NULL_HANDLE)
+      return false;
+   if (att->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+       att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+      return false;
+   const VkRenderingAttachmentFlagsInfoKHR *flags =
+      vk_find_struct_const(att->pNext, RENDERING_ATTACHMENT_FLAGS_INFO_KHR);
+   if (flags && flags->flags)
+      return false;
+
+   VK_FROM_HANDLE(hk_image_view, iview, att->imageView);
+   return iview->vk.image == &image->vk;
+}
+
 /*
- * Dead depth stores (AGX3).
+ * Dead depth/stencil stores (AGX3).
  *
- * Applications often store a depth attachment that is cleared again before
- * anything reads it; Minecraft stores its depth image at the end of every
- * pass and clears the whole image with vkCmdClearDepthStencilImage before
- * the next one (hk_defer_clear() kills the pending store there). A cleared and
- * stored attachment makes the pass process every tile, including tiles no
- * draw covered, only to write the clear value. When the next pass begins
- * with that whole image as its depth attachment, cleared or with undefined
- * contents, over its whole area, and nothing recorded between the two
- * passes could read the image (only buffer commands whose ranges miss it,
- * barriers, or state binding; the same commands a deferred clear survives,
- * see hk_flush_deferred_clears()), the first pass's store is unobservable:
- * drop it, and with it the empty tiles the store alone required.
+ * Applications often store depth and/or stencil attachments that are cleared
+ * again before anything reads them; Minecraft stores its depth image at the
+ * end of every pass and clears the whole image with vkCmdClearDepthStencilImage
+ * before the next one (hk_defer_clear() kills the pending store there), and
+ * modern D3D11/D3D12/Vulkan engines use combined D32S8 attachments the same
+ * way. When the next pass begins with that whole image as its depth and/or
+ * stencil attachment, cleared or with undefined contents, over its whole area,
+ * and nothing recorded between the two passes could read the image, those
+ * overwritten aspect stores are unobservable: drop them, and with them any
+ * empty tiles they alone required.
  */
 static void
 hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
@@ -6434,20 +6472,18 @@ hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
    if (likely(!p->cs))
       return;
 
-   const VkRenderingAttachmentInfo *z = info->pDepthAttachment;
    const struct hk_image *image = p->image;
-   if (z && z->imageView != VK_NULL_HANDLE &&
-       (z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
-        z->loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE) &&
-       !(info->flags & VK_RENDERING_RESUMING_BIT) && !info->viewMask &&
+   if (!(info->flags & VK_RENDERING_RESUMING_BIT) && !info->viewMask &&
        info->renderArea.offset.x == 0 && info->renderArea.offset.y == 0 &&
        info->renderArea.extent.width >= image->vk.extent.width &&
        info->renderArea.extent.height >= image->vk.extent.height) {
-      VK_FROM_HANDLE(hk_image_view, iview, z->imageView);
-      if (iview->vk.image == &image->vk) {
-         hk_kill_pending_z_store(cmd);
-         return;
-      }
+      VkImageAspectFlags kill = 0;
+      if (hk_pending_zs_att_overwrites(info->pDepthAttachment, image))
+         kill |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (hk_pending_zs_att_overwrites(info->pStencilAttachment, image))
+         kill |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      if (kill)
+         hk_kill_pending_z_store_aspects(cmd, kill);
    }
 
    p->cs = NULL;
@@ -8111,24 +8147,42 @@ hk_g17p_mono_own_layout(const struct hk_shader *shader,
    return hk_g17p_inline_blend_own_layout(&shader->b, part);
 }
 
-/* Every G17P fragment program that touches the tile opens the pixel
- * transaction with the entry gate and ends it with a final release
- * (PIXREL with 0x200) just before END. The packer only emits that
- * protocol for shapes it has proven; a shape it does not recognise
- * would come back without it rather than failing, so check the bytes. */
+/* Every native AGX3 / M5 fragment program that touches the tile opens the
+ * pixel transaction with the entry gate and ends it with a final release
+ * (PIXREL with 0x200) just before END. The packer only emits that protocol
+ * for shapes it has proven; a shape it does not recognise would come back
+ * without it rather than failing, so check the bytes. */
 static const char *
-hk_g17p_mono_part_refusal(const struct hk_shader *shader,
+hk_g17p_mono_part_refusal(enum agx_chip chip, const struct hk_shader *shader,
                           const struct agx_shader_part *part)
 {
-   static const uint8_t gate[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
    const uint8_t *code = (const uint8_t *)part->binary + part->info.main_offset;
    const size_t n = part->info.main_size;
    bool has_gate = false;
-   for (size_t o = 0; o + sizeof(gate) <= n && !has_gate; o += 2)
-      has_gate = !memcmp(code + o, gate, sizeof(gate));
-   const bool final_release = n >= 10 && code[n - 4] == 0x0e &&
-      code[n - 10] == 0x07 && code[n - 9] == 0x02 && code[n - 8] == 0x54 &&
-      (code[n - 6] & 0x02) && code[n - 5] == 0x00;
+   bool final_release = false;
+
+   if (agx_chip_g17_m5(chip)) {
+      static const uint8_t gate_c[6] = {0x07, 0x30, 0x00, 0x05, 0x00, 0x00};
+      if (part->info.agx3_colour_link.rt_query_write_acquired)
+         return "ray query write acquired";
+      if (part->info.agx3_colour_link.entry_emitted) {
+         const uint32_t off = part->info.agx3_colour_link.entry_offset;
+         has_gate = (off & 1) == 0 && off <= n && n - off >= sizeof(gate_c) &&
+                    !memcmp(code + off, gate_c, sizeof(gate_c));
+      }
+      /* AGX3C pixrel(..., last=true, wait=0) immediately before END (0x0e). */
+      final_release = n >= 10 && code[n - 4] == 0x0e &&
+         (code[n - 10] & 0x07) == 0x07 && (code[n - 9] & 0x10) != 0 &&
+         code[n - 8] == 0x00 && code[n - 7] == 0x04 &&
+         code[n - 6] == 0x00 && code[n - 5] == 0x00;
+   } else {
+      static const uint8_t gate[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+      for (size_t o = 0; o + sizeof(gate) <= n && !has_gate; o += 2)
+         has_gate = !memcmp(code + o, gate, sizeof(gate));
+      final_release = n >= 10 && code[n - 4] == 0x0e &&
+         code[n - 10] == 0x07 && code[n - 9] == 0x02 && code[n - 8] == 0x54 &&
+         (code[n - 6] & 0x02) && code[n - 5] == 0x00;
+   }
    if (!has_gate || !final_release)
       return "pixel protocol not proven";
 
@@ -8205,7 +8259,7 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
       memcpy(parts, partitions, sizeof(parts));
 
    /* Bumped when the admission changes: refusals are cached as well. */
-   const char magic[8] = "hkmono7";
+   const char magic[8] = "hkmono8";
    const uint8_t preopt_flag = shader->g17p_mono_preoptimized ? 1 : 0;
    const size_t rodata_size =
       shader->b.binary ? shader->b.info.rodata.size_16 * 2 : 0;
@@ -8242,7 +8296,7 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
 static struct agx_shader_part *
 hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                            const struct agx_fs_epilog_key *ekey,
-                           const BITSET_WORD *partitions)
+                           const BITSET_WORD *partitions, bool uniform_blend)
 {
    /* A refusal of these inputs is final: remember it with the programs. */
 #define HK_MONO_REFUSE(why)                                                    \
@@ -8268,8 +8322,6 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    const bool inline_samples = shader->info.fs.m5_inline_sample_shading;
    const bool agx2 =
       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
-   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
-                              !inline_samples;
    if (uniform_blend && !hk_uniform_blend_key(ekey))
       HK_MONO_REFUSE("uniform blend shape");
    if ((ekey->native_spills && !inline_samples) ||
@@ -8298,7 +8350,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                    ? !hk_uniform_blend_part(shader, part)
                    : inline_samples
                    ? hk_g17p_mono_layout_mismatch(&expected, part, false) != NULL
-                   : hk_g17p_mono_part_refusal(shader, part) != NULL)
+                   : hk_g17p_mono_part_refusal(dev->dev.chip, shader, part) != NULL)
                HK_MONO_FAIL("cached program");
             ralloc_free(mem);
             return part;
@@ -8357,13 +8409,20 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       pixel.defer_monolithic_msaa = true;
       agx_nir_fs_epilog_ex(&eb, &pixel, &epilog_res);
       agx_nir_lower_sample_exports_to_end(nir);
-   } else if (uniform_blend) {
+   } else if (uniform_blend ||
+              (agx_chip_g17_m5(dev->dev.chip) && !ekey->link.sample_shading &&
+               !ekey->native_spills)) {
       agx_nir_fs_epilog_ex(&eb, ekey, &epilog_res);
    } else {
       agx_nir_fs_epilog_g17p_ex(&eb, ekey, &epilog_res);
    }
    agx_preprocess_nir(eb.shader);
-   if (!inline_samples && !uniform_blend)
+   if (!inline_samples && !uniform_blend && !ekey->link.sample_shading &&
+       (hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_store_zs_agx) > 1 ||
+        hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_sample_mask_agx) > 1))
+      NIR_PASS(_, eb.shader, agx_nir_hoist_g17p_zs_writes);
+   if (!inline_samples && !uniform_blend &&
+       (!agx_chip_g17_m5(dev->dev.chip) || ekey->nr_samples > 1))
       NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
 
    /* Epilog code reading uniforms (blend constants and the like) would
@@ -8531,7 +8590,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                ? (hk_uniform_blend_part(shader, part) ? NULL
                                                          : "uniform blend launch")
             : inline_samples ? hk_g17p_mono_layout_mismatch(&expected, part, false)
-                             : hk_g17p_mono_part_refusal(shader, part);
+                             : hk_g17p_mono_part_refusal(dev->dev.chip, shader, part);
       if (!why || !without)
          break;
 
@@ -9028,13 +9087,14 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
    const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
                               !shader->info.fs.m5_inline_sample_shading &&
+                              !shader->g17p_mono_preoptimized &&
                               hk_uniform_blend_key(&key->epilog);
    if ((uniform_blend || shader->info.fs.m5_inline_sample_shading ||
-        (agx_chip_native_agx3(dev->dev.chip) &&
+        (agx_chip_native_or_m5(dev->dev.chip) &&
          (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
        !prolog && key->nr_samples_shaded == 0 && shader->g17p_mono_nir) {
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
-         dev, shader, &key->epilog, g17p_tile_partitions);
+         dev, shader, &key->epilog, g17p_tile_partitions, uniform_blend);
       if (mono) {
          struct hk_fast_link_key *mono_key_clone =
             ralloc_memdup(shader->linked.ht, key, sizeof(*key));
@@ -13119,24 +13179,57 @@ hk_prelink_object_fragment(struct hk_device *dev, struct hk_api_shader *fs_api)
    hk_prelink_fragment(dev, fs_api, NULL, &dyn, &format, 1, false, false, 0);
 }
 
-/* A vertex shader that reads no attributes links the same prolog for every
- * vertex input state. Link the hardware program, and/or the software program
- * that tessellation and geometry run, for each index size. */
+/* Pre-link a vertex shader at PSO/shader-object creation time so the first draw
+ * does not stall on prolog compilation or link-table setup. Covers both
+ * attribute-less shaders (all states) and complete graphics pipelines with
+ * static vertex input state, including relocatable UVS fragment masks. */
 void
 hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
+                  const struct hk_api_shader *fs_api,
+                  const struct vk_graphics_pipeline_state *state,
                   bool hw_program, bool sw_program)
 {
    static const struct vk_vertex_input_state no_vi;
    static const uint16_t no_strides[MESA_VK_MAX_VERTEX_BINDINGS];
    struct hk_fast_link_key_vs key;
 
+   const struct hk_shader *fs = fs_api ? &fs_api->variants[0] : NULL;
+
    struct hk_shader *hw = &vs_api->variants[HK_VS_VARIANT_HW];
-   if (hw_program && hw->compiled && !hw->info.vs.attribs_read) {
-      hk_vs_link_key_build(
-         dev, hw, true, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
-         &no_vi, no_strides,
-         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
-      hk_get_fast_linked(dev, hw, &key);
+   if (hw_program && hw->compiled) {
+      const struct vk_vertex_input_state *vi = NULL;
+      uint16_t strides[MESA_VK_MAX_VERTEX_BINDINGS] = {0};
+      const uint16_t *vi_strides = no_strides;
+      if (!hw->info.vs.attribs_read) {
+         vi = &no_vi;
+      } else if (state && state->vi &&
+                 !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI) &&
+                 !BITSET_TEST(state->dynamic,
+                              MESA_VK_DYNAMIC_VI_BINDING_STRIDES)) {
+         vi = state->vi;
+         u_foreach_bit(b, vi->bindings_valid)
+            strides[b] = vi->bindings[b].stride;
+         vi_strides = strides;
+      }
+
+      if (vi) {
+         const enum mesa_prim prim =
+            (state && state->ia &&
+             !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY))
+               ? vk_topology_to_mesa(state->ia->primitive_topology)
+               : MESA_PRIM_TRIANGLES;
+         const VkPipelineRobustnessBufferBehaviorEXT vi_robustness =
+            state ? state->vertex_input_robustness
+                  : VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT;
+         hk_vs_link_key_build(dev, hw, true, prim, false,
+                              AGX_INDEX_SIZE_U32, false, vi, vi_strides,
+                              vi_robustness, &key);
+         if (fs && hw->info.uvs.relocatable && hw->info.uvs.written) {
+            key.uvs_flat = fs->info.fs.interp.flat & hw->info.uvs.written;
+            key.uvs_linear = fs->info.fs.interp.linear & hw->info.uvs.written;
+         }
+         hk_get_fast_linked(dev, hw, &key);
+      }
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];

@@ -1503,7 +1503,7 @@ agx_validate_ra(UNUSED agx_context *ctx)
 #endif
 
 enum agx_size agx_split_width(const agx_instr *I);
-bool agx_allows_16bit_immediate(agx_instr *I);
+bool agx_allows_16bit_immediate(agx_instr *I, enum agx_isa_encoding enc);
 unsigned agx_negate_src_index(agx_instr *I);
 
 static inline bool

@@ -8,6 +8,7 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
+#include "hk_instance.h"
 #include "hk_physical_device.h"
 #include "hk_memory_budget.h"
 #include "hk_wsi.h"
@@ -23,6 +24,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define MIB (UINT64_C(1024) * 1024)
@@ -41,6 +43,7 @@ __typeof__(agx_bo_cache_evict_all) __wrap_agx_bo_cache_evict_all;
 __typeof__(agx_bo_cache_evict_all) __real_agx_bo_cache_evict_all;
 __typeof__(agx_bo_export) __wrap_agx_bo_export;
 __typeof__(agx_bo_import) __wrap_agx_bo_import;
+__typeof__(agx_bo_import_host_ptr) __wrap_agx_bo_import_host_ptr;
 __typeof__(hk_get_cgroup_memory_available) __wrap_hk_get_cgroup_memory_available;
 __typeof__(__vk_errorf) __wrap___vk_errorf;
 __typeof__(os_get_available_system_memory) __wrap_os_get_available_system_memory;
@@ -162,6 +165,22 @@ __wrap_agx_bo_import(struct agx_device *dev, int fd)
                                      AGX_BO_SHARED | AGX_BO_SHAREABLE);
    if (bo)
       p_atomic_set(&bo->refcnt, 1);
+   return bo;
+}
+
+struct agx_bo *
+__wrap_agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
+                              enum agx_host_ptr_access access)
+{
+   enum agx_bo_flags flags = AGX_BO_HOST_PTR | AGX_BO_WRITEBACK | AGX_BO_NO_CACHE;
+   if (access == AGX_HOST_PTR_READ_ONLY)
+      flags |= AGX_BO_READONLY;
+   struct agx_bo *bo = mock_bo_alloc(dev, size, AIL_PAGESIZE, flags);
+   if (bo) {
+      bo->_map = ptr;
+      bo->_map_size = size;
+      p_atomic_set(&bo->refcnt, 1);
+   }
    return bo;
 }
 
@@ -350,6 +369,24 @@ alloc(struct hk_device *dev, uint64_t size, VkDeviceMemory *memory)
    return alloc_type(dev, size, 0, memory);
 }
 
+static VkResult
+alloc_host(struct hk_device *dev, void *ptr, uint64_t size,
+           VkDeviceMemory *memory)
+{
+   const VkImportMemoryHostPointerInfoEXT host_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      .pHostPointer = ptr,
+   };
+   const VkMemoryAllocateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &host_info,
+      .allocationSize = size,
+      .memoryTypeIndex = 0,
+   };
+   return hk_AllocateMemory(hk_device_to_handle(dev), &info, &allocator, memory);
+}
+
 static void
 swapchain_attempt(struct hk_device *dev, uint64_t image_size)
 {
@@ -389,9 +426,11 @@ swapchain_attempt(struct hk_device *dev, uint64_t image_size)
 int
 main(void)
 {
+   struct hk_instance *instance = calloc(1, sizeof(*instance));
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
-   assert(dev && pdev);
+   assert(instance && dev && pdev);
+   pdev->vk.instance = &instance->vk;
    dev->vk.alloc = *vk_default_allocator();
    allocator = dev->vk.alloc;
    allocator.pfnAllocation = allocate;
@@ -400,6 +439,10 @@ main(void)
    vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
    vk_object_base_init(NULL, &pdev->vk.base, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
    dev->dev.chip = AGX_CHIP_G17P;
+   simple_mtx_init(&dev->host_alias.lock, mtx_plain);
+   simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
+   list_inithead(&dev->host_alias.cmd_buffers);
+   u_rwlock_init(&dev->host_alias.patch_lock);
    static struct hk_heap_usage heap_usage;
    pdev->heap_usage = &heap_usage;
    pdev->mem_types[0].heapIndex = 0;
@@ -780,10 +823,100 @@ main(void)
    hk_sync_xfer_end(&cmd);
    vk_object_base_finish(&cmd.vk.base);
 
+   /* Host-pointer imports track aliasing per import via /proc/self/maps and
+    * range overlap on non-M5 chips and on M5 with host_alias.dynamic, while
+    * keeping va_alias_resources == 0 for disjoint private anonymous mappings. */
+   const size_t host_sz = 65536;
+   void *priv_a = mmap(NULL, host_sz * 2, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+   void *shared_a = mmap(NULL, host_sz, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+   assert(priv_a != MAP_FAILED && shared_a != MAP_FAILED);
+
+   /* G17P: disjoint private-anonymous imports do not raise va_alias_resources;
+    * overlapping or shared-mapping imports do, and freeing restores 0. */
+   dev->dev.chip = AGX_CHIP_G17P;
+   dev->host_alias.dynamic = false;
+   dev->may_alias_memory = false;
+   assert(!dev->va_alias_resources && !dev->alias_live &&
+          !hk_cdm_alias_scope(dev));
+
+   VkDeviceMemory hm0 = 0, hm1 = 0, hm_ov = 0, hm_sh = 0;
+   passing = 32;
+   assert(alloc_host(dev, priv_a, host_sz, &hm0) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 0 && !hk_cdm_alias_scope(dev));
+   assert(alloc_host(dev, (char *)priv_a + host_sz, host_sz, &hm1) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 0 && !hk_cdm_alias_scope(dev));
+   assert(alloc_host(dev, priv_a, host_sz, &hm_ov) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 2 && hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm_ov, &allocator);
+   assert(dev->va_alias_resources == 0 && !hk_cdm_alias_scope(dev));
+   assert(alloc_host(dev, shared_a, host_sz, &hm_sh) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 1 && hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm_sh, &allocator);
+   assert(dev->va_alias_resources == 0 && !hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm1, &allocator);
+   hk_FreeMemory(hk_device_to_handle(dev), hm0, &allocator);
+   assert(dev->va_alias_resources == 0 && !pinned && !host_live);
+
+   /* M5 (G17C) with host_alias.dynamic: va_alias_resources and alias_live stay
+    * 0 for disjoint private-anonymous imports and track overlaps/shared maps
+    * together. */
+   dev->dev.chip = AGX_CHIP_G17C;
+   dev->host_alias.dynamic = true;
+   dev->may_alias_memory = false;
+   passing = 32;
+   assert(alloc_host(dev, priv_a, host_sz, &hm0) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 0 && dev->alias_live == 0 &&
+          !hk_cdm_alias_scope(dev));
+   assert(alloc_host(dev, priv_a, host_sz, &hm_ov) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 2 && dev->alias_live == 2 &&
+          hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm_ov, &allocator);
+   assert(dev->va_alias_resources == 0 && dev->alias_live == 0 &&
+          !hk_cdm_alias_scope(dev));
+   assert(alloc_host(dev, shared_a, host_sz, &hm_sh) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 1 && dev->alias_live == 1 &&
+          hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm_sh, &allocator);
+   hk_FreeMemory(hk_device_to_handle(dev), hm0, &allocator);
+   assert(dev->va_alias_resources == 0 && dev->alias_live == 0 &&
+          !pinned && !host_live);
+
+   /* M5 static per-device fallback: writable host imports still count
+    * unconditionally in va_alias_resources. */
+   dev->host_alias.dynamic = false;
+   dev->may_alias_memory = true;
+   passing = 16;
+   assert(alloc_host(dev, priv_a, host_sz, &hm0) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 1 && hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), hm0, &allocator);
+   assert(dev->va_alias_resources == 0 && !pinned && !host_live);
+
+   /* Reset to G17P and verify fd imports still count unconditionally. */
+   dev->dev.chip = AGX_CHIP_G17P;
+   dev->may_alias_memory = false;
+   import_info.fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+   assert(import_info.fd >= 0);
+   import_size = MIB;
+   passing = 16;
+   assert(hk_AllocateMemory(hk_device_to_handle(dev), &import_alloc, &allocator,
+                            &memory) == VK_SUCCESS);
+   assert(dev->va_alias_resources == 1 && hk_cdm_alias_scope(dev));
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(dev->va_alias_resources == 0 && !hk_cdm_alias_scope(dev));
+
+   munmap(shared_a, host_sz);
+   munmap(priv_a, host_sz * 2);
+
    assert(!pinned && !host_live && !kernel_oom_attempts);
    wsi_headless_finish_wsi(&pdev->wsi_device, vk_default_allocator());
    vk_object_base_finish(&dev->vk.base);
    vk_object_base_finish(&pdev->vk.base);
+   hk_host_imports_fini(&dev->host_alias.imports);
+   u_rwlock_destroy(&dev->host_alias.patch_lock);
+   simple_mtx_destroy(&dev->host_alias.cmd_lock);
+   simple_mtx_destroy(&dev->host_alias.lock);
    util_vma_heap_finish(&dev->dev.main_heap);
    simple_mtx_destroy(&dev->dev.vma_lock);
    simple_mtx_destroy(&dev->dev.bo_cache.lock);
@@ -791,6 +924,7 @@ main(void)
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);
+   free(instance);
    puts("PASS: 2050 swapchain allocation attempts, sync-file probe and fd imports, no kernel OOM entry or retained backing");
    return 0;
 }

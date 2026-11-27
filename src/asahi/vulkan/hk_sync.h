@@ -717,6 +717,8 @@ void hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
 void hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd);
 void hk_sync_replace_render(struct hk_cmd_buffer *cmd, struct hk_cs *from,
                             struct hk_cs *into);
+void hk_sync_apply_dep(struct hk_cmd_buffer *cmd, struct hk_cs *into,
+                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 /* Whether a submission records tile-hazard footprints, and whether the
  * queue may still be running one, so the caller fetches the completed
  * timeline point only when it can matter. */
