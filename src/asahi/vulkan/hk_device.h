@@ -146,6 +146,12 @@ struct hk_device {
     * (hk_device_may_alias_memory()). M5 uses it in place of
     * va_alias_resources, see hk_cdm_alias_scope(). */
    bool may_alias_memory;
+   /* The kernel runs a render's fragment work after the previous render's
+    * on a queue, partial renders included
+    * (DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS): a render that only loads
+    * whole tiles an earlier render stores waits for it in its fragment half
+    * alone (hk_sync.h, tile hazards). */
+   bool load_hazard_frag;
    /* M5 with host_alias.dynamic: live resources through which memory has or
     * may have a second GPU address (hk_device_alias_get()), atomic:
     * va_alias_resources, fd and dma-buf imports, and host imports that may

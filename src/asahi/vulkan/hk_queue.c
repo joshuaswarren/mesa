@@ -1412,6 +1412,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    queue->sync.stage_overlap = old.stage_overlap;
    queue->sync.precise_tile_evictions = old.precise_tile_evictions;
    queue->sync.direct_single_footprints = old.direct_single_footprints;
+   queue->sync.load_hazard_frag = old.load_hazard_frag;
    /* The submission that starts it waits for all sibling work too. */
    memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
    queue->sib.used = false;
@@ -8537,6 +8538,7 @@ hk_queue_create(struct hk_device *dev,
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.precise_tile_evictions = true;
    queue->sync.direct_single_footprints = true;
+   queue->sync.load_hazard_frag = dev->load_hazard_frag;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete

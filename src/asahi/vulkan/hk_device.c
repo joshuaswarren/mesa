@@ -1154,6 +1154,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_fd;
    }
 
+   /* The kernel's feature word, read when the device was opened: queues copy
+    * this into their submission tracking when they are created. */
+   dev->load_hazard_frag = dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS;
+
    /* Splitting a long submission lets the GPU start work from the first ioctl
     * while the kernel validates later ioctls, so a profile may cap batch size. */
    dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
