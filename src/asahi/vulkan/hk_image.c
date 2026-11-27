@@ -558,14 +558,12 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
     * VK_IMAGE_CREATE_ALIAS_BIT, which vkd3d-proton sets on every placed
     * resource, is admitted under the colour policy's contract: images of
     * identical creation parameters get the same layout, metadata included.
-    * An image whose memory another alias wrote must leave UNDEFINED before
-    * use, and that transition initializes the metadata
-    * (brl_barrier_needs_metadata_init()). vkd3d-proton defers it to a
-    * resource's activation (clear, discard, full copy), so a UAV texture that
-    * a dispatch writes after an aliasing barrier meets whatever the previous
-    * alias left. Gen10 storage stores merge into such tiles exactly
-    * (tests/vulkan_storage_alias.c: every texel a dispatch stored over random
-    * and constant metadata, with and without the transition). */
+    * Gen10 storage stores merge directly into tiles over arbitrary prior
+    * metadata (tests/vulkan_storage_alias.c: every stored or rendered texel
+    * over all 256 metadata byte patterns and random garbage, with or without
+    * an UNDEFINED transition), so brl_barrier_needs_metadata_init() skips
+    * discard metadata fast-clears when hk_chip_supports_compressed_storage_pbe()
+    * holds. */
    const VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
