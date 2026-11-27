@@ -17567,6 +17567,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t len = 0;
             if (!agx3_translate_mem(enc, I, is_store, slot, wait, &d))
                AGX3_REFUSE(I);
+            if (is_store && ctx->key->dev.chip == AGX_CHIP_G17P &&
+                ctx->stage == MESA_SHADER_COMPUTE) {
+               /* On G17P (AGX3b), setting stdev f75=1 bypasses per-core L1
+                * write-allocation and writes straight through to shared L2,
+                * keeping L1 capacity free for streaming reads across compute
+                * dispatches. */
+               d.coherent = true;
+            }
             if (g17p_vertex_load_policy && !is_store) {
                const bool first = vertex_loads_seen++ == 0;
                const bool last = --device_loads_left == 0;
