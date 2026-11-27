@@ -15,8 +15,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "asahi/compiler/agx3_compose/agx3_decode.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/compiler/agx3_reencode_cache.h"
+#include "asahi/isa/disasm.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 
 #define CHECK(x)                                                               \
@@ -174,5 +176,66 @@ main(void)
    CHECK(n[0].hits * 10 >= n[0].cases * 9);
    CHECK(all.hits > 0 && all.misses > 16 * CLASSES);
    agx3_reencode_cache_clear(&cache);
+
+   /* G18G general HAL300 tile programs must keep the witnessed 0x200 SR14
+    * helper base after agx3d re-encoding even on multi-cluster G18G devices
+    * (2 clusters on J873, or 4 on wider parts), matching
+    * agx3_g18g_tile_program_generate() byte for byte. */
+   const unsigned g18_clusters[] = {2, 4};
+   const struct agx3_transcode_ioto tile_ioto = {
+      .api_program = false,
+      .shader_gprs = 16,
+   };
+   for (unsigned store = 0; store < 2; ++store) {
+      const struct agx3_g17p_graphics_program_desc ref_desc = {
+         .program_va = UINT64_C(0x10000100000),
+         .shader_va = UINT64_C(0x100000003c0),
+         .shader_binary_size = 60,
+         .nr_gprs = 16,
+         .compiler_d_valid = true,
+         .fragment = true,
+         .imageblock = {.sample_size_B = 8, .nr_samples = 1, .tile_size_px = 1024},
+      };
+      struct agx3_g17p_graphics_program ref_prog;
+      const char *why = NULL;
+      unsigned at = 0;
+      CHECK(agx3_g18g_tile_program_generate(&ref_desc, store, &ref_prog));
+      CHECK(agx3_reencode_program(&ref_prog, &tile_ioto, &why, &at));
+
+      for (unsigned ci = 0; ci < ARRAY_SIZE(g18_clusters); ++ci) {
+         struct agx3_g17p_graphics_program_desc desc = ref_desc;
+         desc.usc_clusters = g18_clusters[ci];
+         struct agx3_g17p_graphics_program got_prog;
+         why = NULL;
+         at = 0;
+         CHECK(agx3_g18g_general_tile_program_generate(&desc, store, &got_prog));
+         CHECK(agx3_reencode_program(&got_prog, &tile_ioto, &why, &at));
+         CHECK(got_prog.length == ref_prog.length);
+         CHECK(!memcmp(got_prog.bytes, ref_prog.bytes, ref_prog.length));
+
+         bool helper_base_next = false;
+         unsigned sr14_bases = 0;
+         for (unsigned off = 0; off < got_prog.length;) {
+            const char *disp = NULL;
+            const signed len = agx3d_instr_length(
+               got_prog.bytes + off, got_prog.length - off, &disp);
+            CHECK(len > 0);
+            uint64_t f[AGX3_MAX_FIELDS];
+            if (helper_base_next) {
+               CHECK(agx3_decode(&agx3d_table, got_prog.bytes + off,
+                                 (unsigned)len, AGX3_MN_ldimm, f) >= 0);
+               CHECK(f[2] == 0 && f[14] == 0x200);
+               sr14_bases++;
+               helper_base_next = false;
+            } else if (agx3_decode(&agx3d_table, got_prog.bytes + off,
+                                   (unsigned)len, AGX3_MN_rld, f) >= 0 &&
+                       f[21] == 14) {
+               helper_base_next = true;
+            }
+            off += (unsigned)len;
+         }
+         CHECK(sr14_bases == 1);
+      }
+   }
    return 0;
 }

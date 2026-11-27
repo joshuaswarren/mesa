@@ -130,6 +130,7 @@ test_supported_contracts(void)
       {AGX_CHIP_G17G, AGX_ISA_ENCODING_AGX3C, 14, 8},
       {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C, 14, 8},
       {AGX_CHIP_G17C, AGX_ISA_ENCODING_AGX3C, 14, 8},
+      {AGX_CHIP_G17D, AGX_ISA_ENCODING_AGX3C, 14, 8},
    };
 
    for (unsigned c = 0; c < sizeof(chips) / sizeof(chips[0]); ++c) {

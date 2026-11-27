@@ -23,6 +23,7 @@
 
 #include "agx_bo.h"
 #include "agx_chip.h"
+#include "agx_drm_names.h"
 #include "agx_pack.h"
 #include "decode.h"
 #include "layout.h"
@@ -35,20 +36,6 @@
 struct vdrm_device;
 struct asahi_ccmd_submit_res;
 #endif
-
-/* DRM name of the native kernel driver. Kernels before the Aurora rename
- * report "asahi", so both are accepted and Mesa and the kernel can update in
- * either order.
- */
-#define AGX_DRM_DRIVER_NAME        "aurora"
-#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
-
-static inline bool
-agx_is_native_drm_driver(const char *name)
-{
-   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
-                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
-}
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
@@ -559,6 +546,31 @@ agx_has_soft_fault(const struct agx_device *dev)
 {
    return (dev->params.features & DRM_ASAHI_FEATURE_SOFT_FAULTS) &&
           !(dev->debug & AGX_DBG_NOSOFT);
+}
+
+/*
+ * Whether every M5 compute barrier takes memory scope: every launch's ordering
+ * record (0x6000017c) and every flush recorded for a dependency, whatever
+ * memory the device can alias (hk_cdm_alias_scope()). Selected by what the
+ * kernel reports, a GPU of more than one die, as agx_gather_device_key()
+ * already selects multi-die coherency, and only where the scoped ordering
+ * record is grounded for the chip.
+ *
+ * On the M5 Ultra (two dies, J775D), with plain barriers wherever no memory
+ * aliases, 6 cases of a 117-case compute CTS subset, 2059 to 2160 of 8520
+ * ycbcr cases (a different set from run to run) and 270 of 5310
+ * host_image_copy cases failed, and llama.cpp's output was wrong; with memory
+ * scope on every barrier all of them pass. Why it needs the scope is not
+ * established: the die count is the property that separates it from the M5
+ * parts that have not shown the failure, not a measured cause. An M5 Pro or
+ * M5 Max run of those six cases under plain barriers would say whether the
+ * line is the dies or the M5 family.
+ */
+static inline bool
+agx_cdm_ordering_memory_scope(const struct agx_device *dev)
+{
+   return dev->params.num_dies > 1 && agx_chip_g17_m5(dev->chip) &&
+          agx_chip_has_record(dev->chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY);
 }
 
 /* Base of the G17P USC exec window.  MEASURED RULE: bit 40 of the program VA

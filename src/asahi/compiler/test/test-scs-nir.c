@@ -102,6 +102,7 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
       if(out){FILE *f=fopen(out,"wb");assert(f);assert(fwrite(part.binary+part.info.main_offset,1,part.info.main_size,f)==part.info.main_size);assert(!fclose(f));printf("bytes=%u gprs=%u\n",part.info.main_size,part.info.nr_gprs);
          struct agx3_g17p_graphics_program_desc desc={
             .program_va=0x10000000000ull, .shader_va=0x10000003000ull,
+            .usc_clusters=2, /* the M5 Pro's lead */
             .shader_binary_size=part.info.main_size,.nr_gprs=part.info.nr_gprs,
             .scratch_size=MAX2(part.info.scratch_size, part.info.agx3_spectpr_scratch_size),
             .compiler_d_valid=part.info.agx3_staging_known,

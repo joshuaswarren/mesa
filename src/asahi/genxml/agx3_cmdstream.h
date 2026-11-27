@@ -570,6 +570,17 @@ agx3_cdm_barrier_flush_memory_grounded(enum agx_chip chip)
    return agx_chip_has_record(chip, AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
 }
 
+/* Whether a barrier's flags take memory scope on this chip: the strong flush
+ * (flags 5) wherever memory scope is grounded, and the ordering record
+ * (flags 0) where AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY is. */
+static inline bool
+agx3_cdm_barrier_flush_memory_flags(enum agx_chip chip, uint8_t flags)
+{
+   return flags == 5 ||
+          (flags == 0 &&
+           agx_chip_has_record(chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY));
+}
+
 static inline uint32_t
 agx3_cdm_barrier_word(uint8_t flags)
 {
@@ -595,7 +606,7 @@ agx3_cdm_barrier_pack(const struct agx3_cdm_barrier_info *info,
 
    if (info->flush_memory &&
        (!agx3_cdm_barrier_flush_memory_grounded(info->chip) ||
-        info->flags != 5))
+        !agx3_cdm_barrier_flush_memory_flags(info->chip, info->flags)))
       return false;
    agx3_cmdstream_store_le32(
       packed, agx3_cdm_barrier_word(info->flags) |
@@ -645,7 +656,7 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
    if (!agx3_cdm_barrier_flags_grounded(chip, flags))
       return false;
 
-   if (flush_memory && flags != 5)
+   if (flush_memory && !agx3_cdm_barrier_flush_memory_flags(chip, flags))
       return false;
    info->chip = chip;
    info->flags = flags;

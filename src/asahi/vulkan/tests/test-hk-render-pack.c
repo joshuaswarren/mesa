@@ -499,7 +499,20 @@ test_member(void)
 
    c = split(4);
    first_cs(c)->timestamp.end.handle = 1;
-   T("a render with an end stamp is not", !hk_render_pack_member(c));
+   T("a render with an end stamp is a member", hk_render_pack_member(c));
+   T("taking the fragment end",
+     hk_render_pack_stamp_slots(first_cs(c)) == 2);
+
+   c = split(4);
+   first_cs(c)->timestamp.vtx_end.handle = 1;
+   T("a render with a vertex-end stamp is a member",
+     hk_render_pack_member(c) && hk_render_pack_stamp_slots(first_cs(c)) == 1);
+
+   c = split(4);
+   first_cs(c)->timestamp.start.handle = 1;
+   T("a render with a start stamp is not", !hk_render_pack_member(c));
+   T("and says so",
+     !strcmp(hk_render_pack_member_refusal(c) ?: "", "timestamp"));
 
    c = split(4);
    first_cs(c)->oq_stamp[3].handle = 1;
@@ -940,7 +953,6 @@ test_fold(bool exact)
    T(N("a later member's image reads carry an earlier tail to the vertex half"),
      cs->sync.vtx_images &&
         (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
-
    /* Final-member resolve fold: merges process_empty_tiles, EOT program,
     * tile resources, and fragment attachment sets. */
    struct hk_cmd_buffer *a5 = split(4), *b5 = split(6);
@@ -970,6 +982,19 @@ test_fold(bool exact)
         cs->fragment_attachments.count == 2 &&
         cs->fragment_attachments.list[1].pointer == 0x20000 &&
         cs->fragment_attachments.complete);
+
+   /* A leading top-of-pipe stamp on the first member's vertex end and an
+    * end stamp on the last member's fragment end ride on the packet. */
+   struct hk_cmd_buffer *a6 = split(10), *b6 = split(10);
+   first_cs(a6)->timestamp.vtx_end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 8};
+   first_cs(b6)->timestamp.end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 16};
+   struct hk_cmd_buffer *ab6[] = {a6, b6};
+   packet = pack(ab6, 2, &cs);
+   T(N("the packet carries the members' vertex-end and fragment-end stamps"),
+     cs->timestamp.vtx_end.offset_B == 8 && cs->timestamp.end.offset_B == 16 &&
+        !cs->timestamp.start.handle);
 #undef N
 }
 

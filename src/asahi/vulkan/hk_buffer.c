@@ -691,6 +691,14 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       VK_FROM_HANDLE(hk_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(hk_buffer, buffer, pBindInfos[i].buffer);
 
+      if (mem && !p_atomic_read(&mem->has_buffer_binding)) {
+         VK_FROM_HANDLE(hk_device, dev, device);
+         p_atomic_set(&mem->has_buffer_binding, true);
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+         if (p_atomic_read(&mem->has_image_binding))
+            p_atomic_inc(&dev->buffer_alias_mem_gen);
+      }
+
       if (buffer->va) {
          VK_FROM_HANDLE(hk_device, dev, device);
          /* The VA allocation includes an overread guard, not backed by this

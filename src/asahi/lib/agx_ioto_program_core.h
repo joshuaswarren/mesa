@@ -262,8 +262,11 @@ bool agx_ioto_program_copy_suffix_offset(enum agx_chip chip, const void *body,
 bool agx_ioto_program_first_copy_offset(enum agx_chip chip, const void *body,
                                        size_t body_size, size_t *offset);
 
+/* usc_clusters: the cluster count the USC window's lead was built for
+ * (agx3_m5_container_group_offset()), the kernel's num_clusters_total. */
 bool agx_ioto_m5_resource_program_compose_classes(
-   enum agx_chip chip, uint64_t program_va, const void *body, size_t body_size,
+   enum agx_chip chip, unsigned usc_clusters, uint64_t program_va,
+   const void *body, size_t body_size,
    const struct agx_ioto_state_tail_output *packed_tail,
    enum agx_ioto_g17g_program_stage stage, unsigned colour_classes,
    void *output, size_t capacity, size_t *written);
