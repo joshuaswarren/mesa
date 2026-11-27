@@ -6318,11 +6318,6 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
-          !hk_nir_root_reads_range(
-             nir, hk_root_descriptor_offset(cs.group_count_addr),
-             hk_root_descriptor_offset(cs.group_count_addr) +
-                sizeof(uint64_t),
-             sizeof(struct hk_root_descriptor_table)) &&
           hk_nir_can_coalesce_workgroup(nir))
          wg_coalesce_cand = true;
    }

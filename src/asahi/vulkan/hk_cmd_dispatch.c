@@ -5115,12 +5115,15 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
             : 256u;
       const uint64_t min_wgs =
          MAX2(256ull, 4ull * agx_get_num_cores(&dev->dev));
-      uint16_t coalesced[3];
+      uint16_t reshaped[3];
       if (hk_coalesce_workgroup_size_ex(
              selected->b.info.workgroup_size, grid.count,
              dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
-             target_wg, min_wgs, coalesced)) {
-         local_size = agx_workgroup(coalesced[0], coalesced[1], coalesced[2]);
+             target_wg, min_wgs, reshaped) ||
+          hk_split_workgroup_size_ex(
+             selected->b.info.workgroup_size, grid.count,
+             2ull * agx_get_num_cores(&dev->dev), reshaped)) {
+         local_size = agx_workgroup(reshaped[0], reshaped[1], reshaped[2]);
       }
    }
 
