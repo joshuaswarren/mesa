@@ -190,6 +190,9 @@ struct hk_shader_info {
    /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
     * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
    uint64_t agx3_dynbuf_reads;
+   /* Bitmask of 32-bit root.push[] dwords read by this shader (UINT64_MAX on
+    * non-constant push indexing). Only meaningful when HK_ROOT_READS_PUSH is set. */
+   uint64_t agx3_push_read_dwords;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -261,6 +264,7 @@ struct hk_local_read_shader_meta {
    uint8_t set_count;
    uint8_t agx3_root_reads;
    uint64_t agx3_dynbuf_reads;
+   uint64_t agx3_push_read_dwords;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
