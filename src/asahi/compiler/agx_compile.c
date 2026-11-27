@@ -12093,13 +12093,19 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
-   /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
-    * before runtime-loop unrolling and vectorization, while the loop induction
-    * variable is still unit-stepped. */
+   /* Eliminate tautological monotonic bit-insert guards, collapse top-2 min
+    * (argmin2) loop recurrences, and rewrite single-workgroup shared-memory
+    * indirect bitonic sorts into key-memoized + subgroup-shuffle passes before
+    * runtime-loop unrolling and vectorization, while induction variables are
+    * still unit-stepped. */
+   bool shared_sort_opt = false;
    {
-      bool folded_bits = false;
-      NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
-      if (folded_bits)
+      bool pre_unroll = false;
+      NIR_PASS(pre_unroll, nir, agx_nir_opt_monotonic_bit_insert);
+      NIR_PASS(pre_unroll, nir, agx_nir_opt_top2_min);
+      if (agx3_compute_opts && !nir->info.internal)
+         NIR_PASS(shared_sort_opt, nir, agx_nir_opt_shared_index_sort);
+      if (pre_unroll || shared_sort_opt)
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
@@ -12313,7 +12319,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(_, nir, nir_opt_algebraic);
 
    nir_divergence_analysis(nir);
-   bool sub_progress = false;
+   bool sub_progress = shared_sort_opt;
    bool addr_progress = false;
 
    static const nir_lower_subgroups_options subgroups_options = {

@@ -443,5 +443,7 @@ bool agx_nir_fold_const_select_alu(struct nir_shader *shader);
 bool agx_nir_opt_narrow_u8_fadd_tree(struct nir_shader *shader);
 
 bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
+bool agx_nir_opt_shared_index_sort(struct nir_shader *shader);
+bool agx_nir_opt_top2_min(struct nir_shader *shader);
 bool agx_nir_opt_shared_flat_phase_cse(struct nir_shader *shader);
 bool agx_nir_opt_shared_vec2(struct nir_shader *shader);
