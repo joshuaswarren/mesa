@@ -3593,7 +3593,8 @@ match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out,
                   nir_def *a_cand = pairs[which][1 - side];
                   enum hk_resize_lerp_mode m =
                      alu->op == nir_op_fadd
-                        ? HK_RESIZE_LERP_ONE_MINUS_ADD
+                        ? (which == 0 ? HK_RESIZE_LERP_ONE_MINUS_ADD_A
+                                      : HK_RESIZE_LERP_ONE_MINUS_ADD_B)
                         : (which == 0 ? HK_RESIZE_LERP_ONE_MINUS_FFMA_A
                                       : HK_RESIZE_LERP_ONE_MINUS_FFMA_B);
                   if (pairs[1 - which][0] == t) {
@@ -5628,9 +5629,13 @@ eval_lerp_f32(nir_builder *b, nir_def *a, nir_def *bv, nir_def *t,
               enum hk_resize_lerp_mode mode)
 {
    switch (mode) {
-   case HK_RESIZE_LERP_ONE_MINUS_ADD: {
+   case HK_RESIZE_LERP_ONE_MINUS_ADD_A: {
       nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);
       return nir_fadd(b, nir_fmul(b, omt, a), nir_fmul(b, t, bv));
+   }
+   case HK_RESIZE_LERP_ONE_MINUS_ADD_B: {
+      nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);
+      return nir_fadd(b, nir_fmul(b, t, bv), nir_fmul(b, omt, a));
    }
    case HK_RESIZE_LERP_ONE_MINUS_FFMA_A: {
       nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);

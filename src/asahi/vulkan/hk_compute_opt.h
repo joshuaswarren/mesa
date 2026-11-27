@@ -28,11 +28,12 @@ enum hk_compute_opt_kind {
  * HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 so the emitted kernel reproduces
  * the matched shader's rounding bit-for-bit. */
 enum hk_resize_lerp_mode {
-   HK_RESIZE_LERP_ONE_MINUS_ADD = 0,
-   HK_RESIZE_LERP_ONE_MINUS_FFMA_A = 1,
-   HK_RESIZE_LERP_ONE_MINUS_FFMA_B = 2,
-   HK_RESIZE_LERP_DIFF_FFMA = 3,
-   HK_RESIZE_LERP_DIFF_ADD = 4,
+   HK_RESIZE_LERP_ONE_MINUS_ADD_A = 0,
+   HK_RESIZE_LERP_ONE_MINUS_ADD_B = 1,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_A = 2,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_B = 3,
+   HK_RESIZE_LERP_DIFF_FFMA = 4,
+   HK_RESIZE_LERP_DIFF_ADD = 5,
 };
 
 struct hk_compute_opt_binding {

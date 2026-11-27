@@ -885,12 +885,15 @@ test_bilinear_resize_border(void)
 
    /* Verify pre-lowered GB6 form: in-arm primary stores, dst reload at primary
     * index, (1 - t) * a + t * b lerp, and 4 direct sibling mirror border ifs.
-    * variant 0 = valid GB6 form; 1 = bad reload; 2 = mismatched scale grouping
-    * `(x * sw) * frcp(dw)`; 3 = unlowered flrp (must reject). */
-   for (unsigned variant = 0; variant < 4; variant++) {
+    * variant 0 = valid GB6 form `(1-t)*a + t*b`; 1 = bad reload; 2 = mismatched
+    * scale grouping `(x * sw) * frcp(dw)`; 3 = unlowered flrp (must reject);
+    * 4 = reversed-operand `t*b + (1-t)*a` (must match as ONE_MINUS_ADD_B and
+    * preserve fadd operand order so algebraic late-FMA fuses identically). */
+   for (unsigned variant = 0; variant < 5; variant++) {
       const bool bad_reload = (variant == 1);
       const bool bad_scale = (variant == 2);
       const bool use_flrp = (variant == 3);
+      const bool rev_add = (variant == 4);
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_COMPUTE, &test_nir_options, "resize_prelower");
       b.shader->info.internal = false;
@@ -968,6 +971,12 @@ test_bilinear_resize_border(void)
                   nir_def *t = nir_flrp(&b, p00, p01, fx);
                   nir_def *bt = nir_flrp(&b, p10, p11, fx);
                   v = nir_flrp(&b, t, bt, fy);
+               } else if (rev_add) {
+                  nir_def *omfx = nir_fsub(&b, nir_imm_float(&b, 1.0f), fx);
+                  nir_def *omfy = nir_fsub(&b, nir_imm_float(&b, 1.0f), fy);
+                  nir_def *t = nir_fadd(&b, nir_fmul(&b, fx, p01), nir_fmul(&b, omfx, p00));
+                  nir_def *bt = nir_fadd(&b, nir_fmul(&b, fx, p11), nir_fmul(&b, omfx, p10));
+                  v = nir_fadd(&b, nir_fmul(&b, fy, bt), nir_fmul(&b, omfy, t));
                } else {
                   nir_def *omfx = nir_fsub(&b, nir_imm_float(&b, 1.0f), fx);
                   nir_def *omfy = nir_fsub(&b, nir_imm_float(&b, 1.0f), fy);
@@ -1040,20 +1049,52 @@ test_bilinear_resize_border(void)
       nir_validate_shader(b.shader, "resize_prelower");
       struct hk_compute_opt_plan p3 = {0};
       bool matched = hk_nir_match_compute_opt(b.shader, 1, layouts, &p3);
-      assert(matched == (variant == 0));
+      assert(matched == (variant == 0 || variant == 4));
       if (matched) {
          assert(p3.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
-         assert(p3.flags == HK_RESIZE_LERP_ONE_MINUS_ADD);
+         assert(p3.flags == (rev_add ? HK_RESIZE_LERP_ONE_MINUS_ADD_B
+                                     : HK_RESIZE_LERP_ONE_MINUS_ADD_A));
          nir_shader *opt3 = hk_nir_build_compute_opt(
             NULL, b.shader, &p3, nir_address_format_64bit_bounded_global);
          assert(opt3 != NULL);
          bool saw_fadd = false, saw_ffma = false, saw_fmin = false, saw_fmax = false;
+         bool saw_a_first = false, saw_b_first = false;
          nir_foreach_block(blk, nir_shader_get_entrypoint(opt3)) {
             nir_foreach_instr(ins, blk) {
                if (ins->type != nir_instr_type_alu)
                   continue;
-               switch (nir_instr_as_alu(ins)->op) {
-               case nir_op_fadd: saw_fadd = true; break;
+               nir_alu_instr *alu = nir_instr_as_alu(ins);
+               switch (alu->op) {
+               case nir_op_fadd: {
+                  saw_fadd = true;
+                  nir_instr *s0 = nir_def_instr(alu->src[0].src.ssa);
+                  nir_instr *s1 = nir_def_instr(alu->src[1].src.ssa);
+                  if (s0->type == nir_instr_type_alu &&
+                      s1->type == nir_instr_type_alu &&
+                      nir_instr_as_alu(s0)->op == nir_op_fmul &&
+                      nir_instr_as_alu(s1)->op == nir_op_fmul) {
+                     nir_alu_instr *m0 = nir_instr_as_alu(s0);
+                     bool s0_has_omt = false;
+                     for (unsigned k = 0; k < 2; k++) {
+                        nir_instr *mi = nir_def_instr(m0->src[k].src.ssa);
+                        if (mi->type != nir_instr_type_alu)
+                           continue;
+                        nir_alu_instr *ma = nir_instr_as_alu(mi);
+                        if ((ma->op == nir_op_fsub || ma->op == nir_op_fadd) &&
+                            ((nir_src_is_const(ma->src[0].src) &&
+                              nir_src_as_float(ma->src[0].src) == 1.0f) ||
+                             (ma->op == nir_op_fadd &&
+                              nir_src_is_const(ma->src[1].src) &&
+                              nir_src_as_float(ma->src[1].src) == 1.0f)))
+                           s0_has_omt = true;
+                     }
+                     if (s0_has_omt)
+                        saw_a_first = true;
+                     else
+                        saw_b_first = true;
+                  }
+                  break;
+               }
                case nir_op_ffma: saw_ffma = true; break;
                case nir_op_fmin: saw_fmin = true; break;
                case nir_op_fmax: saw_fmax = true; break;
@@ -1062,6 +1103,7 @@ test_bilinear_resize_border(void)
             }
          }
          assert(saw_fadd && !saw_ffma && saw_fmin && saw_fmax);
+         assert(saw_a_first == !rev_add && saw_b_first == rev_add);
          ralloc_free(opt3);
       }
       ralloc_free(b.shader);
