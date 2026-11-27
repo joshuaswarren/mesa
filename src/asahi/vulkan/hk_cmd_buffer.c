@@ -12,6 +12,7 @@
 #include "hk_ppp_state.h"
 #include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
+#include "hk_g17p_compression.h"
 #include "hk_g17p_patch.h"
 #include "hk_g17p_varyings.h"
 
@@ -1454,6 +1455,14 @@ brl_barrier_needs_metadata_init(const struct hk_cmd_buffer *cmd,
    VK_FROM_HANDLE(hk_image, image, bar->image);
    if (!(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
        !image->planes[0].layout.compressed)
+      return false;
+
+   /* Gen10 (HAL300) compressed storage PBE merges partial stores directly
+    * into compressed tiles regardless of prior metadata contents
+    * (tests/vulkan_storage_alias.c), so discarding from UNDEFINED does not
+    * require pre-clearing compression metadata. */
+   if (hk_chip_supports_compressed_storage_pbe(
+          hk_cmd_buffer_device(cmd)->dev.chip))
       return false;
 
    *acquire = false;
