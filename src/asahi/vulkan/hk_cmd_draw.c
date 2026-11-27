@@ -4216,11 +4216,16 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 
 /* Whether the attachment of a beginning instance continues the one the
  * ended instance had in the same slot: the same view (or none in both),
- * loaded, stored the same way, unresolved, with the same flags. */
+ * loaded, with matching store op (or a final STORE -> DONT_CARE discard),
+ * unresolved or ending with a final colour resolve over whole attachments,
+ * and matching non-resolve flags. */
 static const char *
 hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
                            const struct hk_attachment *att,
-                           unsigned expected_samples)
+                           unsigned expected_samples, bool is_color,
+                           bool allow_store_drop, bool prev_whole,
+                           uint32_t prev_width, uint32_t prev_height,
+                           bool *eot_changed, bool *resolving)
 {
    const bool present = info != NULL && info->imageView != VK_NULL_HANDLE;
    if (present != (att->iview != NULL))
@@ -4239,12 +4244,37 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
    }
    if (info->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
       return "load op";
-   if (info->storeOp != att->store_op)
+   const bool store_drop =
+      allow_store_drop &&
+      att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+      info->storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   if (info->storeOp != att->store_op && !store_drop)
       return "store op";
-   if (info->resolveMode != VK_RESOLVE_MODE_NONE)
-      return "resolve";
-   if (vk_get_rendering_attachment_flags(info) != att->flags)
+
+   const bool has_resolve = info->resolveMode != VK_RESOLVE_MODE_NONE;
+   if (has_resolve) {
+      if (!is_color || !prev_whole ||
+          info->resolveImageView == VK_NULL_HANDLE)
+         return "resolve";
+      VK_FROM_HANDLE(hk_image_view, res_iview, info->resolveImageView);
+      const unsigned res_level = res_iview->vk.base_mip_level;
+      if (u_minify(res_iview->vk.image->extent.width, res_level) !=
+             prev_width ||
+          u_minify(res_iview->vk.image->extent.height, res_level) !=
+             prev_height)
+         return "resolve extent";
+   }
+
+   VkRenderingAttachmentFlagsKHR flags = vk_get_rendering_attachment_flags(info);
+   if (has_resolve)
+      flags &= ~VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
+   if (flags != att->flags)
       return "flags";
+
+   if (store_drop || has_resolve)
+      *eot_changed = true;
+   if (has_resolve)
+      *resolving = true;
    return NULL;
 }
 
@@ -4280,6 +4310,9 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
                             "MSAA pass merge ended by a layout or ownership transition");
       return;
    }
+
+   if (hk_m5_pass_merge_non_local_src(src, dst))
+      m->non_local_src = true;
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -4672,6 +4705,31 @@ hk_m5_ordered_draw_hazard(struct hk_cmd_buffer *cmd)
    return NULL;
 }
 
+static uint64_t
+hk_image_att_bloom(const struct vk_image *image)
+{
+   if (!image)
+      return 0;
+
+   const struct hk_image *hk_img = container_of(image, struct hk_image, vk);
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
+       image->external_handle_types ||
+       (image->create_flags & unsafe_flags) ||
+       image->tiling == VK_IMAGE_TILING_LINEAR)
+      return UINT64_MAX;
+
+   uint64_t bloom = 0;
+   for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
+      if (!hk_img->planes[p].addr)
+         return UINT64_MAX;
+      bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
+   }
+   return bloom;
+}
+
 /* Continue the ended instance's render stream with the instance beginning
  * with info when everything above holds. Returns false, with the candidacy
  * ended, when the instance begins normally instead. */
@@ -4731,23 +4789,30 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    const char *slot = NULL;
+   bool color_eot_changed = false;
+   bool zls_changed = false;
+   bool any_resolve = false;
    if (!why) {
       slot = "depth";
-      why = hk_m5_attachment_continues(info->pDepthAttachment,
-                                       &prev->depth_att,
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         info->pDepthAttachment, &prev->depth_att, prev->tilebuffer.nr_samples,
+         false, prev->zls_precise, prev->cr.whole_attachments, prev->cr.width,
+         prev->cr.height, &zls_changed, &any_resolve);
    }
    if (!why) {
       slot = "stencil";
-      why = hk_m5_attachment_continues(info->pStencilAttachment,
-                                       &prev->stencil_att,
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         info->pStencilAttachment, &prev->stencil_att,
+         prev->tilebuffer.nr_samples, false, prev->zls_precise,
+         prev->cr.whole_attachments, prev->cr.width, prev->cr.height,
+         &zls_changed, &any_resolve);
    }
    for (uint32_t i = 0; !why && i < info->colorAttachmentCount; ++i) {
       slot = "color";
-      why = hk_m5_attachment_continues(&info->pColorAttachments[i],
-                                       &prev->color_att[i],
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         &info->pColorAttachments[i], &prev->color_att[i],
+         prev->tilebuffer.nr_samples, true, true, prev->cr.whole_attachments,
+         prev->cr.width, prev->cr.height, &color_eot_changed, &any_resolve);
    }
 
    if (why) {
@@ -4757,13 +4822,53 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    /* An ordered dependency, or one recorded before an earlier continuation
-    * of this stream, needs the merged pass to be memory-equivalent. */
+    * of this stream, needs the merged pass to be memory-equivalent. Keep
+    * final-pass resolves out of ordered continuations and out of streams
+    * preceded by a barrier whose first scope covers non-attachment graphics
+    * stages, so earlier fragment shaders cannot race against the newly added
+    * resolve target. */
    const bool ordered = m->ordered || cs->m5_ordered;
+   const bool non_local_src = m->non_local_src || cs->m5_non_local_src;
    if (ordered) {
-      why = hk_m5_ordered_refusal(cmd, info, prev, cs);
+      why = any_resolve ? "resolve" : hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
          hk_frame_anatomy_note(dev, "pass-merge end: ordered, %s", why);
          return false;
+      }
+   }
+   if (any_resolve && non_local_src) {
+      hk_frame_anatomy_note(dev,
+                            "pass-merge end: resolve after non-attachment barrier");
+      return false;
+   }
+
+   /* A newly added resolve target must not overlap an existing attachment, a
+    * pending transfer, or an earlier render pass's tile footprint in this
+    * command buffer (whose wait would not be on the already-created stream). */
+   if (any_resolve) {
+      if (hk_sync_xfer_pending(&cmd->sync)) {
+         hk_frame_anatomy_note(dev, "pass-merge end: resolve pending xfer");
+         return false;
+      }
+      for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+         if (att->imageView == VK_NULL_HANDLE ||
+             att->resolveMode == VK_RESOLVE_MODE_NONE)
+            continue;
+         VK_FROM_HANDLE(hk_image_view, res_iview, att->resolveImageView);
+         if (hk_m5_image_is_attachment(prev, res_iview->vk.image)) {
+            hk_frame_anatomy_note(dev, "pass-merge end: resolve aliases att");
+            return false;
+         }
+         util_dynarray_foreach(&cmd->sync_pass_records,
+                               struct hk_sync_pass_record, rec) {
+            if (rec->last && rec->last != cs &&
+                rec->fp.image == res_iview->vk.image) {
+               hk_frame_anatomy_note(
+                  dev, "pass-merge end: resolve target prior pass");
+               return false;
+            }
+         }
       }
    }
 
@@ -4787,9 +4892,12 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->cr.stencil = prev->cr.stencil;
    cs->cr.zls_control = prev->cr.zls_control;
    cs->render_pack_elided = 0;
+   cs->render_pack_has_full_programs = false;
+   cs->render_pack_zls_elided_store = 0;
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
+   cs->m5_non_local_src = non_local_src;
    cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
@@ -4797,7 +4905,160 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    *render = *prev;
    render->flags = info->flags;
 
+   if (color_eot_changed) {
+      render->g17p_direct_color_resolve = false;
+      for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+         if (att->imageView == VK_NULL_HANDLE)
+            continue;
+         render->color_att[i].store_op = att->storeOp;
+         render->color_att[i].flags = vk_get_rendering_attachment_flags(att);
+         if (att->resolveMode != VK_RESOLVE_MODE_NONE) {
+            VK_FROM_HANDLE(hk_image_view, res_iview, att->resolveImageView);
+            render->color_att[i].resolve_mode = att->resolveMode;
+            render->color_att[i].resolve_iview = res_iview;
+         }
+      }
+
+      const bool incomplete_render_area = !render->cr.whole_attachments;
+      struct hk_g17p_bg_eot_cache_entry *bg_eot_cache =
+         hk_g17p_bg_eot_cache_get(cmd, info, incomplete_render_area);
+      render->cr.eot.main =
+         hk_build_bg_eot(cmd, info, true, false, incomplete_render_area,
+                         bg_eot_cache);
+      if (vk_command_buffer_has_error(&cmd->vk)) {
+         hk_sync_merge_rendering(cmd, cs);
+         return true;
+      }
+
+      if (agx_chip_g17_m5(dev->dev.chip)) {
+         cs->tile_resources.primary_bytes =
+            MAX2(cs->tile_resources.primary_bytes,
+                 render->cr.eot.main.primary_storage_B);
+         cs->tile_resources.secondary_bytes =
+            MAX2(cs->tile_resources.secondary_bytes,
+                 render->cr.eot.main.staging_storage_B);
+      }
+
+      if (render->g17p_direct_color_resolve) {
+         cs->cr.process_empty_tiles = true;
+         render->empty_tiles_other = true;
+
+         if (agx_chip_native_or_g18g(dev->dev.chip)) {
+            for (uint32_t i = 0; i < render->color_att_count; ++i) {
+               struct hk_image_view *res_view =
+                  render->color_att[i].resolve_iview;
+               if (!res_view)
+                  continue;
+               struct hk_image *image =
+                  container_of(res_view->vk.image, struct hk_image, vk);
+               const uint8_t image_plane = res_view->planes[0].image_plane;
+               if (image_plane >= image->plane_count) {
+                  cs->fragment_attachments.complete = false;
+               } else {
+                  const struct hk_image_plane *plane =
+                     &image->planes[image_plane];
+                  const uint64_t size = plane->layout.size_B;
+                  if (!plane->addr || !size)
+                     cs->fragment_attachments.complete = false;
+                  else
+                     hk_drm_attachment_set_add(&cs->fragment_attachments,
+                                               plane->addr, size);
+               }
+            }
+         }
+      }
+   }
+
+   if (zls_changed) {
+      VkRenderingAttachmentInfo z_info = {0}, s_info = {0};
+      const VkRenderingAttachmentInfo *attach_z = NULL, *attach_s = NULL;
+      struct ail_layout *z_layout = NULL, *s_layout = NULL;
+      if (render->depth_att.iview && info->pDepthAttachment) {
+         render->depth_att.store_op = info->pDepthAttachment->storeOp;
+         z_info = *info->pDepthAttachment;
+         z_info.loadOp = prev->depth_att.load_op;
+         attach_z = &z_info;
+         struct hk_image *z_img =
+            container_of(render->depth_att.iview->vk.image, struct hk_image, vk);
+         z_layout = &z_img->planes[0].layout;
+      }
+      if (render->stencil_att.iview && info->pStencilAttachment) {
+         render->stencil_att.store_op = info->pStencilAttachment->storeOp;
+         s_info = *info->pStencilAttachment;
+         s_info.loadOp = prev->stencil_att.load_op;
+         attach_s = &s_info;
+         struct hk_image *s_img = container_of(
+            render->stencil_att.iview->vk.image, struct hk_image, vk);
+         const unsigned s_plane =
+            hk_image_aspects_to_plane(s_img, VK_IMAGE_ASPECT_STENCIL_BIT);
+         s_layout = &s_img->planes[s_plane].layout;
+      }
+      const bool incomplete_render_area = !render->cr.whole_attachments;
+      hk_pack_zls_control_final(&render->zls_control_only, z_layout, s_layout,
+                                attach_z, attach_s, incomplete_render_area,
+                                false);
+      hk_pack_zls_control_final(&render->zls_control_last, z_layout, s_layout,
+                                attach_z, attach_s, incomplete_render_area,
+                                true);
+      render->pending_zs_store_mask = 0;
+   }
+
+   if (any_resolve) {
+      uint32_t alias_gen = 0;
+      if (!cmd->sync.has_alias_image_render) {
+         alias_gen = p_atomic_read(&dev->buffer_alias_mem_gen);
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      }
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         const struct hk_image_view *res_iview =
+            render->color_att[i].resolve_iview;
+         if (!res_iview)
+            continue;
+         const struct vk_image *image = res_iview->vk.image;
+         const struct hk_image *hk_img =
+            container_of(image, struct hk_image, vk);
+         render->att_bloom |= hk_image_att_bloom(image);
+         if (hk_image_mem_may_alias_buffer(hk_img)) {
+            render->m5_attachments_reach_memory = true;
+         } else if (!hk_img->swapchain_memory &&
+                    (image->create_flags & VK_IMAGE_CREATE_ALIAS_BIT)) {
+            render->m5_attachments_alias_image = true;
+         }
+      }
+      if (render->m5_attachments_alias_image &&
+          !render->m5_attachments_reach_memory &&
+          !cmd->sync.has_alias_image_render) {
+         cmd->sync.has_alias_image_render = true;
+         cmd->sync.buffer_alias_mem_gen = alias_gen;
+      }
+      if (render->m5_attachments_reach_memory) {
+         cs->sync.kind |= HK_SYNC_GFX_MEM;
+         cs->sync.alias_image_render = false;
+      } else if (render->m5_attachments_alias_image) {
+         cs->sync.alias_image_render = true;
+      }
+   }
+
    hk_sync_merge_rendering(cmd, cs);
+   if (render->g17p_direct_color_resolve) {
+      const uint32_t pass_layers = render->cr.layers;
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         const struct hk_image_view *res_iview =
+            render->color_att[i].resolve_iview;
+         if (!res_iview)
+            continue;
+         const uint32_t level = res_iview->vk.base_mip_level;
+         hk_sync_pass_footprint(
+            cmd, res_iview->vk.image, level, res_iview->vk.base_array_layer,
+            res_iview->vk.base_array_layer + MAX2(pass_layers, 1),
+            u_minify(res_iview->vk.image->extent.width, level),
+            u_minify(res_iview->vk.image->extent.height, level), render->area,
+            render->view_mask &&
+               render->view_mask != BITFIELD64_MASK(pass_layers),
+            false);
+      }
+   }
    hk_sync_first_render_stream(cmd, cs);
 
    /* The per-instance state hk_begin_rendering() resets. */
@@ -4937,7 +5198,7 @@ static uint8_t
 hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
                         const struct hk_render_pack_pass *pass,
                         struct hk_render_pack_edges *e, bool *msaa_end,
-                        const char **why)
+                        bool *non_local_src, const char **why)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    const bool msaa = pass && hk_render_pack_samples(pass) > 1;
@@ -4945,6 +5206,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
 
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       dep = MAX2(dep, hk_m5_pass_merge_dependency(b->srcStageMask,
                                                   b->dstStageMask,
                                                   b->dstAccessMask, false,
@@ -4953,6 +5216,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, true,
@@ -4973,6 +5238,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
          transition && !transfer && hk_pass_merge_layout_proof_supported(chip) &&
          !(image->create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
          (!undef_alias || !pass || !hk_render_pack_aliases_va(pass, image));
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
@@ -5020,6 +5287,7 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
          e->head_dep = MAX2(e->head_dep,
                             hk_render_pack_classify(cmd, info, NULL, e,
                                                     &e->head_msaa_end,
+                                                    &e->head_non_local_src,
                                                     &e->head_why));
    }
    if (e->tail_open) {
@@ -5027,7 +5295,8 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
       const char *why = "barrier";
       e->tail_dep = MAX2(e->tail_dep,
                          hk_render_pack_classify(cmd, info, &e->tail_pass, e,
-                                                 &msaa_end, &why));
+                                                 &msaa_end,
+                                                 &e->tail_non_local_src, &why));
       if (msaa_end && e->tail_msaa)
          why = "multisampled transition";
       if ((msaa_end && e->tail_msaa) || e->tail_dep == HK_M5_MERGE_DEP_END) {
@@ -5179,6 +5448,7 @@ hk_render_pack_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * stream counts for a later one too (hk_m5_pass_merge_begin()). */
    e->tail_dep = cs->m5_ordered ? HK_M5_MERGE_DEP_ORDERED
                                 : HK_M5_MERGE_DEP_LOCAL;
+   e->tail_non_local_src = cs->m5_non_local_src;
    e->tail_stream = cs;
    e->tail_seq = cs->sync.seq;
    e->tail_current = cs->current;
@@ -5883,23 +6153,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             continue;
          const struct hk_image *hk_img =
             container_of(image, struct hk_image, vk);
-         const VkImageCreateFlags unsafe_flags =
-            VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
-            VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
-         if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
-             image->external_handle_types ||
-             (image->create_flags & unsafe_flags) ||
-             image->tiling == VK_IMAGE_TILING_LINEAR) {
-            render->att_bloom = UINT64_MAX;
-         } else {
-            for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
-               if (!hk_img->planes[p].addr) {
-                  render->att_bloom = UINT64_MAX;
-                  break;
-               }
-               render->att_bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
-            }
-         }
+         render->att_bloom |= hk_image_att_bloom(image);
          if (hk_image_mem_may_alias_buffer(hk_img)) {
             render->m5_attachments_reach_memory = true;
          } else if (!hk_img->swapchain_memory &&
@@ -6602,6 +6856,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       merge->open_cs_current =
          cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
       merge->ordered = false;
+      merge->non_local_src = false;
       merge->valid = true;
    }
    /* The render state is cleared by now; the candidate kept a copy. */
@@ -14566,8 +14821,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           * ordinary mesh output extent uses the same encoding as G17S.
           * Threadgroup memory is allocated separately by the shader program.
           */
-         if (dev->dev.chip == AGX_CHIP_G17P ||
-             dev->dev.chip == AGX_CHIP_G17S) {
+         if (agx_chip_g17p_or_m5(dev->dev.chip)) {
             if (!agx_vdm_m5_mesh_set_output_limits(
                    &state, hw_vs->info.mesh.max_vertices,
                    hw_vs->info.mesh.max_primitives, hw_vs->info.uvs.size)) {
@@ -14575,7 +14829,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                return;
             }
          }
-         if (dev->dev.chip == AGX_CHIP_G17S) {
+         if (agx_chip_g17_m5(dev->dev.chip)) {
             /* Native object->mesh kicks with task mesh storage bound size
              * tail[0] in 1 KiB payload slot units to cover the optional 16 B
              * child-grid record plus the task payload. Payload-free task kicks
@@ -17027,9 +17281,9 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
    const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && !sw_task && dev->dev.chip != AGX_CHIP_G17S) ||
+       (task_api && !sw_task && !agx_chip_g17_m5(dev->dev.chip)) ||
        (dev->dev.chip != AGX_CHIP_G17P &&
-        (dev->dev.chip != AGX_CHIP_G17S ||
+        (!agx_chip_g17_m5(dev->dev.chip) ||
          !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;

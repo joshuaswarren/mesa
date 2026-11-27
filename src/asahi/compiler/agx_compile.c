@@ -2450,11 +2450,10 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
    load->memory_is_packed = packed_count != 0;
    /* nir_opt_access proved nothing writes this memory and it is not
-    * volatile, so the read is a function of its address alone. The AGX3
-    * spiller may then repeat it in place of filling the value from a spill
-    * slot. */
+    * volatile, so the read is a function of its address alone. On AGX3 the
+    * spiller may repeat it in place of filling a spill slot; on AGX2 wait
+    * insertion may keep it in flight across a threadgroup barrier. */
    load->memory_can_reorder =
-      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       nir_intrinsic_can_reorder(instr) && !nir_is_coherent(instr);
    agx_emit_cached_split(b, dest, instr->def.num_components);
 }
@@ -12497,12 +12496,19 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * if 8 costs occupancy (AGX3C) or Dynamic Caching register pressure
     * (AGX3B). */
    if (runtime_loop_opts && m5_unroll_factor >= 2) {
-      /* Hoist loop-invariant transcendental (SFU) chains from direct loop
-       * bodies before unrolling so body-size budgets see the true
-       * per-iteration cost while staying strictly inside the 64-half
-       * max-occupancy tier (56-half NIR cap leaves RA headroom). */
-      if (agx3_compute_opts)
+      /* Hoist loop-invariant transcendental (SFU) and speculatable constant-
+       * load chains from direct loop bodies before unrolling so body-size
+       * budgets see the true per-iteration cost while staying strictly inside
+       * the 64-half max-occupancy tier (56-half NIR cap leaves RA headroom). */
+      if (agx3_compute_opts) {
          NIR_PASS(_, nir, agx_nir_opt_licm_direct_sfu, 56);
+         bool hoisted_const = false;
+         NIR_PASS(hoisted_const, nir, agx_nir_opt_licm_direct_const_loads, 56);
+         if (hoisted_const) {
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
 
       bool jammed = false;
       if (agx3_compute_opts)
@@ -17745,20 +17751,163 @@ agx3_preamble_load_within_root(const struct agx_shader_key *key,
    return offset_B >= 0 && offset_B + size_B <= key->preamble_root_size_B;
 }
 
-/* Fill in a candidate whose address is a buffer descriptor's: the 64-bit
- * pack of two adjacent words of one constant-offset load through the root
- * table (a dynamic buffer descriptor) or a static set. */
 static bool
-agx3_uniform_dma_buffer(const struct agx_shader_key *key, nir_def *ptr,
-                        struct agx3_uniform_dma_candidate *c)
+agx3_uniform_dma_scalar_is_desc_comp(nir_scalar s,
+                                     const nir_intrinsic_instr *desc,
+                                     unsigned comp)
 {
-   nir_alu_instr *pack = nir_def_as_alu_or_null(ptr);
-   if (!pack || pack->op != nir_op_pack_64_2x32_split ||
-       pack->src[0].src.ssa != pack->src[1].src.ssa ||
-       pack->src[1].swizzle[0] != pack->src[0].swizzle[0] + 1)
+   s = nir_scalar_resolved(s.def, s.comp);
+   return s.def == &desc->def && s.comp == comp;
+}
+
+static bool
+agx3_uniform_dma_is_usub_sat_size(nir_scalar s,
+                                  const nir_intrinsic_instr *desc,
+                                  unsigned size_comp, uint32_t sub,
+                                  nir_instr **usub_out)
+{
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_usub_sat)
+      return false;
+   nir_scalar lhs = nir_scalar_chase_alu_src(s, 0);
+   nir_scalar rhs = nir_scalar_chase_alu_src(s, 1);
+   if (!agx3_uniform_dma_scalar_is_desc_comp(lhs, desc, size_comp) ||
+       !nir_scalar_is_const(rhs) || nir_scalar_as_uint(rhs) != sub)
+      return false;
+   if (usub_out)
+      *usub_out = nir_def_instr(s.def);
+   return true;
+}
+
+/* Whether `valid` is the exact bounds predicate for a constant-offset load of
+ * [load_offset_B, load_offset_B + load_size_B) against `desc.(size_comp)`:
+ *   ult(load_offset_B, usub_sat(size, load_size_B - 1))
+ *   ine(usub_sat(size, load_size_B - 1), 0)          (when load_offset_B == 0)
+ *   uge(size, load_offset_B + load_size_B)
+ *   ult(load_offset_B + load_size_B - 1, size)
+ * The driver's AGX3_UNIFORM_DMA_BUFFER span copies dwords below the buffer's
+ * size and fills the rest from AGX_ZERO_PAGE_ADDRESS, matching this predicate
+ * up to the 4-byte robust buffer access size alignment. */
+static bool
+agx3_uniform_dma_is_bounded_check(nir_scalar valid,
+                                  const nir_intrinsic_instr *desc,
+                                  unsigned size_comp, uint64_t load_offset_B,
+                                  unsigned load_size_B,
+                                  nir_instr **usub_out)
+{
+   if (load_size_B < 4 || (load_offset_B & 3) || (load_size_B & 3) ||
+       load_offset_B + load_size_B > UINT32_MAX)
       return false;
 
-   nir_intrinsic_instr *desc = nir_src_as_intrinsic(pack->src[0].src);
+   valid = nir_scalar_resolved(valid.def, valid.comp);
+   if (!nir_scalar_is_alu(valid))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(valid);
+   const nir_scalar s0 = nir_scalar_chase_alu_src(valid, 0);
+   const nir_scalar s1 = nir_scalar_chase_alu_src(valid, 1);
+   if (usub_out)
+      *usub_out = NULL;
+
+   if (op == nir_op_ult && nir_scalar_is_const(s0)) {
+      const uint64_t lhs = nir_scalar_as_uint(s0);
+      if (lhs == load_offset_B &&
+          agx3_uniform_dma_is_usub_sat_size(s1, desc, size_comp,
+                                            load_size_B - 1, usub_out))
+         return true;
+      if (lhs == load_offset_B + load_size_B - 1 &&
+          agx3_uniform_dma_scalar_is_desc_comp(s1, desc, size_comp))
+         return true;
+   } else if (op == nir_op_ine && load_offset_B == 0) {
+      if ((nir_scalar_is_zero(s1) &&
+           agx3_uniform_dma_is_usub_sat_size(s0, desc, size_comp,
+                                             load_size_B - 1, usub_out)) ||
+          (nir_scalar_is_zero(s0) &&
+           agx3_uniform_dma_is_usub_sat_size(s1, desc, size_comp,
+                                             load_size_B - 1, usub_out)))
+         return true;
+   } else if (op == nir_op_uge &&
+              agx3_uniform_dma_scalar_is_desc_comp(s0, desc, size_comp) &&
+              nir_scalar_is_const(s1) &&
+              nir_scalar_as_uint(s1) == load_offset_B + load_size_B) {
+      return true;
+   }
+
+   return false;
+}
+
+/* Fill in a candidate whose address is a buffer descriptor's: either the
+ * unguarded 64-bit pack of two adjacent words of one constant-offset load
+ * through the root table or a static set, or its G17P bounded equivalent
+ * selecting AGX_ZERO_PAGE_ADDRESS when out of bounds against the descriptor's
+ * size word. If `plumbing` is non-NULL, record any bounded-address ALU
+ * instructions that become dead once the load moves to uniform DMA. */
+static bool
+agx3_uniform_dma_buffer(const struct agx_shader_key *key, nir_def *ptr,
+                        uint64_t load_offset_B, unsigned load_size_B,
+                        struct agx3_uniform_dma_candidate *c,
+                        struct set *plumbing)
+{
+   nir_alu_instr *pack = nir_def_as_alu_or_null(ptr);
+   if (!pack || pack->op != nir_op_pack_64_2x32_split)
+      return false;
+
+   nir_intrinsic_instr *desc = NULL;
+   unsigned comp = 0;
+   nir_instr *bounded_instrs[5] = {NULL};
+   unsigned bounded_count = 0;
+
+   if (pack->src[0].src.ssa == pack->src[1].src.ssa &&
+       pack->src[1].swizzle[0] == pack->src[0].swizzle[0] + 1) {
+      desc = nir_src_as_intrinsic(pack->src[0].src);
+      comp = pack->src[0].swizzle[0];
+   } else if (pack->src[0].swizzle[0] == 0 && pack->src[1].swizzle[0] == 0) {
+      nir_alu_instr *lo = nir_def_as_alu_or_null(pack->src[0].src.ssa);
+      nir_alu_instr *hi = nir_def_as_alu_or_null(pack->src[1].src.ssa);
+      if (!lo || !hi || lo->op != nir_op_bcsel || hi->op != nir_op_bcsel)
+         return false;
+
+      nir_scalar lo_cond = nir_scalar_resolved(lo->src[0].src.ssa,
+                                               lo->src[0].swizzle[0]);
+      nir_scalar hi_cond = nir_scalar_resolved(hi->src[0].src.ssa,
+                                               hi->src[0].swizzle[0]);
+      nir_scalar lo_zero = nir_scalar_resolved(lo->src[2].src.ssa,
+                                               lo->src[2].swizzle[0]);
+      nir_scalar hi_zero = nir_scalar_resolved(hi->src[2].src.ssa,
+                                               hi->src[2].swizzle[0]);
+      if (!nir_scalar_equal(lo_cond, hi_cond) ||
+          !nir_scalar_is_const(lo_zero) || !nir_scalar_is_const(hi_zero) ||
+          nir_scalar_as_uint(lo_zero) != (uint32_t)AGX_ZERO_PAGE_ADDRESS ||
+          nir_scalar_as_uint(hi_zero) !=
+             (uint32_t)(AGX_ZERO_PAGE_ADDRESS >> 32))
+         return false;
+
+      nir_scalar lo_addr = nir_scalar_resolved(lo->src[1].src.ssa,
+                                               lo->src[1].swizzle[0]);
+      nir_scalar hi_addr = nir_scalar_resolved(hi->src[1].src.ssa,
+                                               hi->src[1].swizzle[0]);
+      if (lo_addr.def != hi_addr.def || hi_addr.comp != lo_addr.comp + 1)
+         return false;
+
+      desc = nir_def_as_intrinsic_or_null(lo_addr.def);
+      comp = lo_addr.comp;
+      if (!desc || desc->intrinsic != nir_intrinsic_load_constant_agx ||
+          desc->def.bit_size != 32 || comp + 2 >= desc->def.num_components)
+         return false;
+
+      nir_instr *usub = NULL;
+      if (!agx3_uniform_dma_is_bounded_check(lo_cond, desc, comp + 2,
+                                             load_offset_B, load_size_B, &usub))
+         return false;
+
+      bounded_instrs[bounded_count++] = &pack->instr;
+      bounded_instrs[bounded_count++] = &lo->instr;
+      bounded_instrs[bounded_count++] = &hi->instr;
+      bounded_instrs[bounded_count++] = nir_def_instr(lo_cond.def);
+      if (usub)
+         bounded_instrs[bounded_count++] = usub;
+   }
+
    if (!desc || desc->intrinsic != nir_intrinsic_load_constant_agx ||
        desc->def.bit_size != 32)
       return false;
@@ -17776,7 +17925,7 @@ agx3_uniform_dma_buffer(const struct agx_shader_key *key, nir_def *ptr,
 
    /* A 16-byte buffer descriptor (address, then size): one of the root
     * table's, or a set's, where buffer descriptors are 16-byte aligned. */
-   const int64_t descriptor_B = offset_B + 4 * pack->src[0].swizzle[0];
+   const int64_t descriptor_B = offset_B + 4 * comp;
    const int64_t table_B = pointer == key->g17p_dma_root
                               ? descriptor_B - key->g17p_dma_buffers_B
                               : descriptor_B;
@@ -17785,6 +17934,10 @@ agx3_uniform_dma_buffer(const struct agx_shader_key *key, nir_def *ptr,
         table_B / 16 >= key->g17p_dma_buffer_count))
       return false;
 
+   if (plumbing) {
+      for (unsigned i = 0; i < bounded_count; ++i)
+         _mesa_set_add(plumbing, bounded_instrs[i]);
+   }
    c->source = AGX3_UNIFORM_DMA_BUFFER;
    c->pointer = pointer;
    c->descriptor_B = descriptor_B;
@@ -17823,7 +17976,8 @@ agx3_uniform_dma_collect(nir_shader *nir, const struct agx_shader_key *key,
                if (pointer < 0)
                   continue;
                c.pointer = pointer;
-            } else if (!agx3_uniform_dma_buffer(key, intr->src[0].ssa, &c)) {
+            } else if (!agx3_uniform_dma_buffer(key, intr->src[0].ssa,
+                                                offset_B, size_B, &c, NULL)) {
                continue;
             } else if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
                        nir->info.stage == MESA_SHADER_COMPUTE &&
@@ -18622,7 +18776,8 @@ agx3_uniform_dma_constant_reserve(nir_shader *nir)
  * whose vertex constant programs compute ProjMat * ModelViewMat, copying
  * doubled the vertex uniforms and cost 0.42 ms of GPU time per frame. */
 static bool
-agx3_vertex_preamble_only_forwards(nir_shader *nir)
+agx3_vertex_preamble_only_forwards(nir_shader *nir,
+                                   const struct agx_shader_key *key)
 {
    /* As many other operations as agx3_inline_cheap_vertex_preamble() moves
     * into the main program once the copies leave nothing else: up to 4
@@ -18631,11 +18786,33 @@ agx3_vertex_preamble_only_forwards(nir_shader *nir)
    unsigned other = 0;
    unsigned cheap_alu = 0;
    unsigned load_bytes = 0;
+   struct set *bounds_plumbing = _mesa_pointer_set_create(NULL);
+
    nir_foreach_function_impl(impl, nir) {
       if (!impl->function->is_preamble)
          continue;
-      if (exec_list_length(&impl->body) != 1)
+      if (exec_list_length(&impl->body) != 1) {
+         _mesa_set_destroy(bounds_plumbing, NULL);
          return false;
+      }
+      /* Identify bounded-buffer address/bounds-check ALU that disappears once
+       * its constant load moves to AGX3_UNIFORM_DMA_BUFFER. */
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_constant_agx)
+               continue;
+            unsigned size_B;
+            const int64_t offset_B = agx3_uniform_dma_offset(intr, &size_B);
+            if (offset_B < 0)
+               continue;
+            struct agx3_uniform_dma_candidate c = {0};
+            agx3_uniform_dma_buffer(key, intr->src[0].ssa, offset_B, size_B,
+                                    &c, bounds_plumbing);
+         }
+      }
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             switch (instr->type) {
@@ -18653,9 +18830,12 @@ agx3_vertex_preamble_only_forwards(nir_shader *nir)
                                 DIV_ROUND_UP(intr->def.bit_size, 8);
                   continue;
                }
+               _mesa_set_destroy(bounds_plumbing, NULL);
                return false;
             }
             case nir_instr_type_alu: {
+               if (_mesa_set_search(bounds_plumbing, instr))
+                  continue;
                const nir_op op = nir_instr_as_alu(instr)->op;
                switch (op) {
                case nir_op_mov:
@@ -18674,17 +18854,21 @@ agx3_vertex_preamble_only_forwards(nir_shader *nir)
                   else
                      ++other;
                   if (other + cheap_alu > 4 &&
-                      !(other == 0 && cheap_alu <= 12))
+                      !(other == 0 && cheap_alu <= 12)) {
+                     _mesa_set_destroy(bounds_plumbing, NULL);
                      return false;
+                  }
                   continue;
                }
             }
             default:
+               _mesa_set_destroy(bounds_plumbing, NULL);
                return false;
             }
          }
       }
    }
+   _mesa_set_destroy(bounds_plumbing, NULL);
    return (other + cheap_alu <= 4) ||
           (other == 0 && cheap_alu <= 12 && load_bytes <= 16);
 }
@@ -18695,7 +18879,7 @@ agx3_nir_lower_uniform_dma(nir_shader *nir, const struct agx_shader_key *key,
 {
    /* A vertex constant program that computes keeps its loads. */
    if (nir->info.stage == MESA_SHADER_VERTEX &&
-       !agx3_vertex_preamble_only_forwards(nir))
+       !agx3_vertex_preamble_only_forwards(nir, key))
       return false;
 
    const unsigned exports_end = info->push_count;

@@ -94,3 +94,26 @@ hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
 
    return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
 }
+
+/* Whether a barrier's first scope covers graphics work outside the
+ * framebuffer-local attachment stages while its second scope reaches graphics
+ * work. Such a barrier still classifies as HK_M5_MERGE_DEP_LOCAL when its
+ * second scope is attachment-only (e.g. FRAGMENT_SHADER ->
+ * COLOR_ATTACHMENT_OUTPUT), which is safe while continuing the same
+ * attachments but would break a WAR/WAW barrier before a final-pass resolve
+ * writing a separate image. */
+static inline bool
+hk_m5_pass_merge_non_local_src(VkPipelineStageFlags2 src_stages,
+                               VkPipelineStageFlags2 dst_stages)
+{
+   const VkPipelineStageFlags2 local_stages =
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+   const bool from_non_local_gfx =
+      hk_sync_kinds_src(src_stages & ~local_stages) & HK_SYNC_GFX;
+   const bool to_gfx =
+      hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
+   return from_non_local_gfx && to_gfx;
+}

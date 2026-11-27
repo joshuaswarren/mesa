@@ -3024,6 +3024,111 @@ test_compute_self_cut(void)
                           : !flush && (cmd->sync.host_flush_kinds &
                                        HK_SYNC_COMPUTE));
          }
+
+         /* A pure query-memory predecessor (HK_SYNC_STAMP or HK_SYNC_QRESET)
+          * is never named by an application barrier: c2 stays open across a
+          * compute barrier when no earlier HK_SYNC_ALL compute stream sits
+          * behind it. */
+         const uint8_t non_app[] = {HK_SYNC_STAMP, HK_SYNC_QRESET};
+         for (unsigned k = 0; k < ARRAY_SIZE(non_app); ++k) {
+            struct hk_cmd_buffer *cmd = timestamp_cmd(chips[i], exact);
+            cmd->sync.kind_override = non_app[k];
+            struct hk_cs *s0 = add(cmd, true);
+            cmd->sync.kind_override = 0;
+            s0->stats.cmds = 1;
+            struct hk_cs *c2 = add(cmd, true);
+            cmd->current_cs.cs = c2;
+            c2->stats.cmds = 1;
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            hk_sync_check_cs(cmd);
+            T("self cut: pure query-memory predecessor keeps c2 open",
+              cmd->current_cs.cs == c2 &&
+              c2->sync.dep[HK_SYNC_CDM].cut == NULL);
+         }
+
+         /* An earlier unwaited application compute stream behind a pure
+          * HK_SYNC_STAMP stream still forces c2 to end across a barrier. */
+         {
+            struct hk_cmd_buffer *cmd = timestamp_cmd(chips[i], exact);
+            struct hk_cs *c0 = add(cmd, true);
+            c0->stats.cmds = 1;
+            cmd->sync.kind_override = HK_SYNC_STAMP;
+            struct hk_cs *s1 = add(cmd, true);
+            cmd->sync.kind_override = 0;
+            s1->stats.cmds = 1;
+            struct hk_cs *c2 = add(cmd, true);
+            cmd->current_cs.cs = c2;
+            c2->stats.cmds = 1;
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            hk_sync_check_cs(cmd);
+            T("self cut: unwaited compute behind stamp stream still ends c2",
+              cmd->current_cs.cs == NULL &&
+              c2->sync.dep[HK_SYNC_CDM].cut == NULL);
+         }
+
+         /* Once c2 already waits for the earlier application compute stream
+          * c0, an intervening pure HK_SYNC_STAMP stream s1 does not split c2
+          * across a compute barrier. */
+         {
+            struct hk_cmd_buffer *cmd = timestamp_cmd(chips[i], exact);
+            struct hk_cs *c0 = add(cmd, true);
+            c0->stats.cmds = 1;
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            cmd->sync.kind_override = HK_SYNC_STAMP;
+            struct hk_cs *s1 = add(cmd, true);
+            cmd->sync.kind_override = 0;
+            s1->stats.cmds = 1;
+            struct hk_cs *c2 = add(cmd, true);
+            cmd->current_cs.cs = c2;
+            c2->stats.cmds = 1;
+            T("self cut: c2 waits on c0 and skips intervening stamp stream",
+              c2->sync.dep[HK_SYNC_CDM].cut == c0);
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            hk_sync_check_cs(cmd);
+            T("self cut: intervening stamp stream keeps waited c2 open",
+              cmd->current_cs.cs == c2 &&
+              c2->sync.dep[HK_SYNC_CDM].cut == c0);
+         }
+
+         /* A query/event caller through hk_sync_get_cs_after() with a
+          * dependency on an earlier HK_SYNC_STAMP stream must still end c2
+          * (or make a pinned c2 wait on the stamp stream) when a compute
+          * barrier produced a self cut at c2. */
+         {
+            struct hk_cmd_buffer *cmd = timestamp_cmd(chips[i], exact);
+            cmd->sync.kind_override = HK_SYNC_STAMP;
+            struct hk_cs *s0 = add(cmd, true);
+            cmd->sync.kind_override = 0;
+            s0->stats.cmds = 1;
+            struct hk_cs *c2 = add(cmd, true);
+            cmd->current_cs.cs = c2;
+            c2->stats.cmds = 1;
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            struct hk_sync_dep qdep[HK_SYNC_NUM_SQ];
+            hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, c2, qdep);
+            cmd->vk.record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            hk_sync_get_cs_after(cmd, qdep);
+            T("self cut: query scope after stamp stream still ends c2",
+              cmd->current_cs.cs == NULL &&
+              c2->sync.dep[HK_SYNC_CDM].cut == NULL);
+         }
+         {
+            struct hk_cmd_buffer *cmd = timestamp_cmd(chips[i], exact);
+            cmd->sync.kind_override = HK_SYNC_STAMP;
+            struct hk_cs *s0 = add(cmd, true);
+            cmd->sync.kind_override = 0;
+            s0->stats.cmds = 1;
+            struct hk_cs *c2 = add(cmd, true);
+            cmd->current_cs.cs = c2;
+            c2->stats.cmds = 1;
+            hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+            struct hk_sync_dep qdep[HK_SYNC_NUM_SQ];
+            hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, c2, qdep);
+            cmd->sync.pin_cs = true;
+            T("self cut: pinned query scope after stamp stream waits on s0",
+              hk_sync_get_cs_after(cmd, qdep) == c2 &&
+              c2->sync.dep[HK_SYNC_CDM].cut == s0);
+         }
       }
    }
 }
@@ -3418,6 +3523,55 @@ main(void)
         draw_b->sync.dep[HK_SYNC_VDM].cut == NULL &&
            draw_b->sync.dep_ta[HK_SYNC_VDM].cut == NULL &&
            pass_a->sync.seq != 0);
+   }
+   /* Retired exact prior pruning drops completed VDM/CDM ordinals while
+    * preserving unretired dependencies and FRAGMENT_BARRIERS ta_split. */
+   {
+      struct hk_queue *rq = new_queue(true);
+      /* Submit 1 (point 10): HK_SYNC_GFX_MEM render (ord 1) + barrier. */
+      rq->drm.timeline_value = 10;
+      struct hk_cmd_buffer *s1 = new_cmd();
+      struct hk_cs *r_mem = add(s1, false);
+      hk_sync_note_memory_write(s1, r_mem);
+      hk_sync_barrier(s1, HK_SYNC_ALL, HK_SYNC_ALL);
+      T("retired-prior setup s1",
+        hk_sync_resolve_submit(rq, &s1, 1, false, false, 0, NULL));
+      T("retired-prior reports unretired priors after s1",
+        hk_sync_submit_has_unretired_priors(rq));
+
+      /* Submit 2 (point 11): plain render (ord 2) + fragment-only barrier,
+       * while point 10 is still in flight (completed = 0). */
+      rq->drm.timeline_value = 11;
+      struct hk_cmd_buffer *s2 = new_cmd();
+      struct hk_cs *r2 = add(s2, false);
+      hk_sync_barrier(s2, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+      T("retired-prior s2 unretired",
+        hk_sync_resolve_submit(rq, &s2, 1, false, false, 0, NULL));
+      T("retired-prior keeps unretired GFX_MEM prior_ta",
+        r2->sync.prior[HK_SYNC_VDM] == 1 && r2->sync.prior_ta[HK_SYNC_VDM] == 1);
+
+      /* Submit 3 (point 12): point 10 has retired (completed = 10), point 11
+       * is still live -> prior_ta[VDM] (1) prunes to 0 while prior[VDM] (2)
+       * stays live with ta_split=true! */
+      rq->drm.timeline_value = 12;
+      struct hk_cmd_buffer *s3 = new_cmd();
+      struct hk_cs *r3 = add(s3, false);
+      T("retired-prior s3 partial retirement",
+        hk_sync_resolve_submit(rq, &s3, 1, false, false, 10, NULL));
+      T("retired-prior prunes retired prior_ta while keeping live fragment prior",
+        r3->sync.prior[HK_SYNC_VDM] == 2 && r3->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+           r3->sync.ta_split);
+
+      /* Submit 4 (point 13): everything through point 12 has retired -> both
+       * prior and prior_ta prune to 0 and ta_split clears. */
+      rq->drm.timeline_value = 13;
+      struct hk_cmd_buffer *s4 = new_cmd();
+      struct hk_cs *r4 = add(s4, false);
+      T("retired-prior s4 full retirement",
+        hk_sync_resolve_submit(rq, &s4, 1, false, false, 12, NULL));
+      T("retired-prior clears both priors and ta_split when all retired",
+        r4->sync.prior[HK_SYNC_VDM] == 0 && r4->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+           !r4->sync.ta_split);
    }
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);

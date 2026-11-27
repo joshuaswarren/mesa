@@ -276,6 +276,20 @@ hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
                 ? 1 : cs->cr.layers;
 }
 
+static bool
+hk_render_has_color_attachments(const struct hk_cs *cs)
+{
+   if (cs->tib.sample_size_B != 0)
+      return true;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cs->tib.logical_format); ++i) {
+      if (cs->tib.logical_format[i] != PIPE_FORMAT_NONE)
+         return true;
+   }
+
+   return false;
+}
+
 static void
 asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
                        struct drm_asahi_cmd_render *c)
@@ -378,6 +392,26 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    /* Can be 0 for attachmentless rendering with no draws */
    c->samples = MAX2(cs->tib.nr_samples, 1);
+
+   /* On M5 (G17S), Metal sets ZLS_CONTROL bit 0 (0x00080045 for D32F,
+    * 0x04080045 for D16 in isolated macOS-HV render.shadow trace t4) on
+    * single-sample depth-only passes with no colour or stencil attachments
+    * (tib=0B). Setting bit 0 on colour-attached passes suppresses colour
+    * output, and trace t4 only covered depth-only passes without stencil, so
+    * restrict it to colour-free, stencil-free single-sample depth passes
+    * without shader memory writes. */
+   if (agx_chip_g17_m5(dev->dev.chip) && c->samples == 1 &&
+       cs->cr.depth.buffer != 0 && !cs->cr.stencil.buffer &&
+       !cs->m5_shader_writes_memory &&
+       !hk_render_has_color_attachments(cs)) {
+      agx_unpack(NULL, &c->zls_ctrl, ZLS_CONTROL, zls);
+      if (zls.z_load || zls.z_store) {
+         zls.unknown_0 = true;
+         agx_pack(&c->zls_ctrl, ZLS_CONTROL, cfg) {
+            cfg = zls;
+         }
+      }
+   }
    c->layers = layers;
 
    /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
@@ -2222,18 +2256,20 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       nr_cdm++;
    }
 
-   /* Tile hazards against this queue's earlier submissions need the point
-    * the queue has completed; fetched only when a partial-tile render pass
-    * instance is submitted while such a footprint may still be running. On
-    * failure every earlier submission is treated as still running. */
-   uint64_t completed = 0;
+   /* Tile hazards against this queue's earlier submissions and retired exact
+    * prior pruning need the point the queue has completed. Start from the
+    * cached monotonic lower bound and refresh via drmSyncobjQuery() when live
+    * footprints or unretired exact priors exist. On failure, earlier
+    * submissions remain conservatively treated as running. */
+   uint64_t completed = p_atomic_read(&queue->drm.signalled_value);
    if (hk_sync_submit_needs_completed(
           queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
-          submit->command_buffer_count)) {
+          submit->command_buffer_count) ||
+       hk_sync_submit_has_unretired_priors(queue)) {
       uint64_t point = 0;
       if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0) {
          hk_queue_note_signalled(queue, point);
-         completed = point;
+         completed = MAX2(completed, point);
       }
    }
 
@@ -2581,18 +2617,36 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             hk_query_stamps_note_cs(dev, queue, queue->drm.timeline_value, cs);
 
+            /* Prefer DRM_ASAHI_RENDER_FRAGMENT_BARRIERS over staged render
+             * prefixes whenever the vertex half needs no render prefix and the
+             * compute prefix is unchanged: both describe identical ordering,
+             * while FRAGMENT_BARRIERS keeps the smaller render payload and
+             * stays eligible for direct kernel publication. */
+            const bool m5_frag_barriers_only =
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+               cs->sync.ta_split &&
+               cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+               cs->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+               ta_command_prior[HK_SYNC_VDM] == 0 &&
+               cs->sync.barrier_ta[HK_SYNC_CDM] == cs->sync.barrier[HK_SYNC_CDM] &&
+               cs->sync.prior_ta[HK_SYNC_CDM] == cs->sync.prior[HK_SYNC_CDM] &&
+               ta_command_prior[HK_SYNC_CDM] == command_prior[HK_SYNC_CDM] &&
+               (cs->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
+                cs->sync.prior[HK_SYNC_VDM] != 0);
+
             /* M5: the vertex half's own render and compute prefixes, when
              * they are narrower than the whole render's, so its tiling can
              * overlap the fragment work of the renders only its fragment
              * half depends on. Supersedes the single-subqueue forms below. */
             const bool m5_staged_v2 =
                agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
-               queue->sync.exact_prior &&
+               queue->sync.exact_prior && !m5_frag_barriers_only &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
                cs->sync.ta_split;
             const bool stage_prefixes =
-               !m5_staged_v2 &&
+               !m5_staged_v2 && !m5_frag_barriers_only &&
                agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
                queue->sync.exact_prior &&
                (dev->dev.params.features &

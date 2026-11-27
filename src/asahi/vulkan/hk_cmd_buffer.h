@@ -1719,6 +1719,13 @@ struct hk_cs {
     * stream ends first (hk_m5_ordered_draw_hazard()). */
    bool m5_ordered;
 
+   /* M5: an earlier continuation of this stream crossed a barrier whose first
+    * scope covers graphics work outside the attachment stages
+    * (hk_m5_pass_merge_non_local_src()). A later instance may not terminate
+    * this stream with a final-pass resolve, since earlier fragment shaders in
+    * the stream may have read or written the resolve target. */
+   bool m5_non_local_src;
+
    /* M5: every attachment of the continued instances is in an
     * attachment-only layout, so no descriptor can access one of them and
     * descriptor sets bound for graphics need not end an ordered continuation
@@ -2442,6 +2449,11 @@ struct hk_cmd_buffer {
        * beyond attachment operations; continuing then needs the stronger
        * conditions of hk_m5_ordered_refusal(). */
       bool ordered;
+      /* A recorded barrier between this instance and the next has a graphics
+       * first scope outside the attachment stages
+       * (hk_m5_pass_merge_non_local_src()), so a final-pass resolve may not
+       * merge into this stream. */
+      bool non_local_src;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
    } pass_merge;
@@ -3253,6 +3265,12 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       hk_tess_batch_flush(cmd);
 
    if ((*ptr) == NULL) {
+      if (compute && unlikely(cmd->sync.lead_ts.handle)) {
+         hk_sync_flush_lead_timestamp(cmd);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return NULL;
+      }
+
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       struct hk_cs *cs = hk_cs_create(cmd, compute);
       if (!cs)
@@ -3606,8 +3624,11 @@ hk_flush_oq_pending(struct hk_cmd_buffer *cmd)
    if (!count)
       return;
 
+   const uint8_t saved_kind = cmd->sync.kind_override;
+   cmd->sync.kind_override = HK_SYNC_STAMP;
    struct hk_cs *cs =
       hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.post_gfx, true);
+   cmd->sync.kind_override = saved_kind;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 

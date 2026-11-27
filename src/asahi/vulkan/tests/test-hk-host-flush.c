@@ -215,6 +215,23 @@ hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
 }
 
 void
+hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
+                       uint64_t address, uint64_t size, uint32_t value)
+{
+   (void)cmd; (void)target; (void)address; (void)size; (void)value;
+   abort();
+}
+
+struct agx_ptr
+hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
+                        uint32_t size, uint32_t alignment,
+                        enum hk_cmd_bo_type type)
+{
+   (void)cmd; (void)uploader; (void)size; (void)alignment; (void)type;
+   abort();
+}
+
+void
 hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct hk_stamp_copy *copies, unsigned count)
 {

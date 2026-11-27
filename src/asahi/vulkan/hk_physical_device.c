@@ -412,7 +412,7 @@ hk_get_device_features(
       
       .taskShader = supported_extensions->EXT_mesh_shader &&
                     (dev->chip == AGX_CHIP_G17P ||
-                     (dev->chip == AGX_CHIP_G17S &&
+                     (agx_chip_g17_m5(dev->chip) &&
                       hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
       /* G17P replays a multiview mesh draw per view, as other draws. */
@@ -2227,7 +2227,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * VK_KHR_cooperative_matrix does not advertise it. */
    supported_extensions.NV_cooperative_matrix2 = m5_cmat;
 
-   supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
+   supported_extensions.EXT_mesh_shader = agx_chip_g17_m5(pdev->dev.chip) &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */

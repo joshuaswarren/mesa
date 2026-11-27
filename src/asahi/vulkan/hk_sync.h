@@ -95,13 +95,14 @@ enum hk_sync_kind {
    HK_SYNC_GFX_MEM = 1 << 5,
 
    /* Stream kinds and first scopes only, never named by an application
-    * dependency: a command the driver records to carry a timestamp alone, or
-    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
-    * query memory, which only query commands and later timestamps read, so
-    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
-    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
-    * does not order later work after it. It waits like work of every class
-    * (hk_sync_full_kinds()). */
+    * dependency: a command the driver records to carry a timestamp alone, to
+    * copy timestamps (hk_sync_write_timestamp()), or to publish post-graphics
+    * query availability (hk_flush_oq_pending(),
+    * hk_queue_query_available_write()). It writes nothing but query memory,
+    * which only query commands, events, and later timestamps observe, so only
+    * their first scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope());
+    * a pipeline barrier, even an ALL_COMMANDS one, does not order later work
+    * after it. It waits like work of every class (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
 
    /* Stream kinds and first scopes only, never named by an application
@@ -474,13 +475,15 @@ struct hk_sync_state {
 
    /* On chips whose start stamps latch before barriers resolve: a
     * timestamp recorded before any stream of the command buffer, waiting for
-    * the first one to carry it on an end stamp, which is latched after that
-    * stream's barriers (a render's vertex end, a compute stream's end). That
-    * stream waits for lead_scope, the kinds of the stamp's first scope as
-    * hk_sync_src_dep() takes them: the resets of timestamp queries alone for
-    * a top-of-pipe stamp, whose first scope is empty; the earlier work of
-    * its stages and the earlier timestamps for any other. Then the end stamp
-    * is latched no earlier than a command of its own could latch it. */
+    * a first render stream to carry it on its vertex end stamp (vtx_end),
+    * which is latched after the render's barriers and remains distinct from
+    * fragment end (end). That render waits for lead_scope, the kinds of the
+    * stamp's first scope as hk_sync_src_dep() takes them: the resets of
+    * timestamp queries alone for a top-of-pipe stamp, whose first scope is
+    * empty; the earlier work of its stages and the earlier timestamps for
+    * any other. A compute stream has no separate start-side end stamp, so
+    * opening one first flushes lead_ts into a preceding timestamp-only
+    * carrier (hk_sync_flush_lead_timestamp()). */
    struct agx_timestamp_req lead_ts;
    uint8_t lead_scope;
    bool has_unordered_start_ts;
@@ -591,12 +594,23 @@ struct hk_sync_queue {
     * (hk_sync.h, tile hazards). */
    bool load_hazard_frag;
    uint64_t last_preserve, evicted_preserve;
-
    /* Recent VDM renders' attachment blooms for exact-image HK_SYNC_GFX_IMG
     * narrowing across submissions. */
    struct hk_sync_vdm_att recent_vdm_att[HK_SYNC_RECENT_VDM_ATT];
    uint32_t recent_vdm_att_next, recent_vdm_att_count;
    uint64_t recent_vdm_att_evicted;
+
+   /* Retired-ordinal map for exact priors: each entry pairs a queue timeline
+    * point with the submitted VDM/CDM ordinals through that submission. Once
+    * `completed >= point`, every ordinal up to `ord[sq]` has retired and can
+    * be pruned to 0. */
+#define HK_SYNC_RETIRED_RING 64
+   struct {
+      uint64_t point;
+      uint64_t ord[HK_SYNC_NUM_SQ];
+   } retired[HK_SYNC_RETIRED_RING];
+   uint32_t retired_next, retired_count;
+   uint64_t retired_ord[HK_SYNC_NUM_SQ];
 };
 
 void hk_sync_reset(struct hk_cmd_buffer *cmd);
@@ -755,6 +769,7 @@ void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
+void hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 
 /* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a
@@ -830,6 +845,7 @@ void hk_sync_apply_dep(struct hk_cmd_buffer *cmd, struct hk_cs *into,
 bool hk_sync_submit_needs_completed(const struct hk_queue *queue,
                                     struct hk_cmd_buffer *const *cmdbufs,
                                     unsigned count);
+bool hk_sync_submit_has_unretired_priors(const struct hk_queue *queue);
 
 /* The driver's own resolve pass after a render: waits on the render. */
 void hk_sync_resolve_begin(struct hk_cmd_buffer *cmd);

@@ -36,7 +36,7 @@ g17g_graphics_program_generate(
    size_t bound;
    const bool mesh = stage == AGX_IOTO_G17G_PROGRAM_MESH ||
                      stage == AGX_IOTO_G17G_PROGRAM_OBJECT;
-   if (!agx_chip_g17_m5(chip) || (mesh && chip != AGX_CHIP_G17S) ||
+   if (!agx_chip_g17_m5(chip) ||
        !desc || !program || (mesh && desc->fragment) ||
        !desc->shader_binary_size ||
        desc->preloaded_root ||
