@@ -458,14 +458,20 @@ can_repeat_alu(const agx_context *ctx, const agx_instr *I)
    case AGX_OPCODE_FADD:
    case AGX_OPCODE_FMUL:
    case AGX_OPCODE_FFMA:
+   case AGX_OPCODE_HADD:
+   case AGX_OPCODE_HMUL:
+   case AGX_OPCODE_HFMA:
    case AGX_OPCODE_FCMPSEL:
    case AGX_OPCODE_ICMPSEL:
    case AGX_OPCODE_IADD:
    case AGX_OPCODE_IMAD:
    case AGX_OPCODE_ASR:
    case AGX_OPCODE_BFEIL:
+   case AGX_OPCODE_EXTR:
    case AGX_OPCODE_BITOP:
    case AGX_OPCODE_CONVERT:
+   case AGX_OPCODE_FLTNORM_AGX3:
+   case AGX_OPCODE_NORMFLT_AGX3:
       break;
    default:
       return false;
@@ -1626,12 +1632,46 @@ struct block_local_defs {
    unsigned n_defined;
 };
 
+/* Braun & Hack Section 4.1: penalize loop-exit edges so spilling inside a hot
+ * loop evicts outer/post-loop values ahead of loop-carried inner values. */
+#define AGX_SPILL_LOOP_EXIT_PENALTY 10000u
+#define AGX_SPILL_MAX_DIST (DIST_INFINITY / 2u)
+
+static inline dist_t
+dist_add_clamped(dist_t d, uint32_t penalty)
+{
+   if (d == DIST_INFINITY)
+      return DIST_INFINITY;
+   dist_t sum = dist_sum(d, penalty);
+   return MIN2(sum, AGX_SPILL_MAX_DIST);
+}
+
 static ATTRIBUTE_NOINLINE void
 global_next_use_distances(agx_context *ctx, void *memctx,
                           struct spill_block *blocks)
 {
    u_worklist worklist;
    u_worklist_init(&worklist, ctx->num_blocks, NULL);
+
+   /* Compute structured loop-nesting depth per block: for each loop header h,
+    * find its furthest back-edge predecessor and count the loop once even when
+    * multiple continue edges target the same header. */
+   uint32_t *loop_depth = calloc(MAX2(ctx->num_blocks, 1), sizeof(*loop_depth));
+   uint32_t *loop_end = calloc(MAX2(ctx->num_blocks, 1), sizeof(*loop_end));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index &&
+             block->index < ctx->num_blocks) {
+            loop_end[succ->index] = MAX2(loop_end[succ->index],
+                                         (uint32_t)block->index + 1u);
+         }
+      }
+   }
+   for (unsigned h = 0; h < ctx->num_blocks; ++h) {
+      for (unsigned i = h; i < loop_end[h]; ++i)
+         loop_depth[i]++;
+   }
+   free(loop_end);
 
    BITSET_WORD *defined = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *phi_dests = BITSET_CALLOC(ctx->alloc);
@@ -1731,11 +1771,18 @@ global_next_use_distances(agx_context *ctx, void *memctx,
       agx_foreach_predecessor(blk, pred) {
          struct spill_block *sp = &blocks[(*pred)->index];
          bool progress = false;
+         uint32_t exit_penalty = 0;
+         if (loop_depth[(*pred)->index] > loop_depth[blk->index]) {
+            const uint32_t delta =
+               MIN2(loop_depth[(*pred)->index] - loop_depth[blk->index], 100u);
+            exit_penalty = delta * AGX_SPILL_LOOP_EXIT_PENALTY;
+         }
 
          if (has_phis) {
             foreach_next_use(&sb->next_use_in, node, dist) {
                if (!BITSET_TEST(phi_dests, node) &&
-                   set_next_use_min(&sp->next_use_out, node, dist))
+                   set_next_use_min(&sp->next_use_out, node,
+                                    dist_add_clamped(dist, exit_penalty)))
                   progress = true;
             }
 
@@ -1743,12 +1790,14 @@ global_next_use_distances(agx_context *ctx, void *memctx,
             agx_foreach_phi_in_block(blk, I) {
                agx_index operand = I->src[pred_idx];
                if (operand.type == AGX_INDEX_NORMAL &&
-                   set_next_use_min(&sp->next_use_out, operand.value, 0))
+                   set_next_use_min(&sp->next_use_out, operand.value,
+                                    exit_penalty))
                   progress = true;
             }
          } else {
             foreach_next_use(&sb->next_use_in, node, dist) {
-               if (set_next_use_min(&sp->next_use_out, node, dist))
+               if (set_next_use_min(&sp->next_use_out, node,
+                                    dist_add_clamped(dist, exit_penalty)))
                   progress = true;
             }
          }
@@ -1766,6 +1815,7 @@ global_next_use_distances(agx_context *ctx, void *memctx,
    for (unsigned i = 0; i < ctx->num_blocks; ++i)
       free(local_defs[i].defined);
    free(local_defs);
+   free(loop_depth);
    free(phi_dests);
    free(defined);
    u_worklist_fini(&worklist);
