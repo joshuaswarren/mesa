@@ -25,6 +25,7 @@
 #include "hk_private.h"
 
 #include "hk_descriptor_table.h"
+#include "hk_gpu_waits.h"
 #include "hk_host_alias.h"
 #include "hk_native_sampler.h"
 #include "hk_queue.h"
@@ -133,6 +134,8 @@ struct hk_compute_kick;
 struct hk_device {
    struct vk_device vk;
    struct agx_device dev;
+   /* Same-queue binary semaphore waits ordered on the GPU. */
+   struct hk_gpu_waits gpu_waits;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
    /* Live buffers and image planes with a GPU virtual address of their own

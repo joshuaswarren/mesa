@@ -2365,6 +2365,7 @@ hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
             v = MAX2(v, q->last_absolute[k][sq]);
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
             v = MAX2(v, q->tail[k][sq]);
+         v = MAX2(v, q->wait_floor[sq]);
          if (count[sq])
             v = MAX2(v, base[sq] + count[sq]);
          if (v > base[sq] && v - base[sq] < DRM_ASAHI_BARRIER_NONE)
@@ -2535,6 +2536,7 @@ resolve_one(const struct submit_state *ss, unsigned sq,
       uint64_t v = resolve_absolute(ss, dep, sq);
       u_foreach_bit(k, kinds)
          v = MAX2(v, ss->carry_absolute[k][sq]);
+      v = MAX2(v, ss->queue->sync.wait_floor[sq]);
       const uint64_t base = ss->queue->sync.submitted[sq];
       /* A command too far back for the 16-bit field is in an earlier ioctl
        * of this submission (at most max_commands_per_submit() each), already

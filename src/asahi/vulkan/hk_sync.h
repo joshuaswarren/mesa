@@ -483,6 +483,11 @@ struct hk_sync_queue {
     * half after the serialized prefix. */
    bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
+   /* Exact priors: every command of the submission being resolved waits
+    * through these ordinals (same-queue semaphore waits, hk_gpu_waits.h).
+    * Set by the submitter around hk_sync_resolve_submit_ex() and
+    * hk_sync_host_flush_prefix(), zero otherwise. */
+   uint64_t wait_floor[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    /* G17P: the largest whole render prefix of a render submitted without

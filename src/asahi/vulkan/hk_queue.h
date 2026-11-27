@@ -110,6 +110,10 @@ struct hk_queue {
 
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
+   /* Counts restarts of sync's ordinals (a new kernel queue or sibling use):
+    * a binary semaphore's record of them is only valid in its generation
+    * (hk_gpu_waits.h). */
+   uint64_t gpu_wait_generation;
 
    /* Scratch for queue_submit: the resolved sync fields of each stream
     * occurrence of the submission being built (hk_sync_resolve_submit()). */
