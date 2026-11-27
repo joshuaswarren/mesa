@@ -186,3 +186,37 @@ TEST_F(SpillPhiSources, WrittenUniformIsCopiedAtTheStart)
    EXPECT_TRUE(phi->src[0].memory);
    EXPECT_EQ(memory_writes(entry), 1u);
 }
+
+/* A phi read in its own block stays in registers although x was spilled: x is
+ * filled on its edge in place of a fill before the read, and nothing is
+ * written to memory for the uniform's edge.
+ */
+TEST_F(SpillPhiSources, PhiReadInItsBlockStaysInRegisters)
+{
+   agx_instr *phi = build(u(20), true);
+   spill();
+
+   phi = phi_in(merge);
+   ASSERT_NE(phi, nullptr);
+   EXPECT_FALSE(phi->dest[0].memory);
+   EXPECT_EQ(phi->src[0].type, AGX_INDEX_UNIFORM);
+   EXPECT_FALSE(phi->src[1].memory);
+   EXPECT_EQ(fills(els), 1u);
+   EXPECT_EQ(fills(merge), 0u);
+   EXPECT_EQ(memory_writes(then), 0u);
+   EXPECT_EQ(memory_writes(merge), 0u);
+}
+
+/* Without the read in merge the phi is spilled, as before, and read from its
+ * slot in tail.
+ */
+TEST_F(SpillPhiSources, PhiReadOnlyLaterIsSpilled)
+{
+   agx_instr *phi = build(u(20), false);
+   spill();
+
+   phi = phi_in(merge);
+   ASSERT_NE(phi, nullptr);
+   EXPECT_TRUE(phi->dest[0].memory);
+   EXPECT_EQ(fills(tail), 1u);
+}

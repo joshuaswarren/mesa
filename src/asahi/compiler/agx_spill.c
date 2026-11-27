@@ -1564,17 +1564,27 @@ compute_w_entry(struct spill_ctx *ctx)
          all_found &= found;
       }
 
+      const dist_t dist =
+         search_next_uses(&sb->next_use_in, I->dest[0].value);
+
       /* Heuristic: if any phi source is spilled, spill the whole phi. This is
        * suboptimal, but it massively reduces pointless fill/spill chains with
        * massive phi webs. A remat-only pass never spills: the missing sources
        * are constants, rematerialized along their edges.
+       *
+       * A phi this block reads is the exception. Spilled, it is filled before
+       * that read on every path into the block, and its sources still in
+       * registers are spilled on their edges. In registers, only its spilled
+       * sources are filled, each on its own edge, so that costs no more
+       * memory traffic and frees the slot. Whether it fits is left to the
+       * next-use order below, like any other candidate.
        */
-      if (!all_found && !ctx->remat_only)
+      if (!all_found && !ctx->remat_only && dist >= sb->cycles)
          continue;
 
       candidates[j++] = (struct candidate){
          .node = I->dest[0].value,
-         .dist = search_next_uses(&sb->next_use_in, I->dest[0].value),
+         .dist = dist,
       };
    }
 
