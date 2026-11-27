@@ -10490,8 +10490,14 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
       return NULL;
    if (dw_a && dw_a->has_epilogue && !hk_nir_clamp_epilogue_valid(&dw_a->epilogue))
       return NULL;
+   if (dw_a && dw_a->has_expand && dw_a->has_exp_epilogue &&
+       !hk_nir_clamp_epilogue_valid(&dw_a->exp_epilogue))
+      return NULL;
    if (gemm_dw && gemm_dw->has_epilogue &&
        !hk_nir_clamp_epilogue_valid(&gemm_dw->epilogue))
+      return NULL;
+   if (gemm_dw && gemm_dw->has_proj && gemm_dw->has_proj_epilogue &&
+       !hk_nir_clamp_epilogue_valid(&gemm_dw->proj_epilogue))
       return NULL;
    if (hk_compute_pair_dual_is_fadd_ep(dual_write) != (fadd_ep != NULL))
       return NULL;

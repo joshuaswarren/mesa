@@ -19,6 +19,8 @@
 #include "agx_ppp_hal200_graphics_core.h"
 #include "agx_ppp_hal300_graphics_core.h"
 #include "hk_ppp_state.h"
+#include "hk_device_memory.h"
+#include "util/u_atomic.h"
 #include "agx_vdm_state_core.h"
 #include "agx_ppp_hal200_raster_core.h"
 #include "agx_ppp_hal300_depth_bias_scissor_core.h"
@@ -4235,6 +4237,8 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
 
 static bool hk_m5_image_is_attachment(const struct hk_rendering_state *render,
                                       const struct vk_image *image);
+static bool hk_m5_image_aliases_attachment(const struct hk_rendering_state *render,
+                                           const struct vk_image *image);
 
 static void
 hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
@@ -4255,8 +4259,7 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
    if (transition && image &&
        hk_pass_merge_layout_proof_supported(chip) &&
        !hk_m5_image_is_attachment(&m->render, image) &&
-       !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
-                                VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
+       !hk_m5_image_aliases_attachment(&m->render, image))
       transition = false;
    if (m->render.tilebuffer.nr_samples > 1 && transition) {
       m->valid = false;
@@ -4316,6 +4319,92 @@ hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
             b->srcQueueFamilyIndex != b->dstQueueFamilyIndex,
          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ? NULL : image);
    }
+}
+
+/* Whether an image has external, imported, exported, or sparse backing whose
+ * physical pages could be reached through another GPU virtual address. */
+static bool
+hk_image_has_external_va(const struct hk_image *image)
+{
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      return true;
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      const struct hk_device_memory *mem = image->planes[p].mem;
+      if (!mem || mem->alias_import || mem->alias_fd ||
+          mem->vk.export_handle_types != 0)
+         return true;
+   }
+   return false;
+}
+
+/* Whether an optimal image's backing memory may also be accessed through a
+ * buffer, linear mapping, sparse binding, or external/imported handle. */
+static bool
+hk_image_mem_may_alias_buffer(const struct hk_image *image)
+{
+   if (image->swapchain_memory)
+      return false;
+   if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
+       (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT))
+      return true;
+   if (!(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT))
+      return false;
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      const struct hk_device_memory *mem = image->planes[p].mem;
+      if (!mem || mem->alias_import || mem->alias_fd ||
+          mem->vk.export_handle_types != 0 ||
+          p_atomic_read(&mem->has_buffer_binding))
+         return true;
+   }
+   return false;
+}
+
+/* Whether two images can share physical storage (same image, external/sparse
+ * memory, unbound, or overlapping GPU VA ranges). */
+static bool
+hk_images_va_overlap(const struct hk_image *a, const struct hk_image *b)
+{
+   if (a == b)
+      return true;
+   if (hk_image_has_external_va(a) || hk_image_has_external_va(b))
+      return true;
+   uint64_t alo, ahi, blo, bhi;
+   hk_image_va_range(a, &alo, &ahi);
+   hk_image_va_range(b, &blo, &bhi);
+   if (alo >= ahi || blo >= bhi)
+      return true;
+   return alo < bhi && blo < ahi;
+}
+
+/* Whether `image` may alias any attachment of `render`. */
+static bool
+hk_m5_image_aliases_attachment(const struct hk_rendering_state *render,
+                               const struct vk_image *image)
+{
+   if (!(image->create_flags &
+         (VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
+      return false;
+   if (image->create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      return true;
+   const struct hk_image *img = container_of(image, struct hk_image, vk);
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].iview &&
+          hk_images_va_overlap(
+             container_of(render->color_att[i].iview->vk.image, struct hk_image, vk),
+             img))
+         return true;
+   }
+   if (render->depth_att.iview &&
+       hk_images_va_overlap(
+          container_of(render->depth_att.iview->vk.image, struct hk_image, vk),
+          img))
+      return true;
+   if (render->stencil_att.iview &&
+       hk_images_va_overlap(
+          container_of(render->stencil_att.iview->vk.image, struct hk_image, vk),
+          img))
+      return true;
+   return false;
 }
 
 /* Whether the image of an attachment view may hold the attachment's contents
@@ -4774,6 +4863,33 @@ hk_render_pack_names(const struct hk_render_pack_pass *pass,
    return false;
 }
 
+static bool
+hk_render_pack_aliases_va(const struct hk_render_pack_pass *pass,
+                          const struct vk_image *image)
+{
+   const struct hk_image *img = container_of(image, struct hk_image, vk);
+   for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s) {
+      if (!pass->att[s].image)
+         continue;
+      if (hk_images_va_overlap(
+             container_of(pass->att[s].image, struct hk_image, vk), img))
+         return true;
+   }
+   return false;
+}
+
+static bool
+hk_render_pack_names_or_aliases(const struct hk_render_pack_pass *pass,
+                                const struct vk_image *image)
+{
+   if (hk_render_pack_names(pass, image))
+      return true;
+   if (image->create_flags &
+       (VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT))
+      return hk_render_pack_aliases_va(pass, image);
+   return false;
+}
+
 static unsigned
 hk_render_pack_samples(const struct hk_render_pack_pass *pass)
 {
@@ -4838,10 +4954,12 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
       VK_FROM_HANDLE(vk_image, image, b->image);
       const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
       const bool transition = b->oldLayout != b->newLayout || transfer;
+      const bool alias_bit = (image->create_flags & VK_IMAGE_CREATE_ALIAS_BIT) != 0;
+      const bool undef_alias = alias_bit && b->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED;
       const bool transparent =
          transition && !transfer && hk_pass_merge_layout_proof_supported(chip) &&
-         !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
-                                  VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
+         !(image->create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+         (!undef_alias || !pass || !hk_render_pack_aliases_va(pass, image));
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
@@ -4853,17 +4971,23 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
       if (transition && !transparent) {
          *msaa_end = true;
       } else if (transparent && pass) {
-         if (msaa && hk_render_pack_names(pass, image)) {
+         if (msaa && hk_render_pack_names_or_aliases(pass, image)) {
             dep = HK_M5_MERGE_DEP_END;
             *why = "multisampled attachment transition";
          }
       } else if (transparent) {
-         /* Only a multisampled first instance needs to know which images
-          * were transitioned (hk_render_pack_begin()). */
-         if (e->transition_count < ARRAY_SIZE(e->transitions))
+         /* Remember transitioned images until the head instance's attachments
+          * are known (hk_render_pack_begin()): needed for MSAA and for
+          * UNDEFINED transitions on ALIAS_BIT images. */
+         if (e->transition_count < ARRAY_SIZE(e->transitions)) {
+            if (undef_alias)
+               e->head_undef_alias_mask |= BITFIELD_BIT(e->transition_count);
             e->transitions[e->transition_count++] = image;
-         else
+         } else {
             e->transitions_overflow = true;
+            if (undef_alias)
+               e->head_undef_alias_overflow = true;
+         }
       }
    }
    return dep;
@@ -4986,14 +5110,27 @@ hk_render_pack_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    p->layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
 
    /* A multisampled instance ends at a transition of an attachment, or at
-    * any the head could not take as transparent. */
+    * any the head could not take as transparent. An UNDEFINED transition of
+    * an ALIAS_BIT image ends the head if its VA overlaps an attachment. */
    uint8_t dep = e->head_dep;
    if (dep == HK_M5_MERGE_DEP_END)
       why = barrier_why ? barrier_why : "barrier";
-   if (hk_render_pack_samples(p) > 1) {
+   if (dep != HK_M5_MERGE_DEP_END &&
+       (e->head_undef_alias_overflow || e->head_undef_alias_mask)) {
+      bool aliased = e->head_undef_alias_overflow;
+      for (unsigned t = 0; !aliased && t < e->transition_count; ++t) {
+         if (e->head_undef_alias_mask & BITFIELD_BIT(t))
+            aliased |= hk_render_pack_aliases_va(p, e->transitions[t]);
+      }
+      if (aliased) {
+         dep = HK_M5_MERGE_DEP_END;
+         why = "transition of an image that may alias";
+      }
+   }
+   if (dep != HK_M5_MERGE_DEP_END && hk_render_pack_samples(p) > 1) {
       bool transitioned = e->head_msaa_end || e->transitions_overflow;
       for (unsigned t = 0; t < e->transition_count; ++t)
-         transitioned |= hk_render_pack_names(p, e->transitions[t]);
+         transitioned |= hk_render_pack_names_or_aliases(p, e->transitions[t]);
       if (transitioned) {
          dep = HK_M5_MERGE_DEP_END;
          why = "multisampled transition";
@@ -5713,7 +5850,13 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->g17p_zls_written = 0;
    render->m5_attachments_reach_memory = false;
    render->att_bloom = 0;
+   render->m5_attachments_alias_image = false;
    {
+      uint32_t alias_gen = 0;
+      if (!cmd->sync.has_alias_image_render) {
+         alias_gen = p_atomic_read(&dev->buffer_alias_mem_gen);
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      }
       const struct hk_image_view *views[2 * HK_MAX_RTS + 4] = {
          render->depth_att.iview, render->stencil_att.iview,
          render->depth_att.resolve_iview, render->stencil_att.resolve_iview};
@@ -5723,36 +5866,39 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       }
       for (unsigned i = 0; i < 4 + 2 * render->color_att_count; ++i) {
          const struct vk_image *image = views[i] ? views[i]->vk.image : NULL;
-         if (image) {
-            const struct hk_image *hk_img =
-               container_of(image, struct hk_image, vk);
-            const VkImageCreateFlags unsafe_flags =
-               VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
-               VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
-            if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
-                image->external_handle_types ||
-                (image->create_flags & unsafe_flags) ||
-                image->tiling == VK_IMAGE_TILING_LINEAR) {
-               render->att_bloom = UINT64_MAX;
-            } else {
-               for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
-                  if (!hk_img->planes[p].addr) {
-                     render->att_bloom = UINT64_MAX;
-                     break;
-                  }
-                  render->att_bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
+         if (!image)
+            continue;
+         const struct hk_image *hk_img =
+            container_of(image, struct hk_image, vk);
+         const VkImageCreateFlags unsafe_flags =
+            VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+            VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+         if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
+             image->external_handle_types ||
+             (image->create_flags & unsafe_flags) ||
+             image->tiling == VK_IMAGE_TILING_LINEAR) {
+            render->att_bloom = UINT64_MAX;
+         } else {
+            for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
+               if (!hk_img->planes[p].addr) {
+                  render->att_bloom = UINT64_MAX;
+                  break;
                }
+               render->att_bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
             }
          }
-         /* Swapchain memory aliases images only (hk_image::swapchain_memory),
-          * which later work reads through an image. */
-         const VkImageCreateFlags aliasing =
-            image && container_of(image, struct hk_image, vk)->swapchain_memory
-               ? VK_IMAGE_CREATE_SPARSE_BINDING_BIT
-               : VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
-         if (image && ((image->create_flags & aliasing) ||
-                       image->tiling == VK_IMAGE_TILING_LINEAR))
+         if (hk_image_mem_may_alias_buffer(hk_img)) {
             render->m5_attachments_reach_memory = true;
+         } else if (!hk_img->swapchain_memory &&
+                    (image->create_flags & VK_IMAGE_CREATE_ALIAS_BIT)) {
+            render->m5_attachments_alias_image = true;
+         }
+      }
+      if (render->m5_attachments_alias_image &&
+          !render->m5_attachments_reach_memory &&
+          !cmd->sync.has_alias_image_render) {
+         cmd->sync.has_alias_image_render = true;
+         cmd->sync.buffer_alias_mem_gen = alias_gen;
       }
    }
    render->g17p_zls_elide_mask = 0;

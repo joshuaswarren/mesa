@@ -1376,6 +1376,37 @@ test_g17p_vertex_after_memory_writers(void)
      (cleared->sync.kind & HK_SYNC_GFX_MEM) &&
      after_clear->sync.dep_ta[HK_SYNC_VDM].cut == cleared);
 
+   /* An optimal ALIAS_BIT attachment whose memory has no buffer binding is
+    * exempted from HK_SYNC_GFX_MEM while buffer_alias_mem_gen is unchanged,
+    * allowing vertex/fragment overlap; if a buffer is later bound to an
+    * image-bearing memory (advancing buffer_alias_mem_gen), submit-time
+    * resolution upgrades it conservatively and widens intra-CB vertex waits. */
+   for (unsigned stale = 0; stale < 2; ++stale) {
+      struct hk_cmd_buffer *ac = timestamp_cmd(AGX_CHIP_G17P, true);
+      struct hk_device *adev = hk_cmd_buffer_device(ac);
+      ac->sync.has_alias_image_render = true;
+      ac->sync.buffer_alias_mem_gen = adev->buffer_alias_mem_gen;
+      ac->state.gfx.render.m5_attachments_alias_image = true;
+      struct hk_cs *aliased = add(ac, false);
+      ac->state.gfx.render.m5_attachments_alias_image = false;
+      hk_sync_barrier(ac, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *after_alias = add(ac, false);
+      T("alias-image render skips HK_SYNC_GFX_MEM at record time",
+        !(aliased->sync.kind & HK_SYNC_GFX_MEM) &&
+        aliased->sync.alias_image_render &&
+        after_alias->sync.dep_ta[HK_SYNC_VDM].cut == NULL);
+      if (stale)
+         adev->buffer_alias_mem_gen++;
+      struct hk_queue *aq = new_queue(true);
+      T("alias-image render submit", submit(aq, ac));
+      T("alias-image render submit-time gen check",
+        ((aliased->sync.kind & HK_SYNC_GFX_MEM) != 0) == (stale != 0) &&
+        after_alias->sync.barrier[HK_SYNC_VDM] == 1 &&
+        after_alias->sync.barrier_ta[HK_SYNC_VDM] ==
+           (stale ? 1 : DRM_ASAHI_BARRIER_NONE) &&
+        after_alias->sync.ta_split == !stale);
+   }
+
    struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G15S, true);
    struct hk_cs *plain = add(cmd, false);
    hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);

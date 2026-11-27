@@ -115,8 +115,10 @@ struct hk_render_pack_edges {
    bool head_open;
    bool head_msaa_end;
    bool transitions_overflow;
+   bool head_undef_alias_overflow;
    uint8_t head_dep;
    uint8_t transition_count;
+   uint8_t head_undef_alias_mask;
    uint32_t head_epoch;
    const struct vk_image *transitions[HK_RENDER_PACK_TRANSITIONS];
 

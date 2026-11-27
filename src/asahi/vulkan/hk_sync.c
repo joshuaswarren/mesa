@@ -6,6 +6,7 @@
  * described in hk_sync.h.
  */
 #include "hk_sync.h"
+#include "util/u_atomic.h"
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -1049,6 +1050,8 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * whether or not the stream records a draw. */
    if (!compute && cmd->state.gfx.render.m5_attachments_reach_memory)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
+   else if (!compute && cmd->state.gfx.render.m5_attachments_alias_image)
+      cs->sync.alias_image_render = true;
    if (!compute)
       cs->sync.att_bloom =
          st->in_pass ? cmd->state.gfx.render.att_bloom : UINT64_MAX;
@@ -2872,10 +2875,17 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
     * occurrence, and saves it to out, before the next one starts. */
    for (unsigned i = 0; i < count; ++i) {
       struct hk_cmd_buffer *cmd = cmdbufs[i];
+      const bool alias_mem_stale =
+         cmd->sync.has_alias_image_render &&
+         cmd->sync.buffer_alias_mem_gen !=
+            p_atomic_read(&hk_cmd_buffer_device(cmd)->buffer_alias_mem_gen);
 
       /* Positions first: cuts point at streams of this command buffer. */
-      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
          cs->sync.index = ++ss.count[hk_sync_sq(cs)];
+         if (unlikely(alias_mem_stale) && cs->sync.alias_image_render)
+            cs->sync.kind |= HK_SYNC_GFX_MEM;
+      }
 
       list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
@@ -2934,6 +2944,11 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
                               &cs->sync.barrier_ta[sq],
                               &cs->sync.prior_ta[sq]);
                }
+            }
+            if (unlikely(alias_mem_stale) && cs->type != HK_CS_CDM &&
+                sq == HK_SYNC_VDM) {
+               cs->sync.barrier_ta[sq] = cs->sync.barrier[sq];
+               cs->sync.prior_ta[sq] = cs->sync.prior[sq];
             }
             if (cs->sync.heap_slot > 0) {
                const unsigned hs = cs->sync.heap_slot - 1;
@@ -3064,6 +3079,15 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
             const unsigned sq = hk_sync_sq(cs);
             ss.last_heap_slot[hs][sq] =
                value_max(ss.last_heap_slot[hs][sq], cs->sync.index);
+         }
+      }
+      if (unlikely(alias_mem_stale)) {
+         const unsigned mem_k = util_logbase2(HK_SYNC_GFX_MEM);
+         list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+            if (cs->sync.alias_image_render) {
+               const unsigned sq = hk_sync_sq(cs);
+               ss.last[mem_k][sq] = value_max(ss.last[mem_k][sq], cs->sync.index);
+            }
          }
       }
 
