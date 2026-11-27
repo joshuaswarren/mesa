@@ -856,12 +856,16 @@ struct hk_rendering_state {
     */
    VkImageAspectFlags g17p_zls_written;
 
-   /* M5: an attachment of the pass can alias another resource (aliased,
-    * sparse or linear image), so its stores count as memory writes for
-    * dependency tracking (HK_SYNC_GFX_MEM). */
+   /* M5: an attachment of the pass can alias a buffer or external/linear
+    * resource, so its stores count as memory writes for dependency tracking
+    * (HK_SYNC_GFX_MEM). */
    bool m5_attachments_reach_memory;
    /* Bloom filter of plane GPU VAs of all pass/resolve attachments. */
    uint64_t att_bloom;
+   /* M5: an optimal VK_IMAGE_CREATE_ALIAS_BIT attachment was exempted from
+    * m5_attachments_reach_memory because its memory had no buffer binding at
+    * record time; checked against hk_device::buffer_alias_mem_gen at submit. */
+   bool m5_attachments_alias_image;
 
    /* AGX3 dead depth/stencil store: aspects stored in this single-stream pass
     * that may become dead if overwritten before read (hk_take_pending_z_store),

@@ -151,6 +151,13 @@ struct hk_device {
     * va_alias_resources, fd and dma-buf imports, and host imports that may
     * alias. hk_cdm_alias_scope() asks for memory scope while it is not 0. */
    uint32_t alias_live;
+
+   /* Monotonic counter incremented atomically whenever a buffer is first bound
+    * to an hk_device_memory that already has an image binding. Checked at
+    * submit time so command buffers recorded before a post-record buffer bind
+    * conservatively upgrade their aliased attachment renders to
+    * HK_SYNC_GFX_MEM. */
+   uint32_t buffer_alias_mem_gen;
    struct {
       /* M5: the device enabled a feature through which memory can get a
        * second address, so the scope follows alias_live instead of
