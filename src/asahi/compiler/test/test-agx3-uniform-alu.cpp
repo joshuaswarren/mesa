@@ -1220,17 +1220,21 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortAluArmOnAgx3)
       enum agx_chip chip;
       bool emit_agx3d;
       mesa_shader_stage stage;
+      bool uniform_cond;
       bool expect_jump;
    } cases[] = {
-      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_FRAGMENT, false},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_COMPUTE, true},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_COMPUTE, true},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, false},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_FRAGMENT, false, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_COMPUTE, true, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_COMPUTE, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_COMPUTE, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, false, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, true, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_FRAGMENT, false, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_COMPUTE, true, false},
    };
 
    for (const auto &c : cases) {
@@ -1245,8 +1249,10 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortAluArmOnAgx3)
       agx_block *entry = list_first_entry(&b->shader->blocks, agx_block, link);
       agx_block *body = agx_test_block(b->shader);
       agx_block *end = agx_test_block(b->shader);
-      agx_if_icmp(b, agx_register(0, AGX_SIZE_16), agx_immediate(0),
-                  1, AGX_ICOND_UEQ, true, end);
+      agx_instr *if_ = agx_if_icmp(b, agx_register(0, AGX_SIZE_16),
+                                   agx_immediate(0), 1, AGX_ICOND_UEQ, true,
+                                   end);
+      if_->uniform_cond = c.uniform_cond;
       agx_builder middle = agx_init_builder(b->shader, agx_after_block(body));
       for (unsigned i = 0; i < 12; ++i)
          agx_iadd_to(&middle, agx_register(2, AGX_SIZE_32),

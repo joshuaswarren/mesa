@@ -77,6 +77,16 @@ main(void)
       assert(agx_chip_has_depth_clip_control(elide_chips[i]));
    assert(!agx_chip_has_depth_clip_control(AGX_CHIP_G18G));
 
+   /* Shader-reconstructed packed 4:2:2 YCbCr and 10/12-bit plane UNORM range
+    * normalization apply across native AGX3 and M5, keeping AGX2 and AGX3D
+    * (G18G) off. */
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_packed_ycbcr(elide_chips[i]));
+   assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G13G));
+   assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G14X));
+   assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G15P));
+   assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G18G));
+
    /* Kernel-feature-gated cumulative signals and sibling compute queues apply
     * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C/G17D) without chip
     * forks. */

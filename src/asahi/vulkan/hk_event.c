@@ -251,8 +251,10 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
        * trailing edge of the open compute stream when it closes). */
       if (agx_chip_command_stream_generation(dev->dev.chip) ==
               AGX_CS_GENERATION_AGX2 &&
-          !HK_PERF(dev, ALWAYSCDMBARRIER))
+          !HK_PERF(dev, FULLCDMBARRIER)) {
          cmd->state.cs.cdm_barrier_pending = true;
+         cmd->state.cs.cdm_barrier_full_needed = true;
+      }
       hk_sync_barrier(cmd, src_kinds, dst_kinds);
       if (init)
          brl_discard_init_record(cmd, &pDependencyInfos[i], init_dst);

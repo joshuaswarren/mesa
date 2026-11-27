@@ -262,8 +262,16 @@ test_gpu_vdm_builder(enum agx_chip chip, bool indexed, bool republishes,
 static void
 test_chip_gating(void)
 {
-   /* Only HAL200/HAL300 command-stream generations are admitted; G15 (M3) is
-    * excluded by capability. */
+   /* The builder admits every chip with the returning VDM Stream Link record,
+    * whatever its command-stream generation (G15, HAL200, HAL300); AGX2 has
+    * only its own non-returning link. */
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G15G));
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G15S));
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G16G));
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G17P));
+   CHECK(agx_vdm_stream_link_core_supported(AGX_CHIP_G17S));
+   CHECK(!agx_vdm_stream_link_core_supported(AGX_CHIP_G13G));
+   CHECK(!agx_vdm_stream_link_core_supported(AGX_CHIP_G14X));
    CHECK(agx_chip_command_stream_generation(AGX_CHIP_G17P) ==
          AGX_CS_GENERATION_HAL200);
    CHECK(agx_chip_command_stream_generation(AGX_CHIP_G16G) ==

@@ -511,17 +511,7 @@ struct agx_device_key {
     * the instruction encoding, notably formatted PBE store inputs. */
    enum agx_chip chip;
 
-   /*
-    * Binary encoding of the instruction set to emit.
-    *
-    * Every part this compiler supports is AGX2, so the packer accepts only
-    * that and asserts on anything else. Carrying it explicitly is what makes
-    * a future AGX3 table a dispatch rather than a rewrite, and it means a
-    * caller that reaches the compiler with an unsupported part is caught in
-    * the compiler instead of producing an instruction stream for the wrong
-    * hardware. See agx_chip.h for why the encoding, rather than the chip, is
-    * the thing that decides.
-    */
+   /* Encoding used by the instruction packer, before any transcoding. */
    enum agx_isa_encoding encoding;
 
    /* Does the target GPU need explicit cluster coherency for atomics?
@@ -546,6 +536,17 @@ struct agx_device_key {
     */
    bool emit_agx3d;
 };
+
+/* AGX3D uses the AGX3C packer and transcodes its output. Resolve the
+ * physical target once for both runtime and precompiled shaders. */
+static inline void
+agx_device_key_set_target(struct agx_device_key *dev, enum agx_chip chip)
+{
+   const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
+   dev->emit_agx3d = encoding == AGX_ISA_ENCODING_AGX3D;
+   dev->chip = dev->emit_agx3d ? AGX_CHIP_G17G : chip;
+   dev->encoding = dev->emit_agx3d ? AGX_ISA_ENCODING_AGX3C : encoding;
+}
 
 /*
  * Is this a compile for the M6 GPU (G18G)? G18G compiles with the G17G key
@@ -891,7 +892,6 @@ agx_round_registers(unsigned halfregs)
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
-   .lower_fdiv = true,
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_flrp16 = true,

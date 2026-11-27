@@ -144,6 +144,13 @@ struct hk_descriptor_set {
    /* mapped_ptr is in a CPU-cached pool BO (hk_descriptor_pool::cpu_cached). */
    bool cpu_cached;
 
+   /* Exact-image bloom filter for vertex-visible image descriptors written
+    * into this set (monotonic OR of hk_sync_image_bloom(plane->addr)).
+    * vs_img_unsafe is set if any such descriptor is a texel buffer or an
+    * image that may alias, is linear/external/sparse, or uses swapchain memory. */
+   uint64_t vs_img_bloom;
+   bool vs_img_unsafe;
+
    /* Optional CPU provenance, for ordinary single-element storage bindings. */
    struct hk_storage_backing *storage_backings;
 
@@ -174,6 +181,8 @@ struct hk_push_descriptor_set {
    uint64_t last_gpu_addr;
    const void *last_cpu_ptr;
    uint32_t last_size;
+   uint64_t vs_img_bloom;
+   bool vs_img_unsafe;
    uint8_t data[HK_PUSH_DESCRIPTOR_SET_SIZE];
 };
 

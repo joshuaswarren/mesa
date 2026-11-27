@@ -580,6 +580,28 @@ check_m5_depth(void)
       CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
       CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17G, 0, &c));
       CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17C, 0, &c));
+      /* So do cube-compatible depth arrays (vkd3d-proton's square six-layer
+       * placed depth, both planes), but only in a cube's shape. */
+      c = image(formats[f], 1024, 1024, 1, ds);
+      c.arrayLayers = 6;
+      c.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_ALIAS_BIT;
+      for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip) {
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 0, &c) ==
+               agx_chip_g17_m5((enum agx_chip)chip));
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 1, &c) ==
+               (agx_chip_g17_m5((enum agx_chip)chip) &&
+                formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
+      }
+      c.arrayLayers = 12;
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.arrayLayers = 8;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.arrayLayers = 6;
+      c.extent.height = 512;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.extent.height = 1024;
+      c.mipLevels = 2;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
       c = i;
       c.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));

@@ -73,7 +73,7 @@ select_and_check_size(struct hk_graphics_state *fresh,
                       uint32_t required_size, bool memo, bool shadow)
 {
    CHECK(fresh_select(fresh, reads, required_size) ==
-         hk_agx3_fragment_root_select(cached, reads, required_size, memo,
+         hk_agx3_fragment_root_select(cached, reads, 0, required_size, memo,
                                       shadow));
    CHECK(fresh->fs_root == cached->fs_root);
    CHECK(fresh->fs_root_cpu == cached->fs_root_cpu);
@@ -385,6 +385,53 @@ main(void)
       CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
       CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
       free(d);
+   }
+
+   /* Constant-offset dynamic-buffer reads are compared slot by slot where
+    * the roots are compared in place (CPU-cached roots, !use_shadow): a
+    * fragment shader reading only slot 4 keeps fs_root when only slot 0 (a
+    * vertex-stage per-draw uniform buffer) changes, adopts the new root when
+    * slot 4 changes, and the positive memo never vouches for another slot.
+    * Where the caller relies on the snapshots, which leave the dynamic
+    * buffers out, such a shader always follows the current root. */
+   for (unsigned in_place = 0; in_place < 2; ++in_place) {
+      const bool use_shadow = !in_place;
+      memset(cached, 0, sizeof(*cached));
+      memset(&source, 0, sizeof(source));
+      source.dynamic_buffers[0] =
+         (struct hk_buffer_address){.base_addr = 0x10000, .size = 256};
+      source.dynamic_buffers[4] =
+         (struct hk_buffer_address){.base_addr = 0x40000, .size = 256};
+      source.dynamic_buffers[5] =
+         (struct hk_buffer_address){.base_addr = 0x50000, .size = 256};
+      publish(fresh, cached, &gpu[0], &source, 6, 0x1000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) == 0x1000);
+
+      /* Slot 0 changes: a shader reading slot 4 keeps 0x1000 in place. */
+      source.dynamic_buffers[0].base_addr = 0x10100;
+      publish(fresh, cached, &gpu[1], &source, 6, 0x2000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) ==
+            (in_place ? 0x1000 : 0x2000));
+      /* A shader reading slot 0 adopts 0x2000, memo or not. */
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(0), 0,
+                                         true, use_shadow) == 0x2000);
+
+      /* Slot 5 changes: slot 4 readers keep 0x2000, slot 5 readers adopt. */
+      source.dynamic_buffers[5].base_addr = 0x50200;
+      publish(fresh, cached, &gpu[2], &source, 6, 0x3000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) ==
+            (in_place ? 0x2000 : 0x3000));
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(5), 0,
+                                         true, use_shadow) == 0x3000);
+
+      /* A non-constant index (the opaque class) always adopts. */
+      source.dynamic_buffers[0].base_addr = 0x10200;
+      publish(fresh, cached, &gpu[3], &source, 6, 0x4000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, HK_ROOT_READS_DYNAMIC_BUFFERS,
+                                         0, 0, true, use_shadow) == 0x4000);
    }
 
    printf("root fragment: %" PRIu64 " checks passed\n", checks);

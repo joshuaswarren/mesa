@@ -274,24 +274,28 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
 {
    /* Verify mod-3 tie-breaking, loop_phi_targets, and rmw_web stay strictly
     * gated on AGX_CAP_MOD3_REG_BANK_RA and non-preamble shaders: disabled on
-    * M5/AGX3C (G17G), on non-capable AGX3B chips (G16G), and on G17P
-    * preambles. Use the same k/pad0/pad1/m loop that G17P resolves to 0
+    * AGX3D (G18G), on non-capable AGX2 chips (G13G), and on G17P/M5
+    * preambles. Use the same k/pad0/pad1/m loop that AGX3B and M5 resolve to 0
     * conflicts and confirm it stays untouched (k=r1, m=r4) when gated off. */
-   for (unsigned mode = 0; mode < 3; ++mode) {
+   for (unsigned mode = 0; mode < 4; ++mode) {
       nir_builder nb = make_compute_shader("g17p-mod3-gating");
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
       struct agx_shader_info out = {};
       if (mode == 0) {
-         key.dev.chip = AGX_CHIP_G17G;
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = AGX_CHIP_G18G;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3D;
       } else if (mode == 1) {
-         key.dev.chip = AGX_CHIP_G16G;
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      } else {
+         key.dev.chip = AGX_CHIP_G13G;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+      } else if (mode == 2) {
          key.dev.chip = AGX_CHIP_G17P;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         b->shader->is_preamble = true;
+      } else {
+         key.dev.chip = AGX_CHIP_G17C;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
          b->shader->is_preamble = true;
       }
       b->shader->key = &key;
@@ -341,6 +345,81 @@ TEST(G17PMod3RA, NonG17PAndPreambleGating)
          }
       }
       EXPECT_GT(mod3_conflicts, 0u);
+      EXPECT_EQ(b->shader->scratch_size_B, 0u);
+      ralloc_free(mem);
+      ralloc_free(nb.shader);
+   }
+}
+
+TEST(G17PMod3RA, M5ResolvesMod3Conflicts)
+{
+   /* Verify native AGX3 (G15, G16G) and M5 (G17G, G17S, G17C) carry
+    * AGX_CAP_MOD3_REG_BANK_RA and resolve the same co-read loop to zero
+    * mod-3 bank conflicts without spilling. */
+   const enum agx_chip cap_chips[] = {
+      AGX_CHIP_G15G,
+      AGX_CHIP_G15S,
+      AGX_CHIP_G15C,
+      AGX_CHIP_G16G,
+      AGX_CHIP_G17G,
+      AGX_CHIP_G17S,
+      AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cap_chips); ++i) {
+      nir_builder nb = make_compute_shader("m5-mod3-loop");
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      struct agx_shader_info out = {};
+      key.dev.chip = cap_chips[i];
+      key.dev.encoding = agx_chip_isa_encoding(cap_chips[i]);
+      b->shader->key = &key;
+      b->shader->out = &out;
+      b->shader->nir = nb.shader;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *loop = agx_test_block(b->shader);
+      agx_block *latch = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      loop->loop_header = true;
+      agx_block_add_successor(entry, loop);
+      agx_block_add_successor(loop, latch);
+      agx_block_add_successor(latch, loop);
+      agx_block_add_successor(loop, exit);
+
+      b->cursor = agx_after_block(entry);
+      agx_index k = agx_mov_imm(b, 32, 0x3f800000);
+      agx_index pad0 = agx_mov_imm(b, 32, 0x40000000);
+      agx_index pad1 = agx_mov_imm(b, 32, 0x40400000);
+      agx_index m = agx_mov_imm(b, 32, 0x40800000);
+
+      b->cursor = agx_after_block(loop);
+      agx_index x0 = agx_ffma(b, k, m, pad0);
+      agx_index x1 = agx_ffma(b, k, m, pad1);
+      agx_index x2 = agx_ffma(b, k, m, x0);
+      agx_index x3 = agx_ffma(b, k, m, x1);
+
+      b->cursor = agx_after_block(exit);
+      agx_unit_test(b, x2);
+      agx_unit_test(b, x3);
+
+      agx_compute_liveness(b->shader);
+      agx_ra(b->shader);
+
+      unsigned mod3_conflicts = 0;
+      agx_foreach_instr_in_block(loop, I) {
+         if (I->op != AGX_OPCODE_FFMA)
+            continue;
+         if (I->src[0].type == AGX_INDEX_REGISTER &&
+             I->src[1].type == AGX_INDEX_REGISTER) {
+            unsigned r0 = I->src[0].value >> 1;
+            unsigned r1 = I->src[1].value >> 1;
+            if (r0 != r1 && (r0 % 3u) == (r1 % 3u))
+               mod3_conflicts++;
+         }
+      }
+      EXPECT_EQ(mod3_conflicts, 0u);
       EXPECT_EQ(b->shader->scratch_size_B, 0u);
       ralloc_free(mem);
       ralloc_free(nb.shader);
@@ -605,4 +684,243 @@ TEST(G17PMod3RA, AboveHwmHoleAndUnalignedBoundaryResolution)
       ralloc_free(mem);
       ralloc_free(nb.shader);
    }
+}
+
+TEST(G17PMod3RA, MultiBlockLoopAndLivePreheaderKeepPhiCoalescing)
+{
+   /* Case 1: Multi-block loop (header -> body -> latch -> header) on M5 where
+    * the body block is distinct from header. Enclosing loop-header phi targets
+    * must stay protected in body and RMW accumulator chains must stay in their
+    * header phi registers so latch emits zero back-edge mov/swap copies. */
+   {
+      nir_builder nb = make_compute_shader("m5-mod3-multiblock-loop");
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      struct agx_shader_info out = {};
+      key.dev.chip = AGX_CHIP_G17C;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      b->shader->key = &key;
+      b->shader->out = &out;
+      b->shader->nir = nb.shader;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *header = agx_test_block(b->shader);
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *latch = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      header->loop_header = true;
+      agx_block_add_successor(entry, header);
+      agx_block_add_successor(header, body);
+      agx_block_add_successor(header, exit);
+      agx_block_add_successor(body, latch);
+      agx_block_add_successor(latch, header);
+
+      b->cursor = agx_after_block(entry);
+      b->shader->any_cf = true;
+      agx_index init[8];
+      for (unsigned i = 0; i < 8; ++i)
+         init[i] = agx_mov_imm(b, 32, 0);
+      agx_index w[4];
+      for (unsigned i = 0; i < 4; ++i)
+         w[i] = agx_mov_imm(b, 32, 0x3f800000 + i);
+
+      b->cursor = agx_after_block(header);
+      agx_instr *phis[8];
+      agx_index acc[8];
+      for (unsigned i = 0; i < 8; ++i) {
+         acc[i] = agx_temp(b->shader, AGX_SIZE_32);
+         phis[i] = agx_phi_to(b, acc[i], 2);
+         phis[i]->src[0] = init[i];
+      }
+
+      b->cursor = agx_after_block(body);
+      for (unsigned step = 0; step < 4; ++step) {
+         agx_index s = agx_fadd(b, w[step], w[(step + 1) & 3]);
+         for (unsigned i = 0; i < 8; ++i)
+            acc[i] = agx_ffma(b, s, w[step], acc[i]);
+      }
+      for (unsigned i = 0; i < 8; ++i)
+         phis[i]->src[1] = acc[i];
+
+      b->cursor = agx_after_block(exit);
+      for (unsigned i = 0; i < 8; ++i)
+         agx_unit_test(b, phis[i]->dest[0]);
+
+      agx_compute_liveness(b->shader);
+      agx_ra(b->shader);
+
+      unsigned latch_copies = 0;
+      agx_foreach_instr_in_block(latch, I) {
+         if (I->op == AGX_OPCODE_MOV || I->op == AGX_OPCODE_BITOP)
+            latch_copies++;
+      }
+      EXPECT_EQ(latch_copies, 0u);
+      EXPECT_EQ(b->shader->scratch_size_B, 0u);
+      ralloc_free(mem);
+      ralloc_free(nb.shader);
+   }
+
+   /* Case 2: Sliding-window loop whose pre-header phi sources remain live
+    * after the loop (so phi_web[root].reg stays pinned to the pre-header
+    * registers while the header phis take distinct registers) and whose
+    * loop-carried updates also feed a post-loop merge phi. Direct back-edge
+    * tracking must keep all updates in their loop-header phi registers with
+    * zero back-edge copies. */
+   {
+      nir_builder nb = make_compute_shader("m5-mod3-live-preheader-phi");
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      struct agx_shader_info out = {};
+      key.dev.chip = AGX_CHIP_G17C;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      b->shader->key = &key;
+      b->shader->out = &out;
+      b->shader->nir = nb.shader;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *preheader = agx_test_block(b->shader);
+      agx_block *loop = agx_test_block(b->shader);
+      agx_block *latch = agx_test_block(b->shader);
+      agx_block *after_loop = agx_test_block(b->shader);
+      agx_block *bypass = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      loop->loop_header = true;
+      agx_block_add_successor(entry, preheader);
+      agx_block_add_successor(entry, bypass);
+      agx_block_add_successor(preheader, loop);
+      agx_block_add_successor(loop, latch);
+      agx_block_add_successor(latch, loop);
+      agx_block_add_successor(loop, after_loop);
+      agx_block_add_successor(bypass, exit);
+      agx_block_add_successor(after_loop, exit);
+
+      b->cursor = agx_after_block(entry);
+      b->shader->any_cf = true;
+      agx_index base[4];
+      for (unsigned i = 0; i < 4; ++i)
+         base[i] = agx_mov_imm(b, 16, 10 + i);
+      agx_index step_v = agx_mov_imm(b, 16, 3);
+
+      b->cursor = agx_after_block(loop);
+      agx_instr *phis[4];
+      agx_index cur[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         cur[i] = agx_temp(b->shader, AGX_SIZE_16);
+         phis[i] = agx_phi_to(b, cur[i], 2);
+         phis[i]->src[0] = base[i];
+      }
+      agx_index nxt[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index t = agx_iadd(b, step_v, agx_immediate(i + 1), 0);
+         nxt[i] = agx_iadd(b, cur[i], t, 0);
+         phis[i]->src[1] = nxt[i];
+      }
+
+      b->cursor = agx_after_block(exit);
+      agx_index merged[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         merged[i] = agx_temp(b->shader, AGX_SIZE_16);
+         agx_instr *ephi = agx_phi_to(b, merged[i], 2);
+         ephi->src[0] = base[i];
+         ephi->src[1] = nxt[i];
+      }
+      for (unsigned i = 0; i < 4; ++i) {
+         /* Keep pre-header `base[i]` live across the loop. */
+         agx_unit_test(b, agx_iadd(b, merged[i], agx_neg(base[i]), 0));
+      }
+
+      agx_compute_liveness(b->shader);
+      agx_ra(b->shader);
+
+      unsigned latch_copies = 0;
+      agx_foreach_instr_in_block(latch, I) {
+         if (I->op == AGX_OPCODE_MOV || I->op == AGX_OPCODE_BITOP)
+            latch_copies++;
+      }
+      EXPECT_EQ(latch_copies, 0u);
+      EXPECT_EQ(b->shader->scratch_size_B, 0u);
+      ralloc_free(mem);
+      ralloc_free(nb.shader);
+   }
+}
+
+TEST(G17PMod3RA, AdjacentFmaAccumulatorsAvoidSameBankRuns)
+{
+   /* Consecutive independent 3-source FFMA accumulator updates inside a hot
+    * loop must avoid clustering adjacent destinations onto the same mod-3
+    * register bank (which serializes back-to-back bank ports on G17/M5). */
+   nir_builder nb = make_compute_shader("m5-mod3-adj-fma");
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   struct agx_shader_info out = {};
+   key.dev.chip = AGX_CHIP_G17C;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   b->shader->key = &key;
+   b->shader->out = &out;
+   b->shader->nir = nb.shader;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *loop = agx_test_block(b->shader);
+   agx_block *latch = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   loop->loop_header = true;
+   agx_block_add_successor(entry, loop);
+   agx_block_add_successor(loop, latch);
+   agx_block_add_successor(latch, loop);
+   agx_block_add_successor(loop, exit);
+
+   b->cursor = agx_after_block(entry);
+   b->shader->any_cf = true;
+   agx_index a = agx_mov_imm(b, 32, 0x3f800000);
+   agx_index w = agx_mov_imm(b, 32, 0x40000000);
+   agx_index init[6];
+   for (unsigned i = 0; i < 6; ++i)
+      init[i] = agx_ffma(b, a, w, agx_mov_imm(b, 32, 0x3f000000 + i));
+
+   b->cursor = agx_after_block(loop);
+   agx_instr *phis[6];
+   agx_index acc[6];
+   for (unsigned i = 0; i < 6; ++i) {
+      acc[i] = agx_temp(b->shader, AGX_SIZE_32);
+      phis[i] = agx_phi_to(b, acc[i], 2);
+      phis[i]->src[0] = init[i];
+   }
+   for (unsigned i = 0; i < 6; ++i) {
+      acc[i] = agx_ffma(b, a, w, acc[i]);
+      phis[i]->src[1] = acc[i];
+   }
+
+   b->cursor = agx_after_block(exit);
+   for (unsigned i = 0; i < 6; ++i)
+      agx_unit_test(b, acc[i]);
+
+   agx_compute_liveness(b->shader);
+   agx_ra(b->shader);
+
+   unsigned adj_same_bank = 0;
+   int prev_bank = -1;
+   agx_foreach_instr_in_block(loop, I) {
+      if (I->op != AGX_OPCODE_FFMA)
+         continue;
+      int bank = (int)((I->dest[0].value >> 1) % 3u);
+      if (prev_bank == bank)
+         adj_same_bank++;
+      prev_bank = bank;
+   }
+   unsigned latch_copies = 0;
+   agx_foreach_instr_in_block(latch, I) {
+      if (I->op == AGX_OPCODE_MOV || I->op == AGX_OPCODE_BITOP)
+         latch_copies++;
+   }
+   EXPECT_EQ(adj_same_bank, 0u);
+   EXPECT_EQ(latch_copies, 0u);
+   EXPECT_EQ(b->shader->scratch_size_B, 0u);
+   ralloc_free(mem);
+   ralloc_free(nb.shader);
 }

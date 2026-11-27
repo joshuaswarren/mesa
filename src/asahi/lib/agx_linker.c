@@ -806,13 +806,17 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       struct agx_varyings_fs *prolog_vary =
          prolog ? &prolog->info.varyings.fs : NULL;
 
+      /* The number of coefficient registers bounds both lists for parts the
+       * compiler built; refuse, in every build, parts that break that. */
+      if (linked->cf.nr_bindings > ARRAY_SIZE(linked->cf.bindings) ||
+          (prolog_vary &&
+           prolog_vary->nr_bindings >
+              ARRAY_SIZE(linked->cf.bindings) - linked->cf.nr_bindings))
+         goto invalid_bindings;
+
       if (prolog_vary && prolog_vary->nr_bindings) {
          assert(!prolog_vary->reads_z);
          linked->cf.nr_cf = MAX2(linked->cf.nr_cf, prolog_vary->nr_cf);
-
-         assert(linked->cf.nr_bindings + prolog_vary->nr_bindings <=
-                   ARRAY_SIZE(linked->cf.bindings) &&
-                "bounded by # of coeff registers");
 
          memcpy(linked->cf.bindings + linked->cf.nr_bindings,
                 prolog_vary->bindings,
@@ -841,6 +845,12 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
 
 invalid_start_marker:
    fprintf(stderr, "agx_fast_link: invalid G17P part-start FLTNORM marker\n");
+   agx_bo_unreference(dev, linked->bo);
+   linked->bo = NULL;
+   return false;
+
+invalid_bindings:
+   fprintf(stderr, "agx_fast_link: coefficient bindings overflow the list\n");
    agx_bo_unreference(dev, linked->bo);
    linked->bo = NULL;
    return false;

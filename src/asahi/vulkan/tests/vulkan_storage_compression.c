@@ -60,7 +60,7 @@
     }                                                                          \
   } while (0)
 
-enum enc { F16, F32, UN8, SN8, U8, I8, UN16, SN16, U16, I16 };
+enum enc { F16, F32, UN8, SN8, U8, I8, UN16, SN16, U16, I16, U32, I32 };
 struct fmt {
   VkFormat vk;
   const char *name;
@@ -68,6 +68,7 @@ struct fmt {
   enum enc enc;
   char type; /* f, u, i: the shader's component type */
   float scale;
+  bool bgra; /* channel 0 is stored in byte 2 and channel 2 in byte 0 */
 };
 
 static const struct fmt formats[] = {
@@ -93,10 +94,30 @@ static const struct fmt formats[] = {
    {VK_FORMAT_R16_SNORM, "r16_snorm", 1, SN16, 'f', 1.0f / 32767},
    {VK_FORMAT_R16_UINT, "r16ui", 1, U16, 'u', 1},
    {VK_FORMAT_R16_SINT, "r16i", 1, I16, 'i', 1},
+   {VK_FORMAT_B8G8R8A8_UNORM, "bgra8", 4, UN8, 'f', 1.0f / 255, true},
+   {VK_FORMAT_R8G8_UNORM, "rg8", 2, UN8, 'f', 1.0f / 255},
+   {VK_FORMAT_R8G8_SNORM, "rg8_snorm", 2, SN8, 'f', 1.0f / 127},
+   {VK_FORMAT_R8G8_UINT, "rg8ui", 2, U8, 'u', 1},
+   {VK_FORMAT_R8G8_SINT, "rg8i", 2, I8, 'i', 1},
+   {VK_FORMAT_R8_UNORM, "r8", 1, UN8, 'f', 1.0f / 255},
+   {VK_FORMAT_R8_SNORM, "r8_snorm", 1, SN8, 'f', 1.0f / 127},
+   {VK_FORMAT_R8_UINT, "r8ui", 1, U8, 'u', 1},
+   {VK_FORMAT_R8_SINT, "r8i", 1, I8, 'i', 1},
+   {VK_FORMAT_R32G32_UINT, "rg32ui", 2, U32, 'u', 1},
+   {VK_FORMAT_R32G32_SINT, "rg32i", 2, I32, 'i', 1},
+   {VK_FORMAT_R32G32B32A32_UINT, "rgba32ui", 4, U32, 'u', 1},
+   {VK_FORMAT_R32G32B32A32_SINT, "rgba32i", 4, I32, 'i', 1},
 };
 
+/* The byte offset of channel c within a texel. */
+static unsigned channel_offset(const struct fmt *f, unsigned c, unsigned bytes) {
+  return (f->bgra && (c == 0 || c == 2) ? 2 - c : c) * bytes;
+}
+
 static unsigned channel_bytes(enum enc e) {
-  return e == F32 ? 4 : (e == UN8 || e == SN8 || e == U8 || e == I8) ? 1 : 2;
+  return (e == F32 || e == U32 || e == I32) ? 4
+         : (e == UN8 || e == SN8 || e == U8 || e == I8) ? 1
+                                                         : 2;
 }
 
 /* The format's bits for k (0 <= k <= 64). */
@@ -529,8 +550,9 @@ int main(int argc, char **argv) {
           const unsigned gx = r4.x + x, gy = r4.y + y;
           const unsigned k = (gx * 3 + gy + 11 * c) % 64;
           const uint32_t bits = encode(F->enc, k);
-          memcpy(up + ((size_t)y * r4.w + x) * texel_B + c * cb_bytes, &bits,
-                 cb_bytes);
+          memcpy(up + ((size_t)y * r4.w + x) * texel_B +
+                    channel_offset(F, c, cb_bytes),
+                 &bits, cb_bytes);
           K[(gy * W + gx) * 4 + c] = k;
         }
     model_rmw(K, rall, &p6);
@@ -678,7 +700,8 @@ int main(int argc, char **argv) {
         for (unsigned c = 0; c < F->channels; c++) {
           const unsigned want = K[i * 4 + c];
           uint32_t got[3] = {kr[i][c], kr[texels + i][c], 0};
-          memcpy(&got[2], rb + i * texel_B + c * cb_bytes, cb_bytes);
+          memcpy(&got[2], rb + i * texel_B + channel_offset(F, c, cb_bytes),
+                 cb_bytes);
           const uint32_t expect[3] = {want, want, encode(F->enc, want)};
           for (unsigned m = 0; m < 3; m++) {
             if (got[m] == expect[m])

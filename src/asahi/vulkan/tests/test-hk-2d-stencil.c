@@ -18,7 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const nir_shader_compiler_options test_nir_options = {0};
+static const nir_shader_compiler_options test_nir_options = {
+   .has_cs_global_id = true,
+};
 
 static struct hk_descriptor_set_layout *
 make_test_layout(unsigned count, bool uab)
@@ -209,7 +211,8 @@ test_box_blur_matcher_and_builder(void)
       assert(got == expect);
       if (expect) {
          assert(plan.kind == HK_2D_STENCIL_BOX_BLUR_U8);
-         assert(plan.tile_w == 64 && plan.tile_h == 16);
+         assert(plan.tile_w == HK_BOX_BLUR_STRIP_W &&
+                plan.tile_h == HK_BOX_BLUR_TILE_H);
          assert(plan.width_pc_offset_B == 0);
          assert(plan.height_pc_offset_B == 4);
          assert(plan.stride_pc_offset_B == 8);
@@ -272,7 +275,33 @@ test_box_blur_matcher_and_builder(void)
       uint32_t gx = 0, gy = 0;
       assert(hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
                                                   60, 135, 1, &gx, &gy));
-      assert(gx == 30 && gy == 68);
+      /* r = 3: strips start 4 columns left of their outputs and yield 120
+       * columns; 128-row tiles. */
+      assert(hk_box_blur_halo(3) == 4 && hk_box_blur_out_w(3) == 120);
+      assert(gx == 16 && gy == 9);
+
+      /* Every radius: the strip starts a multiple of 4 columns and at least
+       * r + 1 columns left of its first output, the last output's window
+       * ends inside the 128-column strip, and one more output lane would
+       * not fit. */
+      for (uint32_t r = 0; r <= HK_2D_STENCIL_MAX_RADIUS; r++) {
+         const uint32_t halo = hk_box_blur_halo(r);
+         const uint32_t ow = hk_box_blur_out_w(r);
+         assert(halo % 4 == 0 && halo >= r + 1 && halo < r + 5);
+         assert(ow % 4 == 0 && ow >= 4);
+         assert(ow - 1 + halo + r <= HK_BOX_BLUR_STRIP_W - 1);
+         assert(ow + 3 + halo + r > HK_BOX_BLUR_STRIP_W - 1);
+      }
+
+      /* Narrower than one u8x4 read -> reject (the original shader runs). */
+      pc[0] = 3;
+      pc[2] = 3;
+      memcpy(desc.root.push, pc, sizeof(pc));
+      assert(!hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                   60, 135, 1, &gx, &gy));
+      pc[0] = 1920;
+      pc[2] = 1920;
+      memcpy(desc.root.push, pc, sizeof(pc));
 
       /* Aliasing active -> reject. */
       assert(!hk_2d_stencil_validate_dispatch_core(false, &desc, &plan, 0, 0, 0,
@@ -830,6 +859,780 @@ test_sobel_3x3_matcher_and_builder(void)
    printf("hk_2d_stencil: sobel 3x3 matcher/builder/validator tests passed\n");
 }
 
+enum fast9_variant {
+   FAST9_NONE = 0,
+   FAST9_WITH_BASE_WG,
+   FAST9_VEC_PUSH_WG32X1,
+   FAST9_SCALAR_PTS_U32PACK,
+   FAST9_BAD_ARC_LIMIT,
+   FAST9_BAD_OFFSET,
+};
+
+static nir_def *
+fast9_sign_expr(nir_builder *b, nir_def *p, nir_def *c_hi, nir_def *c_lo)
+{
+   nir_def *hi = nir_bcsel(b, nir_ilt(b, c_hi, p), nir_imm_int(b, 1),
+                           nir_imm_int(b, 0));
+   return nir_bcsel(b, nir_ilt(b, p, c_lo), nir_imm_int(b, -1), hi);
+}
+
+static nir_shader *
+build_fast9_shader(enum fast9_variant var)
+{
+   static const int8_t dx[16] = {
+      0,  1,  2,  3,  3,  3,  2,  1,
+      0, -1, -2, -3, -3, -3, -2, -1,
+   };
+   static const int8_t dy[16] = {
+      3,  3,  2,  1,  0, -1, -2, -3,
+     -3, -3, -2, -1,  0,  1,  2,  3,
+   };
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &test_nir_options, "fast9_test");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] =
+      (var == FAST9_VEC_PUSH_WG32X1 || var == FAST9_SCALAR_PTS_U32PACK) ? 1 : 2;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 4;
+
+   nir_deref_instr *src_base = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+   nir_deref_instr *score_base = make_ssbo_base(&b, 1, glsl_uint_type(), 4);
+   nir_deref_instr *cnt_base = make_ssbo_base(&b, 2, glsl_uint_type(), 4);
+   nir_deref_instr *pts_base =
+      var == FAST9_SCALAR_PTS_U32PACK
+         ? make_ssbo_base(&b, 3, glsl_int_type(), 4)
+         : make_ssbo_base(&b, 3, glsl_ivec2_type(), 8);
+
+   nir_def *width = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                           .base = 0, .range = 4);
+   nir_def *height = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                            .base = 4, .range = 4);
+   nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                            .base = 8, .range = 4);
+   nir_def *border = NULL, *thresh = NULL;
+   if (var == FAST9_VEC_PUSH_WG32X1) {
+      nir_def *bt = nir_load_push_constant(&b, 2, 32, nir_imm_int(&b, 0),
+                                           .base = 12, .range = 8);
+      border = nir_channel(&b, bt, 0);
+      thresh = nir_channel(&b, bt, 1);
+   } else {
+      border = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                      .base = 12, .range = 4);
+      thresh = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                      .base = 16, .range = 4);
+   }
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *gx0 = nir_channel(&b, gid, 0);
+   nir_def *gy0 = nir_channel(&b, gid, 1);
+   const bool wg1 =
+      (var == FAST9_VEC_PUSH_WG32X1 || var == FAST9_SCALAR_PTS_U32PACK);
+   if (var == FAST9_WITH_BASE_WG || wg1) {
+      nir_def *bwg = nir_load_base_workgroup_id(&b, 32);
+      gx0 = nir_iadd(&b, gx0, nir_ishl_imm(&b, nir_channel(&b, bwg, 0), 5));
+      nir_def *by = nir_channel(&b, bwg, 1);
+      gy0 = nir_iadd(&b, gy0, wg1 ? by : nir_ishl_imm(&b, by, 1));
+   }
+
+   nir_def *nwg = nir_load_num_workgroups(&b);
+   nir_def *step_x = nir_ishl_imm(&b, nir_channel(&b, nwg, 0), 5);
+   nir_def *step_y =
+      wg1 ? nir_channel(&b, nwg, 1) : nir_ishl_imm(&b, nir_channel(&b, nwg, 1), 1);
+
+   nir_variable *y_v = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+   nir_store_var(&b, y_v, gy0, 0x1);
+
+   nir_def *min_b = nir_imax(&b, nir_imm_int(&b, 3), border);
+   nir_def *w_m3 = nir_iadd_imm(&b, width, -3);
+   nir_def *h_m3 = nir_iadd_imm(&b, height, -3);
+   nir_def *w_mb = nir_isub(&b, width, border);
+   nir_def *h_mb = nir_isub(&b, height, border);
+
+   nir_push_loop(&b);
+   {
+      nir_def *y = nir_load_var(&b, y_v);
+      nir_push_if(&b, nir_ige(&b, y, height));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *y_out = nir_ior(
+         &b, nir_ilt(&b, y, min_b),
+         nir_ior(&b, nir_ilt(&b, h_mb, y), nir_ige(&b, y, h_m3)));
+
+      nir_variable *x_v =
+         nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_store_var(&b, x_v, gx0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, x_v);
+         nir_push_if(&b, nir_ige(&b, x, width));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_def *out_idx = nir_iadd(&b, nir_imul(&b, y, width), x);
+         nir_def *x_out = nir_ior(
+            &b, nir_ilt(&b, x, min_b),
+            nir_ior(&b, nir_ilt(&b, w_mb, x),
+                    nir_ior(&b, nir_ige(&b, x, w_m3), y_out)));
+
+         nir_push_if(&b, x_out);
+         {
+            nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                            nir_imm_int(&b, 0), 0x1);
+         }
+         nir_push_else(&b, NULL);
+         {
+            nir_def *base_idx = nir_iadd(
+               &b, nir_iadd(&b, nir_imul(&b, nir_iadd(&b, y, border), stride),
+                            border),
+               x);
+            nir_def *c8 = nir_load_deref(
+               &b, nir_build_deref_ptr_as_array(&b, src_base, base_idx));
+            nir_def *c = nir_u2u32(&b, c8);
+            nir_def *c_hi = nir_iadd(&b, c, thresh);
+            nir_def *c_lo = nir_iadd(&b, c, nir_ineg(&b, thresh));
+
+            nir_def *p8[16] = {NULL};
+            nir_def *s[16] = {NULL};
+
+            /* East (4) and West (12) */
+            p8[4] = nir_load_deref(
+               &b, nir_build_deref_ptr_as_array(
+                      &b, src_base, nir_iadd_imm(&b, base_idx, 3)));
+            p8[12] = nir_load_deref(
+               &b, nir_build_deref_ptr_as_array(
+                      &b, src_base, nir_iadd_imm(&b, base_idx, -3)));
+            s[4] = fast9_sign_expr(&b, nir_u2u32(&b, p8[4]), c_hi, c_lo);
+            s[12] = fast9_sign_expr(&b, nir_u2u32(&b, p8[12]), c_hi, c_lo);
+
+            nir_push_if(&b, nir_ieq_imm(&b, nir_umax(&b, s[4], s[12]), 0));
+            {
+               nir_store_deref(&b,
+                               nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                               nir_imm_int(&b, 0), 0x1);
+            }
+            nir_push_else(&b, NULL);
+            {
+               /* South (0) and North (8) */
+               nir_def *s3 = nir_imul_imm(&b, stride, 3);
+               p8[0] = nir_load_deref(
+                  &b, nir_build_deref_ptr_as_array(
+                         &b, src_base, nir_iadd(&b, base_idx, s3)));
+               p8[8] = nir_load_deref(
+                  &b, nir_build_deref_ptr_as_array(
+                         &b, src_base, nir_isub(&b, base_idx, s3)));
+               s[0] = fast9_sign_expr(&b, nir_u2u32(&b, p8[0]), c_hi, c_lo);
+               s[8] = fast9_sign_expr(&b, nir_u2u32(&b, p8[8]), c_hi, c_lo);
+
+               nir_push_if(&b, nir_ieq_imm(&b, nir_umax(&b, s[0], s[8]), 0));
+               {
+                  nir_store_deref(
+                     &b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                     nir_imm_int(&b, 0), 0x1);
+               }
+               nir_push_else(&b, NULL);
+               {
+                  nir_def *sum_s = nir_imm_int(&b, 0);
+                  for (unsigned k = 0; k < 16; k++) {
+                     if (!p8[k]) {
+                        int ddx = dx[k] + (var == FAST9_BAD_OFFSET && k == 2 ? 1 : 0);
+                        nir_def *off = nir_iadd(
+                           &b, nir_iadd_imm(&b, base_idx, ddx),
+                           nir_imul_imm(&b, stride, dy[k]));
+                        p8[k] = nir_load_deref(
+                           &b, nir_build_deref_ptr_as_array(&b, src_base, off));
+                        s[k] = fast9_sign_expr(&b, nir_u2u32(&b, p8[k]), c_hi,
+                                               c_lo);
+                     }
+                     sum_s = (k == 0) ? s[k] : nir_iadd(&b, sum_s, s[k]);
+                  }
+
+                  nir_def *pw[4];
+                  for (unsigned g = 0; g < 4; g++) {
+                     if (var == FAST9_SCALAR_PTS_U32PACK) {
+                        nir_def *b0 = nir_u2u32(&b, p8[g * 4 + 0]);
+                        nir_def *b1 =
+                           nir_ishl_imm(&b, nir_u2u32(&b, p8[g * 4 + 1]), 8);
+                        nir_def *b2 =
+                           nir_ishl_imm(&b, nir_u2u32(&b, p8[g * 4 + 2]), 16);
+                        nir_def *b3 =
+                           nir_ishl_imm(&b, nir_u2u32(&b, p8[g * 4 + 3]), 24);
+                        pw[g] = nir_ior(&b, nir_ior(&b, b0, b1),
+                                        nir_ior(&b, b2, b3));
+                     } else {
+                        nir_def *lo = nir_ior(
+                           &b, nir_u2u16(&b, p8[g * 4 + 0]),
+                           nir_ishl_imm(&b, nir_u2u16(&b, p8[g * 4 + 1]), 8));
+                        nir_def *hi = nir_ior(
+                           &b, nir_u2u16(&b, p8[g * 4 + 2]),
+                           nir_ishl_imm(&b, nir_u2u16(&b, p8[g * 4 + 3]), 8));
+                        pw[g] = nir_pack_32_2x16_split(&b, lo, hi);
+                     }
+                  }
+
+                  nir_variable *ai_v =
+                     nir_local_variable_create(b.impl, glsl_int_type(), "ai");
+                  nir_variable *amin_v =
+                     nir_local_variable_create(b.impl, glsl_int_type(), "amin");
+                  nir_variable *best_v =
+                     nir_local_variable_create(b.impl, glsl_int_type(), "best");
+                  nir_variable *rem_v =
+                     nir_local_variable_create(b.impl, glsl_int_type(), "rem");
+                  nir_variable *fnd_v =
+                     nir_local_variable_create(b.impl, glsl_bool_type(), "fnd");
+                  nir_store_var(&b, ai_v, nir_imm_int(&b, 0), 0x1);
+                  nir_store_var(&b, amin_v, thresh, 0x1);
+                  nir_store_var(&b, best_v, nir_imm_int(&b, 0), 0x1);
+                  nir_store_var(&b, rem_v, nir_imm_int(&b, 9), 0x1);
+                  nir_store_var(&b, fnd_v, nir_imm_false(&b), 0x1);
+
+                  nir_loop *al = nir_push_loop(&b);
+                  al->control = nir_loop_control_dont_unroll;
+                  {
+                     nir_def *ai = nir_load_var(&b, ai_v);
+                     nir_push_if(
+                        &b, nir_ige_imm(&b, ai,
+                                        var == FAST9_BAD_ARC_LIMIT ? 23 : 24));
+                     nir_jump(&b, nir_jump_break);
+                     nir_pop_if(&b, NULL);
+
+                     nir_def *idx16 = nir_iand_imm(&b, ai, 15);
+                     nir_def *w01 =
+                        nir_bcsel(&b, nir_ult_imm(&b, idx16, 4), pw[0], pw[1]);
+                     nir_def *w23 =
+                        nir_bcsel(&b, nir_ult_imm(&b, idx16, 12), pw[2], pw[3]);
+                     nir_def *wd =
+                        nir_bcsel(&b, nir_ult_imm(&b, idx16, 8), w01, w23);
+                     nir_def *sh = nir_ishl_imm(&b, nir_iand_imm(&b, ai, 3), 3);
+                     nir_def *pv = nir_ubitfield_extract(&b, wd, sh,
+                                                         nir_imm_int(&b, 8));
+                     nir_def *sub_cp = nir_isub(&b, c, pv);
+                     nir_def *diff =
+                        nir_bcsel(&b, nir_ilt(&b, nir_imm_int(&b, 0), sum_s),
+                                  nir_ineg(&b, sub_cp), sub_cp);
+
+                     nir_def *amin = nir_load_var(&b, amin_v);
+                     nir_def *best = nir_load_var(&b, best_v);
+                     nir_def *rem = nir_load_var(&b, rem_v);
+                     nir_def *fnd = nir_load_var(&b, fnd_v);
+
+                     nir_def *pass = nir_ilt(&b, thresh, diff);
+                     nir_def *mv = nir_bcsel(&b, nir_ieq_imm(&b, rem, 9), diff,
+                                             nir_imin(&b, amin, diff));
+                     nir_def *mc = nir_bcsel(&b, pass, mv, thresh);
+                     nir_def *rn = nir_bcsel(&b, pass, nir_iadd_imm(&b, rem, -1),
+                                             nir_imm_int(&b, 9));
+                     nir_def *rz = nir_ieq_imm(&b, rn, 0);
+
+                     nir_store_var(
+                        &b, ai_v,
+                        nir_iadd_imm(
+                           &b, nir_bcsel(&b, rz, nir_iadd_imm(&b, ai, -8), ai),
+                           1),
+                        0x1);
+                     nir_store_var(&b, amin_v, nir_bcsel(&b, rz, thresh, mc),
+                                   0x1);
+                     nir_store_var(
+                        &b, best_v,
+                        nir_bcsel(&b, rz, nir_imax(&b, best, mc), best), 0x1);
+                     nir_store_var(&b, rem_v,
+                                   nir_bcsel(&b, rz, nir_imm_int(&b, 9), rn),
+                                   0x1);
+                     nir_store_var(&b, fnd_v,
+                                   nir_bcsel(&b, rz, nir_imm_true(&b), fnd),
+                                   0x1);
+                  }
+                  nir_pop_loop(&b, NULL);
+
+                  nir_push_if(&b, nir_load_var(&b, fnd_v));
+                  {
+                     nir_def *sc = nir_i2f32(
+                        &b, nir_iadd_imm(&b, nir_load_var(&b, best_v), -1));
+                     nir_store_deref(
+                        &b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                        sc, 0x1);
+                     nir_deref_instr *ce = nir_build_deref_ptr_as_array(
+                        &b, cnt_base, nir_imm_int(&b, 0));
+                     nir_def *pi = nir_deref_atomic(
+                        &b, 32, &ce->def, nir_imm_int(&b, 1),
+                        .atomic_op = nir_atomic_op_iadd);
+                     if (var == FAST9_SCALAR_PTS_U32PACK) {
+                        nir_def *pi2 = nir_ishl_imm(&b, pi, 1);
+                        nir_store_deref(
+                           &b, nir_build_deref_ptr_as_array(&b, pts_base, pi2),
+                           x, 0x1);
+                        nir_store_deref(
+                           &b,
+                           nir_build_deref_ptr_as_array(
+                              &b, pts_base, nir_iadd_imm(&b, pi2, 1)),
+                           y, 0x1);
+                     } else {
+                        nir_store_deref(
+                           &b, nir_build_deref_ptr_as_array(&b, pts_base, pi),
+                           nir_vec2(&b, x, y), 0x3);
+                     }
+                  }
+                  nir_push_else(&b, NULL);
+                  {
+                     nir_store_deref(
+                        &b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                        nir_imm_int(&b, 0), 0x1);
+                  }
+                  nir_pop_if(&b, NULL);
+               }
+               nir_pop_if(&b, NULL);
+            }
+            nir_pop_if(&b, NULL);
+         }
+         nir_pop_if(&b, NULL);
+
+         nir_store_var(&b, x_v, nir_iadd(&b, x, step_x), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_store_var(&b, y_v, nir_iadd(&b, y, step_y), 0x1);
+   }
+   nir_pop_loop(&b, NULL);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_validate_shader(b.shader, "build_fast9_shader");
+   return b.shader;
+}
+
+static void
+test_fast9_matcher_and_builder(void)
+{
+   struct hk_descriptor_set_layout *layout = make_test_layout(4, false);
+   struct hk_descriptor_set_layout *uab_layout = make_test_layout(4, true);
+   struct vk_descriptor_set_layout *layouts[1] = {&layout->vk};
+   struct vk_descriptor_set_layout *uab_layouts[1] = {&uab_layout->vk};
+
+   for (unsigned v = FAST9_NONE; v <= FAST9_BAD_OFFSET; v++) {
+      nir_shader *s = build_fast9_shader((enum fast9_variant)v);
+      struct hk_2d_stencil_plan plan = {0};
+      bool expect = (v <= FAST9_SCALAR_PTS_U32PACK);
+      bool got = hk_nir_match_2d_stencil(s, 1, layouts, &plan);
+      if (got != expect)
+         fprintf(stderr, "fast9 variant %u failed: got=%d expect=%d\n", v, got,
+                 expect);
+      assert(got == expect);
+      if (expect) {
+         assert(plan.kind == HK_2D_STENCIL_FAST9_U8);
+         assert(plan.tile_w == 32 && plan.tile_h == 8);
+         assert(plan.width_pc_offset_B == 0);
+         assert(plan.height_pc_offset_B == 4);
+         assert(plan.stride_pc_offset_B == 8);
+         assert(plan.border_pc_offset_B == 12);
+         assert(plan.threshold_pc_offset_B == 16);
+
+         nir_shader *tiled = hk_nir_build_tiled_2d_stencil(
+            NULL, s, &plan, nir_address_format_64bit_bounded_global);
+         assert(tiled != NULL);
+         assert(tiled->info.workgroup_size[0] == 32 &&
+                tiled->info.workgroup_size[1] == 8);
+         ralloc_free(tiled);
+      }
+      ralloc_free(s);
+   }
+
+   /* Test AGX-preprocessed NIR (including hk_preprocess_nir sysval lowering). */
+   {
+      nir_shader *s = build_fast9_shader(FAST9_NONE);
+      agx_preprocess_nir_native_defer_idiv(s, AGX_CHIP_G17P);
+      const nir_lower_compute_system_values_options csv_opts = {
+         .has_base_workgroup_id = true,
+      };
+      nir_lower_compute_system_values(s, &csv_opts);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(s, 1, layouts, &plan));
+      assert(plan.kind == HK_2D_STENCIL_FAST9_U8);
+      nir_shader *tiled = hk_nir_build_tiled_2d_stencil(
+         NULL, s, &plan, nir_address_format_64bit_bounded_global);
+      assert(tiled != NULL);
+      ralloc_free(tiled);
+      ralloc_free(s);
+   }
+   {
+      nir_shader *s = build_fast9_shader(FAST9_SCALAR_PTS_U32PACK);
+      agx_preprocess_nir_native_defer_idiv(s, AGX_CHIP_G17P);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(s, 1, layouts, &plan));
+      assert(plan.kind == HK_2D_STENCIL_FAST9_U8);
+      ralloc_free(s);
+   }
+
+   /* Build a shader mirroring the exact pre-lowered NIR shape: extra
+    * uninitialized loop-carried scratch phis, two nested border `if`s (`2 < x`
+    * then `border`), duplicate readonly `src` loads, `ior`-guarded sign bcsels,
+    * and an `if (0 < sum_s)` + nested `if/else` phi-tree of `c - p[k]`. */
+   {
+      static const int8_t dx[16] = {
+         0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1,
+      };
+      static const int8_t dy[16] = {
+         3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3,
+      };
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &test_nir_options, "fast9_prelower");
+      b.shader->info.internal = false;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 4;
+
+      nir_deref_instr *src_base = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+      nir_deref_instr *score_base = make_ssbo_base(&b, 1, glsl_uint_type(), 4);
+      nir_deref_instr *cnt_base = make_ssbo_base(&b, 2, glsl_uint_type(), 4);
+      nir_deref_instr *pts_base = make_ssbo_base(&b, 3, glsl_ivec2_type(), 8);
+
+      nir_def *width = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                              .base = 0, .range = 4);
+      nir_def *height = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                               .base = 4, .range = 4);
+      nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                               .base = 8, .range = 4);
+      nir_def *border = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                               .base = 12, .range = 4);
+      nir_def *thresh = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                               .base = 16, .range = 4);
+
+      nir_def *gid = nir_load_global_invocation_id(&b, 32);
+      nir_def *bwg = nir_load_base_workgroup_id(&b, 32);
+      nir_def *nwg = nir_load_num_workgroups(&b);
+      nir_def *gx0 = nir_iadd(&b, nir_channel(&b, gid, 0),
+                              nir_ishl_imm(&b, nir_channel(&b, bwg, 0), 5));
+      nir_def *gy0 = nir_iadd(&b, nir_channel(&b, gid, 1),
+                              nir_channel(&b, bwg, 1));
+      nir_def *step_x = nir_ishl_imm(&b, nir_channel(&b, nwg, 0), 5);
+      nir_def *step_y = nir_channel(&b, nwg, 1);
+
+      /* Uninitialized scratch local hoisted outside loops (creates extra phis). */
+      nir_variable *scratch_v =
+         nir_local_variable_create(b.impl, glsl_int_type(), "scr");
+      nir_variable *y_v = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_store_var(&b, y_v, gy0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_v);
+         nir_push_if(&b, nir_ige(&b, y, height));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_variable *x_v =
+            nir_local_variable_create(b.impl, glsl_int_type(), "x");
+         nir_store_var(&b, x_v, gx0, 0x1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, x_v);
+            nir_push_if(&b, nir_ige(&b, x, width));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+
+            nir_def *out_idx = nir_iadd(&b, nir_imul(&b, y, width), x);
+            nir_def *in3 = nir_iand(
+               &b,
+               nir_iand(&b, nir_ilt(&b, x, nir_iadd_imm(&b, width, -3)),
+                        nir_ilt(&b, y, nir_iadd_imm(&b, height, -3))),
+               nir_iand(&b, nir_ilt(&b, nir_imm_int(&b, 2), x),
+                        nir_ilt(&b, nir_imm_int(&b, 2), y)));
+            nir_push_if(&b, nir_inot(&b, in3));
+            {
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                               nir_imm_int(&b, 0), 0x1);
+            }
+            nir_push_else(&b, NULL);
+            {
+               nir_def *out_b = nir_ior(
+                  &b,
+                  nir_ior(&b, nir_ilt(&b, nir_isub(&b, width, border), x),
+                          nir_ilt(&b, nir_isub(&b, height, border), y)),
+                  nir_ior(&b, nir_ilt(&b, x, border), nir_ilt(&b, y, border)));
+               nir_push_if(&b, out_b);
+               {
+                  nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                                  nir_imm_int(&b, 0), 0x1);
+               }
+               nir_push_else(&b, NULL);
+               {
+                  nir_def *base_idx = nir_iadd(
+                     &b, nir_iadd(&b, x, border),
+                     nir_imul(&b, nir_iadd(&b, y, border), stride));
+                  nir_deref_instr *cd =
+                     nir_build_deref_ptr_as_array(&b, src_base, base_idx);
+                  nir_deref_instr *pd[16];
+                  for (unsigned k = 0; k < 16; k++) {
+                     nir_def *off =
+                        nir_iadd(&b, nir_imm_int(&b, dx[k]),
+                                 nir_imul(&b, nir_imm_int(&b, dy[k]), stride));
+                     pd[k] = nir_build_deref_ptr_as_array(
+                        &b, src_base, nir_iadd(&b, base_idx, off));
+                  }
+                  nir_def *neg_t = nir_ineg(&b, thresh);
+                  nir_def *s_ew[2];
+                  const unsigned ew_idx[2] = {4, 12};
+                  for (unsigned j = 0; j < 2; j++) {
+                     nir_def *cv = nir_u2u32(&b, nir_load_deref(&b, cd));
+                     nir_def *pv = nir_u2u32(&b, nir_load_deref(&b, pd[ew_idx[j]]));
+                     nir_def *ch = nir_ilt(&b, nir_iadd(&b, cv, thresh), pv);
+                     nir_def *cl = nir_ilt(&b, pv, nir_iadd(&b, cv, neg_t));
+                     nir_def *t1 = nir_bcsel(&b, ch, nir_imm_int(&b, 1),
+                                             nir_load_var(&b, scratch_v));
+                     nir_def *t2 = nir_bcsel(&b, cl, nir_imm_int(&b, -1), t1);
+                     s_ew[j] = nir_bcsel(&b, nir_ior(&b, cl, ch), t2,
+                                         nir_imm_int(&b, 0));
+                     nir_store_var(&b, scratch_v, s_ew[j], 0x1);
+                  }
+                  nir_push_if(&b, nir_ieq_imm(&b, nir_umax(&b, s_ew[0], s_ew[1]), 0));
+                  {
+                     nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                                     nir_imm_int(&b, 0), 0x1);
+                  }
+                  nir_push_else(&b, NULL);
+                  {
+                     nir_def *s_ns[2];
+                     const unsigned ns_idx[2] = {0, 8};
+                     for (unsigned j = 0; j < 2; j++) {
+                        nir_def *cv = nir_u2u32(&b, nir_load_deref(&b, cd));
+                        nir_def *pv = nir_u2u32(&b, nir_load_deref(&b, pd[ns_idx[j]]));
+                        nir_def *ch = nir_ilt(&b, nir_iadd(&b, cv, thresh), pv);
+                        nir_def *cl = nir_ilt(&b, pv, nir_iadd(&b, cv, neg_t));
+                        nir_def *t1 = nir_bcsel(&b, ch, nir_imm_int(&b, 1),
+                                                nir_load_var(&b, scratch_v));
+                        nir_def *t2 = nir_bcsel(&b, cl, nir_imm_int(&b, -1), t1);
+                        s_ns[j] = nir_bcsel(&b, nir_ior(&b, cl, ch), t2,
+                                            nir_imm_int(&b, 0));
+                        nir_store_var(&b, scratch_v, s_ns[j], 0x1);
+                     }
+                     nir_push_if(&b, nir_ieq_imm(&b, nir_umax(&b, s_ns[0], s_ns[1]), 0));
+                     {
+                        nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                                        nir_imm_int(&b, 0), 0x1);
+                     }
+                     nir_push_else(&b, NULL);
+                     {
+                        nir_def *sum_s = NULL;
+                        nir_def *diffs[16];
+                        for (unsigned k = 0; k < 16; k++) {
+                           nir_def *cv = nir_u2u32(&b, nir_load_deref(&b, cd));
+                           nir_def *pv = nir_u2u32(&b, nir_load_deref(&b, pd[k]));
+                           nir_def *ch = nir_ilt(&b, nir_iadd(&b, cv, thresh), pv);
+                           nir_def *cl = nir_ilt(&b, pv, nir_iadd(&b, cv, neg_t));
+                           nir_def *t1 = nir_bcsel(&b, ch, nir_imm_int(&b, 1),
+                                                   nir_load_var(&b, scratch_v));
+                           nir_def *t2 = nir_bcsel(&b, cl, nir_imm_int(&b, -1), t1);
+                           nir_def *sk = nir_bcsel(&b, nir_ior(&b, cl, ch), t2,
+                                                   nir_imm_int(&b, 0));
+                           nir_store_var(&b, scratch_v, sk, 0x1);
+                           sum_s = sum_s ? nir_iadd(&b, sum_s, sk) : sk;
+                           nir_def *cv2 = nir_u2u32(&b, nir_load_deref(&b, cd));
+                           diffs[k] = nir_iadd(&b, cv2, nir_ineg(&b, pv));
+                        }
+
+                        nir_variable *ai_v =
+                           nir_local_variable_create(b.impl, glsl_int_type(), "ai");
+                        nir_variable *amin_v =
+                           nir_local_variable_create(b.impl, glsl_int_type(), "amin");
+                        nir_variable *best_v =
+                           nir_local_variable_create(b.impl, glsl_int_type(), "best");
+                        nir_variable *rem_v =
+                           nir_local_variable_create(b.impl, glsl_int_type(), "rem");
+                        nir_variable *fnd_v =
+                           nir_local_variable_create(b.impl, glsl_bool_type(), "fnd");
+                        nir_store_var(&b, ai_v, nir_imm_int(&b, 0), 0x1);
+                        nir_store_var(&b, amin_v, thresh, 0x1);
+                        nir_store_var(&b, best_v, nir_imm_int(&b, 0), 0x1);
+                        nir_store_var(&b, rem_v, nir_imm_int(&b, 9), 0x1);
+                        nir_store_var(&b, fnd_v, nir_imm_false(&b), 0x1);
+
+                        nir_loop *al = nir_push_loop(&b);
+                        al->control = nir_loop_control_dont_unroll;
+                        {
+                           nir_def *ai = nir_load_var(&b, ai_v);
+                           nir_push_if(&b, nir_ige_imm(&b, ai, 24));
+                           nir_jump(&b, nir_jump_break);
+                           nir_pop_if(&b, NULL);
+
+                           nir_variable *dv =
+                              nir_local_variable_create(b.impl, glsl_int_type(), "dv");
+                           nir_push_if(&b, nir_ilt(&b, nir_imm_int(&b, 0), sum_s));
+                           {
+                              nir_def *idx16 = nir_iand_imm(&b, ai, 15);
+                              nir_variable *lv =
+                                 nir_local_variable_create(b.impl, glsl_int_type(), "lv");
+                              nir_push_if(&b, nir_ilt_imm(&b, idx16, 8));
+                              {
+                                 nir_def *v = diffs[7];
+                                 for (int k = 6; k >= 0; k--)
+                                    v = nir_bcsel(&b, nir_ilt_imm(&b, idx16, k + 1),
+                                                  diffs[k], v);
+                                 nir_store_var(&b, lv, v, 0x1);
+                              }
+                              nir_push_else(&b, NULL);
+                              {
+                                 nir_def *v = diffs[15];
+                                 for (int k = 14; k >= 8; k--)
+                                    v = nir_bcsel(&b, nir_ilt_imm(&b, idx16, k + 1),
+                                                  diffs[k], v);
+                                 nir_store_var(&b, lv, v, 0x1);
+                              }
+                              nir_pop_if(&b, NULL);
+                              nir_store_var(&b, dv, nir_ineg(&b, nir_load_var(&b, lv)), 0x1);
+                           }
+                           nir_push_else(&b, NULL);
+                           {
+                              nir_def *idx16 = nir_iand_imm(&b, ai, 15);
+                              nir_variable *lv =
+                                 nir_local_variable_create(b.impl, glsl_int_type(), "lv2");
+                              nir_push_if(&b, nir_ilt_imm(&b, idx16, 8));
+                              {
+                                 nir_def *v = diffs[7];
+                                 for (int k = 6; k >= 0; k--)
+                                    v = nir_bcsel(&b, nir_ilt_imm(&b, idx16, k + 1),
+                                                  diffs[k], v);
+                                 nir_store_var(&b, lv, v, 0x1);
+                              }
+                              nir_push_else(&b, NULL);
+                              {
+                                 nir_def *v = diffs[15];
+                                 for (int k = 14; k >= 8; k--)
+                                    v = nir_bcsel(&b, nir_ilt_imm(&b, idx16, k + 1),
+                                                  diffs[k], v);
+                                 nir_store_var(&b, lv, v, 0x1);
+                              }
+                              nir_pop_if(&b, NULL);
+                              nir_store_var(&b, dv, nir_load_var(&b, lv), 0x1);
+                           }
+                           nir_pop_if(&b, NULL);
+
+                           nir_def *diff = nir_load_var(&b, dv);
+                           nir_def *amin = nir_load_var(&b, amin_v);
+                           nir_def *best = nir_load_var(&b, best_v);
+                           nir_def *rem = nir_load_var(&b, rem_v);
+                           nir_def *fnd = nir_load_var(&b, fnd_v);
+
+                           nir_def *pass = nir_ilt(&b, thresh, diff);
+                           nir_def *mv = nir_bcsel(&b, nir_ieq_imm(&b, rem, 9), diff,
+                                                   nir_imin(&b, amin, diff));
+                           nir_def *mc = nir_bcsel(&b, pass, mv, thresh);
+                           nir_def *rn = nir_bcsel(&b, pass, nir_iadd_imm(&b, rem, -1),
+                                                   nir_imm_int(&b, 9));
+                           nir_def *rz = nir_ieq_imm(&b, rn, 0);
+
+                           nir_store_var(&b, ai_v,
+                                         nir_iadd_imm(&b, nir_bcsel(&b, rz, nir_iadd_imm(&b, ai, -8), ai), 1),
+                                         0x1);
+                           nir_store_var(&b, amin_v, nir_bcsel(&b, rz, thresh, mc), 0x1);
+                           nir_store_var(&b, best_v,
+                                         nir_bcsel(&b, rz, nir_imax(&b, best, mc), best), 0x1);
+                           nir_store_var(&b, rem_v, nir_bcsel(&b, rz, nir_imm_int(&b, 9), rn), 0x1);
+                           nir_store_var(&b, fnd_v, nir_ior(&b, rz, fnd), 0x1);
+                        }
+                        nir_pop_loop(&b, NULL);
+
+                        nir_push_if(&b, nir_load_var(&b, fnd_v));
+                        {
+                           nir_def *sc = nir_i2f32(&b, nir_iadd_imm(&b, nir_load_var(&b, best_v), -1));
+                           nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                                           sc, 0x1);
+                           nir_deref_instr *ce =
+                              nir_build_deref_ptr_as_array(&b, cnt_base, nir_imm_int(&b, 0));
+                           nir_def *pi = nir_deref_atomic(&b, 32, &ce->def, nir_imm_int(&b, 1),
+                                                          .atomic_op = nir_atomic_op_iadd);
+                           nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, pts_base, pi),
+                                           nir_vec2(&b, x, y), 0x3);
+                        }
+                        nir_push_else(&b, NULL);
+                        {
+                           nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, score_base, out_idx),
+                                           nir_imm_int(&b, 0), 0x1);
+                        }
+                        nir_pop_if(&b, NULL);
+                     }
+                     nir_pop_if(&b, NULL);
+                  }
+                  nir_pop_if(&b, NULL);
+               }
+               nir_pop_if(&b, NULL);
+            }
+            nir_pop_if(&b, NULL);
+
+            nir_store_var(&b, x_v, nir_iadd(&b, x, step_x), 0x1);
+         }
+         nir_pop_loop(&b, NULL);
+
+         nir_store_var(&b, y_v, nir_iadd(&b, y, step_y), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_lower_vars_to_ssa(b.shader);
+      nir_validate_shader(b.shader, "fast9_prelower");
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(b.shader, 1, layouts, &plan));
+      assert(plan.kind == HK_2D_STENCIL_FAST9_U8);
+      assert(plan.width_pc_offset_B == 0 && plan.height_pc_offset_B == 4 &&
+             plan.stride_pc_offset_B == 8 && plan.border_pc_offset_B == 12 &&
+             plan.threshold_pc_offset_B == 16);
+      ralloc_free(b.shader);
+   }
+
+   /* Reject UPDATE_AFTER_BIND. */
+   {
+      nir_shader *s = build_fast9_shader(FAST9_NONE);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(!hk_nir_match_2d_stencil(s, 1, uab_layouts, &plan));
+      ralloc_free(s);
+   }
+
+   /* Dispatch validation. */
+   {
+      nir_shader *s = build_fast9_shader(FAST9_NONE);
+      struct hk_2d_stencil_plan plan = {0};
+      assert(hk_nir_match_2d_stencil(s, 1, layouts, &plan));
+
+      struct hk_buffer_address bufs[4] = {
+         {.base_addr = 0x1000000, .size = 2112 * 1088},
+         {.base_addr = 0x2000000, .size = 2048 * 1024 * 4},
+         {.base_addr = 0x4000000, .size = 4},
+         {.base_addr = 0x5000000, .size = 2048 * 1024 * 8},
+      };
+      struct hk_descriptor_set ds = {
+         .layout = layout,
+         .mapped_ptr = bufs,
+         .size = sizeof(bufs),
+      };
+      struct hk_descriptor_state desc = {0};
+      desc.sets[0] = &ds;
+      int32_t pc[5] = {2048, 1024, 2112, 16, 20};
+      memcpy(desc.root.push, pc, sizeof(pc));
+      desc.push_written_dwords = 0x1f;
+
+      /* Grid-stride dispatch with fewer groups than pixels -> accepted. */
+      uint32_t gx = 0, gy = 0;
+      assert(hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                  8, 8, 1, &gx, &gy));
+      assert(gx == 64 && gy == 128);
+
+      /* Overlapping buffers -> reject. */
+      bufs[3].base_addr = bufs[1].base_addr + 16;
+      assert(!hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                   8, 8, 1, &gx, &gy));
+      bufs[3].base_addr = 0x5000000;
+
+      /* Negative threshold -> reject. */
+      pc[4] = -1;
+      memcpy(desc.root.push, pc, sizeof(pc));
+      assert(!hk_2d_stencil_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                   8, 8, 1, &gx, &gy));
+      ralloc_free(s);
+   }
+
+   free(layout);
+   free(uab_layout);
+   printf("hk_2d_stencil: fast9 matcher/builder/validator tests passed\n");
+}
+
 int
 main(void)
 {
@@ -837,6 +1640,7 @@ main(void)
    test_box_blur_matcher_and_builder();
    test_stereo_sad_matcher_and_builder();
    test_sobel_3x3_matcher_and_builder();
+   test_fast9_matcher_and_builder();
    glsl_type_singleton_decref();
    return 0;
 }

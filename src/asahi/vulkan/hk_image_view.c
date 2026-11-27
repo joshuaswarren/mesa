@@ -236,7 +236,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   const unsigned packed_ycbcr = agx_chip_native_agx3(dev->dev.chip)
+   const unsigned packed_ycbcr = agx_chip_has_packed_ycbcr(dev->dev.chip)
       ? hk_packed_ycbcr_bits(view->vk.format) : 0;
    if (packed_ycbcr)
       p_format = packed_ycbcr == 8 ? PIPE_FORMAT_R8G8B8A8_UNORM :

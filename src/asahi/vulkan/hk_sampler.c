@@ -291,13 +291,13 @@ hk_CreateSampler(VkDevice device,
    sampler->mip_lod_bias = info->mipLodBias;
    if (sampler->vk.ycbcr_conversion) {
       sampler->ycbcr = sampler->vk.ycbcr_conversion->state;
-      /* Packed 4:2:2 views on native AGX3 are backed by plain RGBA word
+      /* Packed 4:2:2 views on native AGX3 and M5 are backed by plain RGBA word
        * textures (see hk_image_view.c) and lowered via lower_ycbcr_explicit() /
        * lower_packed_ycbcr_center(), since nir_vk_lower_ycbcr_tex() skips
        * packed formats. Keep this internal lowering flag enabled regardless of
        * advertised CHROMA_RECONSTRUCTION_EXPLICIT format features.
        */
-      if (agx_chip_native_agx3(dev->dev.chip) &&
+      if (agx_chip_has_packed_ycbcr(dev->dev.chip) &&
           hk_packed_ycbcr_bits(sampler->ycbcr.format))
          sampler->ycbcr.force_explicit_reconstruction = true;
       /* Explicit nearest chroma maps luma (i,j) to (i/2,j/2), independent
@@ -380,7 +380,7 @@ hk_CreateSampler(VkDevice device,
    /* Packed conversion fetches raw words; chroma filtering runs in the
     * shader and does not consume a second sampler/descriptor plane. */
    if (sampler->vk.ycbcr_conversion &&
-       !(agx_chip_native_agx3(dev->dev.chip) &&
+       !(agx_chip_has_packed_ycbcr(dev->dev.chip) &&
          hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
       assert(!uses_border(info) &&
              "consequence of VUID-VkSamplerCreateInfo-addressModeU-01646");

@@ -458,14 +458,20 @@ can_repeat_alu(const agx_context *ctx, const agx_instr *I)
    case AGX_OPCODE_FADD:
    case AGX_OPCODE_FMUL:
    case AGX_OPCODE_FFMA:
+   case AGX_OPCODE_HADD:
+   case AGX_OPCODE_HMUL:
+   case AGX_OPCODE_HFMA:
    case AGX_OPCODE_FCMPSEL:
    case AGX_OPCODE_ICMPSEL:
    case AGX_OPCODE_IADD:
    case AGX_OPCODE_IMAD:
    case AGX_OPCODE_ASR:
    case AGX_OPCODE_BFEIL:
+   case AGX_OPCODE_EXTR:
    case AGX_OPCODE_BITOP:
    case AGX_OPCODE_CONVERT:
+   case AGX_OPCODE_FLTNORM_AGX3:
+   case AGX_OPCODE_NORMFLT_AGX3:
       break;
    default:
       return false;
@@ -525,36 +531,92 @@ remat_load_offset(const agx_instr *L, unsigned comp, int16_t *offset)
    return true;
 }
 
-/* Whether node can be reloaded by repeating its instruction with the
- * registers in regs
- */
 static bool
-can_reload_by_repeat(struct spill_ctx *ctx, unsigned node,
-                     const BITSET_WORD *regs)
+srcs_in_regs(const agx_instr *I, const BITSET_WORD *regs)
 {
-   agx_instr *L = ctx->repeat[node];
-   int16_t offset;
-
-   if (!L || !remat_load_offset(L, ctx->repeat_comp[node], &offset))
-      return false;
-
-   agx_foreach_ssa_src(L, s) {
-      if (!BITSET_TEST(regs, L->src[s].value))
+   agx_foreach_ssa_src(I, s) {
+      if (!BITSET_TEST(regs, I->src[s].value))
          return false;
    }
 
    return true;
 }
 
-static void
-reload_by_repeat(agx_builder *b, struct spill_ctx *ctx, unsigned node)
+/*
+ * Whether node can be reloaded by repeating its instruction with the
+ * registers in regs.
+ *
+ * Repeated arithmetic may also make one of its operands again when that
+ * operand has left the register file: a constant that can be rematerialized,
+ * or repeatable arithmetic over registers in the file. A rotated sample
+ * offset ffma(c, k1, -(s * k2)) is the typical case: the product dies at the
+ * ffma, so only s and c stay live. The operand goes to a new value that dies
+ * at the repeated instruction, which needs room for one more value of its
+ * size while the pair runs. If so, *operand is that operand's node,
+ * otherwise ~0.
+ */
+static bool
+can_reload_by_repeat(struct spill_ctx *ctx, unsigned node,
+                     const BITSET_WORD *regs, unsigned room, unsigned *operand)
+{
+   agx_instr *L = ctx->repeat[node];
+   int16_t offset;
+
+   *operand = ~0;
+
+   if (!L || !remat_load_offset(L, ctx->repeat_comp[node], &offset))
+      return false;
+
+   agx_foreach_ssa_src(L, s) {
+      const unsigned v = L->src[s].value;
+      if (BITSET_TEST(regs, v) || v == *operand)
+         continue;
+
+      /* At most one operand: a constant, or arithmetic over registers in
+       * the file
+       */
+      const agx_instr *J = ctx->repeat[v];
+      if (L->op == AGX_OPCODE_DEVICE_LOAD || *operand != ~0 ||
+          node_size(ctx, v) > room)
+         return false;
+
+      if (!ctx->remat[v] &&
+          (!J || J->op == AGX_OPCODE_DEVICE_LOAD || !srcs_in_regs(J, regs)))
+         return false;
+
+      *operand = v;
+   }
+
+   return true;
+}
+
+/* Whether repeating node, with its operand computed again if any, reads v */
+static bool
+repeat_reads(const struct spill_ctx *ctx, unsigned node, unsigned operand,
+             unsigned v)
 {
    const agx_instr *L = ctx->repeat[node];
-   const agx_index dst = reconstruct_index(ctx, node);
-   int16_t offset;
-   ASSERTED bool ok = remat_load_offset(L, ctx->repeat_comp[node], &offset);
-   assert(ok);
 
+   agx_foreach_ssa_src(L, s) {
+      if (L->src[s].value == v && v != operand)
+         return true;
+   }
+
+   if (operand != ~0 && !ctx->remat[operand]) {
+      const agx_instr *J = ctx->repeat[operand];
+
+      agx_foreach_ssa_src(J, s) {
+         if (J->src[s].value == v)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+static agx_instr *
+repeat_to(agx_builder *b, const agx_instr *L, agx_index dst)
+{
    agx_instr *I = agx_alloc_instr(b, L->op, 1, L->nr_srcs);
    agx_index *dest = I->dest, *src = I->src;
    memcpy(I, L, sizeof(*I));
@@ -566,6 +628,40 @@ reload_by_repeat(agx_builder *b, struct spill_ctx *ctx, unsigned node)
    /* Sources are renamed to their reaching copies by SSA repair */
    dest[0] = dst;
    agx_builder_insert(&b->cursor, I);
+   return I;
+}
+
+static void
+reload_by_repeat(agx_builder *b, struct spill_ctx *ctx, unsigned node,
+                 unsigned operand)
+{
+   const agx_instr *L = ctx->repeat[node];
+   const agx_index dst = reconstruct_index(ctx, node);
+   int16_t offset;
+   ASSERTED bool ok = remat_load_offset(L, ctx->repeat_comp[node], &offset);
+   assert(ok);
+
+   /* The operand gets a value of its own, so its old live range is not
+    * extended and SSA repair has nothing to rename for it.
+    */
+   agx_index tmp = agx_null();
+   if (operand != ~0) {
+      tmp = agx_temp_like(ctx->shader, reconstruct_index(ctx, operand));
+
+      if (ctx->remat[operand])
+         remat_to(b, tmp, ctx, operand);
+      else
+         repeat_to(b, ctx->repeat[operand], tmp);
+   }
+
+   agx_instr *I = repeat_to(b, L, dst);
+
+   if (operand != ~0) {
+      agx_foreach_ssa_src(I, s) {
+         if (I->src[s].value == operand)
+            I->src[s].value = tmp.value;
+      }
+   }
 
    if (L->op == AGX_OPCODE_DEVICE_LOAD) {
       I->mask = BITFIELD_MASK(agx_channels(dst));
@@ -602,7 +698,7 @@ insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 
 static void
 insert_reload(struct spill_ctx *ctx, agx_block *block, agx_cursor cursor,
-              unsigned node, bool by_repeat)
+              unsigned node, bool by_repeat, unsigned operand)
 {
    agx_builder b = agx_init_builder(ctx->shader, cursor);
    agx_index idx = reconstruct_index(ctx, node);
@@ -611,7 +707,7 @@ insert_reload(struct spill_ctx *ctx, agx_block *block, agx_cursor cursor,
    if (ctx->remat[node]) {
       remat_to(&b, idx, ctx, node);
    } else if (by_repeat) {
-      reload_by_repeat(&b, ctx, node);
+      reload_by_repeat(&b, ctx, node, operand);
    } else {
       agx_mov_to(&b, idx, agx_index_as_mem(idx, ctx->spill_base));
    }
@@ -789,13 +885,19 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
       BITSET_SET(pred_S, sp->S_exit[i]);
 
    /* Values in registers on both sides of the edge, where a reload may read
-    * them without extending their live ranges.
+    * them without extending their live ranges. Nothing else is in a register
+    * along the edge, so what the start of succ does not use is free there.
+    * There is none when the entry exceeds k, which a remat-only pass allows.
     */
+   unsigned entry_size = 0;
    for (unsigned j = 0; j < ss->nW_entry; ++j) {
       unsigned v = ss->W_entry[j];
+      entry_size += node_size(ctx, v);
       if (BITSET_TEST(pred_W, v))
          BITSET_SET(edge_regs, v);
    }
+
+   const unsigned room = entry_size < ctx->k ? ctx->k - entry_size : 0;
 
    agx_foreach_phi_in_block(succ, phi) {
       unsigned chased = chase_mem_index(phi->dest[0], ctx->spill_base);
@@ -887,8 +989,11 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
 
       /* Otherwise, inserting a reload defines the variable along the edge */
       agx_block *reload_block = agx_edge_to_block(pred, succ);
+      unsigned operand;
+      bool by_repeat =
+         can_reload_by_repeat(ctx, node, edge_regs, room, &operand);
       insert_reload(ctx, reload_block, agx_along_edge(pred, succ), node,
-                    can_reload_by_repeat(ctx, node, edge_regs));
+                    by_repeat, operand);
    }
 
    agx_foreach_phi_in_block(succ, I) {
@@ -910,9 +1015,11 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
       /* Fill the phi source in the predecessor */
       if (!BITSET_TEST(pred_W, I->src[s].value)) {
          agx_block *reload_block = agx_edge_to_block(pred, succ);
+         unsigned operand;
+         bool by_repeat = can_reload_by_repeat(ctx, I->src[s].value, edge_regs,
+                                               room, &operand);
          insert_reload(ctx, reload_block, agx_along_edge(pred, succ),
-                       I->src[s].value,
-                       can_reload_by_repeat(ctx, I->src[s].value, edge_regs));
+                       I->src[s].value, by_repeat, operand);
       }
 
       /* Leave as-is for the GPR version */
@@ -1111,18 +1218,25 @@ min_algorithm(struct spill_ctx *ctx)
 
       /* W now holds what is in registers at I. A repeated instruction may
        * read anything there except another repeated reload, which it would
-       * have to follow.
+       * have to follow. The room left for I's destinations is free until I,
+       * so an operand computed again for a repeat may use it. Reloads for an
+       * export are hoisted above every export of the group, whose sources
+       * are all live there, so they do not get that room, and there is none
+       * while W exceeds k, which a remat-only pass allows.
        */
+      const unsigned room =
+         I->op == AGX_OPCODE_EXPORT || ctx->nW >= ctx->k ? 0 : ctx->k - ctx->nW;
       bool by_repeat[AGX_MAX_NORMAL_SOURCES];
-      for (unsigned i = 0; i < nR; ++i)
-         by_repeat[i] = can_reload_by_repeat(ctx, R[i], ctx->W);
+      unsigned operand[AGX_MAX_NORMAL_SOURCES];
+      for (unsigned i = 0; i < nR; ++i) {
+         by_repeat[i] =
+            can_reload_by_repeat(ctx, R[i], ctx->W, room, &operand[i]);
+      }
 
       for (unsigned i = 0; i < nR; ++i) {
          for (unsigned j = 0; j < nR && by_repeat[i]; ++j) {
-            agx_foreach_ssa_src(ctx->repeat[R[i]], s) {
-               if (by_repeat[j] && ctx->repeat[R[i]]->src[s].value == R[j])
-                  by_repeat[i] = false;
-            }
+            if (by_repeat[j] && repeat_reads(ctx, R[i], operand[i], R[j]))
+               by_repeat[i] = false;
          }
       }
 
@@ -1172,7 +1286,7 @@ min_algorithm(struct spill_ctx *ctx)
             if (by_repeat[i] == (pass == 1)) {
                insert_reload(ctx, ctx->block,
                              agx_before_instr_logical(ctx->block, I), R[i],
-                             by_repeat[i]);
+                             by_repeat[i], operand[i]);
             }
          }
       }
@@ -1399,11 +1513,13 @@ compute_w_entry(struct spill_ctx *ctx)
    unsigned j = 0;
 
    /* Variables that are in all predecessors are assumed in W_entry. Phis and
-    * variables in some predecessors are scored by next-use.
+    * variables in some predecessors are scored by next-use. W_entry lists
+    * them all, so the coupling code knows every register live into the block.
     */
    foreach_next_use(&sb->next_use_in, i, dist) {
       if (freq[i] == agx_num_predecessors(ctx->block)) {
          insert_W(ctx, i);
+         sb->W_entry[sb->nW_entry++] = i;
       } else if (freq[i]) {
          candidates[j++] = (struct candidate){.node = i, .dist = dist};
       }
@@ -1516,12 +1632,46 @@ struct block_local_defs {
    unsigned n_defined;
 };
 
+/* Braun & Hack Section 4.1: penalize loop-exit edges so spilling inside a hot
+ * loop evicts outer/post-loop values ahead of loop-carried inner values. */
+#define AGX_SPILL_LOOP_EXIT_PENALTY 10000u
+#define AGX_SPILL_MAX_DIST (DIST_INFINITY / 2u)
+
+static inline dist_t
+dist_add_clamped(dist_t d, uint32_t penalty)
+{
+   if (d == DIST_INFINITY)
+      return DIST_INFINITY;
+   dist_t sum = dist_sum(d, penalty);
+   return MIN2(sum, AGX_SPILL_MAX_DIST);
+}
+
 static ATTRIBUTE_NOINLINE void
 global_next_use_distances(agx_context *ctx, void *memctx,
                           struct spill_block *blocks)
 {
    u_worklist worklist;
    u_worklist_init(&worklist, ctx->num_blocks, NULL);
+
+   /* Compute structured loop-nesting depth per block: for each loop header h,
+    * find its furthest back-edge predecessor and count the loop once even when
+    * multiple continue edges target the same header. */
+   uint32_t *loop_depth = calloc(MAX2(ctx->num_blocks, 1), sizeof(*loop_depth));
+   uint32_t *loop_end = calloc(MAX2(ctx->num_blocks, 1), sizeof(*loop_end));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index &&
+             block->index < ctx->num_blocks) {
+            loop_end[succ->index] = MAX2(loop_end[succ->index],
+                                         (uint32_t)block->index + 1u);
+         }
+      }
+   }
+   for (unsigned h = 0; h < ctx->num_blocks; ++h) {
+      for (unsigned i = h; i < loop_end[h]; ++i)
+         loop_depth[i]++;
+   }
+   free(loop_end);
 
    BITSET_WORD *defined = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *phi_dests = BITSET_CALLOC(ctx->alloc);
@@ -1621,11 +1771,18 @@ global_next_use_distances(agx_context *ctx, void *memctx,
       agx_foreach_predecessor(blk, pred) {
          struct spill_block *sp = &blocks[(*pred)->index];
          bool progress = false;
+         uint32_t exit_penalty = 0;
+         if (loop_depth[(*pred)->index] > loop_depth[blk->index]) {
+            const uint32_t delta =
+               MIN2(loop_depth[(*pred)->index] - loop_depth[blk->index], 100u);
+            exit_penalty = delta * AGX_SPILL_LOOP_EXIT_PENALTY;
+         }
 
          if (has_phis) {
             foreach_next_use(&sb->next_use_in, node, dist) {
                if (!BITSET_TEST(phi_dests, node) &&
-                   set_next_use_min(&sp->next_use_out, node, dist))
+                   set_next_use_min(&sp->next_use_out, node,
+                                    dist_add_clamped(dist, exit_penalty)))
                   progress = true;
             }
 
@@ -1633,12 +1790,14 @@ global_next_use_distances(agx_context *ctx, void *memctx,
             agx_foreach_phi_in_block(blk, I) {
                agx_index operand = I->src[pred_idx];
                if (operand.type == AGX_INDEX_NORMAL &&
-                   set_next_use_min(&sp->next_use_out, operand.value, 0))
+                   set_next_use_min(&sp->next_use_out, operand.value,
+                                    exit_penalty))
                   progress = true;
             }
          } else {
             foreach_next_use(&sb->next_use_in, node, dist) {
-               if (set_next_use_min(&sp->next_use_out, node, dist))
+               if (set_next_use_min(&sp->next_use_out, node,
+                                    dist_add_clamped(dist, exit_penalty)))
                   progress = true;
             }
          }
@@ -1656,6 +1815,7 @@ global_next_use_distances(agx_context *ctx, void *memctx,
    for (unsigned i = 0; i < ctx->num_blocks; ++i)
       free(local_defs[i].defined);
    free(local_defs);
+   free(loop_depth);
    free(phi_dests);
    free(defined);
    u_worklist_fini(&worklist);

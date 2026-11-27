@@ -10,6 +10,7 @@
 #include "hk_compute_pair.h"
 #include "hk_identity_copy4.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_shader_upload_core.h"
 #include "hk_buffer.h"
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
@@ -149,6 +150,13 @@ struct hk_fs_key {
     * keep the NIR to compile the zs_self_dep twin (hk_fbl_twin()).
     */
    bool dynamic_zs_self_dep : 1;
+
+   /** A fragment library compiled without its output interface. Only a fast
+    * link uses this compile (an optimized link compiles the shader again), so
+    * draws link it with the split epilog rather than compile an inline-blend
+    * program for it.
+    */
+   bool output_interface_later : 1;
 
    uint8_t pad[3];
 };
@@ -797,6 +805,10 @@ hk_populate_fs_key(struct hk_fs_key *key,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !ms->alpha_to_coverage_enable)
       key->discard_color_outputs = true;
+
+   key->output_interface_later =
+      !state->cal &&
+      !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP);
 }
 
 static bool
@@ -3669,7 +3681,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lookup_ycbcr_conversion, &ycbcr_state);
    NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
             lower_ycbcr_chroma_blend, nir_metadata_none, (void *)&ycbcr_state);
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_has_packed_ycbcr(dev->dev.chip)) {
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                lower_ycbcr_plane_range, nir_metadata_control_flow,
                (void *)&ycbcr_state);
@@ -4183,6 +4195,32 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                nir_opt_if_avoid_64bit_phis);
 }
 
+/* Upload the part of the binary the GPU reads from the shader itself: its
+ * constant program and promoted constants. The main runs from fast-linked
+ * copies, so a large main does not take the USC window twice
+ * (hk_shader_upload_start()). */
+static bool
+hk_upload_code(struct hk_device *dev, struct hk_shader *s)
+{
+   const struct agx_shader_info *info = &s->b.info;
+   const uint32_t start = hk_shader_upload_start(
+      info->binary_size, info->has_preamble, info->preamble_offset,
+      info->rodata.offset, info->rodata.size_16, HK_CODE_ALIGNMENT);
+   assert(start < info->binary_size);
+   const size_t size = info->binary_size - start;
+
+   s->bo = hk_code_alloc(dev, size, &s->bo_offset);
+   if (!s->bo)
+      return false;
+
+   s->bo_skip = start;
+   memcpy((uint8_t *)agx_bo_map(s->bo) + s->bo_offset,
+          (const uint8_t *)s->b.binary + start, size);
+   agx_bo_assert_range(s->bo, s->bo_offset, size);
+   s->preamble_addr = hk_shader_code_va(s) + info->preamble_offset;
+   return true;
+}
+
 /* Report a failed executable-preamble upload, so the caller's error path
  * destroys the half-built shader instead of keeping one with preamble_addr
  * 0. */
@@ -4197,19 +4235,8 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
       shader->constant_data_id = p_atomic_inc_return(&next_constant_data_id);
 
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
-      /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
-      size_t size = shader->b.info.binary_size;
-      assert(size > 0);
-
-      shader->bo = hk_code_alloc(dev, size, &shader->bo_offset);
-      if (!shader->bo)
+      if (!hk_upload_code(dev, shader))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-
-      memcpy((uint8_t *)agx_bo_map(shader->bo) + shader->bo_offset,
-             shader->b.binary, size);
-      agx_bo_assert_range(shader->bo, shader->bo_offset, size);
-      shader->preamble_addr =
-         hk_shader_code_va(shader) + shader->b.info.preamble_offset;
    }
 
    if (!shader->linked.ht) {
@@ -4368,15 +4395,16 @@ hk_g17p_pbe_record(nir_builder *b, nir_scalar s)
 }
 
 /* Honeykrisp names a storage image by the byte offset of its PBE in the
- * descriptor set. G17P's imgwci instead takes a PBE heap from a uniform and
- * the index of a PBE record in that heap, so the set itself is the heap and
- * the store carries its record index.
+ * descriptor set. G17P's imgwci and imgwblk instead take a PBE heap from a
+ * uniform and the index of a PBE record in that heap, so the set itself is
+ * the heap and the store carries its record index.
  */
 static bool
 hk_g17p_lower_storage_records(nir_builder *b, nir_intrinsic_instr *intr,
                               UNUSED void *data)
 {
-   if (intr->intrinsic != nir_intrinsic_bindless_image_store)
+   if (intr->intrinsic != nir_intrinsic_bindless_image_store &&
+       intr->intrinsic != nir_intrinsic_bindless_image_store_block_agx)
       return false;
 
    nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
@@ -4625,9 +4653,11 @@ hk_nir_constant_offset(nir_scalar s, unsigned depth, uint64_t *value)
 
 /* The HK_ROOT_READS_* classes of the root bytes one use of load_root_agx can
  * read: an immediate offset loaded as is falls in the classes of its bytes,
- * anything else could read any byte. */
+ * with statically indexed dynamic_buffers[] slots recorded in *dynbuf_reads
+ * instead of the opaque HK_ROOT_READS_DYNAMIC_BUFFERS bit; anything else could
+ * read any byte. */
 static uint8_t
-hk_nir_root_use_reads(nir_src *use)
+hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads)
 {
    const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                        HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
@@ -4646,6 +4676,12 @@ hk_nir_root_use_reads(nir_src *use)
                                8, &offset))
       return any;
 
+   const uint64_t dyn_start = hk_root_descriptor_offset(dynamic_buffers);
+   const uint64_t dyn_stride = sizeof(struct hk_buffer_address);
+   const uint64_t dyn_end = dyn_start + HK_MAX_DYNAMIC_BUFFERS * dyn_stride;
+   static_assert(HK_MAX_DYNAMIC_BUFFERS <= 64,
+                 "agx3_dynbuf_reads bitmask fits all dynamic buffer slots");
+
    uint8_t reads = 0;
    nir_foreach_use_including_if(load_use, &add->def) {
       if (nir_src_is_if(load_use) ||
@@ -4659,17 +4695,32 @@ hk_nir_root_use_reads(nir_src *use)
           load_use != &load->src[0])
          return any;
 
-      reads |= hk_root_reads_of(
-         offset, offset + load->def.num_components * load->def.bit_size / 8);
+      const uint64_t end =
+         offset + load->def.num_components * load->def.bit_size / 8;
+      uint8_t span_reads = hk_root_reads_of(offset, end);
+      if (span_reads & HK_ROOT_READS_DYNAMIC_BUFFERS) {
+         const uint64_t lo = MAX2(offset, dyn_start);
+         const uint64_t hi = MIN2(end, dyn_end);
+         if (hi > lo) {
+            const unsigned first = (unsigned)((lo - dyn_start) / dyn_stride);
+            const unsigned last = (unsigned)((hi - 1 - dyn_start) / dyn_stride);
+            for (unsigned slot = first; slot <= last; ++slot)
+               *dynbuf_reads |= BITFIELD64_BIT(slot);
+         }
+         span_reads &= ~HK_ROOT_READS_DYNAMIC_BUFFERS;
+      }
+      reads |= span_reads;
    }
    return reads;
 }
 
-/* hk_shader_info::agx3_root_reads, gathered where hk_nir_uses_root() is. */
+/* hk_shader_info::agx3_root_reads and agx3_dynbuf_reads, gathered where
+ * hk_nir_uses_root() is. */
 static uint8_t
-hk_nir_root_reads(const nir_shader *nir)
+hk_nir_root_reads(const nir_shader *nir, uint64_t *dynbuf_reads_out)
 {
    uint8_t reads = 0;
+   uint64_t dynbuf_reads = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -4680,11 +4731,12 @@ hk_nir_root_reads(const nir_shader *nir)
 
             nir_foreach_use_including_if(use,
                                          &nir_instr_as_intrinsic(instr)->def)
-               reads |= hk_nir_root_use_reads(use);
+               reads |= hk_nir_root_use_reads(use, &dynbuf_reads);
          }
       }
    }
 
+   *dynbuf_reads_out = dynbuf_reads;
    return reads;
 }
 
@@ -6261,15 +6313,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    bool wg_coalesce_cand = false;
    if (agx_chip_agx3_path(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
-      shader->info.agx3_root_reads = hk_nir_root_reads(nir);
+      shader->info.agx3_root_reads =
+         hk_nir_root_reads(nir, &shader->info.agx3_dynbuf_reads);
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
-          !hk_nir_root_reads_range(
-             nir, hk_root_descriptor_offset(cs.group_count_addr),
-             hk_root_descriptor_offset(cs.group_count_addr) +
-                sizeof(uint64_t),
-             sizeof(struct hk_root_descriptor_table)) &&
           hk_nir_can_coalesce_workgroup(nir))
          wg_coalesce_cand = true;
    }
@@ -6493,11 +6541,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
-      !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
+      !preserve_raw_mono && agx_chip_native_or_m5(dev->dev.chip) &&
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
-      !nir->info.fs.uses_sample_shading;
+      !nir->info.fs.uses_sample_shading &&
+      !(key && key->fs.output_interface_later);
 
    if (preserve_raw_mono) {
       struct blob blob;
@@ -6818,6 +6867,7 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->code_size = s->b.info.binary_size;
    s->bo = NULL;
    s->bo_offset = 0;
+   s->bo_skip = 0;
    s->preamble_addr = 0;
    memset(&s->linked, 0, sizeof(s->linked));
    s->only_linked = NULL;
@@ -6833,16 +6883,11 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->preamble_cs_attempted = false;
 
    if (s->b.info.has_preamble || s->b.info.rodata.size_16) {
-      const size_t size = s->b.info.binary_size;
-      s->bo = size ? hk_code_alloc(dev, size, &s->bo_offset) : NULL;
-      if (!s->bo) {
+      if (!hk_upload_code(dev, s)) {
          free(s->b.binary);
          free(s);
          return NULL;
       }
-      memcpy((uint8_t *)agx_bo_map(s->bo) + s->bo_offset, s->b.binary, size);
-      agx_bo_assert_range(s->bo, s->bo_offset, size);
-      s->preamble_addr = hk_shader_code_va(s) + s->b.info.preamble_offset;
    }
    return s;
 }
@@ -6869,6 +6914,7 @@ hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
    s->info.set_count = meta->set_count;
    s->info.agx3_uses_root = meta->agx3_uses_root;
    s->info.agx3_root_reads = meta->agx3_root_reads;
+   s->info.agx3_dynbuf_reads = meta->agx3_dynbuf_reads;
    s->info.agx3_root_uniform = meta->agx3_root_uniform;
    s->info.agx3_gen1_fragment_rq = false;
    s->info.agx3_combined_sampler_valid = meta->agx3_combined_sampler_valid;
@@ -7520,7 +7566,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, hk_lower_uvs_index, MESA_SHADER_FRAGMENT, 0, 0);
    meta.agx3_uses_root = hk_nir_uses_root(nir);
-   meta.agx3_root_reads = hk_nir_root_reads(nir);
+   meta.agx3_root_reads = hk_nir_root_reads(nir, &meta.agx3_dynbuf_reads);
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);
@@ -7644,6 +7690,34 @@ hk_fs_sample_source_destroy(struct hk_fs_sample_source *src)
    free(src);
 }
 
+nir_shader *
+hk_deserialize_nested_nir(void *mem_ctx, const void *data, size_t size,
+                          mesa_shader_stage stage)
+{
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   nir_shader *nir = nir_deserialize(mem_ctx, &agx_nir_options, &reader);
+   if (nir && (reader.overrun || reader.current != reader.end ||
+               nir->info.stage != stage || !nir_shader_get_entrypoint(nir))) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   return nir;
+}
+
+/* A source a shader cannot draw without (a sample-variant or twin source) is
+ * checked when the shader is imported: a binary that holds a bad one is
+ * refused, and a cache entry that does is compiled again. Optional programs
+ * are checked when first built, since they fall back when missing.
+ */
+static bool
+hk_nested_nir_valid(const void *data, size_t size, mesa_shader_stage stage)
+{
+   nir_shader *nir = hk_deserialize_nested_nir(NULL, data, size, stage);
+   ralloc_free(nir);
+   return nir != NULL;
+}
+
 /* Compile the `samples` variant of obj from nir, which it consumes. */
 static VkResult
 hk_compile_fs_sample_variant(struct hk_device *dev,
@@ -7680,17 +7754,14 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
       obj->variants[i].info.fs.has_input_attachments |=
          src->has_input_attachments;
       if (src->lr_nir) {
-         struct blob_reader lr_reader;
-         blob_reader_init(&lr_reader, src->lr_nir, src->lr_nir_size);
          nir_shader *lr_nir =
-            nir_deserialize(NULL, &agx_nir_options, &lr_reader);
-         if (lr_nir && !lr_reader.overrun) {
+            hk_deserialize_nested_nir(NULL, src->lr_nir, src->lr_nir_size,
+                                      MESA_SHADER_FRAGMENT);
+         if (lr_nir) {
             hk_prepare_local_read_nir(dev, lr_nir, &src->lr_info,
                                       &src->robustness, &key, src->features,
                                       src->set_layout_count,
                                       src->static_set_mask, &obj->variants[i]);
-         } else {
-            ralloc_free(lr_nir);
          }
       }
       p_atomic_set(&src->ready_mask, src->ready_mask | BITFIELD_BIT(i));
@@ -7870,9 +7941,8 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
          src->owned_mask |= BITFIELD_BIT(i);
          p_atomic_set(&src->ready_mask, src->ready_mask | BITFIELD_BIT(i));
       } else {
-         struct blob_reader reader;
-         blob_reader_init(&reader, src->nir, src->nir_size);
-         nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+         nir_shader *nir = hk_deserialize_nested_nir(
+            NULL, src->nir, src->nir_size, MESA_SHADER_FRAGMENT);
          if (nir) {
             src->owned_mask |= BITFIELD_BIT(i);
             result = hk_compile_fs_sample_variant(dev, NULL, nir, obj, samples);
@@ -9942,9 +10012,8 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                 struct hk_api_shader **built)
 {
    *built = NULL;
-   struct blob_reader reader;
-   blob_reader_init(&reader, src->nir, src->nir_size);
-   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+   nir_shader *nir =
+      hk_deserialize_nested_nir(NULL, src->nir, src->nir_size, obj->vk.stage);
    if (!nir)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -10908,7 +10977,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                   hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
                   NULL);
 
-      if (agx_chip_native_or_m5(dev->dev.chip)) {
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip)) {
          enum hk_nir_widen_16bit_varyings_mode mode = 0;
 
          if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -10943,7 +11013,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          nir_io_add_intrinsic_xfb_info(nir);
       }
 
-      if (agx_chip_native_or_m5(dev->dev.chip))
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_widen_integer_io,
                   nir_metadata_control_flow, NULL);
 
@@ -11245,17 +11316,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
        * either way. */
       if (vs) {
          const bool pre_raster_after_vs = tes || gs;
-         hk_prelink_vertex(dev, vs, !state || !pre_raster_after_vs,
+         hk_prelink_vertex(dev, vs, fs, state, !state || !pre_raster_after_vs,
                            !state || pre_raster_after_vs);
       }
 
       if (fs && !state) {
          hk_prelink_object_fragment(dev, fs);
-      } else if (fs && vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
-         const struct hk_shader *hw_vs =
-            gs    ? &gs->variants[HK_GS_VARIANT_RAST]
-            : tes ? &tes->variants[HK_VS_VARIANT_HW]
-                  : &vs->variants[HK_VS_VARIANT_HW];
+      } else if (fs && state) {
+         const struct hk_shader *hw_vs = NULL;
+         if (vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
+            hw_vs = gs    ? &gs->variants[HK_GS_VARIANT_RAST]
+                    : tes ? &tes->variants[HK_VS_VARIANT_HW]
+                          : &vs->variants[HK_VS_VARIANT_HW];
+         }
          hk_prelink_pipeline_fragment(dev, hw_vs, fs, state);
       }
    }
@@ -11342,6 +11415,40 @@ hk_pack_loop_bound_deserialize(struct blob_reader *blob,
    return !blob->overrun;
 }
 
+/* A binary's digest is not keyed, so its root prefix is untrusted. Accept
+ * only a size the compile path can produce (hk_shader_root_descriptor_size())
+ * for the shader's stage and layout: zero (not trimmed, so the whole table is
+ * uploaded) or at most the whole table, in 16-byte steps, and holding the
+ * stage's floor -- the set pointers the root uniform range loads -- and every
+ * root-relative uniform DMA span the launch loads. */
+static bool
+hk_deserialized_root_valid(const struct hk_shader_info *info,
+                           const struct agx_shader_info *b_info,
+                           uint32_t root_descriptor_size)
+{
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   if (info->set_count > HK_MAX_SETS ||
+       b_info->agx3_uniform_dma_count > AGX3_UNIFORM_DMA_MAX_SPANS ||
+       root_descriptor_size > full ||
+       (root_descriptor_size % 16 && root_descriptor_size != full))
+      return false;
+
+   const uint32_t size = root_descriptor_size ? root_descriptor_size : full;
+   if (size < hk_shader_root_descriptor_floor(
+                 info->stage, info->set_count, hk_root_descriptor_offset(sets),
+                 hk_root_descriptor_offset(push), full))
+      return false;
+
+   for (unsigned i = 0; i < b_info->agx3_uniform_dma_count; ++i) {
+      const struct agx3_uniform_dma_span *span = &b_info->agx3_uniform_dma[i];
+      if (span->source == AGX3_UNIFORM_DMA_POINTER &&
+          span->pointer == info->agx3_root_uniform &&
+          (uint64_t)span->offset_B + 2 * span->halfs > size)
+         return false;
+   }
+   return true;
+}
+
 VkResult
 hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
                       struct hk_shader *shader, bool absent,
@@ -11349,6 +11456,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
+   /* A short read leaves info as it was: use none of it. */
+   if (blob->overrun)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    const uint32_t root_descriptor_size =
       (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
          ? blob_read_uint32(blob)
@@ -11359,6 +11469,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 
    struct agx_shader_info b_info;
    blob_copy_bytes(blob, &b_info, sizeof(b_info));
+   if (blob->overrun ||
+       !hk_deserialized_root_valid(&info, &b_info, root_descriptor_size))
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
    if (!hk_agx3_vdm_program_cache_deserialize(blob,
@@ -11476,11 +11589,15 @@ hk_fs_sample_source_deserialize(struct hk_api_shader *obj,
    src->static_set_mask = blob_read_uint8(blob);
    src->nir_size = blob_read_uint32(blob);
    const void *nir = blob_read_bytes(blob, src->nir_size);
-   src->nir = blob->overrun ? NULL : malloc(src->nir_size);
+   if (blob->overrun ||
+       !hk_nested_nir_valid(nir, src->nir_size, MESA_SHADER_FRAGMENT)) {
+      free(src);
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+   }
+   src->nir = malloc(src->nir_size);
    if (!src->nir) {
       free(src);
-      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
-                           : VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    memcpy(src->nir, nir, src->nir_size);
    simple_mtx_init(&src->lock, mtx_plain);
@@ -11496,7 +11613,7 @@ hk_fs_sample_source_deserialize(struct hk_api_shader *obj,
 
 static VkResult
 hk_border_source_deserialize(struct hk_border_source **out,
-                             struct blob_reader *blob)
+                             struct blob_reader *blob, mesa_shader_stage stage)
 {
    struct hk_border_source *src = calloc(1, sizeof(*src));
    if (!src)
@@ -11512,11 +11629,14 @@ hk_border_source_deserialize(struct hk_border_source **out,
    src->static_set_mask = blob_read_uint8(blob);
    src->nir_size = blob_read_uint32(blob);
    const void *nir = blob_read_bytes(blob, src->nir_size);
-   src->nir = blob->overrun ? NULL : malloc(src->nir_size);
+   if (blob->overrun || !hk_nested_nir_valid(nir, src->nir_size, stage)) {
+      free(src);
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+   }
+   src->nir = malloc(src->nir_size);
    if (!src->nir) {
       free(src);
-      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
-                           : VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    memcpy(src->nir, nir, src->nir_size);
    simple_mtx_init(&src->lock, mtx_plain);
@@ -12204,7 +12324,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_border_source) {
-      VkResult result = hk_border_source_deserialize(&obj->border_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->border_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -12212,7 +12333,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_mesh_source) {
-      VkResult result = hk_border_source_deserialize(&obj->mesh_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->mesh_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -12220,7 +12342,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    }
 
    if (has_fbl_source) {
-      VkResult result = hk_border_source_deserialize(&obj->fbl_source, blob);
+      VkResult result =
+         hk_border_source_deserialize(&obj->fbl_source, blob, stage);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -13064,10 +13187,9 @@ hk_shader_get_preamble_cs(struct hk_device *dev, struct hk_shader *vs)
    }
 
    struct hk_shader *cs = NULL;
-   struct blob_reader reader;
-   blob_reader_init(&reader, vs->preamble_nir, vs->preamble_nir_size);
-   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
-   if (nir && !reader.overrun) {
+   nir_shader *nir = hk_deserialize_nested_nir(
+      NULL, vs->preamble_nir, vs->preamble_nir_size, MESA_SHADER_COMPUTE);
+   if (nir) {
       cs = calloc(1, sizeof(*cs));
       if (cs) {
          struct agx_shader_key cs_key = {
@@ -13580,7 +13702,8 @@ hk_m5_fragment_variant_preflight(struct hk_device *dev,
    struct agx3_ioto_uniform_range ranges[2];
    size_t count = 1;
    if (!hk_agx3_g17p_root_range(AGX_ABI_FUNI_ROOT, 0,
-                                 dev->dev.shader_base + 0x10000, &ranges[0]))
+                                 dev->dev.shader_base + 0x10000,
+                                 hk_shader_root_size(s), &ranges[0]))
       return false;
    if (s->b.info.rodata.size_16) {
       const struct agx_rodata *rodata = &s->b.info.rodata;
