@@ -47,47 +47,20 @@ def_size(nir_def *def, unsigned *size, unsigned *align,
 }
 
 static void
-def_size_g17p(nir_def *def, unsigned *size, unsigned *align,
+def_size_agx3(nir_def *def, unsigned *size, unsigned *align,
               nir_preamble_class *class)
 {
    def_size(def, size, align, class);
    nir_intrinsic_instr *intr = nir_def_as_intrinsic_or_null(def);
-   if (!intr || intr->intrinsic != nir_intrinsic_bindless_image_agx ||
-       intr->src[0].ssa->bit_size != 64)
-      return;
-
-   /* G17P cannot export texture state, so its native image descriptor is
-    * carried in general uniforms. The opaque token is 32 bits; reserve the
-    * 64-bit payload that lower_store_preamble actually exports instead.
-    * Image-class slot units and the other encodings stay unchanged.
-    */
-   *class = nir_preamble_class_general;
-   *size = *align = 4;
-}
-
-/* The AGX3C constant-program export is a 32-bit uniform COPY: a lone half
- * is published as one pair-aligned copy whose upper half is padding (Apple
- * widens scalar half preamble results the same way), and no half-width
- * copy-to-uniform form is witnessed. Give a scalar 16-bit value its own
- * aligned pair so the export never lands on an odd half. */
-/* A half result takes a whole word, see widen_half_exports(). */
-static void
-def_size_agx3b(nir_def *def, unsigned *size, unsigned *align,
-               nir_preamble_class *class)
-{
-   def_size_g17p(def, size, align, class);
-   if (*class == nir_preamble_class_general && def->num_components == 1 &&
-       def->bit_size <= 16) {
-      *size = 2;
-      *align = 2;
+   if (intr && intr->intrinsic == nir_intrinsic_bindless_image_agx &&
+       intr->src[0].ssa->bit_size == 64) {
+      /* Reserve the 64-bit descriptor payload exported in general uniforms.
+       * The opaque image token itself is only 32 bits. */
+      *class = nir_preamble_class_general;
+      *size = *align = 4;
    }
-}
 
-static void
-def_size_agx3c(nir_def *def, unsigned *size, unsigned *align,
-               nir_preamble_class *class)
-{
-   def_size_g17p(def, size, align, class);
+   /* Widen scalar half exports to a pair-aligned uniform COPY. */
    if (*class == nir_preamble_class_general && def->num_components == 1 &&
        def->bit_size <= 16) {
       *size = 2;
@@ -568,6 +541,46 @@ avoid_instr(const nir_instr *instr, const void *data)
    return false;
 }
 
+static bool
+in_loop(const nir_block *block)
+{
+   for (const nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
+      if (n->type == nir_cf_node_loop)
+         return true;
+   }
+   return false;
+}
+
+/*
+ * On the AGX3B encoding, a 16-bit float ALU instruction that reads a 16-bit
+ * operand from the uniform file runs slower than one that reads it from a
+ * register, while 32-bit operands read from the uniform file cost nothing
+ * extra. Compiled for every AGX3B GPU, our own fp16 FMA loop kernels read
+ * their 16-bit loop-invariant operands from registers and their 32-bit ones
+ * from the uniform file.
+ *
+ * So a 16-bit float value that code inside a loop reads is computed in the
+ * shader, once per invocation into a register, instead of being stored to
+ * the uniform file by the preamble. Its own inputs can still come from the
+ * preamble.
+ */
+static bool
+keep_half_loop_operand_in_registers(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size != 16 ||
+       nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) !=
+          nir_type_float)
+      return false;
+   nir_foreach_use(src, &alu->def) {
+      if (in_loop(nir_src_use_instr(src)->block))
+         return true;
+   }
+   return false;
+}
+
 static const nir_opt_preamble_options preamble_options = {
    .drawid_uniform = true,
    .subgroup_size_uniform = true,
@@ -1034,7 +1047,7 @@ guard_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
  * register pair. A half exported from the top of a pair, or into the top of a
  * word, cannot be packed, and that refusal costs the shader its whole constant
  * program. So export every half result as a word with zeroes on top, in the
- * slot def_size_agx3b() reserved; the main program still reads the low half.
+ * slot def_size_agx3() reserved; the main program still reads the low half.
  */
 static bool
 widen_half_exports(nir_shader *nir)
@@ -1080,15 +1093,18 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
     * invariant ALU and buffer loads remain eligible for the CProg. */
    options.no_textures = agx3c;
    if (g17p) {
+      options.def_size = def_size_agx3;
       /* The G17P uniform fabs cost is not an M5 witness; keep the
        * generic instruction cost there. */
-      options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
       options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
-   /* Every AGX3B chip: the uniform file it fills is the encoding's. */
+   /* The AGX3B encoding: the uniform file the preamble fills is the
+    * encoding's. */
+   const bool agx3b = g17p && !agx3c;
    struct set *branches = NULL;
-   if (g17p && !agx3c) {
+   if (agx3b) {
+      options.avoid_instr_cb = keep_half_loop_operand_in_registers;
       branches = surviving_branches(nir, &options, sizes, flatten);
       options.cb_data = branches;
    }

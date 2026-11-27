@@ -38,6 +38,7 @@
 #include "hk_shader.h"
 #include "hk_compute_pair.h"
 #include "hk_sync.h"
+#include "hk_render_pack.h"
 #include "hk_tess_batch.h"
 
 #include "hk_cmd_pool.h"
@@ -488,6 +489,27 @@ hk_root_matches_push(const struct hk_root_descriptor_table *a, size_t a_size,
                                hk_root_descriptor_offset(dynamic_buffers));
 }
 
+/* Whether two roots agree on every dynamic_buffers[] slot named in mask. */
+static inline bool
+hk_root_matches_dynbuf_mask(const struct hk_root_descriptor_table *a,
+                            size_t a_size,
+                            const struct hk_root_descriptor_table *b,
+                            size_t b_size, uint64_t mask)
+{
+   const uint8_t *ab = (const uint8_t *)a;
+   const uint8_t *bb = (const uint8_t *)b;
+   const size_t a_lim = MIN2(a_size, sizeof(*a));
+   const size_t b_lim = MIN2(b_size, sizeof(*b));
+   const size_t base = hk_root_descriptor_offset(dynamic_buffers);
+   const size_t stride = sizeof(a->dynamic_buffers[0]);
+   u_foreach_bit64(slot, mask) {
+      const size_t start = base + slot * stride;
+      if (!hk_root_span_matches(ab, a_lim, bb, b_lim, start, start + stride))
+         return false;
+   }
+   return true;
+}
+
 /* Build the same visible-byte sequence as hk_root_matches_for_fragment().
  * Keeping this derived from the shared span list includes future root fields
  * and padding without duplicating the root ABI. Push constants sit alongside
@@ -597,6 +619,7 @@ struct hk_descriptor_state {
    uint32_t uploaded_root_size;
    uint64_t uploaded_root_generation;
    uint8_t uploaded_dynamic_buffer_end;
+   bool uploaded_root_cpu_cached;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -795,6 +818,7 @@ struct hk_rendering_state {
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
+   uint8_t agx2_resolve_mask;
 
    /* Exact admission result for the current physical tilebuffer layout.
     * The layout is immutable after BeginRendering except for the one
@@ -832,18 +856,24 @@ struct hk_rendering_state {
     */
    VkImageAspectFlags g17p_zls_written;
 
-   /* M5: an attachment of the pass can alias another resource (aliased,
-    * sparse or linear image), so its stores count as memory writes for
-    * dependency tracking (HK_SYNC_GFX_MEM). */
+   /* M5: an attachment of the pass can alias a buffer or external/linear
+    * resource, so its stores count as memory writes for dependency tracking
+    * (HK_SYNC_GFX_MEM). */
    bool m5_attachments_reach_memory;
+   /* Bloom filter of plane GPU VAs of all pass/resolve attachments. */
+   uint64_t att_bloom;
+   /* M5: an optimal VK_IMAGE_CREATE_ALIAS_BIT attachment was exempted from
+    * m5_attachments_reach_memory because its memory had no buffer binding at
+    * record time; checked against hk_device::buffer_alias_mem_gen at submit. */
+   bool m5_attachments_alias_image;
 
-   /* AGX3 dead depth store: the "only" ZLS word with the depth store
-    * dropped, and whether the pass processes empty tiles without that store,
-    * for a later pass that makes the store dead (hk_take_pending_z_store()).
-    * Valid when no_z_store_ok. */
-   bool no_z_store_ok;
-   bool process_empty_tiles_without_z;
-   struct agx_zls_control_packed zls_control_only_no_z_store;
+   /* AGX3 dead depth/stencil store: aspects stored in this single-stream pass
+    * that may become dead if overwritten before read (hk_take_pending_z_store),
+    * plus empty-tile attribution split across color/resolve vs Z vs S clears. */
+   VkImageAspectFlags pending_zs_store_mask;
+   bool empty_tiles_other;
+   bool empty_tiles_z;
+   bool empty_tiles_s;
 
    /* G17P: colour attachments a draw or clear of the pass may write, and
     * whether a fragment shader reads the tilebuffer. See
@@ -1031,6 +1061,10 @@ struct hk_graphics_state {
    struct hk_root_fragment_snapshot fs_root_fragment_snapshot;
    const struct hk_root_descriptor_table *root_fragment_snapshot_cpu;
    const struct hk_root_descriptor_table *fs_root_fragment_snapshot_cpu;
+   /* Whether root_cpu / fs_root_cpu point into CPU write-back (AGX_BO_WRITEBACK)
+    * command-pool BOs that can be compared directly without shadow snapshots. */
+   bool root_cpu_cached;
+   bool fs_root_cpu_cached;
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
@@ -1291,11 +1325,19 @@ hk_root_fragment_snapshot_publish(struct hk_graphics_state *gfx,
 
 /* Select the same immutable root as the fresh byte comparison. Hidden reads
  * always use the current root; snapshots and the positive identity memo only
- * accelerate the equality check for shaders that cannot observe those bytes. */
+ * accelerate the equality check for shaders that cannot observe those bytes.
+ *
+ * dynbuf_reads names the dynamic_buffers[] slots the shader reads at constant
+ * offsets (hk_shader_info::agx3_dynbuf_reads). Those slots are compared
+ * directly in the CPU mappings, so that only happens when the caller compares
+ * roots there (!use_shadow, CPU-cached roots): the snapshots leave the
+ * dynamic buffers out, and there such a shader keeps following the current
+ * root. The slots are checked on every call, ahead of the identity memo,
+ * because the memo does not cover them. */
 static inline uint64_t
 hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
-                             uint32_t required_size, bool use_memo,
-                             bool use_shadow)
+                             uint64_t dynbuf_reads, uint32_t required_size,
+                             bool use_memo, bool use_shadow)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                           HK_ROOT_READS_DYNAMIC_BUFFERS;
@@ -1311,7 +1353,12 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
                        gfx->fs_root_fragment_snapshot_cpu == gfx->fs_root_cpu;
 
    if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
-       prev_size >= req && !(root_reads & hidden)) {
+       prev_size >= req && !(root_reads & hidden) &&
+       (!dynbuf_reads ||
+        (!use_shadow &&
+         hk_root_matches_dynbuf_mask(gfx->fs_root_cpu, prev_size,
+                                     gfx->root_cpu, cur_size,
+                                     dynbuf_reads)))) {
       const bool memo_bytes = use_memo && gfx->fs_root_checked_root &&
                               gfx->fs_root_checked_root == gfx->root;
       if (memo_bytes && (!reads_push || gfx->fs_root_checked_push_match))
@@ -1360,6 +1407,7 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
    gfx->fs_root_size = gfx->root_size;
+   gfx->fs_root_cpu_cached = gfx->root_cpu_cached;
    return gfx->root;
 }
 
@@ -1370,6 +1418,14 @@ struct hk_compute_state {
     * Lives on the command buffer so it survives CS splits and
     * merge_control_streams. */
    bool cdm_barrier_pending;
+   /* True when the pending barrier requires the full default CDM barrier word
+    * (0x1ff, with USC/PBE/texture maintenance) rather than the pure compute
+    * SSBO word (0x160). */
+   bool cdm_barrier_full_needed;
+   /* True if any launch in the open CDM stream used images, textures, or
+    * samplers (including bindless), so Vulkan 1.0 SHADER_READ/WRITE barriers
+    * keep the default word. */
+   bool cdm_stream_has_images;
 };
 
 /*
@@ -1426,6 +1482,11 @@ struct hk_cs {
 
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
+
+   /* The command buffer whose recording holds the control stream at addr,
+    * when that is not cmd: a submission's render packet runs the first
+    * member's stream (hk_render_pack_init()). */
+   struct hk_cmd_buffer *stream_owner;
 
    /* Data master */
    enum hk_cs_type type;
@@ -1570,6 +1631,23 @@ struct hk_cs {
     * descriptor sets bound for graphics need not end an ordered continuation
     * (hk_m5_attachments_exclude_descriptors()). */
    bool m5_layout_proof;
+
+   /* A draw recorded into this stream could break the memory equivalence of
+    * an ordered continuation (hk_m5_ordered_draw_hazard()): transform
+    * feedback, conditional rendering, software or mesh stages, or adjacency.
+    * Submit-time render packing (hk_render_pack.h) continues across an
+    * ordered dependency only into and out of streams without one. */
+   bool render_pack_unsafe;
+
+   /* A submit-time render packet: how many command buffers it runs. */
+   uint16_t render_pack_members;
+
+   /* Colour attachments whose load and store hk_g17p_elide_untouched_color()
+    * dropped from this stream's tile programs. Two streams' programs are the
+    * same programs, recorded in two command buffers, when their passes have
+    * the same attachments and operations and this mask is the same
+    * (hk_render_pack_streams_match()). */
+   uint8_t render_pack_elided;
 
    /* Scratch requirements */
    struct {
@@ -1764,10 +1842,16 @@ struct hk_cs {
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
     * kernel writes both from the firmware's native pass record.
+    *
+    * vtx_end, render only: the vertex end, for a command buffer's leading
+    * top-of-pipe timestamp (hk_sync_write_timestamp()). Like every end stamp
+    * it is latched after the command's barriers resolve, here those of the
+    * vertex half.
     */
    struct {
       struct agx_timestamp_req start;
       struct agx_timestamp_req end;
+      struct agx_timestamp_req vtx_end;
    } timestamp;
 
    /* G17P and M5: timestamp.start came from a leading TOP_OF_PIPE write on a
@@ -1777,7 +1861,8 @@ struct hk_cs {
 
    /* Render only: occlusion availability slots written by the kernel at
     * retirement, indexed vertex start, vertex end, fragment start, fragment
-    * end. Slots 0 and 3 are only used when timestamp.start/end are not. */
+    * end. Slots 0, 1 and 3 are only used when timestamp.start, vtx_end and
+    * end are not. */
    struct agx_timestamp_req oq_stamp[4];
 
    /* G17P query commands observe timestamp writes from earlier streams.
@@ -2256,6 +2341,10 @@ struct hk_cmd_buffer {
       struct hk_rendering_state render;
    } pass_merge;
 
+   /* How the command buffer begins and ends, for submit-time render packing
+    * (hk_render_pack.h). */
+   struct hk_render_pack_edges render_pack;
+
    /* Per-recording compute group-count cache (384 B) lives outside `state` so
     * empty and graphics-only command buffer resets skip zeroing it. */
    struct hk_group_count_cache_entry {
@@ -2285,6 +2374,8 @@ struct hk_cmd_buffer {
          struct hk_image *image;
          VkImageAspectFlags aspects;
          VkClearValue value;
+         bool from_gfx;
+         struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
       bool deferred_clear_flushing;
@@ -2310,16 +2401,18 @@ struct hk_cmd_buffer {
        * hk_resolve_pending_oq_available(). */
       struct hk_cs *oq_pending_render;
 
-      /* AGX3: the last render pass instance stored a whole depth-only image
-       * that nothing recorded since may have read. A later instance that
-       * clears the whole image, or does not care about its contents, makes
-       * that store dead (hk_take_pending_z_store()). Kept across exactly the
-       * commands deferred clears survive (deferred_clear_hold). */
+      /* AGX3: the last render pass instance stored a whole depth/stencil image
+       * that nothing recorded since may have read. A later instance or clear
+       * that overwrites depth and/or stencil over the whole image makes those
+       * aspect stores dead (hk_take_pending_z_store()). Kept across exactly
+       * the commands deferred clears survive (deferred_clear_hold). */
       struct hk_pending_z_store {
          struct hk_cs *cs;
          const struct hk_image *image;
-         struct agx_zls_control_packed zls_control;
-         bool process_empty_tiles;
+         VkImageAspectFlags aspects;
+         bool empty_tiles_other;
+         bool empty_tiles_z;
+         bool empty_tiles_s;
       } pending_z_store;
 
       /* M5: the open render stream is an ordered continuation (hk_cs::
@@ -2732,6 +2825,12 @@ struct agx_ptr hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
                                        uint32_t size, uint32_t alignment,
                                        enum hk_cmd_bo_type type);
 
+struct agx_ptr hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                                              struct hk_uploader *uploader,
+                                              uint32_t size, uint32_t alignment,
+                                              enum hk_cmd_bo_type type,
+                                              bool *cpu_cached_out);
+
 /* Bump allocation from the uploader's current BO; a new BO or a large
  * allocation takes hk_pool_alloc_from_slow(). */
 static inline struct agx_ptr
@@ -2751,6 +2850,28 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    }
 
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_from_cached(struct hk_cmd_buffer *cmd,
+                          struct hk_uploader *uploader, uint32_t size,
+                          uint32_t alignment, enum hk_cmd_bo_type type,
+                          bool *cpu_cached_out)
+{
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         cpu_cached_out);
 }
 
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
@@ -2874,15 +2995,36 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
 
-/* The depth image of the pending store is overwritten as a whole before
- * anything read it: the store is dead (see hk_take_pending_z_store()). */
+/* Aspects of the depth/stencil image of the pending store are overwritten as a
+ * whole before anything read them: drop those aspect stores (see
+ * hk_take_pending_z_store()). */
 static inline void
-hk_kill_pending_z_store(struct hk_cmd_buffer *cmd)
+hk_kill_pending_z_store_aspects(struct hk_cmd_buffer *cmd,
+                                VkImageAspectFlags kill_aspects)
 {
    struct hk_pending_z_store *p = &cmd->state.pending_z_store;
-   p->cs->cr.zls_control = p->zls_control;
-   p->cs->cr.process_empty_tiles = p->process_empty_tiles;
-   p->cs = NULL;
+   const VkImageAspectFlags kill = p->aspects & kill_aspects;
+   if (!p->cs || !kill)
+      return;
+
+   agx_unpack(NULL, &p->cs->cr.zls_control, ZLS_CONTROL, control);
+   if (kill & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      control.z_store = false;
+      p->empty_tiles_z = false;
+   }
+   if (kill & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      control.s_store = false;
+      p->empty_tiles_s = false;
+   }
+   agx_pack(&p->cs->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg = control;
+   }
+
+   p->aspects &= ~kill;
+   p->cs->cr.process_empty_tiles =
+      p->empty_tiles_other || p->empty_tiles_z || p->empty_tiles_s;
+   if (!p->aspects)
+      p->cs = NULL;
 }
 void hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
                                     uint64_t size);
@@ -3100,6 +3242,16 @@ hk_bound_fs(struct hk_cmd_buffer *cmd)
                         cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
+/* The root prefix a launch of s reads from: its trimmed size, or the whole
+ * table when it was not trimmed. Every root uploaded for s holds at least
+ * this much. */
+static inline uint32_t
+hk_shader_root_size(const struct hk_shader *s)
+{
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   return s->root_descriptor_size ? MIN2(s->root_descriptor_size, full) : full;
+}
+
 static inline size_t
 hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
 {
@@ -3280,6 +3432,13 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
  * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
+/* Record a non-native pipeline barrier against the open compute stream.
+ * Returns true when the caller must end the open compute stream (non-AGX2
+ * command streams such as G18G/HAL300, fullcdmbarrier, or an open graphics
+ * batch). */
+bool hk_cdm_record_pipeline_barrier(struct hk_cmd_buffer *cmd,
+                                    const VkDependencyInfo *dep);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -3454,11 +3613,27 @@ hk_stat_enabled(uint64_t addr)
    return addr != AGX_SCRATCH_PAGE_ADDRESS;
 }
 
+/* A shader part stored in the disk cache (hk_cmd_draw.c) is its
+ * agx_shader_info followed by the binary. The cache does not authenticate
+ * what it returns, so a record whose info does not fit its binary or binding
+ * array (agx_shader_part_info_valid()) yields NULL: a miss, and the part is
+ * rebuilt. The part and its binary are owned by mem_ctx and malloc. */
+struct agx_shader_part *hk_part_from_blob(const uint8_t *data, size_t size,
+                                          void *mem_ctx);
+
 /* AGX3 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
  * while an ended instance is still continuable decides whether the next one
  * may continue in its stream. */
 void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
+
+/* Submit-time render packing (hk_render_pack.h, hk_cmd_draw.c): a pipeline
+ * barrier beside the command buffer's first or last render pass instance
+ * (and its end), and the edges of a command buffer whose recording ends. */
+void hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info);
+void hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd);
+void hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd);
 
 /* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
  * break its memory equivalence (reason names the command). */
@@ -3799,18 +3974,23 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_dispatch_g17g_native(cmd, cs, s, grid, local_size);
       return;
    }
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
-      return;
-   }
-   if (agx_chip_native_agx3(dev->dev.chip)) {
-      hk_reserve_scratch(cmd, cs, s);
-      hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   if (m5 || agx_chip_native_agx3(dev->dev.chip)) {
+      if (m5) {
+         hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
+      } else {
+         hk_reserve_scratch(cmd, cs, s);
+         hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+      }
       /* Software graphics stages communicate through memory: VS outputs,
        * geometry counts and XFB bases are consumed by the next dispatch.
        * The application cannot supply barriers between these internal
        * stages. Preserve the AGX2 flush-after-launch contract, including
-       * indirect launches, by strengthening the native ordering barrier. */
+       * indirect launches, by strengthening the native ordering barrier.
+       * Every M5 part needs this as G17P does. On M5 the flush has memory
+       * scope (hk_cdm_cache_flush(): 0x6000157c, where G17P writes the plain
+       * 0x60001560); without it, tessellated draws of the render CTS fail
+       * on the M5 Ultra (G17D). */
       if (s->info.stage != MESA_SHADER_COMPUTE) {
          hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_cache_flush(dev, cs);
@@ -3824,6 +4004,14 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
    }
    uint32_t usc = uploaded;
+
+   if (s->info.reads_images || s->b.info.texture_state_count != 0 ||
+       s->b.info.sampler_state_count != 0 || s->b.info.uses_sampler_heap ||
+       s->b.info.uses_txf || s->info.stage != MESA_SHADER_COMPUTE ||
+       cmd->in_meta) {
+      cmd->state.cs.cdm_barrier_full_needed = true;
+      cmd->state.cs.cdm_stream_has_images = true;
+   }
 
    hk_reserve_scratch(cmd, cs, s);
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);

@@ -38,6 +38,7 @@
 #include <fcntl.h>
 
 #include "loader.h"
+#include "asahi/lib/agx_drm_names.h"
 #include "target-helpers/drm_helper_public.h"
 #include "frontend/drm_driver.h"
 #include "pipe_loader_priv.h"
@@ -370,8 +371,7 @@ pipe_loader_get_compatible_render_capable_device_fds(int kms_only_fd, unsigned i
    struct pipe_loader_device *dev;
    const char * const drivers[] = {
 #if defined GALLIUM_ASAHI
-      "aurora",
-      "asahi",
+      AGX_DRM_DRIVER_NAMES,
 #endif
 #if defined GALLIUM_ETNAVIV
       "etnaviv",

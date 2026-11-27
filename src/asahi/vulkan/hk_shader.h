@@ -35,6 +35,14 @@
 
 #include "vk_shader.h"
 
+static inline bool
+hk_local_read_tilebuffer(enum agx_chip chip)
+{
+   return agx_chip_local_read_tilebuffer(chip) ||
+          (agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2);
+}
+
 struct hk_physical_device;
 struct hk_compute_pair_info;
 struct hk_compute_pair_producer;
@@ -179,6 +187,9 @@ struct hk_shader_info {
    bool agx3_gen1_fragment_rq;
    /* HK_ROOT_READS_* classes of root bytes the shader may read. */
    uint8_t agx3_root_reads;
+   /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
+    * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
+   uint64_t agx3_dynbuf_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -249,6 +260,7 @@ struct hk_local_read_shader_meta {
    struct agx_fs_epilog_link_info epilog_key;
    uint8_t set_count;
    uint8_t agx3_root_reads;
+   uint64_t agx3_dynbuf_reads;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
@@ -320,9 +332,12 @@ struct hk_shader {
    uint64_t constant_data_id;
 
    /* BO for any uploaded shader part */
-   /* Code heap chunk holding the binary, at bo_offset. */
+   /* Code heap chunk holding the binary from byte bo_skip on, at bo_offset. */
    struct agx_bo *bo;
    uint32_t bo_offset;
+
+   /* Leading bytes of the binary left out of the upload (hk_upload_code()). */
+   uint32_t bo_skip;
 
    /* Cache of fast linked variants */
    struct {
@@ -388,10 +403,12 @@ struct hk_shader {
    bool preamble_cs_attempted;
 };
 
+/* The address byte 0 of the binary would have. Only the bytes from bo_skip on
+ * are uploaded, so address no offset below that. */
 static inline uint64_t
 hk_shader_code_va(const struct hk_shader *s)
 {
-   return s->bo->va->addr + s->bo_offset;
+   return s->bo->va->addr + s->bo_offset - s->bo_skip;
 }
 
 enum hk_vs_variant {
@@ -610,6 +627,12 @@ struct hk_api_shader {
    struct hk_shader variants[];
 };
 
+/* Deserialize NIR that a shader keeps in a blob of its own (from the shader
+ * binary or the cache) to build from later. NULL unless the blob holds exactly
+ * one shader of `stage` with an entrypoint. */
+nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
+                                      size_t size, mesa_shader_stage stage);
+
 /* The custom-border-emulating twin of a shader with a border source, built
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
@@ -712,6 +735,8 @@ void hk_prelink_pipeline_fragment(struct hk_device *dev,
 void hk_prelink_object_fragment(struct hk_device *dev,
                                 struct hk_api_shader *fs);
 void hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs,
+                       const struct hk_api_shader *fs,
+                       const struct vk_graphics_pipeline_state *state,
                        bool hw_program, bool sw_program);
 
 static inline struct hk_shader *

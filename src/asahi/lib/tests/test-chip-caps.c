@@ -49,7 +49,9 @@ static const unsigned all_caps =
    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
    AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
-   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT;
+   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
+   AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |
+   AGX_CAP_FOLD_SHARED_OFFSETS;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -108,15 +110,18 @@ test_unknown_has_none(void)
       CHECK(!agx_chip_has_cap((enum agx_chip)i, 0));
 }
 
-/* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled only on G17P until
- * per-generation hardware A/B benchmarks and CTS rows qualify other parts. */
+/* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled on G17P and M5 (G17G,
+ * G17S, G17C); G15, G16, G18G, and AGX2 stay off until per-generation
+ * hardware A/B benchmarks and CTS rows qualify them. */
 static void
 test_coalesce_pure_global_workgroups(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
-                    (c == AGX_CHIP_G17P),
+                    expected,
                  c);
    }
 }
@@ -136,16 +141,35 @@ test_cdm_war_weak_barrier(void)
    }
 }
 
-/* AGX_CAP_MOD3_REG_BANK_RA is enabled only on G17P until per-generation
- * hardware A/B benchmarks and CTS rows qualify other parts. */
+/* AGX_CAP_MOD3_REG_BANK_RA is qualified on G17P and M5 (G17G/G17S/G17C);
+ * G15, G16, G18G, and AGX2 stay off until per-generation hardware A/B
+ * benchmarks and CTS rows qualify them. */
 static void
 test_mod3_reg_bank_ra(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_MOD3_REG_BANK_RA) ==
-                    (c == AGX_CHIP_G17P),
-                 c);
+      const bool expected = c == AGX_CHIP_G15G || c == AGX_CHIP_G15S ||
+                            c == AGX_CHIP_G15C || c == AGX_CHIP_G16G ||
+                            c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_MOD3_REG_BANK_RA) == expected, c);
+   }
+}
+
+/* G17D partitions AGX_CAPS_M5 into measured and excluded capabilities so any
+ * new M5 capability fails this test until assigned to one set. */
+static void
+test_g17d_partitions_m5(void)
+{
+   CHECK((AGX_CAPS_G17D_MEASURED & AGX_CAPS_G17D_EXCLUDED) == 0);
+   CHECK((AGX_CAPS_G17D_MEASURED | AGX_CAPS_G17D_EXCLUDED) == AGX_CAPS_M5);
+   for (unsigned bit = 1; bit; bit <<= 1) {
+      if (!(all_caps & bit))
+         continue;
+      CHECK_CHIP(agx_chip_has_cap(AGX_CHIP_G17D, bit) ==
+                    ((AGX_CAPS_G17D_MEASURED & bit) != 0),
+                 AGX_CHIP_G17D);
    }
 }
 
@@ -157,7 +181,7 @@ test_gen10_2d_compression(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17G || c == AGX_CHIP_G17S ||
-                            c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17C || c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_GEN10_2D_COMPRESSION) == expected,
                  c);
    }
@@ -173,7 +197,7 @@ test_sparse_binding(void)
       const bool expected =
          c == AGX_CHIP_G13G || c == AGX_CHIP_G13X || c == AGX_CHIP_G14G ||
          c == AGX_CHIP_G14X || c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-         c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+         c == AGX_CHIP_G17S || c == AGX_CHIP_G17C || c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_SPARSE_BINDING) == expected, c);
    }
 }
@@ -249,10 +273,28 @@ test_signed_zero_minmax_select(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+      const bool expected = c == AGX_CHIP_G15G || c == AGX_CHIP_G15S ||
+                            c == AGX_CHIP_G15C || c == AGX_CHIP_G16G ||
+                            c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
                             c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) ==
                     expected,
+                 c);
+   }
+}
+
+/* AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED and AGX_CAP_FOLD_SHARED_OFFSETS are
+ * enabled on the measured G13 rows (G13G, G13X) only. */
+static void
+test_g13_compute_codegen_caps(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED) ==
+                    expected,
+                 c);
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_FOLD_SHARED_OFFSETS) == expected,
                  c);
    }
 }
@@ -266,6 +308,7 @@ main(void)
    test_coalesce_pure_global_workgroups();
    test_cdm_war_weak_barrier();
    test_mod3_reg_bank_ra();
+   test_g17d_partitions_m5();
    test_gen10_2d_compression();
    test_sparse_binding();
    test_zls_full_render_bounds();
@@ -273,6 +316,7 @@ main(void)
    test_hal200_lossless_compression();
    test_hal200_msaa_color_compression();
    test_signed_zero_minmax_select();
+   test_g13_compute_codegen_caps();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

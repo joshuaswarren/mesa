@@ -22,16 +22,16 @@ static const char maps[] =
    "aaaa0000-aaab0000 r-xp 00000000 103:05 1234                       /usr/bin/app\n"
    "aaab0000-aaac0000 rw-p 00010000 103:05 1234                       /usr/bin/app\n"
    "aaac0000-aaae0000 rw-p 00000000 00:00 0                          [heap]\n"
-   "ffff00000000-ffff00100000 rw-p 00000000 00:00 0 \n"
-   "ffff00100000-ffff00200000 rw-p 00000000 00:00 0                  [anon:glibc: malloc]\n"
-   "ffff00300000-ffff00400000 rw-s 00000000 00:01 77                 /memfd:pool (deleted)\n"
-   "ffff00400000-ffff00500000 rw-s 100000000 00:0e 12                /dev/dri/renderD128\n"
-   "ffff00500000-ffff00600000 r--p 00000000 103:05 99                /data/weights with space.bin\n"
-   "ffff00600000-ffff00700000 rw-p 00000000 00:05 4                  /dev/zero\n"
-   "ffff00700000-ffff00800000 rw-s 00000000 00:01 5                  /SYSV00000000 (deleted)\n"
-   "ffff00800000-ffff00900000 rw-p 00000000 00:00 0\n"
-   "ffff00900000-ffff00a00000 rw-s 00000000 00:0f 3                  anon_inode:dmabuf\n"
-   "ffff00a00000-ffff00b00000 rw-p 00000000 00:00 0                  [stack]\n";
+   "b0000000-b0100000 rw-p 00000000 00:00 0 \n"
+   "b0100000-b0200000 rw-p 00000000 00:00 0                  [anon:glibc: malloc]\n"
+   "b0300000-b0400000 rw-s 00000000 00:01 77                 /memfd:pool (deleted)\n"
+   "b0400000-b0500000 rw-s 100000000 00:0e 12                /dev/dri/renderD128\n"
+   "b0500000-b0600000 r--p 00000000 103:05 99                /data/weights with space.bin\n"
+   "b0600000-b0700000 rw-p 00000000 00:05 4                  /dev/zero\n"
+   "b0700000-b0800000 rw-s 00000000 00:01 5                  /SYSV00000000 (deleted)\n"
+   "b0800000-b0900000 rw-p 00000000 00:00 0\n"
+   "b0900000-b0a00000 rw-s 00000000 00:0f 3                  anon_inode:dmabuf\n"
+   "b0a00000-b0b00000 rw-p 00000000 00:00 0                  [stack]\n";
 
 static void
 test_maps(void)
@@ -39,36 +39,32 @@ test_maps(void)
    /* Private anonymous: plain, [heap], named, and across adjacent ones. */
    assert(classify(maps, 0xaaac0000, 0xaaae0000) == HK_HOST_MAP_PRIVATE_ANON);
    assert(classify(maps, 0xaaad0000, 0xaaad4000) == HK_HOST_MAP_PRIVATE_ANON);
-   assert(classify(maps, 0xffff00000000, 0xffff00100000) ==
-          HK_HOST_MAP_PRIVATE_ANON);
-   assert(classify(maps, 0xffff000f0000, 0xffff00110000) ==
-          HK_HOST_MAP_PRIVATE_ANON);
+   assert(classify(maps, 0xb0000000, 0xb0100000) == HK_HOST_MAP_PRIVATE_ANON);
+   assert(classify(maps, 0xb00f0000, 0xb0110000) == HK_HOST_MAP_PRIVATE_ANON);
 
    /* Private mappings of a file: page cache until written. */
    assert(classify(maps, 0xaaab0000, 0xaaac0000) == HK_HOST_MAP_PRIVATE);
-   assert(classify(maps, 0xffff00500000, 0xffff00504000) ==
-          HK_HOST_MAP_PRIVATE);
+   assert(classify(maps, 0xb0500000, 0xb0504000) == HK_HOST_MAP_PRIVATE);
    assert(classify(maps, 0xaaab8000, 0xaaac8000) == HK_HOST_MAP_PRIVATE);
 
    /* Shared, device, special and absent memory. */
-   assert(classify(maps, 0xffff00300000, 0xffff00304000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00400000, 0xffff00404000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00600000, 0xffff00604000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00700000, 0xffff00704000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00900000, 0xffff00904000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00a00000, 0xffff00a04000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0300000, 0xb0304000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0400000, 0xb0404000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0600000, 0xb0604000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0700000, 0xb0704000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0900000, 0xb0904000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0a00000, 0xb0a04000) == HK_HOST_MAP_OTHER);
    /* Private anonymous, then the gap before a shared mapping. */
-   assert(classify(maps, 0xffff001f0000, 0xffff00310000) == HK_HOST_MAP_OTHER);
-   /* A gap: [ffff00200000, ffff00300000) is unmapped. */
-   assert(classify(maps, 0xffff00100000, 0xffff00300000) == HK_HOST_MAP_OTHER);
-   assert(classify(maps, 0xffff00200000, 0xffff00204000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb01f0000, 0xb0310000) == HK_HOST_MAP_OTHER);
+   /* A gap: [b0200000, b0300000) is unmapped. */
+   assert(classify(maps, 0xb0100000, 0xb0300000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0200000, 0xb0204000) == HK_HOST_MAP_OTHER);
    /* Past the last line, and empty. */
-   assert(classify(maps, 0xffff00b00000, 0xffff00c00000) == HK_HOST_MAP_OTHER);
+   assert(classify(maps, 0xb0b00000, 0xb0c00000) == HK_HOST_MAP_OTHER);
    assert(classify(maps, 0x1000, 0x2000) == HK_HOST_MAP_OTHER);
    assert(classify(maps, 0xaaac0000, 0xaaac0000) == HK_HOST_MAP_OTHER);
    /* An anonymous mapping with no trailing pathname padding. */
-   assert(classify(maps, 0xffff00800000, 0xffff00900000) ==
-          HK_HOST_MAP_PRIVATE_ANON);
+   assert(classify(maps, 0xb0800000, 0xb0900000) == HK_HOST_MAP_PRIVATE_ANON);
 
    /* Unparseable lines decide nothing in favour of the range. */
    assert(classify("garbage\n", 0x1000, 0x2000) == HK_HOST_MAP_OTHER);

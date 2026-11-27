@@ -71,6 +71,8 @@ struct hk_agx3_g17p_graphics_program_desc {
    bool patchable;
    struct agx_ioto_constant_program constant_program;
    const struct agx3_cprog_inputs *cprog_inputs;
+   /* agx3_g17p_graphics_program_desc::usc_clusters */
+   unsigned usc_clusters;
 };
 
 #define HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE 6144u
@@ -201,9 +203,10 @@ hk_agx3_g17p_graphics_live_set_count(const uint64_t *halfs, unsigned words,
 }
 
 /* Load one root descriptor followed by every descriptor-set pointer named by
- * the shader's pipeline layout. */
+ * the shader's pipeline layout. Refused unless the root_size_B bytes uploaded
+ * at root_va hold all of them. */
 bool hk_agx3_g17p_root_range(uint16_t start_halfs, uint8_t set_count,
-                             uint64_t root_va,
+                             uint64_t root_va, uint32_t root_size_B,
                              struct agx3_ioto_uniform_range *range);
 
 /* Publish promoted constants through G17P's dword-granular Ioto loader.

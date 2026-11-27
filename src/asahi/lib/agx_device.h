@@ -23,6 +23,7 @@
 
 #include "agx_bo.h"
 #include "agx_chip.h"
+#include "agx_drm_names.h"
 #include "agx_pack.h"
 #include "decode.h"
 #include "layout.h"
@@ -35,20 +36,6 @@
 struct vdrm_device;
 struct asahi_ccmd_submit_res;
 #endif
-
-/* DRM name of the native kernel driver. Kernels before the Aurora rename
- * report "asahi", so both are accepted and Mesa and the kernel can update in
- * either order.
- */
-#define AGX_DRM_DRIVER_NAME        "aurora"
-#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
-
-static inline bool
-agx_is_native_drm_driver(const char *name)
-{
-   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
-                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
-}
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
@@ -561,6 +548,31 @@ agx_has_soft_fault(const struct agx_device *dev)
           !(dev->debug & AGX_DBG_NOSOFT);
 }
 
+/*
+ * Whether every M5 compute barrier takes memory scope: every launch's ordering
+ * record (0x6000017c) and every flush recorded for a dependency, whatever
+ * memory the device can alias (hk_cdm_alias_scope()). Selected by what the
+ * kernel reports, a GPU of more than one die, as agx_gather_device_key()
+ * already selects multi-die coherency, and only where the scoped ordering
+ * record is grounded for the chip.
+ *
+ * On the M5 Ultra (two dies, J775D), with plain barriers wherever no memory
+ * aliases, 6 cases of a 117-case compute CTS subset, 2059 to 2160 of 8520
+ * ycbcr cases (a different set from run to run) and 270 of 5310
+ * host_image_copy cases failed, and llama.cpp's output was wrong; with memory
+ * scope on every barrier all of them pass. Why it needs the scope is not
+ * established: the die count is the property that separates it from the M5
+ * parts that have not shown the failure, not a measured cause. An M5 Pro or
+ * M5 Max run of those six cases under plain barriers would say whether the
+ * line is the dies or the M5 family.
+ */
+static inline bool
+agx_cdm_ordering_memory_scope(const struct agx_device *dev)
+{
+   return dev->params.num_dies > 1 && agx_chip_g17_m5(dev->chip) &&
+          agx_chip_has_record(dev->chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY);
+}
+
 /* Base of the G17P USC exec window.  MEASURED RULE: bit 40 of the program VA
  * must be set.  Do not lower this.  See the note in agx_open_device(). */
 #define AGX_G17P_USC_WINDOW_BASE UINT64_C(0x10000000000)
@@ -686,6 +698,40 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
       .vdm_barrier = barrier_vdm,
       .cdm_barrier = barrier_cdm,
    };
+}
+
+/* Sibling kernel queues for one context's compute work. Firmware runs the
+ * compute kicks of one context's kernel queues at the same time, so
+ * independent compute submissions spread over several of them overlap
+ * instead of running back to back. Borealis measured three queues as the
+ * best split, and a gain only with at least two earlier submissions still in
+ * flight: with one, both kicks run at half speed and finish together
+ * (hk_queue.c). Overlap pays where one dispatch cannot fill the GPU's memory
+ * pipeline and costs where two compete for the same execution units: on the
+ * A18 Pro a stream of 4M-thread copy dispatches went 42 % faster, 262144-
+ * thread FMA dispatches broke even (+0.3 %) and 65536-thread divergent ones
+ * lost 4.6 %, so dispatches below 262144 threads stay on one queue.
+ */
+#define AGX_SIBLING_COMPUTE_QUEUES      3
+#define AGX_SIBLING_COMPUTE_MIN_IN_FLIGHT 2
+#define AGX_SIBLING_COMPUTE_MIN_THREADS (1u << 18)
+
+/* Whether the kernel lets userspace spread a context's compute over sibling
+ * kernel queues and keep completion ordered: independent queues, cumulative
+ * output signals (a submission's outputs include the earlier points of a
+ * private timeline) and input syncs that every command of a submission
+ * waits on. A kernel that already spreads one queue's compute over firmware
+ * channels itself (COMPUTE_MULTI_CHANNEL) needs no siblings.
+ */
+static inline bool
+agx_sibling_compute_supported(const struct agx_device *dev)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
+                             DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
+                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) &&
+          (dev->params.features & required) == required &&
+          !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
 }
 
 /*

@@ -2075,16 +2075,11 @@ agx_gather_device_key(struct agx_device *dev)
                     dev->params.num_clusters_total > 1) ||
                    dev->params.num_dies > 1;
 
-   /* G18G compiles as G17G and re-encodes as agx3d; see emit_agx3d. */
-   const bool g18g = dev->chip == AGX_CHIP_G18G;
-   const enum agx_chip chip = g18g ? AGX_CHIP_G17G : dev->chip;
-
-   return (struct agx_device_key){
-      .chip = chip,
-      .encoding = agx_chip_isa_encoding(chip),
+   struct agx_device_key key = {
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
-      .emit_agx3d = g18g,
-      .shader_quad_control = agx_chip_agx3_shader_quad_control(chip),
    };
+   agx_device_key_set_target(&key, dev->chip);
+   key.shader_quad_control = agx_chip_agx3_shader_quad_control(key.chip);
+   return key;
 }

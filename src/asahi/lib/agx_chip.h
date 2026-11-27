@@ -177,6 +177,10 @@ enum agx_chip_record {
    AGX_RECORD_PPP_VIEWPORT = 1 << 21,
    AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
    AGX_RECORD_VDM_STREAM_LINK_AGX2 = 1 << 23,
+   /* The CDM ordering record (flags 0) with memory scope, 0x6000017c, which
+    * agx_cdm_ordering_memory_scope() gives every M5 launch on a multi-die
+    * device. Hardware results on G17D. */
+   AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY = 1 << 24,
 };
 
 /* AGX2 chips that use the genxml 8-byte non-returning VDM_STREAM_LINK. */
@@ -233,6 +237,8 @@ enum agx_chip_quirk {
    AGX_QUIRK_M5_PATHS = 1 << 12,
    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
    AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
+   AGX_QUIRK_M5_LAYER_OPERAND = 1 << 15,
+   AGX_QUIRK_GL_THROUGH_ZINK = 1 << 16,
 };
 
 /* What the five native AGX3 chips share. */
@@ -267,8 +273,9 @@ enum agx_chip_quirk {
  * not inferred. The Mac G15 parts execute AGX3b; G15G additionally needs
  * explicit scheduling nops. Every G16 part executes AGX3b.
  *
- * G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5 G/S/C
- * parts use AGX3c.
+ * G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5 G/S/C/D
+ * parts use AGX3c. G17D is the M5 Ultra: T6050 with two dies and eight
+ * clusters.
  *
  * G17P is an instruction-set and firmware-HAL profile (AGX3b shaders, HAL200
  * firmware interface), not one SoC. agx_chip_from_params() maps three SoCs to
@@ -339,14 +346,20 @@ enum agx_chip_quirk {
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
      AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS |                \
-        AGX_QUIRK_HW_TXF_BOUNDS,                                               \
+        AGX_QUIRK_HW_TXF_BOUNDS | AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,     \
      __VA_ARGS__)                                                              \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_M5_LAYER_OPERAND |                                           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
+   X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
+     AGX_RECORDS_M5 | AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY,                    \
+     AGX_QUIRK_GL_THROUGH_ZINK, __VA_ARGS__)                                   \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
@@ -705,6 +718,7 @@ agx_chip_from_identity(const struct drm_asahi_params_global *params)
       case 'G': return AGX_CHIP_G17G;
       case 'S': return AGX_CHIP_G17S;
       case 'C': return AGX_CHIP_G17C;
+      case 'D': return AGX_CHIP_G17D;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 18:
@@ -717,6 +731,40 @@ agx_chip_from_identity(const struct drm_asahi_params_global *params)
    default:
       return AGX_CHIP_UNKNOWN;
    }
+}
+
+/* The chip a GPU device tree compatible of the form "apple,agx-g<generation>
+ * <variant>" names ("apple,agx-g17d" is G17D), through agx_chip_from_identity()
+ * given the generation and variant alone; UNKNOWN for any other string, such
+ * as an SoC compatible ("apple,agx-t6050"). A compatible carries no SoC ID, so
+ * where agx_chip_from_identity() also reads the kernel's chip ID (the M4 Pro
+ * and M4 Max on the G17 runtime, G17P there) this gives the generation's own
+ * row (G16S, G16C): for a chip-wide bit only, such as
+ * agx_chip_gl_through_zink(), which none of those rows has. For code that
+ * reads the device tree without opening the device, such as the loader.
+ */
+static inline enum agx_chip
+agx_chip_from_compatible(const char *compatible)
+{
+   static const char prefix[] = "apple,agx-g";
+   struct drm_asahi_params_global params = {0};
+   const char *c = compatible;
+
+   for (unsigned i = 0; i < sizeof(prefix) - 1; ++i, ++c) {
+      if (!c || *c != prefix[i])
+         return AGX_CHIP_UNKNOWN;
+   }
+   if (*c < '1' || *c > '9')
+      return AGX_CHIP_UNKNOWN;
+   for (; *c >= '0' && *c <= '9'; ++c) {
+      params.gpu_generation = params.gpu_generation * 10 + (*c - '0');
+      if (params.gpu_generation > 99)
+         return AGX_CHIP_UNKNOWN;
+   }
+   if (*c < 'a' || *c > 'z' || c[1] != '\0')
+      return AGX_CHIP_UNKNOWN;
+   params.gpu_variant = *c - 'a' + 'A';
+   return agx_chip_from_identity(&params);
 }
 
 #ifdef __cplusplus
@@ -758,6 +806,13 @@ agx_chip_command_stream_generation(enum agx_chip chip)
  * agx_cdm_barrier() emitter produces. */
 #define AGX_CDM_BARRIER_FULL_WORD 0xfffffu
 
+/* Pure compute-to-compute SSBO CDM barrier word on AGX2: bits {5,6,8}
+ * (cross-core L1/L2 memory coherency + execution drain) without bit 3
+ * (USC cache invalidate) or PBE/texture-cache maintenance bits {0,1,2,4,7}.
+ * Valid only between compute launches in the same open CDM stream when no
+ * images, textures, samplers, UBOs, transfers, or host accesses intervene. */
+#define AGX_CDM_BARRIER_SSBO_WORD 0x160u
+
 /* The default flag word of the AGX2 CDM barrier record Borealis emits at a
  * tracked compute dependency (hk_cdm_flush()). The reduced word 0x1ff
  * (unk_0..8, PBE/texture-cache maintenance included) is the set measured on
@@ -777,9 +832,21 @@ agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
    return AGX_CDM_BARRIER_FULL_WORD;
 }
 
+/* The reduced AGX2 CDM barrier word for pure compute-to-compute storage-buffer
+ * dependencies inside an open CDM stream (hk_CmdPipelineBarrier2 /
+ * hk_cdm_flush()). Derived from the device's measured default word so no chip
+ * list is added: parts already on the 0x1ff default word drop bit 3 (USC cache
+ * invalidate) and PBE/texture-cache maintenance bits {0,1,2,4,7} to emit
+ * 0x160; parts still on the full word keep their default word unchanged. */
+static inline uint32_t
+agx2_cdm_barrier_ssbo_word(uint32_t default_word)
+{
+   return default_word == 0x1ffu ? AGX_CDM_BARRIER_SSBO_WORD : default_word;
+}
+
 /* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
  * full word once the device holds a sparse resource or under
- * fullcdmbarrier, the chip's default word otherwise. */
+ * fullcdmbarrier, the caller-selected chip word otherwise. */
 static inline uint32_t
 agx2_cdm_barrier_emit_word(uint32_t default_word, bool sparse_used,
                            bool force_full)
@@ -823,6 +890,7 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
+ *   - G17D (M5 Ultra) keeps the software rewrite until measured on the J775D.
  *   - G18G uses HAL300 records too, but its out-of-range hardware index
  *     behaviour is unmeasured, so it keeps the software rewrite.
  *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
@@ -958,6 +1026,34 @@ agx_chip_m5_paths(enum agx_chip chip)
 }
 
 /*
+ * Whether an M5-form store to a layer of an array takes a layer operand. The
+ * M5 Max (G17C) does, and its array descriptors keep the array form. The
+ * other M5 parts store the layer as the z coordinate of a 3D store: the
+ * shader packer (agx3_pack_binary.c), Borealis's image views and Gallium's
+ * PBE read this one bit so they cannot disagree, and Borealis's store window
+ * past 2048 slices (hk_nir_lower_descriptors()) follows the image view's
+ * layers_as_3d choice. G18G (compiled as G17G) is outside agx_chip_g17_m5(),
+ * which Borealis also requires; its layered stores are its owner's to settle.
+ */
+static inline bool
+agx_chip_m5_layer_operand(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_M5_LAYER_OPERAND;
+}
+
+/*
+ * Whether GL on this chip runs through zink over Borealis rather than the
+ * asahi Gallium driver, whose paths have not run there: the Gallium screen
+ * refuses the chip (agx_screen_create()), and the loader picks zink for it.
+ * The M5 Ultra (G17D) today.
+ */
+static inline bool
+agx_chip_gl_through_zink(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_GL_THROUGH_ZINK;
+}
+
+/*
  * Chip sets that call sites test without a capability of their own. They say
  * which chips and not why, and they are not interchangeable: three of them
  * are "runs an AGX3 path" with G18G or the M5 parts left out. Each replaced
@@ -1047,6 +1143,18 @@ agx_chip_has_depth_clip_control(enum agx_chip chip)
    return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
 }
 
+/* Whether Borealis enables shader-reconstructed single-plane packed 4:2:2
+ * YCbCr formats (8/10/12/16-bit views backed by plain RGBA word textures and
+ * reconstructed in NIR) and 10/12-bit YCbCr plane UNORM range restoration.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C); AGX2 keeps
+ * its existing path and other HAL300 encodings such as AGX3D (G18G) stay off
+ * until qualified on their hardware. */
+static inline bool
+agx_chip_has_packed_ycbcr(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
 /* Whether hardware ASTC HDR decode is qualified on this chip: AGX2, native
  * AGX3, and M5 (AGX3C/HAL300: G17G/G17S/G17C). Other HAL300 encodings such as
  * AGX3D (G18G) stay off until qualified on their hardware. */
@@ -1096,9 +1204,10 @@ agx_chip_usc_base_page_fill_returns_for(enum agx_chip chip,
  * level-zero extent there (AGX_GEN10_IMAGE_EXTENT_OFFSET), so a constant
  * level-zero textureSize() is one load.
  *
- * True for the M5 Gen10 descriptor (G17G, G17S, G17C): the genxml layout has
- * no field there, Gallium's G17G buffer textures keep their element count in
- * it (AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET), and G17C views carry the extent.
+ * True for the M5 Gen10 descriptor (G17G, G17S, G17C, G17D): the genxml
+ * layout has no field there, Gallium's G17G buffer textures keep their
+ * element count in it (AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET), and G17C views
+ * carry the extent.
  * AGX2 descriptors are 24 bytes and have no such word. Nothing shows that
  * the Gen9 texture unit (G15, G16, G17P) or G18G's ignores it: no producer
  * writes a nonzero value there on either (G17P keeps its buffer metadata in
@@ -1145,6 +1254,8 @@ agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
  *     verification on M5 Pro (G17S) / M5 (G17G) is the merge gate.
  *
  * Off elsewhere:
+ *   - G17D (M5 Ultra) keeps the software predicate until measured on the
+ *     J775D.
  *   - G18G uses the Gen10 descriptor layout too, but its texture lowering
  *     (agx_nir_lower_texture_for_generation) always applies the software
  *     predicate and its behaviour is not measured, so it stays off so that
@@ -1372,9 +1483,9 @@ bool agx_params_driver_supported(
 bool agx_params_g18g_bringup_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S) and M5 Max (T6050, G17C)
- * kernel contracts the driver admits. This is not a declaration of a complete
- * or conformant device path. */
+/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S), M5 Max (T6050, G17C) and M5
+ * Ultra (T6050, G17D) kernel contracts the driver admits. This is not a
+ * declaration of a complete or conformant device path. */
 bool agx_params_m5_supported(
    const struct drm_asahi_params_global *params);
 

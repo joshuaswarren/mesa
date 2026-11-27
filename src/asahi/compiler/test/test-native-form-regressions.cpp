@@ -7491,10 +7491,11 @@ TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
 }
 
 /*
- * Unmodified all-scalar-register F32 FFMA on AGX3B (non-G18G) preserves
- * f16 GPR sources (both SSA normal and precoloured register indices) across
- * all operand slots and packs them via agx3_falu_fma_mod_runtime(). Modified,
- * uniform-mixed, and G18G forms keep explicit f16->f32 widening.
+ * Unmodified all-scalar-register F32 FFMA on AGX3B and AGX3C (non-emit_agx3d)
+ * compute preserves f16 GPR sources (both SSA normal and precoloured register
+ * indices) across all operand slots and packs them via
+ * agx3_falu_fma_mod_runtime(). Modified, uniform-mixed, AGX3C non-compute, and
+ * emit_agx3d forms keep explicit f16->f32 widening.
  */
 TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
 {
@@ -7502,6 +7503,7 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       const char *name;
       enum agx_isa_encoding enc;
       bool emit_agx3d;
+      mesa_shader_stage stage;
       bool precoloured;
       unsigned half_mask;
       bool src_neg;
@@ -7510,26 +7512,28 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       bool expect_native;
    };
    const LowerCase cases[] = {
-      {"agx3b_src0_normal", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
-       false, false, true},
-      {"agx3b_src1_normal", AGX_ISA_ENCODING_AGX3B, false, false, 2u, false,
-       false, false, true},
-      {"agx3b_addend_normal", AGX_ISA_ENCODING_AGX3B, false, false, 4u, false,
-       false, false, true},
-      {"agx3b_dual_normal", AGX_ISA_ENCODING_AGX3B, false, false, 5u, false,
-       false, false, true},
-      {"agx3b_src0_precoloured", AGX_ISA_ENCODING_AGX3B, false, true, 1u, false,
-       false, false, true},
-      {"agx3b_neg_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, true,
-       false, false, false},
-      {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
-       true, false, false},
-      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u,
-       false, false, true, false},
-      {"agx3c_src0_widened", AGX_ISA_ENCODING_AGX3C, false, false, 1u, false,
-       false, false, false},
-      {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, false, 1u, false,
-       false, false, false},
+      {"agx3b_src0_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, false, false, false, true},
+      {"agx3b_src1_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 2u, false, false, false, true},
+      {"agx3b_addend_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 4u, false, false, false, true},
+      {"agx3b_dual_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 5u, false, false, false, true},
+      {"agx3b_src0_precoloured", AGX_ISA_ENCODING_AGX3B, false,
+       MESA_SHADER_COMPUTE, true, 1u, false, false, false, true},
+      {"agx3b_neg_widened", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, true, false, false, false},
+      {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, false, true, false, false},
+      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false,
+       MESA_SHADER_COMPUTE, false, 1u, false, false, true, false},
+      {"agx3c_compute_src0_native", AGX_ISA_ENCODING_AGX3C, false,
+       MESA_SHADER_COMPUTE, false, 1u, false, false, false, true},
+      {"agx3c_vertex_src0_widened", AGX_ISA_ENCODING_AGX3C, false,
+       MESA_SHADER_VERTEX, false, 1u, false, false, false, false},
+      {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, MESA_SHADER_COMPUTE,
+       false, 1u, false, false, false, false},
    };
 
    for (const LowerCase &c : cases) {
@@ -7539,7 +7543,7 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       key.dev.encoding = c.enc;
       key.dev.emit_agx3d = c.emit_agx3d;
       b->shader->key = &key;
-      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->stage = c.stage;
 
       agx_index srcs[3];
       for (unsigned s = 0; s < 3; ++s) {
@@ -8119,6 +8123,38 @@ TEST(NativeForms, M5TaskAndMeshMultisampleFetchLowerAndCompile)
    }
 }
 
+TEST(NativeForms, Agx3cSelectKeepsExplicitCompareModifiers)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C, AGX_ISA_ENCODING_AGX3D}) {
+      SCOPED_TRACE(encoding);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.emit_agx3d = encoding == AGX_ISA_ENCODING_AGX3D;
+      key.dev.encoding = key.dev.emit_agx3d ? AGX_ISA_ENCODING_AGX3C : encoding;
+      key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P :
+                     encoding == AGX_ISA_ENCODING_AGX3D ? AGX_CHIP_G18G :
+                                                         AGX_CHIP_G17S;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index y = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index neg_y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, neg_y, agx_neg(y));
+      agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16),
+                                      x, neg_y, agx_immediate(1),
+                                      agx_immediate(0), AGX_FCOND_LT);
+      agx_unit_test(b, sel->dest[0]);
+
+      agx_optimizer_forward(b->shader);
+      const bool skip_fold = encoding == AGX_ISA_ENCODING_AGX3C;
+      EXPECT_EQ(sel->src[1].neg, !skip_fold);
+      EXPECT_EQ(sel->src[1].value, skip_fold ? neg_y.value : y.value);
+      ralloc_free(mem);
+   }
+}
+
 /* A 16-bit FCMPSEL select immediate must keep raw integer bits unless the
  * optimizer explicitly folded a minifloat into the select slot
  * (fcmpsel_minifloat_select):
@@ -8168,11 +8204,18 @@ TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
          agx_unit_test(b, sel->dest[0]);
          agx_optimizer_forward(b->shader);
          agx_materialize_agx3_alu_constants(b->shader);
-         const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
-         ASSERT_NE(def, nullptr);
-         EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
-         EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
-         EXPECT_EQ(def->imm, 0x0020u);
+         if (target.encoding == AGX_ISA_ENCODING_AGX3C) {
+            EXPECT_EQ(sel->src[2].type, AGX_INDEX_IMMEDIATE);
+            EXPECT_EQ(sel->src[2].value, 0x0020u);
+            EXPECT_EQ(sel->src[3].type, AGX_INDEX_IMMEDIATE);
+            EXPECT_EQ(sel->src[3].value, 0u);
+         } else {
+            const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
+            ASSERT_NE(def, nullptr);
+            EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
+            EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
+            EXPECT_EQ(def->imm, 0x0020u);
+         }
          ralloc_free(mem);
       }
 
@@ -8221,6 +8264,177 @@ TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
          EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
          EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
          EXPECT_EQ(def->imm, 0x3800u);
+         ralloc_free(mem);
+      }
+   }
+}
+
+/* agx_materialize_agx3_alu_constants() visits every instruction, including
+ * ones without a destination such as BEGIN_CF. Its AGX3C tied min/max check
+ * must look at the opcode before reading dest[0]; run it over a BEGIN_CF
+ * beside a tied and an untied 32-bit FCMPSEL. A sanitizer build reports the
+ * out-of-bounds read if the order regresses. */
+TEST(NativeForms, Agx3MaterializeConstantsSkipsDestinationlessInstructions)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = target.encoding;
+      key.dev.chip = target.chip;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index y = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_instr *cf = agx_begin_cf(b);
+
+      /* Tied max(x, 0.0) */
+      agx_instr *tied =
+         agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32), x,
+                        agx_immediate(0), x, agx_immediate(0), AGX_FCOND_GTN);
+      /* Untied (x < y) ? y : x */
+      agx_instr *untied = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                         x, y, y, x, AGX_FCOND_LT);
+      agx_unit_test(b, tied->dest[0]);
+      agx_unit_test(b, untied->dest[0]);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+
+      EXPECT_EQ(cf->op, AGX_OPCODE_BEGIN_CF);
+      EXPECT_EQ(cf->nr_dests, 0u);
+      EXPECT_EQ(cf->nr_srcs, 0u);
+
+      /* The pair stays tied. On AGX3C the zero is loaded into one register
+       * used in both positions. */
+      EXPECT_TRUE(agx_is_equiv(tied->src[1], tied->src[3]));
+      if (target.encoding == AGX_ISA_ENCODING_AGX3C)
+         EXPECT_EQ(tied->src[1].type, AGX_INDEX_NORMAL);
+
+      EXPECT_TRUE(agx_is_equiv(untied->src[0], x));
+      EXPECT_TRUE(agx_is_equiv(untied->src[1], y));
+      EXPECT_TRUE(agx_is_equiv(untied->src[2], y));
+      EXPECT_TRUE(agx_is_equiv(untied->src[3], x));
+      ralloc_free(mem);
+   }
+}
+
+/* FCMP shares the FCMPSEL comparand path in agx_materialize_agx3_alu_constants()
+ * but has only two sources. Materializing its nonzero minifloat comparand
+ * must not look at the select slots an FCMPSEL would have. A sanitizer build
+ * reports the out-of-bounds read if it regresses. */
+TEST(NativeForms, Agx3MaterializeFcmpComparandReadsNoSelectSlots)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = target.encoding;
+      key.dev.chip = target.chip;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_instr *cmp = agx_fcmp_to(b, agx_temp(b->shader, AGX_SIZE_16), x,
+                                   agx_immediate_f(0.5f), AGX_FCOND_LT, false);
+      agx_unit_test(b, cmp->dest[0]);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+
+      ASSERT_EQ(cmp->op, AGX_OPCODE_FCMP);
+      ASSERT_EQ(cmp->nr_srcs, 2u);
+      EXPECT_TRUE(agx_is_equiv(cmp->src[0], x));
+      ASSERT_EQ(cmp->src[1].type, AGX_INDEX_NORMAL);
+
+      const agx_instr *def = NULL;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+             agx_is_equiv(I->dest[0], cmp->src[1]))
+            def = I;
+      }
+      ASSERT_NE(def, nullptr);
+      EXPECT_EQ(def->imm, 0x3f000000u);
+      ralloc_free(mem);
+   }
+}
+
+/* A half add with a negated register source becomes fma(a, 1.0h, -b). The
+ * add was allocated with two sources and the FMA has three, so the pass must
+ * give the instruction a larger source array before it writes the addend.
+ * Writing src[2] in the original array goes past the end of the instruction;
+ * today that lands in the bytes ralloc rounds the block up to, so a sanitizer
+ * does not see it. Check the array itself instead. */
+TEST(NativeForms, Agx3SignedHalfAddBecomesThreeSourceFma)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+      for (unsigned negated = 0; negated < 3; ++negated) {
+         SCOPED_TRACE(negated);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.chip = target.chip;
+         b->shader->key = &key;
+
+         /* negated: 0 = a - b, 1 = -a + b, 2 = -a - b */
+         agx_index a = agx_preload(b, agx_register(0, AGX_SIZE_16));
+         agx_index c = agx_preload(b, agx_register(1, AGX_SIZE_16));
+         agx_index s0 = negated ? agx_neg(a) : a;
+         agx_index s1 = negated != 1 ? agx_neg(c) : c;
+         agx_instr *add =
+            agx_hadd_to(b, agx_temp(b->shader, AGX_SIZE_16), s0, s1);
+         agx_unit_test(b, add->dest[0]);
+
+         agx_materialize_agx3_alu_constants(b->shader);
+
+         ASSERT_EQ(add->op, AGX_OPCODE_HFMA);
+         ASSERT_EQ(add->nr_srcs, 3u);
+         /* Not the two-entry array allocated with the add. */
+         EXPECT_NE(add->src, add->dest + add->nr_dests);
+
+         /* For -a + b the operands swap so that b is the multiplicand. */
+         const agx_index product = negated == 1 ? c : a;
+         const agx_index addend = negated == 1 ? a : c;
+         EXPECT_TRUE(agx_is_equiv(add->src[0], product));
+         EXPECT_FALSE(add->src[0].neg);
+         EXPECT_EQ(add->src[1].neg, negated == 2);
+         EXPECT_TRUE(agx_is_equiv(add->src[2], addend));
+         EXPECT_TRUE(add->src[2].neg);
+
+         const agx_instr *one = NULL;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+                agx_is_equiv(I->dest[0], add->src[1]))
+               one = I;
+         }
+         ASSERT_NE(one, nullptr);
+         EXPECT_EQ(one->imm, 0x3c00u);
          ralloc_free(mem);
       }
    }
@@ -8429,4 +8643,112 @@ TEST(NativeForms, BoundsPassesClearMetadataAcrossPreambleAndMain)
    EXPECT_TRUE(share_progress);
 
    ralloc_free(b.shader);
+}
+
+TEST(NativeForms, AGX3CCompilePlacesPreambleLoadBasesLow)
+{
+   for (bool emit_agx3d : {false, true}) {
+      SCOPED_TRACE(emit_agx3d ? "G18G (AGX3D control)" : "G17S (AGX3C)");
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3c preamble load base low");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *table = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *idx = nir_load_local_invocation_index(&b);
+
+      /* Fill > AGX3_SMP_HANDLE_MAX_HALF (252) uniform halves in the preamble
+       * before exporting the 64-bit load base, using per-thread products on each
+       * component so every uniform scalar stays live into the main shader. */
+      nir_def *acc = nir_imm_int(&b, 0);
+      for (unsigned i = 0; i < 36; ++i) {
+         nir_def *u = _nir_build_load_global_constant(
+            &b, 4, 32, nir_iadd_imm(&b, table, 64 + i * 16), {.align_mul = 16});
+         for (unsigned c = 0; c < 4; ++c) {
+            nir_def *lane = nir_iadd_imm(&b, idx, i * 4 + c + 1);
+            acc = nir_iadd(&b, acc, nir_imul(&b, nir_channel(&b, u, c), lane));
+         }
+      }
+
+      nir_def *base = _nir_build_load_global_constant(
+         &b, 1, 64, nir_iadd_imm(&b, table, 4096), {.align_mul = 8});
+      nir_def *val = _nir_build_load_constant_agx(
+         &b, 1, 32, base, idx,
+         {.access = ACCESS_CAN_REORDER, .base = 2, .format = PIPE_FORMAT_R32_UINT});
+      nir_def *out_addr =
+         nir_iadd(&b, table, nir_u2u64(&b, nir_ishl_imm(&b, idx, 2)));
+      _nir_build_store_global(&b, nir_iadd(&b, acc, val), out_addr, {.align_mul = 4});
+
+      agx_preprocess_nir_m5(b.shader);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = emit_agx3d ? AGX_CHIP_G18G : AGX_CHIP_G17S;
+      key.dev.emit_agx3d = emit_agx3d;
+      key.reserved_preamble = 8;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      ASSERT_NE(part.binary, nullptr);
+      ASSERT_TRUE(part.info.has_preamble);
+
+      int load_base_slot = -1;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_constant_agx)
+               continue;
+            nir_intrinsic_instr *base_load =
+               nir_src_as_intrinsic(nir_instr_as_intrinsic(instr)->src[0]);
+            ASSERT_NE(base_load, nullptr);
+            ASSERT_EQ(base_load->intrinsic, nir_intrinsic_load_preamble);
+            load_base_slot = (int)nir_intrinsic_base(base_load);
+         }
+      }
+      ASSERT_GE(load_base_slot, 0);
+      if (!emit_agx3d) {
+         EXPECT_EQ(load_base_slot, 8);
+      } else {
+         EXPECT_GT(load_base_slot, AGX3_SMP_HANDLE_MAX_HALF);
+      }
+
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, AGX3CFfsHalfSourceZeroExtends)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+
+   agx_index src16 = agx_mov_imm(b, 16, 5);
+   agx_index dst32 = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *ffs = agx_ffs_to(b, dst32, src16);
+   agx_unit_test(b, dst32);
+
+   agx_lower_m5_alu_operands(b->shader);
+
+   ASSERT_EQ(ffs->src[0].size, AGX_SIZE_32);
+   ASSERT_EQ(ffs->src[0].type, AGX_INDEX_NORMAL);
+   agx_instr *def = NULL;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->nr_dests >= 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+          I->dest[0].value == ffs->src[0].value) {
+         def = I;
+         break;
+      }
+   }
+   ASSERT_NE(def, nullptr);
+   /* Must zero-extend via MOV (not undef-pad via COLLECT/agx_pad_to_32). */
+   EXPECT_EQ(def->op, AGX_OPCODE_MOV);
+   EXPECT_EQ(def->src[0].size, AGX_SIZE_16);
+   EXPECT_EQ(def->src[0].value, src16.value);
+   ralloc_free(mem);
 }

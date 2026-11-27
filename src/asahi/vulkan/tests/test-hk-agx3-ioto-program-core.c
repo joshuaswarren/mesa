@@ -206,14 +206,14 @@ test_g17p_precompiled_data_layout(void)
 static const enum agx_chip targets[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static bool
 is_gpu1(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 static struct hk_agx3_ioto_program_desc
@@ -584,7 +584,7 @@ test_g17s_minimal_compute_admission(void)
    static const enum agx_chip rejected[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17C, AGX_CHIP_UNKNOWN,
+      AGX_CHIP_G17G, AGX_CHIP_G17C, AGX_CHIP_G17D, AGX_CHIP_UNKNOWN,
    };
    for (size_t i = 0; i < ARRAY_SIZE(rejected); ++i) {
       CHECK(expect_g17s_minimal_hk_failure(rejected[i], &desc,
@@ -1480,21 +1480,29 @@ static int
 test_g17p_root_range(void)
 {
    struct agx3_ioto_uniform_range range = {0};
-   CHECK(hk_agx3_g17p_root_range(12, 0, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 0, UINT64_C(0x10000024000), 8, &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 4 &&
          range.address == UINT64_C(0x10000024000));
-   CHECK(hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 16, &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 8);
-   CHECK(hk_agx3_g17p_root_range(12, 8, UINT64_C(0x10000024000), &range));
+   CHECK(hk_agx3_g17p_root_range(12, 8, UINT64_C(0x10000024000), 4096,
+                                 &range));
    CHECK(range.start_halfs == 12 && range.size_halfs == 36);
 
    const struct agx3_ioto_uniform_range before = range;
-   CHECK(!hk_agx3_g17p_root_range(13, 0, UINT64_C(0x10000024000), &range));
+   CHECK(!hk_agx3_g17p_root_range(13, 0, UINT64_C(0x10000024000), 4096,
+                                  &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
    CHECK(!hk_agx3_g17p_root_range(12, HK_AGX3_G17P_MAX_ROOT_SETS + 1,
-                                  UINT64_C(0x10000024000), &range));
+                                  UINT64_C(0x10000024000), 4096, &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
-   CHECK(!hk_agx3_g17p_root_range(12, 0, 0, &range));
+   CHECK(!hk_agx3_g17p_root_range(12, 0, 0, 4096, &range));
+   CHECK(memcmp(&range, &before, sizeof(range)) == 0);
+   /* The set pointers must lie inside the uploaded root: one set needs 16
+    * bytes, so an 8-byte root is refused rather than read past. */
+   CHECK(!hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 8, &range));
+   CHECK(!hk_agx3_g17p_root_range(12, 1, UINT64_C(0x10000024000), 15,
+                                  &range));
    CHECK(memcmp(&range, &before, sizeof(range)) == 0);
 
    struct agx3_ioto_uniform_range rodata = {0};

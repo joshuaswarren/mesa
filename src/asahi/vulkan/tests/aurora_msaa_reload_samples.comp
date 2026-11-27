@@ -1,0 +1,16 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2DMS ms;
+layout(set = 0, binding = 1, std430) writeonly buffer O { uvec2 v[]; };
+void main() {
+   uint i = gl_GlobalInvocationID.x;
+   if (i >= 1920u * 1080u) return;
+   ivec2 p = ivec2(int(i % 1920u), int(i / 1920u));
+   for (int s = 0; s < 4; s++) {
+      vec4 c = texelFetch(ms, p, s);
+      v[i * 4u + uint(s)] = uvec2(packHalf2x16(c.xy), packHalf2x16(c.zw));
+   }
+}

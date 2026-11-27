@@ -305,7 +305,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_host_import(dev),
-      .EXT_fragment_shader_interlock = agx_chip_native_or_m5(dev->chip),
+      .EXT_fragment_shader_interlock =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -485,9 +486,11 @@ hk_get_device_features(
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      /* HAL200 interpolation is 32-bit, but the compiler performs matching
-       * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = agx_chip_native_or_m5(dev->chip),
+      /* Interpolation uses 32-bit UVS slots; hk_nir_widen_16bit_varyings()
+       * and hk_widen_integer_io() perform matching type-correct widening on
+       * outputs and narrowing on inputs across AGX2, native AGX3, and M5. */
+      .storageInputOutput16 =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -1130,12 +1133,12 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
-   /* AGX3 parts (G15/G16/G17P, M5, and G18G) view texel buffers through the
-    * 2D texture/PBE descriptor with the software alignment tail.
+   /* Both AGX2 and AGX3/M5/G18G view texel buffers through the 2D texture/PBE
+    * descriptor with a software alignment tail.
     */
-   const bool agx3_texel_buffer_tail = agx_chip_agx3_path(dev->chip);
    const bool texel_buffer_single_texel_alignment =
-      hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
+      hk_descriptor_generation_is_agx2(descriptor_generation) ||
+      agx_chip_agx3_path(dev->chip);
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
     * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
@@ -1198,13 +1201,13 @@ hk_get_device_properties(const struct agx_device *dev,
           agx_chip_g17_m5(dev->chip)) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      /* The native AGX3 and M5 texture/PBE includes the software alignment
-       * tail in its height. Reserve the worst-case 15 R8 texels so a
-       * maximally sized view at a single-texel offset still fits the native
-       * 2D descriptor.
+      /* Every 2D texel-buffer texture/PBE with single-texel alignment includes
+       * its software alignment tail in its height. Reserve the worst-case 15
+       * R8 texels so a maximally sized view at a single-texel offset still
+       * fits the 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (agx3_texel_buffer_tail ? 15 : 0),
+                               (texel_buffer_single_texel_alignment ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* Storage buffers are lowered to global address arithmetic with a
@@ -1788,25 +1791,8 @@ hk_get_device_properties(const struct agx_device *dev,
       properties->sparseResidencyNonResidentStrict =
          instance->drirc.misc.sparse_strict_residency;
 
-   if (agx_chip_native_agx3(dev->chip)) {
-      /* Measured per operation under the G17P drm-shim:
-       *
-       *   BASIC             g22_subgroup_basic          encodes
-       *   VOTE              g21_subgroup_vote           encodes
-       *   BALLOT            g05_subgroup_ballot         encodes
-       *   ARITHMETIC        g06_subgroup_arith          encodes
-       *   SHUFFLE           g07_subgroup_shuffle        encodes
-       *   SHUFFLE_RELATIVE  g25_subgroup_shuffle_rel    encodes
-       *   CLUSTERED         g23_subgroup_clustered      encodes
-       *   QUAD              g08_subgroup_quad           encodes
-       *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
-       *
-       * G17P uses the same lane instructions in native vertex/fragment
-       * programs and the compute programs implementing tessellation and
-       * geometry. Other AGX3 targets retain their stage restriction. */
-      properties->subgroupQuadOperationsInAllStages =
-         dev->chip == AGX_CHIP_G17P;
-   }
+   properties->subgroupQuadOperationsInAllStages =
+      agx_chip_has_shader_quad_control(dev->chip);
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
             (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?

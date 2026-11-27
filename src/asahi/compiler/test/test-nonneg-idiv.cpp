@@ -29,8 +29,7 @@ count_alu_op(nir_shader *shader, nir_op op)
    return n;
 }
 
-/* A divisor agx_nir_opt_uniform_idiv cannot move to the preamble, so the
- * one-sided rewrites apply to it. */
+/* A divisor agx_nir_opt_uniform_idiv cannot move to the preamble. */
 static nir_def *
 divergent_divisor(nir_builder *b)
 {
@@ -271,11 +270,10 @@ TEST(NonnegIdiv, SingleNonnegOperandDropRedundantIabs)
    ralloc_free(b.shader);
 }
 
-/* agx_nir_opt_uniform_idiv lowers a division by a uniform divisor with signed
- * magic multipliers, which beat a one-sided rewrite's unsigned division plus
- * sign fixup. Only rewrites that leave a bare udiv/umod apply to such a
- * division; a divergent divisor keeps every rewrite. */
-TEST(NonnegIdiv, UniformDivisorLeftToUniformIdiv)
+/* agx_nir_opt_uniform_idiv lowers a signed division by a uniform divisor as an
+ * unsigned division of the magnitudes plus sign fixups, so the one-sided
+ * rewrites apply to uniform divisors as to divergent ones. */
+TEST(NonnegIdiv, UniformDivisorRewrites)
 {
    glsl_type_singleton_init_or_ref();
    nir_builder b = nir_builder_init_simple_shader(
@@ -293,9 +291,9 @@ TEST(NonnegIdiv, UniformDivisorLeftToUniformIdiv)
    nir_def *d = divergent_divisor(&b);
 
    nir_def *sum = nir_idiv(&b, lid, pc_nonneg); /* udiv */
-   sum = nir_iadd(&b, sum, nir_idiv(&b, lid, pc));        /* stays idiv */
-   sum = nir_iadd(&b, sum, nir_idiv(&b, lid, pc_deref));  /* stays idiv */
-   sum = nir_iadd(&b, sum, nir_imod(&b, lid, pc));        /* stays imod */
+   sum = nir_iadd(&b, sum, nir_idiv(&b, lid, pc));        /* udiv + fixup */
+   sum = nir_iadd(&b, sum, nir_idiv(&b, lid, pc_deref));  /* udiv + fixup */
+   sum = nir_iadd(&b, sum, nir_imod(&b, lid, pc));        /* umod + fixups */
    sum = nir_iadd(&b, sum, nir_irem(&b, lid, pc));        /* umod */
    sum = nir_iadd(&b, sum, nir_idiv(&b, lid, d));         /* udiv + fixup */
    nir_store_global(&b, sum, nir_imm_int64(&b, 0), .align_mul = 4);
@@ -304,12 +302,12 @@ TEST(NonnegIdiv, UniformDivisorLeftToUniformIdiv)
    nir_opt_dce(b.shader);
    nir_validate_shader(b.shader, "nonneg-uniform-div");
 
-   EXPECT_EQ(count_alu_op(b.shader, nir_op_idiv), 2u);
-   EXPECT_EQ(count_alu_op(b.shader, nir_op_imod), 1u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_idiv), 0u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_imod), 0u);
    EXPECT_EQ(count_alu_op(b.shader, nir_op_irem), 0u);
-   EXPECT_EQ(count_alu_op(b.shader, nir_op_udiv), 2u);
-   EXPECT_EQ(count_alu_op(b.shader, nir_op_umod), 1u);
-   EXPECT_EQ(count_alu_op(b.shader, nir_op_bcsel), 1u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_udiv), 4u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_umod), 2u);
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_bcsel), 5u);
    ralloc_free(b.shader);
    glsl_type_singleton_decref();
 }

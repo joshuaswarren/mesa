@@ -648,11 +648,16 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
  *
  * Admitted: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT
  * (stencil is read through its R8_UINT alias and copied through the same
- * graphics path), one mip, one sample (single-layer and layered 2D arrays),
- * a depth attachment, and otherwise only sampled, input-attachment,
- * feedback-loop and transfer usages. Zink marks its depth attachments
- * sample-location compatible and feedback-loop capable, which changes
- * neither. Shared images (external memory, WSI) stay plain.
+ * graphics path), one mip, one sample (single-layer and layered 2D arrays,
+ * cube-compatible ones included), a depth attachment, and otherwise only
+ * sampled, input-attachment, feedback-loop and transfer usages. A cube map
+ * is a six-layer array to every writer (ZLS renders one face at a time) and
+ * its cube views read through the same Gen10 texture descriptor as colour
+ * cube maps, which this file's colour policy already compresses; vkd3d-proton
+ * marks every square D3D12 depth array of six or more layers cube
+ * compatible. Zink marks its depth attachments sample-location compatible
+ * and feedback-loop capable, which changes neither. Shared images (external
+ * memory, WSI) stay plain.
  */
 static inline bool
 hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
@@ -682,7 +687,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    const VkImageCreateFlags allowed_flags =
-      VK_IMAGE_CREATE_ALIAS_BIT |
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
    const VkImageUsageFlags allowed_usage =
@@ -691,6 +696,10 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
       VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+   if ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+       (info->extent.width != info->extent.height || info->arrayLayers % 6))
+      return false;
 
    return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
           info->mipLevels == 1 &&

@@ -33,6 +33,22 @@ agx3_g17p_compute_state_tail(
    if (!tail_ok)
       return false;
 
+   /* A kernel with an imageblock describes it in SPECLM as a fragment program
+    * describes its tile: without it the kernel's imageblock stores are lost
+    * and its block stores write zeros. */
+   if (desc->imageblock_stride_B) {
+      if (desc->threadgroup_memory_size_B)
+         return false;
+      const struct agx_ioto_g17p_imageblock imageblock = {
+         .sample_size_B = (uint8_t)ALIGN_POT(desc->imageblock_stride_B, 8),
+         .nr_samples = 1,
+         .tile_size_px = 32 * 32,
+      };
+      if (!agx_ioto_g17p_fragment_speclm_build(&imageblock, staged.bytes,
+                                               AGX_IOTO_SPECLM_SIZE))
+         return false;
+   }
+
    if (!desc->compiler_d_valid ||
        !agx_ioto_g17p_compiler_spectpr_pack(
           desc->scratch_size, desc->compiler_d,

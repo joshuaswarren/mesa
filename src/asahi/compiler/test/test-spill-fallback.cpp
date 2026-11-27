@@ -2,15 +2,39 @@
 #include <gtest/gtest.h>
 #include "agx_test.h"
 
-TEST(SpillFallback, EdgeStoresReportScratchDuringRematerialization)
+/* The remat-only pass runs where the register file is split statically:
+ * AGX2 and AGX3D (agx_has_static_register_split()). The spiller itself takes
+ * any encoding, so the tests also keep the AGX3 keys they were written with.
+ */
+struct remat_key {
+   enum agx_isa_encoding encoding;
+   enum agx_chip chip;
+   bool emit_agx3d;
+};
+
+static const remat_key remat_keys[] = {
+   {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G14G, false},
+   {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+};
+
+/* The remat-only pass is an occupancy optimization of a program that already
+ * fits the register file. Sixteen phis of constants are not themselves
+ * rematerializable, so rematerialization cannot meet a 24-half budget. The
+ * pass keeps the phis in registers above the budget (register allocation then
+ * uses the full file) instead of moving them to scratch, which used to make
+ * fragment preambles recompile without rematerialization.
+ */
+static void
+remat_only_keeps_phi_webs_in_registers(const remat_key &k)
 {
    for (unsigned mode = 0; mode < 4; ++mode) {
       SCOPED_TRACE(mode);
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
+      key.dev.encoding = k.encoding;
+      key.dev.chip = k.chip;
+      key.dev.emit_agx3d = k.emit_agx3d;
       key.has_scratch = true;
       b->shader->key = &key;
       b->shader->stage = MESA_SHADER_COMPUTE;
@@ -50,14 +74,96 @@ TEST(SpillFallback, EdgeStoresReportScratchDuringRematerialization)
          agx_unit_test(b, value);
       agx_compute_liveness(b->shader);
       agx_spill(b->shader, 24, true);
-      EXPECT_TRUE(b->shader->has_spill_pcopy_reserved);
-      EXPECT_TRUE(b->shader->remat_fallback_spilled);
-      unsigned stores = 0;
+      EXPECT_FALSE(b->shader->has_spill_pcopy_reserved);
+      EXPECT_FALSE(b->shader->remat_fallback_spilled);
+      unsigned memory = 0;
       agx_foreach_instr_global(b->shader, I) {
-         stores += I->op == AGX_OPCODE_MOV && I->dest[0].memory;
+         agx_foreach_src(I, s)
+            memory += I->src[s].memory;
+         agx_foreach_dest(I, d)
+            memory += I->dest[d].memory;
       }
-      EXPECT_GT(stores, 0u);
+      EXPECT_EQ(memory, 0u);
       ralloc_free(mem);
+   }
+}
+
+TEST(SpillFallback, RematOnlyKeepsPhiWebsInRegisters)
+{
+   remat_only_keeps_phi_webs_in_registers(
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false});
+   for (const remat_key &k : remat_keys) {
+      SCOPED_TRACE(k.chip);
+      remat_only_keeps_phi_webs_in_registers(k);
+   }
+}
+
+/* Straight-line form of the above on a fragment preamble (on G17G, the shape
+ * the removed recompile was limited to): constants are rematerialized at their
+ * uses, and the values that cannot be stay in registers although they alone
+ * exceed the budget. Nothing goes to scratch.
+ */
+static void
+remat_only_rematerializes_constants_without_scratch(const remat_key &k)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = k.encoding;
+   key.dev.chip = k.chip;
+   key.dev.emit_agx3d = k.emit_agx3d;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->is_preamble = true;
+
+   agx_index constants[4];
+   for (unsigned i = 0; i < ARRAY_SIZE(constants); ++i)
+      constants[i] = agx_mov_imm(b, 32, 0x12345 + i);
+
+   agx_index values[16];
+   for (unsigned i = 0; i < ARRAY_SIZE(values); ++i) {
+      values[i] = agx_fadd(b, agx_uniform(4 + 2 * i, AGX_SIZE_32),
+                           agx_uniform(2, AGX_SIZE_32));
+   }
+   for (agx_index value : values)
+      agx_unit_test(b, value);
+   for (agx_index constant : constants)
+      agx_unit_test(b, constant);
+
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 24, true);
+   EXPECT_FALSE(b->shader->has_spill_pcopy_reserved);
+   EXPECT_FALSE(b->shader->remat_fallback_spilled);
+
+   unsigned memory = 0, fadds = 0;
+   agx_instr *prev = NULL;
+   agx_foreach_instr_global(b->shader, I) {
+      agx_foreach_src(I, s)
+         memory += I->src[s].memory;
+      agx_foreach_dest(I, d)
+         memory += I->dest[d].memory;
+      fadds += I->op == AGX_OPCODE_FADD;
+
+      /* Every constant is recreated right before its use */
+      if (prev && prev->op == AGX_OPCODE_MOV_IMM) {
+         EXPECT_EQ(I->op, AGX_OPCODE_UNIT_TEST);
+         EXPECT_TRUE(agx_is_equiv(I->src[0], prev->dest[0]));
+      }
+      prev = I;
+   }
+   EXPECT_EQ(memory, 0u);
+   EXPECT_EQ(fadds, ARRAY_SIZE(values));
+   ralloc_free(mem);
+}
+
+TEST(SpillFallback, RematOnlyRematerializesConstantsWithoutScratch)
+{
+   remat_only_rematerializes_constants_without_scratch(
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, false});
+   for (const remat_key &k : remat_keys) {
+      SCOPED_TRACE(k.chip);
+      remat_only_rematerializes_constants_without_scratch(k);
    }
 }
 
@@ -481,7 +587,10 @@ TEST(SpillLoopHeader, AGX3BRepeatsReorderableDeviceLoadInsteadOfSpilling)
  * debug builds or silently emitting memory operands in release builds. */
 TEST(SpillFallback, NoScratchSpillFailsClosed)
 {
-   /* Case 1: remat-only fallback spill when has_scratch == false. */
+   /* Case 1: the remat-only pass over budget when has_scratch == false. It
+    * keeps every value it cannot rematerialize (here the phis) in a register,
+    * so it emits no memory spill and leaves nothing for the no-scratch
+    * refusal to catch. */
    {
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
@@ -521,8 +630,17 @@ TEST(SpillFallback, NoScratchSpillFailsClosed)
 
       agx_compute_liveness(b->shader);
       agx_spill(b->shader, 24, true);
-      EXPECT_TRUE(b->shader->remat_fallback_spilled);
-      EXPECT_TRUE(b->shader->ra_failed);
+      EXPECT_FALSE(b->shader->remat_fallback_spilled);
+      EXPECT_FALSE(b->shader->ra_failed);
+
+      unsigned mem_ops = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         agx_foreach_ssa_dest(I, d)
+            mem_ops += I->dest[d].memory;
+         agx_foreach_ssa_src(I, s)
+            mem_ops += I->src[s].memory;
+      }
+      EXPECT_EQ(mem_ops, 0u);
       ralloc_free(mem);
    }
 
@@ -545,7 +663,7 @@ TEST(SpillFallback, NoScratchSpillFailsClosed)
       for (agx_index value : values)
          agx_unit_test(b, value);
 
-      agx_ra_without_remat(b->shader);
+      agx_ra(b->shader);
       EXPECT_TRUE(b->shader->ra_failed);
 
       unsigned mem_ops = 0;

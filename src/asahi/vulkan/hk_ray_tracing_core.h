@@ -108,6 +108,27 @@ bool hk_rt_group_from_create_info(struct hk_ray_tracing_group *out,
                                   uint32_t intersection_shader);
 
 /*
+ * Whether every stage index of a group is VK_SHADER_UNUSED_KHR or names one of
+ * the pipeline's stage_count stages.  Creation holds the groups it builds to
+ * this; a pipeline loaded from a binary or a cache holds the stored groups to
+ * it too.
+ */
+bool hk_rt_group_indices_valid(const struct hk_ray_tracing_group *group,
+                               uint32_t stage_count);
+
+/*
+ * Whether a group's indices are valid and each names a shader of a stage its
+ * slot takes: a ray generation, miss, callable or closest-hit shader as the
+ * recursive shader, an any-hit shader and an intersection shader in those
+ * slots.  stages[i] is the stage of shader i.  Groups built from create info
+ * satisfy this by the API's valid usage; groups read back from stored data
+ * are checked.
+ */
+bool hk_rt_group_stages_valid(const struct hk_ray_tracing_group *group,
+                              uint32_t stage_count,
+                              const VkShaderStageFlagBits *stages);
+
+/*
  * Rebase one group of an imported pipeline library onto the importing
  * pipeline's flattened stage array.  `stage_base` is the number of stages that
  * precede this library.  VK_SHADER_UNUSED_KHR never moves.

@@ -694,8 +694,47 @@ graphics_program_shape_equal(
    const struct agx3_cprog_inputs *ai = a->cprog_inputs ? a->cprog_inputs : &empty;
    const struct agx3_cprog_inputs *bi = b->cprog_inputs ? b->cprog_inputs : &empty;
    if (ai->count != bi->count || ai->storage_bytes != bi->storage_bytes ||
-       memcmp(ai->halves, bi->halves, sizeof(ai->halves)))
+       (ai->count && memcmp(ai->halves, bi->halves, sizeof(ai->halves))))
       return false;
+
+   if (!a->uniform_range_count)
+      return true;
+
+   /* Common case: every range translates by the exact same non-wrapping delta
+    * (e.g. a batch pool moving forward between draws). Translation preserves
+    * the sorted order, address-cache component partition, and all pairwise
+    * distances, so skip both component builds. */
+   uint64_t end0_a, end0_b;
+   if (a->uniform_ranges[0].start_halfs != b->uniform_ranges[0].start_halfs ||
+       a->uniform_ranges[0].size_halfs != b->uniform_ranges[0].size_halfs ||
+       !graphics_range_end(&a->uniform_ranges[0], &end0_a) ||
+       !graphics_range_end(&b->uniform_ranges[0], &end0_b))
+      return false;
+
+   const bool forward = b->uniform_ranges[0].address >= a->uniform_ranges[0].address;
+   const uint64_t shift = forward
+      ? b->uniform_ranges[0].address - a->uniform_ranges[0].address
+      : a->uniform_ranges[0].address - b->uniform_ranges[0].address;
+   bool uniform_shift = true;
+   for (unsigned i = 1; i < a->uniform_range_count; ++i) {
+      uint64_t ea, eb;
+      if (a->uniform_ranges[i].start_halfs != b->uniform_ranges[i].start_halfs ||
+          a->uniform_ranges[i].size_halfs != b->uniform_ranges[i].size_halfs)
+         return false;
+      if (uniform_shift) {
+         if (!graphics_range_end(&a->uniform_ranges[i], &ea) ||
+             !graphics_range_end(&b->uniform_ranges[i], &eb))
+            return false;
+         const bool dir = b->uniform_ranges[i].address >= a->uniform_ranges[i].address;
+         const uint64_t d = dir
+            ? b->uniform_ranges[i].address - a->uniform_ranges[i].address
+            : a->uniform_ranges[i].address - b->uniform_ranges[i].address;
+         if (dir != forward || d != shift)
+            uniform_shift = false;
+      }
+   }
+   if (uniform_shift)
+      return true;
 
    unsigned ap[AGX3_G17P_GRAPHICS_MAX_RANGES];
    unsigned bp[AGX3_G17P_GRAPHICS_MAX_RANGES];
@@ -711,12 +750,6 @@ graphics_program_shape_equal(
       ab[i] = ba[i] = AGX3_G17P_GRAPHICS_MAX_RANGES;
 
    for (unsigned i = 0; i < a->uniform_range_count; ++i) {
-      if (a->uniform_ranges[i].start_halfs !=
-             b->uniform_ranges[i].start_halfs ||
-          a->uniform_ranges[i].size_halfs !=
-             b->uniform_ranges[i].size_halfs)
-         return false;
-
       /* Require the same partition in both directions. Within a component
        * every range must move by the same amount: comparing to one anchor
        * establishes all pairwise offsets without a quadratic second walk. */
@@ -735,6 +768,28 @@ graphics_program_shape_equal(
    return true;
 }
 
+static inline bool
+graphics_pack_ldimm_encoded(enum agx_ioto_load_encoding encoding,
+                            uint16_t dest_half, uint32_t immediate,
+                            uint8_t out[AGX_IOTO_LOAD_LDIMM_MAX_SIZE],
+                            uint8_t *length)
+{
+   if ((dest_half & 1) != 0 || dest_half >= 256)
+      return false;
+
+   if (dest_half < 32 && immediate < 128) {
+      out[0] = (uint8_t)((encoding == AGX_IOTO_LOAD_ENCODING_GPU0 ? 0x0c : 0x04) |
+                         ((dest_half >> 1) << 4));
+      out[1] = (uint8_t)immediate;
+      *length = 2;
+      return true;
+   }
+
+   agx_ioto_load_pack_ldimm_long(dest_half, immediate, out);
+   *length = 8;
+   return true;
+}
+
 bool
 agx3_g17p_graphics_program_template_relocate(
    enum agx_chip chip,
@@ -749,6 +804,11 @@ agx3_g17p_graphics_program_template_relocate(
        program->program.length > capacity ||
        program->relocation_count > ARRAY_SIZE(program->relocations) ||
        !graphics_program_shape_equal(template_desc, target_desc))
+      return false;
+
+   const enum agx_ioto_load_encoding encoding =
+      agx_ioto_load_target_encoding(chip);
+   if (encoding == AGX_IOTO_LOAD_ENCODING_UNSUPPORTED)
       return false;
 
    uint8_t staged[AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
@@ -779,25 +839,20 @@ agx3_g17p_graphics_program_template_relocate(
       const uint64_t target =
          target_desc->uniform_ranges[range].address + delta;
 
+      const uint32_t old_lo_val = (uint32_t)rel->address;
+      const uint32_t old_hi_val = (uint32_t)(rel->address >> 32);
+      const uint32_t new_lo_val = (uint32_t)target;
+      const uint32_t new_hi_val = (uint32_t)(target >> 32);
+
       uint8_t old_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
       uint8_t old_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t new_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t new_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t old_low_len, old_high_len, new_low_len, new_high_len;
-      if (!agx_ioto_load_pack_ldimm(chip, rel->dest_half,
-                                    (uint32_t)rel->address, old_low,
-                                    &old_low_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half + 2,
-                                    (uint32_t)(rel->address >> 32), old_high,
-                                    &old_high_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half, (uint32_t)target,
-                                    new_low, &new_low_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half + 2,
-                                    (uint32_t)(target >> 32), new_high,
-                                    &new_high_len) ||
+      uint8_t old_low_len, old_high_len;
+      if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half, old_lo_val,
+                                       old_low, &old_low_len) ||
+          !graphics_pack_ldimm_encoded(encoding, rel->dest_half + 2, old_hi_val,
+                                       old_high, &old_high_len) ||
           old_low_len != rel->low_length ||
           old_high_len != rel->high_length ||
-          new_low_len != old_low_len || new_high_len != old_high_len ||
           rel->offset > program->program.length ||
           old_low_len + old_high_len > program->program.length - rel->offset ||
           memcmp(program->program.bytes + rel->offset, old_low,
@@ -806,8 +861,26 @@ agx3_g17p_graphics_program_template_relocate(
                  old_high, old_high_len))
          return false;
 
-      memcpy(staged + rel->offset, new_low, new_low_len);
-      memcpy(staged + rel->offset + new_low_len, new_high, new_high_len);
+      if (new_lo_val != old_lo_val) {
+         uint8_t new_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+         uint8_t new_low_len;
+         if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half, new_lo_val,
+                                          new_low, &new_low_len) ||
+             new_low_len != old_low_len)
+            return false;
+         memcpy(staged + rel->offset, new_low, new_low_len);
+      }
+
+      if (new_hi_val != old_hi_val) {
+         uint8_t new_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+         uint8_t new_high_len;
+         if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half + 2,
+                                          new_hi_val, new_high,
+                                          &new_high_len) ||
+             new_high_len != old_high_len)
+            return false;
+         memcpy(staged + rel->offset + old_low_len, new_high, new_high_len);
+      }
    }
 
    if (template_desc->constant_program.code_size) {

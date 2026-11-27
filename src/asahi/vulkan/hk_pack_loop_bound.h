@@ -137,6 +137,35 @@ hk_pack_eval_work_bound(const struct hk_pack_loop_bound *lb,
    return true;
 }
 
+/* Match the unsigned 128-bit numerator, including wraparound, on targets
+ * without a native 128-bit integer type. The divisor is nonzero. */
+static inline bool
+hk_pack_scale_instrs_portable(uint64_t instrs, uint64_t work, uint32_t divisor,
+                             uint64_t *scaled)
+{
+   const uint64_t ll = (uint64_t)(uint32_t)instrs * (uint32_t)work;
+   const uint64_t lh = (uint64_t)(uint32_t)instrs * (work >> 32);
+   const uint64_t hl = (instrs >> 32) * (uint32_t)work;
+   const uint64_t hh = (instrs >> 32) * (work >> 32);
+   const uint64_t middle = (ll >> 32) + (uint32_t)lh + (uint32_t)hl;
+   const uint64_t product_lo = (middle << 32) | (uint32_t)ll;
+   const uint64_t product_hi = hh + (lh >> 32) + (hl >> 32) + (middle >> 32);
+
+   const uint64_t doubled_lo = product_lo << 1;
+   const uint64_t lo = doubled_lo + (divisor - 1u);
+   const uint64_t hi = (product_hi << 1) + (product_lo >> 63) +
+                       (lo < doubled_lo);
+   if (hi >= divisor)
+      return false;
+
+   /* Divide in base 2^32. Each step has a 64-bit dividend and produces
+    * one 32-bit quotient limb because its incoming remainder is < divisor. */
+   const uint64_t upper = (hi << 32) | (lo >> 32);
+   const uint64_t lower = ((upper % divisor) << 32) | (uint32_t)lo;
+   *scaled = ((upper / divisor) << 32) | (lower / divisor);
+   return true;
+}
+
 /* Compute an upper bound on per-thread AGX instructions for a bounded looping
  * shader. Always requires a valid loop back-edge bound (`lb->valid`); when the
  * CF-weighted NIR work bound is also available, scales `agx_instrs` by
@@ -161,6 +190,7 @@ hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
 
    uint64_t dyn_nir_ops = 0;
    if (hk_pack_eval_work_bound(lb, params, &dyn_nir_ops)) {
+#if defined(__SIZEOF_INT128__)
       const __uint128_t num = (__uint128_t)2u * (__uint128_t)agx_instrs *
                               (__uint128_t)dyn_nir_ops;
       const __uint128_t scaled =
@@ -168,6 +198,11 @@ hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
          (__uint128_t)lb->static_nir_ops;
       if (scaled <= UINT64_MAX) {
          uint64_t eff = (uint64_t)scaled;
+#else
+      uint64_t eff;
+      if (hk_pack_scale_instrs_portable(agx_instrs, dyn_nir_ops,
+                                        lb->static_nir_ops, &eff)) {
+#endif
          if (eff < agx_instrs)
             eff = agx_instrs;
          if (naive_ok && eff > naive)

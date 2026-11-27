@@ -22,6 +22,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx3_code_container_core.h"
 #include "asahi/lib/agx3_g17p_grid_helper_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_g17p_draw_state_upload.h"
 #include "asahi/lib/agx_helpers.h"
 #include "asahi/lib/agx_m5_va.h"
@@ -1343,6 +1344,10 @@ agx_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
    }
 
    ctx->stage[shader].texture_count = new_nr;
+   if (new_nr)
+      ctx->stages_with_textures |= BITFIELD_BIT(shader);
+   else
+      ctx->stages_with_textures &= ~BITFIELD_BIT(shader);
    ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_IMAGE;
 }
 
@@ -2262,9 +2267,9 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       cfg.dimension =
          agx_translate_tex_dim(target, util_res_sample_count(&tex->base.b));
       /* G17G shaders store to layered images as 3D (agx3_pack_binary.c);
-       * G17C stores keep the array. */
+       * G17C stores keep the array (agx_chip_m5_layer_operand()). */
       if (descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
-          dev->chip != AGX_CHIP_G17C &&
+          !agx_chip_m5_layer_operand(dev->chip) &&
           !block_access && cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY)
          cfg.dimension = AGX_TEXTURE_DIMENSION_3D;
       cfg.layout = agx_translate_layout(tex->layout.tiling);
@@ -2576,9 +2581,9 @@ agx_batch_upload_pbe(struct agx_batch *batch,
  * another way ask first.
  */
 bool
-agx_g17g_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
-                          enum pipe_format format, unsigned level,
-                          unsigned layer)
+agx_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
+                     enum pipe_format format, unsigned level,
+                     unsigned layer)
 {
    /* The packer only reads the device through the batch. */
    struct agx_batch scratch = {.ctx = ctx};
@@ -2649,6 +2654,23 @@ agx_set_vertex_buffers(struct pipe_context *pctx, unsigned count,
 {
    struct agx_context *ctx = agx_context(pctx);
 
+   if (buffers && !(ctx->vb_mask & ~BITFIELD_MASK(count))) {
+      bool same = true;
+      for (unsigned i = 0; i < count; ++i) {
+         const struct pipe_vertex_buffer *a = &ctx->vertex_buffers[i];
+         const struct pipe_vertex_buffer *b = &buffers[i];
+         if (a->is_user_buffer != b->is_user_buffer ||
+             a->buffer_offset != b->buffer_offset ||
+             (a->is_user_buffer ? (a->buffer.user != b->buffer.user)
+                                : (a->buffer.resource != b->buffer.resource))) {
+            same = false;
+            break;
+         }
+      }
+      if (same)
+         return;
+   }
+
    util_set_vertex_buffers_mask(ctx->vertex_buffers, &ctx->vb_mask, buffers,
                                 count);
 
@@ -2691,6 +2713,8 @@ static void
 agx_bind_vertex_elements_state(struct pipe_context *pctx, void *cso)
 {
    struct agx_context *ctx = agx_context(pctx);
+   if (ctx->attributes == cso)
+      return;
    ctx->attributes = cso;
    ctx->dirty |= AGX_DIRTY_VERTEX;
 }
@@ -2970,7 +2994,8 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
         * and geometry stages run on the GPU too (hk refuses their
         * preambles on M5 as well). */
        .no_preamble = agx_chip_agx3_path(dev->chip),
-      .g18_native_mixed = g18_native_mixed && dev->chip == AGX_CHIP_G18G,
+      .g18_native_mixed = g18_native_mixed &&
+         agx_chip_has_cap(dev->chip, AGX_CAP_NATIVE_MIXED_EPILOG),
    };
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -3184,6 +3209,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
              compiled->b.info.binary_size);
    }
 
+   agx_compute_shader_upload_sizes(compiled);
    return compiled;
 }
 
@@ -4786,7 +4812,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    if (agx_chip_g17_m5(dev->chip)) {
       /* agx3c's name for the same preprocessing mode (false, true), which
        * theirs exposed as agx_preprocess_nir_g17g(). */
-      agx_preprocess_nir_m5(nir);
+      agx_preprocess_nir_m5_chip(nir, dev->chip);
       if (nir->info.stage == MESA_SHADER_FRAGMENT &&
           (nir->info.inputs_read & VARYING_BIT_LAYER)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
@@ -4899,8 +4925,7 @@ agx_fill_precompile_keys(const struct agx_device *dev,
          key.fs.zero_lod_bias = so->info.lod_bias_samplers;
          /* Match agx_update_fs()'s single-sample key so the precompiled
           * variant hits on the first 1x draw instead of recompiling. */
-         if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-             dev->chip == AGX_CHIP_G18G || so->info.needs_sample_count ||
+         if (agx_chip_agx3_path(dev->chip) || so->info.needs_sample_count ||
              so->info.uses_sample_shading)
             key.fs.nr_samples = 1;
       }
@@ -5664,6 +5689,8 @@ agx_compile_inline_blend_fs(struct agx_context *ctx,
    fs->g17p_custom_border_emulation = main->g17p_custom_border_emulation;
    fs->push_range_count = main->push_range_count;
    memcpy(fs->push, main->push, sizeof(fs->push[0]) * main->push_range_count);
+   fs->stage_uniforms_upload_size = main->stage_uniforms_upload_size;
+   fs->root_uniforms_upload_size = main->root_uniforms_upload_size;
    fs->epilog_key = main->epilog_key;
 
    /* Blend constants are uploaded with every fragment program. A textured
@@ -5987,8 +6014,7 @@ agx_update_gs(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct agx_device *dev = agx_device(ctx->base.screen);
    struct agx_uncompiled_shader *fs = ctx->stage[MESA_SHADER_FRAGMENT].shader;
    struct asahi_gs_shader_key key = {0};
-   if (dev->chip == AGX_CHIP_G18G || agx_chip_native_hal200(dev->chip) ||
-       agx_chip_g17_m5(dev->chip)) {
+   if (agx_chip_native_hal200(dev->chip) || agx_chip_hal300_path(dev->chip)) {
       key.link_uvs = true;
       if (fs) {
          key.flat_varyings = fs->info.inputs_flat_shaded;
@@ -6279,7 +6305,7 @@ agx_update_fs(struct agx_batch *batch)
    /* Run 1139: the epilog builds the same index-order layout and stores
     * exactly what Apple's mixed-format fragments store. */
    link_key.epilog.fs.g18_native_mixed =
-      dev->chip == AGX_CHIP_G18G &&
+      agx_chip_has_cap(dev->chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
       agx_g18g_native_mixed_mask(&batch->tilebuffer_layout) != 0;
 
    memcpy(&link_key.epilog.fs.blend, &ctx->blend->key,
@@ -6596,6 +6622,11 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
       if (bl->g17p_mip_cs[i])
          ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
    }
+
+   if (bl->g17p_block_mip_cs)
+      ctx->delete_compute_state(ctx, bl->g17p_block_mip_cs);
+   if (bl->g17p_block_mip_sampler)
+      ctx->delete_sampler_state(ctx, bl->g17p_block_mip_sampler);
 
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
@@ -7725,42 +7756,16 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_stage_uniforms_size(agx_device(ctx->base.screen)->chip);
    size_t size = full_size;
 
-   /* A vertex or fragment shader reads its stage table only through the
-    * ranges it pushes, unless it indexes the table dynamically, which loads
-    * the table address from the root table. Without such a load, upload only
-    * the pushed prefix of the table, or nothing when no range is pushed.
-    * Geometry and tessellation draws keep the whole table.
+   /* A vertex, fragment, or compute shader reads its stage table only through
+    * the ranges it pushes, unless it indexes the table dynamically (marked by
+    * UINT16_MAX in stage_uniforms_upload_size). Geometry and tessellation
+    * draws keep the whole table.
     */
    if (!ctx->gs && !ctx->in_tess &&
-       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT)) {
-      const unsigned stage_table = AGX_SYSVAL_STAGE(stage);
-      const size_t table_ptr_off =
-         offsetof(struct agx_draw_uniforms, tables[stage_table]);
-      const size_t table_ptr_end = table_ptr_off + sizeof(uint64_t);
-      bool indirect = false;
-      size_t pushed_end = 0;
-
-      for (unsigned i = 0; i < cs->push_range_count; ++i) {
-         const struct agx_push_range *push = &cs->push[i];
-         if (push->table == AGX_SYSVAL_TABLE_ROOT) {
-            const size_t start = push->offset;
-            const size_t end = start + (size_t)push->length * 2;
-            if (start < table_ptr_end && end > table_ptr_off) {
-               indirect = true;
-               break;
-            }
-         } else if (push->table == stage_table) {
-            /* Native Ioto loaders move uniform dwords, so an odd 16-bit
-             * range reads one more half (agx_build_g17p_graphics_program).
-             */
-            const size_t end =
-               (size_t)push->offset + (size_t)ALIGN_POT(push->length, 2) * 2;
-            pushed_end = MAX2(pushed_end, end);
-         }
-      }
-
-      if (!indirect)
-         size = MIN2(ALIGN_POT(pushed_end, 16), full_size);
+       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT ||
+        stage == MESA_SHADER_COMPUTE)) {
+      if (cs->stage_uniforms_upload_size != UINT16_MAX)
+         size = MIN2((size_t)cs->stage_uniforms_upload_size, full_size);
    }
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
@@ -7805,37 +7810,174 @@ struct agx_g17p_graphics_template {
    struct agx3_g17p_graphics_program_desc desc;
    struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
    struct agx3_g17p_graphics_program_template program;
+   bool has_plan;
+   struct hk_g17p_patch_plan plan;
 };
 
 #define AGX_G17P_GRAPHICS_TEMPLATE_LIMIT 8u
+#define AGX_G17P_GRAPHICS_TEMPLATE_MAX_SHAPES 2u
 
-static bool
-agx_g17p_graphics_program_cached(enum agx_chip chip,
-                                 struct agx_linked_shader *linked,
-                                 const struct agx3_g17p_graphics_program_desc *desc,
-                                 void *output, size_t capacity,
-                                 size_t *written)
+static inline bool
+agx_g17p_graphics_desc_supports_plan(
+   const struct agx3_g17p_graphics_program_desc *desc)
 {
+   return !desc->preshader && !desc->preloaded_root &&
+          !desc->constant_program.code_size &&
+          !(desc->cprog_inputs && desc->cprog_inputs->count);
+}
+
+static inline bool
+agx_g17p_graphics_template_matches_shape(
+   const struct agx_g17p_graphics_template *entry,
+   const struct agx3_g17p_graphics_program_desc *desc)
+{
+   const struct agx3_g17p_graphics_program_desc *a = &entry->desc;
+   if (a->uniform_range_count != desc->uniform_range_count ||
+       a->shader_va != desc->shader_va ||
+       a->shader_binary_size != desc->shader_binary_size ||
+       a->scratch_size != desc->scratch_size || a->nr_gprs != desc->nr_gprs ||
+       a->compiler_d_valid != desc->compiler_d_valid ||
+       a->compiler_d != desc->compiler_d || a->fragment != desc->fragment ||
+       a->writes_sample_mask != desc->writes_sample_mask ||
+       a->colour_classes != desc->colour_classes ||
+       a->imageblock.sample_size_B != desc->imageblock.sample_size_B ||
+       a->imageblock.nr_samples != desc->imageblock.nr_samples ||
+       a->imageblock.tile_size_px != desc->imageblock.tile_size_px)
+      return false;
+
+   for (unsigned i = 0; i < desc->uniform_range_count; ++i) {
+      if (entry->ranges[i].start_halfs != desc->uniform_ranges[i].start_halfs ||
+          entry->ranges[i].size_halfs != desc->uniform_ranges[i].size_halfs)
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_g17p_graphics_template_ranges_valid(
+   const struct agx3_ioto_uniform_range *ranges, size_t count)
+{
+   for (size_t i = 0; i < count; ++i) {
+      const uint64_t bytes = (uint64_t)ranges[i].size_halfs * 2;
+      if (!ranges[i].size_halfs || (ranges[i].size_halfs & 1) ||
+          (ranges[i].start_halfs & 1) || (ranges[i].address & 3) ||
+          ranges[i].address > UINT64_MAX - (bytes - 4))
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_g17p_graphics_template_emit_plan(
+   const struct agx_g17p_graphics_template *entry,
+   const struct agx3_ioto_uniform_range *ranges, void *output, size_t capacity,
+   size_t *written)
+{
+   const uint16_t len = entry->program.program.length;
+   if (len > capacity)
+      return false;
+
+   /* Patch in cached stack memory before one sequential write into the
+    * write-combined pipeline pool for ordinary program sizes. */
+   if (likely(len <= 512)) {
+      uint8_t buf[512];
+      memcpy(buf, entry->program.program.bytes, len);
+      hk_g17p_patch_plan_apply(&entry->plan, ranges, buf);
+      memcpy(output, buf, len);
+   } else {
+      memcpy(output, entry->program.program.bytes, len);
+      hk_g17p_patch_plan_apply(&entry->plan, ranges, output);
+   }
+   *written = len;
+   return true;
+}
+
+static struct agx_g17p_graphics_template *
+agx_g17p_graphics_program_find_plan(
+   struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc)
+{
+   if (!agx_g17p_graphics_desc_supports_plan(desc) ||
+       !agx_g17p_graphics_template_ranges_valid(desc->uniform_ranges,
+                                                desc->uniform_range_count))
+      return NULL;
+
    struct agx_g17p_graphics_template **slot =
       &linked->g17p_graphics_templates;
-   unsigned count = 0;
    while (*slot) {
       struct agx_g17p_graphics_template *entry = *slot;
+      if (entry->has_plan &&
+          agx_g17p_graphics_template_matches_shape(entry, desc) &&
+          hk_g17p_patch_plan_fits(&entry->plan, desc->uniform_ranges)) {
+         if (*slot != linked->g17p_graphics_templates) {
+            *slot = entry->next;
+            entry->next = linked->g17p_graphics_templates;
+            linked->g17p_graphics_templates = entry;
+         }
+         return entry;
+      }
+      slot = &entry->next;
+   }
+   return NULL;
+}
+
+static bool
+agx_g17p_graphics_program_relocate_cached(
+   enum agx_chip chip, struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc, void *output,
+   size_t capacity, size_t *written)
+{
+   const struct agx_g17p_graphics_template *plan =
+      agx_g17p_graphics_program_find_plan(linked, desc);
+   if (plan)
+      return agx_g17p_graphics_template_emit_plan(plan, desc->uniform_ranges,
+                                                  output, capacity, written);
+
+   struct agx_g17p_graphics_template **slot =
+      &linked->g17p_graphics_templates;
+   while (*slot) {
+      struct agx_g17p_graphics_template *entry = *slot;
+      if (entry->has_plan) {
+         slot = &entry->next;
+         continue;
+      }
       uint16_t length;
       /* The composer checks the complete shader/imageblock state, range
        * layout, address-cache topology and immediate instruction widths.
        * Only the draw-varying addresses may be patched; a different shape
        * goes through full generation instead. */
       if (agx3_g17p_graphics_program_template_relocate(
-             chip, &entry->desc, desc, &entry->program, output,
-             capacity, &length)) {
-         *slot = entry->next;
-         entry->next = linked->g17p_graphics_templates;
-         linked->g17p_graphics_templates = entry;
+             chip, &entry->desc, desc, &entry->program, output, capacity,
+             &length)) {
+         if (*slot != linked->g17p_graphics_templates) {
+            *slot = entry->next;
+            entry->next = linked->g17p_graphics_templates;
+            linked->g17p_graphics_templates = entry;
+         }
          *written = length;
          return true;
       }
       slot = &entry->next;
+   }
+   return false;
+}
+
+static bool
+agx_g17p_graphics_program_generate_cached(
+   enum agx_chip chip, struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc, void *output,
+   size_t capacity, size_t *written)
+{
+   const bool can_plan = agx_g17p_graphics_desc_supports_plan(desc);
+   unsigned count = 0;
+   unsigned shapes = 0;
+   struct agx_g17p_graphics_template **slot =
+      &linked->g17p_graphics_templates;
+   while (*slot) {
+      if (can_plan && (*slot)->has_plan &&
+          agx_g17p_graphics_template_matches_shape(*slot, desc))
+         ++shapes;
+      slot = &(*slot)->next;
       ++count;
    }
 
@@ -7849,11 +7991,36 @@ agx_g17p_graphics_program_cached(enum agx_chip chip,
    memcpy(entry->ranges, desc->uniform_ranges,
           desc->uniform_range_count * sizeof(entry->ranges[0]));
    entry->desc.uniform_ranges = entry->ranges;
-   if (!agx3_g17p_graphics_program_template_generate(
-          chip, &entry->desc, &entry->program) ||
-       entry->program.program.length > capacity) {
-      ralloc_free(entry);
-      return false;
+
+   /* A layout whose ranges keep moving relative to each other gets one
+    * address-independent template (each range its own 8-byte LDIMM base),
+    * matching Honeykrisp's loader cache. */
+   const bool try_independent =
+      can_plan && shapes >= AGX_G17P_GRAPHICS_TEMPLATE_MAX_SHAPES &&
+      desc->uniform_range_count <= HK_G17P_PATCH_MAX_RANGES;
+   bool generated = false;
+   if (try_independent) {
+      entry->desc.patchable = true;
+      generated = agx3_g17p_graphics_program_template_generate(
+                     chip, &entry->desc, &entry->program) &&
+                  entry->program.program.length <= capacity;
+      if (!generated)
+         entry->desc.patchable = desc->patchable;
+   }
+   if (!generated) {
+      if (!agx3_g17p_graphics_program_template_generate(
+             chip, &entry->desc, &entry->program) ||
+          entry->program.program.length > capacity) {
+         ralloc_free(entry);
+         return false;
+      }
+   }
+
+   if (can_plan) {
+      entry->has_plan = hk_g17p_patch_plan_init(
+         &entry->plan, entry->ranges, entry->desc.uniform_range_count,
+         entry->program.relocations, entry->program.relocation_count,
+         entry->program.program.length, entry->desc.patchable);
    }
 
    /* Bound memory and lookup cost even when an application keeps changing
@@ -7871,6 +8038,20 @@ agx_g17p_graphics_program_cached(enum agx_chip chip,
    *written = entry->program.program.length;
    memcpy(output, entry->program.program.bytes, *written);
    return true;
+}
+
+static bool
+agx_g17p_graphics_program_cached(enum agx_chip chip,
+                                 struct agx_linked_shader *linked,
+                                 const struct agx3_g17p_graphics_program_desc *desc,
+                                 void *output, size_t capacity,
+                                 size_t *written)
+{
+   if (agx_g17p_graphics_program_relocate_cached(chip, linked, desc, output,
+                                                 capacity, written))
+      return true;
+   return agx_g17p_graphics_program_generate_cached(chip, linked, desc, output,
+                                                    capacity, written);
 }
 /* The static TPS frame a graphics program declares. G18 programs it in both
  * SPECTPR words as a 16-byte-aligned byte count divided by four (native1054:
@@ -8101,23 +8282,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                                  &count, NULL))
       return 0;
 
-   size_t capacity;
-   if (!agx3_g17p_graphics_program_bound(dev->chip, ranges, count,
-                                          &capacity))
-      return 0;
-
-   /* The constant program branches to its code in the shader's own upload;
-    * the loader grows by that branch and its prelude only. */
-   if (fs_cprog)
-      capacity += 512;
-
-   struct agx_bo *program_bo = NULL;
-   struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
-      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
-      &program_bo);
-   if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
-       !agx_va_in_usc_window(dev,
-                            linked->bo->va->addr + linked->entry_offset))
+   if (!agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
       return 0;
 
    const uint32_t pass_type =
@@ -8125,7 +8290,8 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = t.gpu,
+      .usc_clusters = dev->params.num_clusters_total,
+      .program_va = 0,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8145,25 +8311,69 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          .tile_size_px = batch->tilebuffer_layout.tile_size,
       },
    };
-   if (fs_cprog) {
-      /* As hk_upload_g17p_graphics_program(): the main shader's own upload
-       * holds the constant program; linking relocates only the main part. */
-      const struct agx_shader_info *pi = &cs->b.info;
-      desc.constant_program = (struct agx_ioto_constant_program){
-         .code = (const uint8_t *)agx_bo_map(cs->bo) + pi->preamble_offset,
-         .code_size = pi->preamble_size,
-         .code_va = cs->bo->va->addr + pi->preamble_offset,
-         .absolute_branch = true,
-         .request_prelude = pi->agx3_preamble_uniform_inputs,
-      };
-      if (pi->agx3_preamble_tps_inputs)
-         desc.cprog_inputs = &pi->agx3_preamble_inputs;
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr t;
+   size_t program_length = 0;
+
+   /* Without a constant program suffix, relocation does not depend on
+    * program_va. Try the cached patch plan before computing a conservative size
+    * bound so plan hits allocate the exact program size with no 6 KiB staging
+    * buffer. */
+   bool relocated = false;
+   if (!fs_cprog && linked->g17p_graphics_templates) {
+      const struct agx_g17p_graphics_template *plan =
+         agx_g17p_graphics_program_find_plan(linked, &desc);
+      if (plan) {
+         const size_t len = plan->program.program.length;
+         t = agx_pool_alloc_aligned_with_bo(
+            &batch->pipeline_pool, len, AGX_IOTO_PROGRAM_ALIGNMENT,
+            &program_bo);
+         if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
+             !agx_g17p_graphics_template_emit_plan(plan, ranges, t.cpu, len,
+                                                   &program_length))
+            return 0;
+         relocated = true;
+      }
    }
 
-   size_t program_length;
-   if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
-                                         capacity, &program_length))
-      return 0;
+   if (!relocated) {
+      size_t capacity;
+      if (!agx3_g17p_graphics_program_bound(dev->chip, ranges, count,
+                                             &capacity))
+         return 0;
+
+      /* The constant program branches to its code in the shader's own upload;
+       * the loader grows by that branch and its prelude only. */
+      if (fs_cprog)
+         capacity += 512;
+
+      t = agx_pool_alloc_aligned_with_bo(
+         &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
+         &program_bo);
+      if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu))
+         return 0;
+
+      desc.program_va = t.gpu;
+      if (fs_cprog) {
+         /* As hk_upload_g17p_graphics_program(): the main shader's own upload
+          * holds the constant program; linking relocates only the main part. */
+         const struct agx_shader_info *pi = &cs->b.info;
+         desc.constant_program = (struct agx_ioto_constant_program){
+            .code = (const uint8_t *)agx_bo_map(cs->bo) + pi->preamble_offset,
+            .code_size = pi->preamble_size,
+            .code_va = cs->bo->va->addr + pi->preamble_offset,
+            .absolute_branch = true,
+            .request_prelude = pi->agx3_preamble_uniform_inputs,
+         };
+         if (pi->agx3_preamble_tps_inputs)
+            desc.cprog_inputs = &pi->agx3_preamble_inputs;
+      }
+
+      if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
+                                            capacity, &program_length))
+         return 0;
+   }
 
    agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
                        program_length);
@@ -8429,6 +8639,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8912,6 +9123,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -9339,6 +9551,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
          .compiler_d = compiler_d,
          .threadgroup_memory_size_B =
             shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+         .imageblock_stride_B = info->imageblock_stride,
          .launch_sources = launch_sources,
          /* The program announces how it will be launched.  An indirectly
           * launched one takes its dimensions from the geometry block; a record
@@ -9358,6 +9571,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       size_t program_length;
       if (g17g) {
          const struct agx3_g17p_graphics_program_desc g17g_desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program.gpu,
             .shader_va = shader_va,
             .uniform_ranges = ranges,
@@ -9668,6 +9882,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -9922,6 +10137,7 @@ agx_g18_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -9941,6 +10157,7 @@ agx_g18_append_compute(struct agx_batch *batch,
    size_t program_length;
    if (g18) {
       const struct agx3_g17p_graphics_program_desc g17g_desc = {
+         .usc_clusters = dev->params.num_clusters_total,
          .program_va = program.gpu,
          .shader_va = shader_va,
          .uniform_ranges = ranges,
@@ -10250,6 +10467,9 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
                       const struct agx_precompiled_shader *cs,
                       const void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
    const bool g18 = dev->chip == AGX_CHIP_G18G;
 
@@ -10293,6 +10513,7 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
    const uint32_t scratch_bytes = MAX3(cs->info.scratch_size,
       cs->info.agx3_spectpr_scratch_size, cs->info.agx3_tps_size);
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10452,6 +10673,9 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
                           const struct agx_precompiled_shader *cs,
                           const void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
 
    if (!agx_precomp_shader_launchable(dev, cs) ||
@@ -10479,6 +10703,7 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
       AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
    const uint64_t shader_va = cs->ptr + cs->entry_offset;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10606,6 +10831,9 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                    enum agx_barrier barrier, enum libagx_program program,
                    void *args, size_t arg_size)
 {
+   /* Driver work, not an application dispatch (agx_batch_sibling_queue). */
+   batch->compute_internal = true;
+
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
    struct agx_precompiled_shader *cs =
       agx_get_precompiled(&batch->ctx->bg_eot, program);
@@ -10727,6 +10955,7 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
             cs->info.local_size
                ? MAX2(256u, ALIGN_POT(cs->info.local_size, 64u))
                : 0,
+         .imageblock_stride_B = cs->info.imageblock_stride,
          /* The program announces how it is launched, as the API compute
           * path's does (agx_g17p_append_compute()). */
          .ldshdr_f1 = indirect_local
@@ -11110,6 +11339,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -11421,6 +11651,7 @@ agx_m5_publish_tile_program(struct agx_batch *batch,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -12203,6 +12434,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
       } else if (op == AGX_BG_EOT_NONE) {
          const struct agx3_g17p_graphics_program_desc desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program_ptr.gpu,
             .shader_va = shader->ptr + shader->info.main_offset,
             .shader_binary_size = shader->info.binary_size,
@@ -14943,7 +15175,7 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
          !batch->g17p_bind_tail_latched || varyings_dirty ||
          (ctx->dirty & ~(AGX_DIRTY_VS | AGX_DIRTY_VERTEX)) != 0 ||
          batch->g17p_latched_vs_shader != vs ||
-         batch->g17p_fragment_shader != ctx->fs ||
+         batch->g17p_fragment_shader != agx_fs_launch_shader(ctx) ||
          batch->g17p_fragment_linked != ctx->linked.fs ||
          (vs_emitted &&
           (!batch->g17p_have_latched_vs ||
@@ -16539,12 +16771,14 @@ agx_nr_textures_read(const struct agx_context *ctx, mesa_shader_stage stage)
 static void
 agx_legalize_feedback_loops(struct agx_context *ctx)
 {
+   const unsigned mask =
+      ctx->stages_with_textures & ~BITFIELD_BIT(MESA_SHADER_COMPUTE);
    /* Trust that u_blitter knows what it's doing */
-   if (ctx->blitter->running)
+   if (!mask || ctx->blitter->running)
       return;
 
-   for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
-      if (stage == MESA_SHADER_COMPUTE)
+   u_foreach_bit(stage, mask) {
+      if (!ctx->stage[stage].shader)
          continue;
 
       bool new_shader =
@@ -18342,11 +18576,15 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct pipe_draw_indirect_info indirect_gs;
    struct pipe_draw_start_count_bias draw_gs;
 
-   /* Wrap the pool allocation in a fake resource for meta-Gallium use */
-   struct agx_resource indirect_rsrc = {.bo = batch->geom_params_bo};
-   struct agx_resource index_rsrc = {};
+   /* Wrap the pool allocation in a fake resource for meta-Gallium use.
+    * Defer initialization until ctx->gs is active to avoid ~2 KiB of stack
+    * zeroing on every non-GS draw. */
+   struct agx_resource indirect_rsrc;
+   struct agx_resource index_rsrc;
 
-   if (ctx->gs) {
+   if (unlikely(ctx->gs)) {
+      indirect_rsrc = (struct agx_resource){.bo = batch->geom_params_bo};
+      index_rsrc = (struct agx_resource){0};
       /* Launch the pre-rasterization parts of the geometry shader */
       agx_launch_gs_prerast(batch, info, draws, indirect);
 
@@ -18681,7 +18919,7 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
          continue;
 
       struct agx_resource *buffer = agx_resource(*res);
-      agx_batch_writes(batch, buffer, 0);
+      agx_batch_writes_storage(batch, buffer, 0);
       batch->incoherent_writes = true;
    }
 
@@ -19162,6 +19400,19 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
    agx_launch(batch, grid, wg, cs, NULL, MESA_SHADER_COMPUTE,
               info->variable_shared_mem, indirect);
+
+   /* Count a plain application dispatch: a direct grid with no query. The
+    * compute blitter's launches are driver work. See
+    * agx_batch_sibling_queue(). */
+   if (ctx->compute_blitter.active || indirect || statistic ||
+       ctx->time_elapsed) {
+      batch->compute_internal = true;
+   } else {
+      const uint64_t threads = (uint64_t)grid.count[0] * grid.count[1] *
+                               grid.count[2];
+      batch->storage_dispatches++;
+      batch->storage_min_threads = MIN2(batch->storage_min_threads, threads);
+   }
 
    /* TODO: Dirty tracking? */
    agx_dirty_all(ctx);

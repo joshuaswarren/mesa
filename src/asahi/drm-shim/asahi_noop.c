@@ -187,6 +187,8 @@ static const struct drm_asahi_params_global params_g16s_as = {
  * generation 3, HAL 200, and soft faults on because fault_control defaults to
  * 0xb.  Select with ASAHI_SHIM_CHIP=g17p.  This exists so the Honeykrisp G17P
  * shader and command-stream paths can be exercised without hardware.
+ * ASAHI_SHIM_RENDER_RAY_QUERY=1 adds the render ray query feature of kernels
+ * that admit them, which G17P ray tracing pipelines need (shim_features()).
  */
 static const struct drm_asahi_params_global params_g17p = {
    .features = DRM_ASAHI_FEATURE_SOFT_FAULTS |
@@ -384,6 +386,26 @@ static const struct drm_asahi_params_global params_g17s = {
    .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
 };
 
+/* Explicit offline M5 Ultra identity (ASAHI_SHIM_CHIP=g17d) for
+ * command-generation tests: the M5 Pro profile's features with the M5 Ultra's
+ * admission contract (agx_params_m5_supported()): T6050, variant D, two dies,
+ * eight clusters of ten cores. It exercises what only a two-die, eight-cluster
+ * part selects: the scoped compute ordering record and the eight-cluster
+ * helper-table offsets. */
+static const struct drm_asahi_params_global params_g17d = {
+   .features = DRM_ASAHI_FEATURE_SOFT_FAULTS | DRM_ASAHI_FEATURE_RENDER_RESOURCES |
+               DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2,
+   .gpu_generation = 17, .gpu_variant = 'D', .gpu_revision = 0,
+   .chip_id = 0x6050, .num_dies = 2, .num_clusters_total = 8,
+   .num_cores_per_cluster = 10,
+   .core_masks = {0x3ff, 0x3ff, 0x3ff, 0x3ff, 0x3ff, 0x3ff, 0x3ff, 0x3ff},
+   .vm_start = 0x4000, .vm_end = (1ull << 42) - 0x8000ull,
+   .vm_kernel_min_size = 0x20000000, .max_commands_per_submission = 64,
+   .max_attachments = 16, .max_frequency_khz = 1500000,
+   .command_timestamp_frequency_hz = 1000000000,
+   .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
+};
+
 /* The M5 Pro as the G17 kernel runtime presents it: GET_PARAMS of the E2
  * kernel on a J716s (features 0x23cfe7c06, two clusters of ten cores): no
  * soft faults, the M5 command set's features (program storage lists, shader
@@ -555,6 +577,8 @@ shim_params(void)
       return &params_g16g;
    if (chip && !strcmp(chip, "g17s"))
       return &params_g17s;
+   if (chip && !strcmp(chip, "g17d"))
+      return &params_g17d;
    if (chip && !strcmp(chip, "t6041"))
       return &params_t6041;
 
@@ -1551,6 +1575,10 @@ shim_features(void)
       features |= DRM_ASAHI_FEATURE_VM_STATUS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS_MIRROR"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
+   /* A kernel that admits render ray queries, which G17P ray tracing
+    * pipelines need; the shim executes nothing either way. */
+   if (shim_env_on("ASAHI_SHIM_RENDER_RAY_QUERY"))
+      features |= DRM_ASAHI_FEATURE_RENDER_RAY_QUERY;
    /* An M5 kernel without the compressed multisample ZLS opt-in, as the
     * M5 Max (J775c) kernel reports its features: its render validation, and
     * so the M5 submission gate, then refuses a single-layer multisample

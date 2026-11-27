@@ -7,10 +7,15 @@
 #include "agx_opcodes.h"
 
 bool
-agx_allows_16bit_immediate(agx_instr *I)
+agx_allows_16bit_immediate(agx_instr *I, enum agx_isa_encoding enc)
 {
+   /* The local load/store index immediate exists only in the AGX2 local
+    * form; AGX3 keeps the offset in the base operand. */
+   const bool local = (I->op == AGX_OPCODE_LOCAL_LOAD) ||
+                      (I->op == AGX_OPCODE_LOCAL_STORE);
    return (I->op == AGX_OPCODE_DEVICE_LOAD) ||
           (I->op == AGX_OPCODE_DEVICE_STORE) ||
+          (local && enc == AGX_ISA_ENCODING_AGX2) ||
           (I->op == AGX_OPCODE_STACK_LOAD) ||
           (I->op == AGX_OPCODE_STACK_STORE) ||
           (I->op == AGX_OPCODE_UNIFORM_STORE) || (I->op == AGX_OPCODE_ATOMIC) ||

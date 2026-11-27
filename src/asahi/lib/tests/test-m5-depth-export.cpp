@@ -41,6 +41,7 @@ struct epilog_shape {
    unsigned samples;
    bool z, s, a2c;
    bool blend = false, sample_shading = false;
+   enum pipe_format format = PIPE_FORMAT_R8G8B8A8_UNORM;
 };
 
 static nir_shader *
@@ -59,7 +60,7 @@ build_epilog(const epilog_shape &shape)
    fs.link.sample_shading = shape.sample_shading;
    fs.blend.alpha_to_coverage = shape.a2c;
    agx_fs_epilog_apply_device_policy(shape.chip, &fs);
-   fs.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
+   fs.rt_formats[0] = shape.format;
    fs.remap[0] = 0;
    for (unsigned rt = 1; rt < ARRAY_SIZE(fs.remap); ++rt)
       fs.remap[rt] = -1;
@@ -499,6 +500,103 @@ TEST_F(M5DepthExport, PackedRgba8BackgroundClearSkipsFltnorm)
    auto ops = mnemonics(part);
    EXPECT_EQ(count_of(ops, "fltnorm"), 0u);
    EXPECT_EQ(count_of(ops, "lstcol"), 1u);
+   free(part.binary);
+   ralloc_free(b.shader);
+}
+
+TEST_F(M5DepthExport, InlineBlendPublishesCompletePixelProtocol)
+{
+   const enum pipe_format formats[] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+   };
+   for (enum pipe_format fmt : formats) {
+      SCOPED_TRACE(util_format_short_name(fmt));
+      epilog_shape shape = {AGX_CHIP_G17S, 1, false, false, false};
+      shape.blend = true;
+      shape.format = fmt;
+      nir_shader *s = build_epilog(shape);
+      agx_preprocess_nir(s);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      key.no_preamble = true;
+      key.fs.nr_samples = 1;
+      BITSET_SET(key.g17p_tile_partitions, 0);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+         << agx_last_compile_refusal();
+      EXPECT_TRUE(part.info.agx3_colour_link.entry_emitted);
+      EXPECT_FALSE(part.info.agx3_colour_link.rt_query_write_acquired);
+      EXPECT_EQ(part.info.agx3_colour_link.colour_classes, 1u);
+      const uint8_t entry[] = {0x07, 0x30, 0x00, 0x05, 0x00, 0x00};
+      const uint8_t release[] = {0x67, 0x10, 0x00, 0x04, 0x00, 0x00};
+      const uint8_t *code = (uint8_t *)part.binary + part.info.main_offset;
+      const size_t n = part.info.main_size;
+      ASSERT_GE(n, 16u);
+      ASSERT_LE(part.info.agx3_colour_link.entry_offset + sizeof(entry), n);
+      EXPECT_EQ(memcmp(code + part.info.agx3_colour_link.entry_offset, entry,
+                       sizeof(entry)), 0);
+      EXPECT_EQ(memcmp(code + n - 10, release, sizeof(release)), 0);
+      EXPECT_EQ(code[n - 4], 0x0e);
+      auto ops = mnemonics(part);
+      EXPECT_EQ(count_of(ops, "lldcol"), 1u);
+      EXPECT_EQ(count_of(ops, "lstcol"), 1u);
+      free(part.binary);
+      ralloc_free(s);
+   }
+}
+
+TEST_F(M5DepthExport, InlineBlendKeepsVaryingInterpBeforeTileLoad)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 inline blend interp order");
+   b.shader->info.inputs_read = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   b.shader->info.outputs_read = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   b.shader->info.fs.uses_fbfetch_output = true;
+   b.shader->info.io_lowered = true;
+   nir_def *bary = nir_load_barycentric_pixel(&b, 32,
+                                              .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *src = nir_load_interpolated_input(&b, 4, 32, bary, nir_imm_int(&b, 0),
+                                              .base = 0, .component = 0,
+                                              .io_semantics = {
+                                                 .location = VARYING_SLOT_VAR0,
+                                                 .num_slots = 1,
+                                              });
+   nir_def *mask = nir_imm_intN_t(&b, 0xff, 16);
+   nir_def *dst = nir_load_local_pixel_agx(&b, 4, 32, mask,
+                                           .base = 0,
+                                           .format = PIPE_FORMAT_R8_UNORM,
+                                           .target = 0);
+   nir_def *a = nir_fsat(&b, nir_channel(&b, src, 3));
+   nir_def *inv_a = nir_fsub(&b, nir_imm_float(&b, 1.0f), a);
+   nir_def *blended = nir_ffma(&b, nir_fsat(&b, src), a, nir_fmul(&b, dst, inv_a));
+   nir_store_local_pixel_agx(&b, blended, mask, nir_undef(&b, 2, 16),
+                             .base = 0, .write_mask = 0xf,
+                             .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.fs.nr_samples = 1;
+   BITSET_SET(key.g17p_tile_partitions, 0);
+   agx_shader_part part = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+      << agx_last_compile_refusal();
+   auto ops = mnemonics(part);
+   int last_interp = -1, first_lldcol = -1;
+   for (size_t i = 0; i < ops.size(); ++i) {
+      if (ops[i].find("interp") != std::string::npos)
+         last_interp = (int)i;
+      if (first_lldcol < 0 && ops[i] == "lldcol")
+         first_lldcol = (int)i;
+   }
+   ASSERT_GE(last_interp, 0);
+   ASSERT_GE(first_lldcol, 0);
+   EXPECT_LT(last_interp, first_lldcol);
    free(part.binary);
    ralloc_free(b.shader);
 }

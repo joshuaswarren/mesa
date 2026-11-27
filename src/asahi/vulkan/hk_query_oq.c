@@ -18,6 +18,13 @@
 #include "util/list.h"
 #include "util/u_dynarray.h"
 
+static inline bool
+hk_oq_compute_no_query_access(const struct hk_cmd_buffer *cmd)
+{
+   return (hk_cmd_buffer_device(cmd)->dev.params.features &
+           DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS) != 0;
+}
+
 void
 hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
 {
@@ -26,14 +33,18 @@ hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
       return;
 
    /* Any later stream or sync record flushed oq_pending_render into post_gfx,
-    * so nothing depends on this render. Verify no tail requirement names it,
-    * then stamp its free retirement slots directly (same slot order as
-    * hk_stamp_oq_available()). */
-   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
-      const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
-      if (cut && cut->sync.seq >= render->sync.seq) {
-         hk_flush_oq_pending(cmd);
-         return;
+    * so nothing depends on this render. Without COMPUTE_NO_QUERY_ACCESS, a
+    * tail requirement naming this render would stall a following compute
+    * command on the host waiting for render retirement; verify none names it.
+    * With COMPUTE_NO_QUERY_ACCESS, only query-accessing computes wait on the
+    * host for overlapping render stamps (hk_query_stamps_conflict()). */
+   if (!hk_oq_compute_no_query_access(cmd)) {
+      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+         const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
+         if (cut && cut->sync.seq >= render->sync.seq) {
+            hk_flush_oq_pending(cmd);
+            return;
+         }
       }
    }
 
@@ -42,6 +53,7 @@ hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
    for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
       const unsigned slot = order[i];
       if ((slot == 0 && render->timestamp.start.handle) ||
+          (slot == 1 && render->timestamp.vtx_end.handle) ||
           render->oq_stamp[slot].handle)
          continue;
       free_slots[nfree++] = slot;
@@ -130,22 +142,64 @@ hk_stamp_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *post)
    if (!render || post->sync.dep[HK_SYNC_VDM].cut != render)
       return HK_OQ_KEEP;
 
+   const bool no_query_access = hk_oq_compute_no_query_access(cmd);
+   bool relaxed = false;
+
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
       if (it == post || it == render)
          continue;
-      if (hk_dep_reaches(&it->sync.dep[HK_SYNC_CDM], post) ||
-          hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_CDM], post))
-         return HK_OQ_KEEP;
-      if (it->type == HK_CS_CDM &&
-          (hk_dep_reaches(&it->sync.dep[HK_SYNC_VDM], render) ||
-           hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_VDM], render)))
-         return HK_OQ_KEEP;
+      if (no_query_access) {
+         const bool waits_post =
+            hk_dep_reaches(&it->sync.dep[HK_SYNC_CDM], post) ||
+            hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_CDM], post);
+         const bool waits_render =
+            hk_dep_reaches(&it->sync.dep[HK_SYNC_VDM], render) ||
+            hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_VDM], render);
+
+         /* Keep the GPU store before any in-CB query-accessing or event
+          * compute stream that waits on this render or availability stream. */
+         if (it->type == HK_CS_CDM &&
+             (it->query_access || it->query_access_untracked)) {
+            if (waits_post || waits_render)
+               return HK_OQ_KEEP;
+         } else {
+            /* Renders and non-query compute streams receive NO_QUERY_ACCESS
+             * and do not wait on the host for render retirement stamps. Only
+             * require that dropping post cannot lose a transitive ordering
+             * edge from render. */
+            if (hk_dep_reaches(&it->sync.dep[HK_SYNC_CDM], post) &&
+                !hk_dep_reaches(&it->sync.dep[HK_SYNC_VDM], render))
+               return HK_OQ_KEEP;
+            if (hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_CDM], post) &&
+                !hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_VDM], render))
+               return HK_OQ_KEEP;
+            if (waits_post || (it->type == HK_CS_CDM && waits_render))
+               relaxed = true;
+         }
+      } else {
+         if (hk_dep_reaches(&it->sync.dep[HK_SYNC_CDM], post) ||
+             hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_CDM], post))
+            return HK_OQ_KEEP;
+         if (it->type == HK_CS_CDM &&
+             (hk_dep_reaches(&it->sync.dep[HK_SYNC_VDM], render) ||
+              hk_dep_reaches(&it->sync.dep_ta[HK_SYNC_VDM], render)))
+            return HK_OQ_KEEP;
+      }
    }
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
-      if (hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_VDM], render) ||
-          hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_CDM], post))
-         return HK_OQ_KEEP;
+      if (no_query_access) {
+         if (hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_CDM], post) &&
+             !hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_VDM], render))
+            return HK_OQ_KEEP;
+         if (hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_VDM], render) ||
+             hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_CDM], post))
+            relaxed = true;
+      } else {
+         if (hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_VDM], render) ||
+             hk_dep_reaches(&cmd->sync.req[k][HK_SYNC_CDM], post))
+            return HK_OQ_KEEP;
+      }
    }
 
    /* The host-written slots only: vertex end and fragment start, which no
@@ -158,12 +212,13 @@ hk_stamp_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *post)
    for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
       const unsigned slot = order[i];
       if ((slot == 0 && render->timestamp.start.handle) ||
+          (slot == 1 && render->timestamp.vtx_end.handle) ||
           render->oq_stamp[slot].handle)
          continue;
       free_slots[nfree++] = slot;
    }
    if (nfree < count)
-      return HK_OQ_MOVABLE;
+      return relaxed ? HK_OQ_KEEP : HK_OQ_MOVABLE;
 
    for (unsigned i = 0; i < count; ++i) {
       render->oq_stamp[free_slots[i]] = (struct agx_timestamp_req){
@@ -336,9 +391,10 @@ hk_oq_render_stamps_supported(enum agx_chip chip)
 void
 hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd)
 {
-   /* Reverse order applies across native HAL200 chips; G15 keeps recording
-    * order until measured there. */
-   if (agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
+   /* Reverse order applies across all chips that support retirement-stamped
+    * occlusion availability (HAL200 and M5); older chips keep recording
+    * order. */
+   if (hk_oq_render_stamps_supported(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_resolve_oq_reverse(cmd);
    else
       hk_resolve_oq_forward(cmd);
