@@ -335,6 +335,7 @@ enum licm_spec_mode {
    LICM_SPEC_NONE = 0,
    LICM_SPEC_ALL,
    LICM_SPEC_SFU_CHAIN,
+   LICM_SPEC_CONST_LOAD_CHAIN,
    LICM_SPEC_AGX2_INTEGER,
 };
 
@@ -345,6 +346,7 @@ struct licm_sim {
    enum licm_spec_mode spec_mode;
    bool hoisted_non_const;
    bool hoisted_sfu;
+   bool hoisted_const_load;
 };
 
 static bool
@@ -621,6 +623,108 @@ agx_licm_filter_all(nir_instr *instr, nir_loop *loop, bool dominates_exit)
 }
 
 static bool
+instr_is_speculatable_const_load(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_global_constant ||
+       !nir_intrinsic_can_reorder(intr))
+      return false;
+   enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   return (access & ACCESS_CAN_SPECULATE) &&
+          !(access & (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_BUFFER_BINDING_AGX));
+}
+
+static bool
+def_feeds_const_load_chain(nir_def *def, nir_loop *loop,
+                           const struct licm_sim *sim, unsigned depth)
+{
+   if (depth == 0)
+      return false;
+
+   nir_foreach_use(u, def) {
+      nir_instr *ui = nir_src_use_instr(u);
+      nir_block *ub = instr_current_block(ui, sim);
+      if (!block_is_direct_loop_body(ub, loop))
+         continue;
+      if (instr_is_speculatable_const_load(ui))
+         return true;
+      nir_def *udef = nir_instr_def(ui);
+      if (udef && agx_licm_can_speculate(ui) &&
+          def_feeds_const_load_chain(udef, loop, sim, depth - 1))
+         return true;
+   }
+   return false;
+}
+
+static bool
+instr_in_direct_const_load_chain(nir_instr *instr, nir_loop *loop,
+                                 const struct licm_sim *sim)
+{
+   nir_block *blk = instr_current_block(instr, sim);
+   if (!block_is_direct_loop_body(blk, loop) ||
+       !agx_licm_can_speculate(instr) || loop_has_terminate(loop))
+      return false;
+
+   if (instr_is_speculatable_const_load(instr))
+      return true;
+
+   nir_def *def = nir_instr_def(instr);
+   return def && def_feeds_const_load_chain(def, loop, sim, 16);
+}
+
+static bool
+loop_has_direct_body_const_load(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      if (block->cf_node.parent->type != nir_cf_node_loop)
+         continue;
+      nir_foreach_instr(instr, block) {
+         if (instr_is_speculatable_const_load(instr))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+cf_list_has_direct_body_const_load(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         if (loop_has_direct_body_const_load(nir_cf_node_as_loop(node)))
+            return true;
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (cf_list_has_direct_body_const_load(&nif->then_list) ||
+             cf_list_has_direct_body_const_load(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+shader_has_direct_body_const_load(nir_shader *shader)
+{
+   nir_foreach_function_impl(impl, shader) {
+      if (cf_list_has_direct_body_const_load(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+static bool
+agx_licm_filter_const_load(nir_instr *instr, nir_loop *loop,
+                           bool dominates_exit)
+{
+   if (dominates_exit)
+      return true;
+   return instr_in_direct_const_load_chain(instr, loop, NULL);
+}
+
+static bool
 agx_licm_filter_sfu(nir_instr *instr, nir_loop *loop, bool dominates_exit)
 {
    if (dominates_exit)
@@ -656,6 +760,9 @@ sim_instr_invariant(nir_instr *instr, struct licm_sim *sim, bool dom_exit,
          return direct_body && agx_licm_can_speculate(instr);
       if (sim->spec_mode == LICM_SPEC_SFU_CHAIN)
          return direct_body && instr_in_direct_sfu_chain(instr, sim->loop, sim);
+      if (sim->spec_mode == LICM_SPEC_CONST_LOAD_CHAIN)
+         return direct_body &&
+                instr_in_direct_const_load_chain(instr, sim->loop, sim);
       return false;
 
    default:
@@ -711,6 +818,8 @@ sim_visit_block(nir_block *block, struct licm_sim *sim, bool dom_exit,
             if (instr->type == nir_instr_type_alu &&
                 alu_is_expensive_sfu(nir_instr_as_alu(instr)->op))
                sim->hoisted_sfu = true;
+            if (instr_is_speculatable_const_load(instr))
+               sim->hoisted_const_load = true;
          }
          progress = true;
       } else {
@@ -1186,6 +1295,8 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
             any_useful |= sim.hoisted_non_const;
          else if (spec_mode == LICM_SPEC_SFU_CHAIN)
             any_useful |= sim.hoisted_sfu;
+         else if (spec_mode == LICM_SPEC_CONST_LOAD_CHAIN)
+            any_useful |= sim.hoisted_const_load;
          else
             any_useful = true;
          compute_sim_liveness(impl, blocks, mem_ctx);
@@ -1314,6 +1425,21 @@ agx_nir_opt_licm_direct_sfu(nir_shader *shader, unsigned budget)
       return false;
 
    return nir_opt_licm(shader, agx_licm_filter_sfu);
+}
+
+bool
+agx_nir_opt_licm_direct_const_loads(nir_shader *shader, unsigned budget)
+{
+   if (!shader_has_direct_body_const_load(shader))
+      return false;
+
+   bool any_hoist = false;
+   if (!simulate_shader_licm(shader, budget, false, LICM_SPEC_CONST_LOAD_CHAIN,
+                             &any_hoist) ||
+       !any_hoist)
+      return false;
+
+   return nir_opt_licm(shader, agx_licm_filter_const_load);
 }
 
 bool
