@@ -860,6 +860,8 @@ struct hk_rendering_state {
     * sparse or linear image), so its stores count as memory writes for
     * dependency tracking (HK_SYNC_GFX_MEM). */
    bool m5_attachments_reach_memory;
+   /* Bloom filter of plane GPU VAs of all pass/resolve attachments. */
+   uint64_t att_bloom;
 
    /* AGX3 dead depth/stencil store: aspects stored in this single-stream pass
     * that may become dead if overwritten before read (hk_take_pending_z_store),

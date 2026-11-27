@@ -25,6 +25,9 @@ struct hk_descriptor_set_binding_layout {
    /* Flags provided when this binding was created */
    VkDescriptorBindingFlags flags;
 
+   /* Shader stages that may access this binding */
+   VkShaderStageFlags stage_flags;
+
    /* Number of array elements in this binding (or size in bytes for inline
     * uniform data)
     */
@@ -62,6 +65,10 @@ struct hk_descriptor_set_layout {
    /* Precomputed at layout creation: true if the layout or any binding permits
     * UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING. */
    bool has_update_after_bind;
+
+   /* Precomputed at layout creation: true if any vertex-visible image binding
+    * permits UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING. */
+   bool has_uab_vs_images;
 
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
