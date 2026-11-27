@@ -1584,6 +1584,155 @@ test_image_barrier_vertex_class(void)
    hk_sync_end_rendering(cmd, false);
 }
 
+static void
+test_vertex_image_bloom(void)
+{
+   /* Find three distinct keys with pairwise-disjoint 64-bit bloom bits. */
+   const uint64_t k_a = UINT64_C(0x100000);
+   uint64_t k_b = UINT64_C(0x200000);
+   while (hk_sync_image_bloom(k_b) == hk_sync_image_bloom(k_a))
+      k_b += 0x10000;
+   uint64_t k_c = k_b + 0x10000;
+   while (hk_sync_image_bloom(k_c) == hk_sync_image_bloom(k_a) ||
+          hk_sync_image_bloom(k_c) == hk_sync_image_bloom(k_b))
+      k_c += 0x10000;
+   const uint64_t b_a = hk_sync_image_bloom(k_a);
+   const uint64_t b_b = hk_sync_image_bloom(k_b);
+   const uint64_t b_c = hk_sync_image_bloom(k_c);
+
+   /* In-CB: disjoint attachment vs VS bloom splits TA while fragment waits. */
+   struct hk_cmd_buffer *cmd = new_cmd();
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_a;
+   struct hk_cs *p1 = add(cmd, false);
+   hk_sync_end_rendering(cmd, false);
+
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_b;
+   struct hk_cs *p2 = add(cmd, false);
+   hk_sync_end_rendering(cmd, false);
+
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+
+   /* Disjoint reader (reads C): waits on neither P1 nor P2 in vertex half. */
+   struct hk_cs *r_disjoint = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_disjoint, b_c);
+   T("in-CB disjoint bloom splits vertex half",
+     !r_disjoint->sync.dep_ta[HK_SYNC_VDM].cut &&
+     r_disjoint->sync.dep[HK_SYNC_VDM].cut == p2);
+
+   /* Reader of A: waits on P1, not P2. */
+   struct hk_cs *r_match_a = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_match_a, b_a);
+   T("in-CB bloom waits on matching earlier render only",
+     r_match_a->sync.dep_ta[HK_SYNC_VDM].cut == p1 &&
+     r_match_a->sync.dep[HK_SYNC_VDM].cut == p2);
+
+   /* Adding a second draw reading B upgrades cut to P2. */
+   hk_sync_vertex_images_bloom(cmd, r_match_a, b_b);
+   T("in-CB second draw widens bloom cut to P2",
+     r_match_a->sync.dep_ta[HK_SYNC_VDM].cut == p2);
+
+   /* Upgrading to unsafe forces full conservative HK_SYNC_GFX_IMG wait. */
+   hk_sync_vertex_images(cmd, r_disjoint);
+   T("in-CB unsafe upgrade forces full wait",
+     r_disjoint->sync.vtx_img_unsafe &&
+     r_disjoint->sync.dep_ta[HK_SYNC_VDM].cut == p2);
+
+   /* In-CB HK_SYNC_GFX_MEM producer always orders even disjoint bloom. */
+   cmd = new_cmd();
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_a;
+   struct hk_cs *pmem = add(cmd, false);
+   hk_sync_note_memory_write(cmd, pmem);
+   hk_sync_end_rendering(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   struct hk_cs *r_after_mem = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_after_mem, b_c);
+   T("in-CB memory-writing render orders disjoint bloom reader",
+     r_after_mem->sync.dep_ta[HK_SYNC_VDM].cut == pmem);
+
+   /* Cross-submit with exact_prior: disjoint splits, matching hits exact ordinal. */
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *s1 = new_cmd();
+   hk_sync_begin_rendering(s1, false);
+   s1->state.gfx.render.att_bloom = b_a;
+   add(s1, false); /* ordinal 1: att A */
+   hk_sync_end_rendering(s1, false);
+   hk_sync_begin_rendering(s1, false);
+   s1->state.gfx.render.att_bloom = b_b;
+   add(s1, false); /* ordinal 2: att B */
+   hk_sync_end_rendering(s1, false);
+   hk_sync_barrier(s1, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   T("bloom cross-submit producer", submit(q, s1));
+
+   struct hk_cmd_buffer *s2 = new_cmd();
+   struct hk_cs *c_disjoint = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_disjoint, b_c);
+   struct hk_cs *c_match_a = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_match_a, b_a);
+   struct hk_cs *c_zero = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_zero, 0);
+   struct hk_cs *c_unsafe = add(s2, false);
+   hk_sync_vertex_images(s2, c_unsafe);
+   T("bloom cross-submit consumers", submit(q, s2));
+
+   T("cross-submit disjoint bloom skips prior renders on VDM TA",
+     c_disjoint->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_disjoint->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+     c_disjoint->sync.prior[HK_SYNC_VDM] == 2 &&
+     c_disjoint->sync.ta_split);
+   T("cross-submit matching bloom waits on exact matching ordinal 1, not 2",
+     c_match_a->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_match_a->sync.prior_ta[HK_SYNC_VDM] == 1 &&
+     c_match_a->sync.prior[HK_SYNC_VDM] == 2 &&
+     c_match_a->sync.ta_split);
+   T("cross-submit empty bloom (null descriptors) skips prior renders",
+     c_zero->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_zero->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+     c_zero->sync.ta_split);
+   T("cross-submit unsafe reader waits on full prior ordinal 2",
+     c_unsafe->sync.prior_ta[HK_SYNC_VDM] == 2 &&
+     !c_unsafe->sync.ta_split);
+
+   /* Cross-submit ring eviction stays conservative at evicted ordinal. */
+   struct hk_queue *qe = new_queue(true);
+   struct hk_cmd_buffer *se = new_cmd();
+   for (unsigned i = 0; i < HK_SYNC_RECENT_VDM_ATT + 4; ++i) {
+      hk_sync_begin_rendering(se, false);
+      se->state.gfx.render.att_bloom = b_a;
+      add(se, false);
+      hk_sync_end_rendering(se, false);
+   }
+   hk_sync_barrier(se, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   T("bloom eviction producer submit", submit(qe, se));
+   struct hk_cmd_buffer *sc = new_cmd();
+   struct hk_cs *c_ev = add(sc, false);
+   hk_sync_vertex_images_bloom(sc, c_ev, b_c);
+   T("bloom eviction consumer submit", submit(qe, sc));
+   T("cross-submit ring eviction waits conservatively on evicted ordinal",
+     c_ev->sync.prior_ta[HK_SYNC_VDM] == 4 &&
+     c_ev->sync.prior[HK_SYNC_VDM] == HK_SYNC_RECENT_VDM_ATT + 4 &&
+     c_ev->sync.ta_split);
+
+   /* Legacy queue (exact_prior == false) falls back conservatively. */
+   struct hk_queue *ql = new_queue(false);
+   struct hk_cmd_buffer *la = new_cmd(), *lb = new_cmd();
+   hk_sync_begin_rendering(la, false);
+   la->state.gfx.render.att_bloom = b_a;
+   add(la, false);
+   hk_sync_end_rendering(la, false);
+   hk_sync_barrier(la, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   struct hk_cs *lr = add(lb, false);
+   hk_sync_vertex_images_bloom(lb, lr, b_c);
+   struct hk_cmd_buffer *lpair[] = {la, lb};
+   T("legacy bloom submit",
+     hk_sync_resolve_submit(ql, lpair, 2, false, false, 0, NULL));
+   T("legacy queue keeps conservative vertex wait",
+     lr->sync.barrier_ta[HK_SYNC_VDM] == lr->sync.barrier[HK_SYNC_VDM] &&
+     lr->sync.barrier_ta[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE);
+}
+
 /* A layout transition the driver performs as work (the metadata clear of a
  * discarded compressed storage image): brl_sync_transition_*(), recorded the
  * way brl_discard_init_prepare()/_record() and hk_CmdWaitEvents2() record it.
@@ -2947,6 +3096,7 @@ main(void)
       T("signalled_value ignores equal point",
         p_atomic_read(&mq->drm.signalled_value) == 12);
    }
+   test_vertex_image_bloom();
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

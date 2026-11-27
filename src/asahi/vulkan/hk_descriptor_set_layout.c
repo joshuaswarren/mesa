@@ -376,13 +376,31 @@ hk_CreateDescriptorSetLayout(VkDevice device,
          continue;
 
       layout->binding[b].type = binding->descriptorType;
+      layout->binding[b].stage_flags = binding->stageFlags;
+
+      const bool is_vs_image_binding =
+         (binding->stageFlags & VK_SHADER_STAGE_VERTEX_BIT) &&
+         (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT);
 
       if (binding_flags_info && binding_flags_info->bindingCount > 0) {
          assert(binding_flags_info->bindingCount == pCreateInfo->bindingCount);
          layout->binding[b].flags = binding_flags_info->pBindingFlags[info_idx];
-         if (layout->binding[b].flags & late_binding_flags)
+         if (layout->binding[b].flags & late_binding_flags) {
             layout->has_update_after_bind = true;
+            if (is_vs_image_binding)
+               layout->has_uab_vs_images = true;
+         }
       }
+      if (is_vs_image_binding &&
+          (pCreateInfo->flags &
+           VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+         layout->has_uab_vs_images = true;
 
       layout->binding[b].array_size = binding->descriptorCount;
 

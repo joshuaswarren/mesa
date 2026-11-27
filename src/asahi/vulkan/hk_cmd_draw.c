@@ -5712,6 +5712,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->g17p_zls_touched = 0;
    render->g17p_zls_written = 0;
    render->m5_attachments_reach_memory = false;
+   render->att_bloom = 0;
    {
       const struct hk_image_view *views[2 * HK_MAX_RTS + 4] = {
          render->depth_att.iview, render->stencil_att.iview,
@@ -5722,6 +5723,27 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       }
       for (unsigned i = 0; i < 4 + 2 * render->color_att_count; ++i) {
          const struct vk_image *image = views[i] ? views[i]->vk.image : NULL;
+         if (image) {
+            const struct hk_image *hk_img =
+               container_of(image, struct hk_image, vk);
+            const VkImageCreateFlags unsafe_flags =
+               VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+               VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+            if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
+                image->external_handle_types ||
+                (image->create_flags & unsafe_flags) ||
+                image->tiling == VK_IMAGE_TILING_LINEAR) {
+               render->att_bloom = UINT64_MAX;
+            } else {
+               for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
+                  if (!hk_img->planes[p].addr) {
+                     render->att_bloom = UINT64_MAX;
+                     break;
+                  }
+                  render->att_bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
+               }
+            }
+         }
          /* Swapchain memory aliases images only (hk_image::swapchain_memory),
           * which later work reads through an image. */
          const VkImageCreateFlags aliasing =
@@ -16073,17 +16095,48 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    if (!hk_sync_image_class(cmd) ||
-       (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch))
+       (cs->sync.vtx_img_unsafe && cs->sync.vtx_images_epoch == cmd->sync.epoch))
       return;
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
-   if (!hw_vs || hw_vs->info.reads_images ||
-       hw_vs->info.writes_external_memory || gfx->xfb_enabled ||
+   if (!hw_vs || hw_vs->info.writes_external_memory || gfx->xfb_enabled ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
-       gfx->shaders[MESA_SHADER_MESH])
+       gfx->shaders[MESA_SHADER_MESH]) {
       hk_sync_vertex_images(cmd, cs);
+      return;
+   }
+
+   if (!hw_vs->info.reads_images)
+      return;
+
+   const struct hk_descriptor_state *desc = &gfx->descriptors;
+   if (desc->buffer_active) {
+      hk_sync_vertex_images(cmd, cs);
+      return;
+   }
+
+   uint64_t draw_bloom = 0;
+   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+      if (desc->push_active & BITFIELD_BIT(s)) {
+         if (!desc->push[s] || desc->push[s]->vs_img_unsafe) {
+            hk_sync_vertex_images(cmd, cs);
+            return;
+         }
+         draw_bloom |= desc->push[s]->vs_img_bloom;
+      } else if (desc->sets[s]) {
+         const struct hk_descriptor_set *set = desc->sets[s];
+         if (!set->layout || set->layout->has_uab_vs_images ||
+             __atomic_load_n(&set->vs_img_unsafe, __ATOMIC_RELAXED)) {
+            hk_sync_vertex_images(cmd, cs);
+            return;
+         }
+         draw_bloom |= __atomic_load_n(&set->vs_img_bloom, __ATOMIC_RELAXED);
+      }
+   }
+
+   hk_sync_vertex_images_bloom(cmd, cs, draw_bloom);
 }
 
 static __attribute__((hot)) void

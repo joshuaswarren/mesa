@@ -24,6 +24,7 @@
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
+#include "hk_sync.h"
 #include "asahi/compiler/agx_nir.h"
 
 #include "util/cache_ops.h"
@@ -171,6 +172,48 @@ hk_border_swizzle_word(const struct hk_image_view *view)
 }
 
 static inline bool
+hk_descriptor_type_is_image(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+          type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+}
+
+static inline void
+hk_descriptor_set_note_vs_image(struct hk_descriptor_set *set, uint32_t binding,
+                                const struct vk_image *vk_img)
+{
+   if (!vk_img || !set->layout || binding >= set->layout->binding_count)
+      return;
+   if (!(set->layout->binding[binding].stage_flags & VK_SHADER_STAGE_VERTEX_BIT))
+      return;
+   const struct hk_image *image = container_of(vk_img, struct hk_image, vk);
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if ((vk_img->create_flags & unsafe_flags) || vk_img->external_handle_types ||
+       vk_img->tiling == VK_IMAGE_TILING_LINEAR || image->swapchain_memory ||
+       image->plane_count == 0) {
+      __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+      return;
+   }
+   uint64_t bloom = 0;
+   for (uint8_t p = 0; p < image->plane_count; ++p) {
+      if (!image->planes[p].addr) {
+         __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+         return;
+      }
+      bloom |= hk_sync_image_bloom(image->planes[p].addr);
+   }
+   if (bloom)
+      __atomic_fetch_or(&set->vs_img_bloom, bloom, __ATOMIC_RELAXED);
+}
+
+static inline bool
 write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
                                           const VkDescriptorImageInfo *info,
                                           uint32_t binding, uint32_t elem,
@@ -254,6 +297,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
    else
       desc.sw.border[0] = hk_border_swizzle_word(view);
 
+   hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
    write_desc(set, binding, elem, &desc, sizeof(desc));
    return true;
 }
@@ -293,6 +337,7 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
    if (descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER && info &&
        info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_image_view, view, info->imageView);
+      hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
 
       plane_count = view->plane_count;
       view_planes = view->plane_count;
@@ -472,6 +517,7 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
 
    if (info && info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_image_view, view, info->imageView);
+      hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
 
       /* Gate on what the PBE packer accepts (storage_pbe_valid carries every
        * real constraint) plus the shape limits of this fallback; any
@@ -691,6 +737,11 @@ write_buffer_view_desc(struct hk_descriptor_set *set,
       hk_storage_image_descriptor_layout(generation);
    uint32_t heap_index = 0;
 
+   if (bufferView != VK_NULL_HANDLE && set->layout &&
+       binding < set->layout->binding_count &&
+       (set->layout->binding[binding].stage_flags & VK_SHADER_STAGE_VERTEX_BIT))
+      __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+
    /* Native buffer-image reads use the same texture heap and software
     * metadata as uniform texel buffers. A missing writable PBE must not
     * replace their readable texture with the null descriptor. */
@@ -841,6 +892,19 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          updated |= copy->descriptorCount > 0;
       }
 
+      if ((dst_binding_layout->stage_flags & VK_SHADER_STAGE_VERTEX_BIT) &&
+          hk_descriptor_type_is_image(dst_binding_layout->type)) {
+         if (src->layout->has_uab_vs_images ||
+             !(src_binding_layout->stage_flags & VK_SHADER_STAGE_VERTEX_BIT) ||
+             __atomic_load_n(&src->vs_img_unsafe, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&dst->vs_img_unsafe, true, __ATOMIC_RELAXED);
+         } else {
+            uint64_t b = __atomic_load_n(&src->vs_img_bloom, __ATOMIC_RELAXED);
+            if (b)
+               __atomic_fetch_or(&dst->vs_img_bloom, b, __ATOMIC_RELAXED);
+         }
+      }
+
       if (updated) {
          if (last_dst != NULL && last_dst != dst)
             p_atomic_inc(&last_dst->update_seq);
@@ -972,6 +1036,11 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                              struct hk_descriptor_set_layout *layout,
                              struct hk_descriptor_set *set)
 {
+   if (memcmp(push_set->layout_hash, layout->vk.blake3,
+              sizeof(push_set->layout_hash)) != 0) {
+      push_set->vs_img_bloom = 0;
+      push_set->vs_img_unsafe = false;
+   }
    memcpy(push_set->layout_hash, layout->vk.blake3,
           sizeof(push_set->layout_hash));
    push_set->layout_flags = layout->vk.flags;
@@ -990,6 +1059,8 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
       .layout = layout,
       .size = sizeof(push_set->data),
       .mapped_ptr = push_set->data,
+      .vs_img_bloom = push_set->vs_img_bloom,
+      .vs_img_unsafe = push_set->vs_img_unsafe,
    };
    return true;
 }
@@ -1065,6 +1136,8 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
       }
    }
 
+   push_set->vs_img_bloom |= set.vs_img_bloom;
+   push_set->vs_img_unsafe |= set.vs_img_unsafe;
    return true;
 }
 
@@ -1553,6 +1626,8 @@ hk_push_descriptor_set_update_template(
       return false;
 
    hk_descriptor_set_write_template(&tmp_set, template, data);
+   push_set->vs_img_bloom |= tmp_set.vs_img_bloom;
+   push_set->vs_img_unsafe |= tmp_set.vs_img_unsafe;
    return true;
 }
 

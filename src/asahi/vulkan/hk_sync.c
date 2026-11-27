@@ -898,14 +898,67 @@ void
 hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    /* Requirements only grow when the epoch advances. */
-   if (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch)
+   if (cs->sync.vtx_img_unsafe && cs->sync.vtx_images_epoch == cmd->sync.epoch)
+      return;
+
+   cs->sync.vtx_images = true;
+   cs->sync.vtx_img_unsafe = true;
+   cs->sync.vtx_images_epoch = cmd->sync.epoch;
+   cs->sync.dep_ta[HK_SYNC_VDM].prior |= cs->sync.dep_ta_img_prior;
+   cs->sync.dep_ta_img_prior = 0;
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_mask(cmd, HK_SYNC_GFX_IMG, dep);
+   hk_sync_stream_wait(cs, dep);
+}
+
+void
+hk_sync_vertex_images_bloom(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                            uint64_t bloom)
+{
+   if (cs->sync.vtx_img_unsafe) {
+      hk_sync_vertex_images(cmd, cs);
+      return;
+   }
+   if (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch &&
+       !(bloom & ~cs->sync.vtx_img_bloom))
       return;
 
    cs->sync.vtx_images = true;
    cs->sync.vtx_images_epoch = cmd->sync.epoch;
+   cs->sync.vtx_img_bloom |= bloom;
+
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    req_for_mask(cmd, HK_SYNC_GFX_IMG, dep);
-   hk_sync_stream_wait(cs, dep);
+
+   /* Whole render / fragment half always keeps full HK_SYNC_GFX_IMG. */
+   stream_wait_frag(cs, dep);
+
+   /* Compute subqueue orders both halves anyway. */
+   if (dep[HK_SYNC_CDM].cut == cs) {
+      cs->sync.dep_ta[HK_SYNC_CDM].prior |= dep[HK_SYNC_CDM].prior;
+   } else {
+      dep_max(&cs->sync.dep_ta[HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
+   }
+
+   /* Render subqueue: wait only on the latest in-CB render at or before the
+    * image-barrier cut that wrote memory or an attachment matching our bloom. */
+   struct hk_cs *vdm_cut = dep[HK_SYNC_VDM].cut;
+   if (vdm_cut && vdm_cut != cs) {
+      struct hk_cs *best = NULL;
+      list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+         if (it->type != HK_CS_VDM || it == cs ||
+             it->sync.seq > vdm_cut->sync.seq)
+            continue;
+         if (((it->sync.kind & HK_SYNC_GFX_MEM) ||
+              (it->sync.att_bloom & cs->sync.vtx_img_bloom)) &&
+             (!best || it->sync.seq > best->sync.seq))
+            best = it;
+      }
+      if (best)
+         cs->sync.dep_ta[HK_SYNC_VDM].cut =
+            hk_sync_later(cs->sync.dep_ta[HK_SYNC_VDM].cut, best);
+   }
+   cs->sync.dep_ta_img_prior |= dep[HK_SYNC_VDM].prior;
 }
 
 void
@@ -996,6 +1049,9 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * whether or not the stream records a draw. */
    if (!compute && cmd->state.gfx.render.m5_attachments_reach_memory)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
+   if (!compute)
+      cs->sync.att_bloom =
+         st->in_pass ? cmd->state.gfx.render.att_bloom : UINT64_MAX;
    cs->sync.prev_mem =
       st->last[util_logbase2(HK_SYNC_GFX_MEM)][hk_sync_sq(cs)];
 
@@ -1676,6 +1732,15 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       into->sync.brl_transition = true;
    }
    into->sync.kind |= from->sync.kind;
+   into->sync.att_bloom |= from->sync.att_bloom;
+   into->sync.vtx_images |= from->sync.vtx_images;
+   into->sync.vtx_img_bloom |= from->sync.vtx_img_bloom;
+   into->sync.dep_ta_img_prior |= from->sync.dep_ta_img_prior;
+   if (into->sync.vtx_img_unsafe || from->sync.vtx_img_unsafe) {
+      into->sync.vtx_img_unsafe = true;
+      into->sync.dep_ta[HK_SYNC_VDM].prior |= into->sync.dep_ta_img_prior;
+      into->sync.dep_ta_img_prior = 0;
+   }
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
       replace_pointer(&st->last[k][sq], from, into);
@@ -2215,10 +2280,16 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_sync_stream_wait(cs, st->internal);
    /* The reopened stream's earlier draws read images in its vertex half,
     * which also runs the continuation's draws. */
+   cs->sync.att_bloom |= cmd->state.gfx.render.att_bloom;
    if (cs->sync.vtx_images) {
-      struct hk_sync_dep img[HK_SYNC_NUM_SQ];
-      req_for_mask(cmd, HK_SYNC_GFX_IMG, img);
-      hk_sync_stream_wait(cs, img);
+      if (cs->sync.vtx_img_unsafe) {
+         struct hk_sync_dep img[HK_SYNC_NUM_SQ];
+         req_for_mask(cmd, HK_SYNC_GFX_IMG, img);
+         hk_sync_stream_wait(cs, img);
+         cs->sync.vtx_images_epoch = cmd->sync.epoch;
+      } else {
+         hk_sync_vertex_images_bloom(cmd, cs, cs->sync.vtx_img_bloom);
+      }
    }
 
    /* As hk_sync_begin_rendering() followed by the creation of cs: the
@@ -2594,6 +2665,60 @@ struct submit_footprint {
    uint32_t next_by_image;
 };
 
+static void
+vdm_att_ring_add(struct hk_sync_queue *q, uint64_t ordinal, uint64_t att_bloom)
+{
+   struct hk_sync_vdm_att *slot = &q->recent_vdm_att[q->recent_vdm_att_next];
+   if (q->recent_vdm_att_count >= HK_SYNC_RECENT_VDM_ATT)
+      q->recent_vdm_att_evicted =
+         MAX2(q->recent_vdm_att_evicted, slot->ordinal);
+   *slot = (struct hk_sync_vdm_att){
+      .ordinal = ordinal,
+      .att_bloom = att_bloom,
+   };
+   q->recent_vdm_att_next =
+      (q->recent_vdm_att_next + 1) % HK_SYNC_RECENT_VDM_ATT;
+   q->recent_vdm_att_count =
+      MIN2(q->recent_vdm_att_count + 1, HK_SYNC_RECENT_VDM_ATT);
+}
+
+static uint64_t
+resolve_exact_vdm_ta_bloom(const struct submit_state *ss,
+                           const struct hk_cs *cs,
+                           const struct hk_sync_dep *t)
+{
+   const struct hk_sync_queue *q = &ss->queue->sync;
+   const uint64_t base = q->submitted[HK_SYNC_VDM];
+
+   uint64_t v_base = resolve_absolute(ss, t, HK_SYNC_VDM);
+   u_foreach_bit(k, cs->sync.kind)
+      v_base = MAX2(v_base, ss->carry_absolute[k][HK_SYNC_VDM]);
+
+   uint64_t v_img_cap =
+      ss->carry_absolute[util_logbase2(HK_SYNC_GFX_IMG)][HK_SYNC_VDM];
+   u_foreach_bit(k, cs->sync.dep_ta_img_prior) {
+      const uint64_t earlier = ss->last[k][HK_SYNC_VDM] > 0
+                                  ? base + ss->last[k][HK_SYNC_VDM]
+                                  : q->last_absolute[k][HK_SYNC_VDM];
+      v_img_cap = MAX2(v_img_cap, earlier);
+   }
+
+   uint64_t v_need = v_base;
+   if (v_img_cap > v_base && cs->sync.vtx_img_bloom) {
+      if (q->recent_vdm_att_evicted)
+         v_need = MAX2(v_need, MIN2(v_img_cap, q->recent_vdm_att_evicted));
+      const uint32_t n = MIN2(q->recent_vdm_att_count, HK_SYNC_RECENT_VDM_ATT);
+      for (uint32_t j = 0; j < n; ++j) {
+         const struct hk_sync_vdm_att *e = &q->recent_vdm_att[j];
+         if (e->ordinal > v_need && e->ordinal <= v_img_cap &&
+             (e->att_bloom & cs->sync.vtx_img_bloom))
+            v_need = e->ordinal;
+      }
+   }
+
+   return v_need;
+}
+
 /* The barrier and prior fields of one requirement on subqueue sq, with the
  * carried requirements of the given destination classes. */
 static void
@@ -2775,6 +2900,10 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
              * destination classes, its vertex half on those of its kinds. A
              * layout transition waits on those of its first scope alone. */
             const uint8_t carry = stream_carry(cs);
+            const bool exact_vdm_bloom =
+               sq == HK_SYNC_VDM && queue->sync.exact_prior &&
+               !cs->sync.brl_transition && cs->sync.vtx_images &&
+               !cs->sync.vtx_img_unsafe;
             const uint8_t ta_carry =
                cs->sync.brl_transition
                   ? cs->sync.brl_carry
@@ -2782,12 +2911,29 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
                        (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0);
             resolve_one(&ss, sq, d, carry, &cs->sync.barrier[sq],
                         &cs->sync.prior[sq]);
-            if (ta_carry == carry && t->cut == d->cut && t->prior == d->prior) {
-               cs->sync.barrier_ta[sq] = cs->sync.barrier[sq];
-               cs->sync.prior_ta[sq] = cs->sync.prior[sq];
+            if (exact_vdm_bloom) {
+               const uint64_t v_need = resolve_exact_vdm_ta_bloom(&ss, cs, t);
+               const uint64_t base = queue->sync.submitted[HK_SYNC_VDM];
+               if (v_need > base && v_need - base < DRM_ASAHI_BARRIER_NONE) {
+                  cs->sync.barrier_ta[HK_SYNC_VDM] = (uint16_t)(v_need - base);
+                  cs->sync.prior_ta[HK_SYNC_VDM] = 0;
+               } else {
+                  cs->sync.barrier_ta[HK_SYNC_VDM] = DRM_ASAHI_BARRIER_NONE;
+                  cs->sync.prior_ta[HK_SYNC_VDM] = v_need;
+               }
             } else {
-               resolve_one(&ss, sq, t, ta_carry, &cs->sync.barrier_ta[sq],
-                           &cs->sync.prior_ta[sq]);
+               struct hk_sync_dep t_eff = *t;
+               if (sq == HK_SYNC_VDM && cs->sync.dep_ta_img_prior)
+                  t_eff.prior |= cs->sync.dep_ta_img_prior;
+               if (ta_carry == carry && t_eff.cut == d->cut &&
+                   t_eff.prior == d->prior) {
+                  cs->sync.barrier_ta[sq] = cs->sync.barrier[sq];
+                  cs->sync.prior_ta[sq] = cs->sync.prior[sq];
+               } else {
+                  resolve_one(&ss, sq, &t_eff, ta_carry,
+                              &cs->sync.barrier_ta[sq],
+                              &cs->sync.prior_ta[sq]);
+               }
             }
             if (cs->sync.heap_slot > 0) {
                const unsigned hs = cs->sync.heap_slot - 1;
@@ -2918,6 +3064,18 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
             const unsigned sq = hk_sync_sq(cs);
             ss.last_heap_slot[hs][sq] =
                value_max(ss.last_heap_slot[hs][sq], cs->sync.index);
+         }
+      }
+
+      if (queue->sync.exact_prior) {
+         const uint64_t vdm_base = queue->sync.submitted[HK_SYNC_VDM];
+         list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+            if (cs->type != HK_CS_VDM)
+               continue;
+            const uint64_t bloom =
+               (cs->sync.kind & HK_SYNC_GFX_MEM) ? UINT64_MAX
+                                                 : cs->sync.att_bloom;
+            vdm_att_ring_add(&queue->sync, vdm_base + cs->sync.index, bloom);
          }
       }
 

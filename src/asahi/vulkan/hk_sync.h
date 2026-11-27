@@ -269,6 +269,25 @@ struct hk_sync_xfer_dst {
    bool device_address;
 };
 
+#define HK_SYNC_RECENT_VDM_ATT 64
+
+static inline uint64_t
+hk_sync_image_bloom(uint64_t key)
+{
+   if (!key)
+      return 0;
+   uint64_t h = key;
+   h ^= h >> 33;
+   h *= UINT64_C(0xff51afd7ed558ccd);
+   h ^= h >> 33;
+   return UINT64_C(1) << (h & 63);
+}
+
+struct hk_sync_vdm_att {
+   uint64_t ordinal;
+   uint64_t att_bloom;
+};
+
 /* Per-stream state, embedded in hk_cs. */
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
@@ -312,9 +331,15 @@ struct hk_sync_stream {
 
    /* For a render: it draws with a pre-rasterization shader that reads
     * images, so its vertex half also waits on HK_SYNC_GFX_IMG, as of the
-    * dependency epoch vtx_images_epoch. */
+    * dependency epoch vtx_images_epoch. When !vtx_img_unsafe, vtx_img_bloom
+    * holds the bloom filter of image plane GPU VAs read by vertex shaders
+    * so VDM waits only on renders whose att_bloom intersects it. */
    bool vtx_images;
+   bool vtx_img_unsafe;
+   uint8_t dep_ta_img_prior;
    uint32_t vtx_images_epoch;
+   uint64_t att_bloom;
+   uint64_t vtx_img_bloom;
 
    /* A layout transition the driver records as work
     * (brl_sync_transition_begin()), or a stream one was merged into: a
@@ -517,6 +542,12 @@ struct hk_sync_queue {
    /* A single command buffer already owns the complete footprint list. */
    bool direct_single_footprints;
    uint64_t last_preserve, evicted_preserve;
+
+   /* Recent VDM renders' attachment blooms for exact-image HK_SYNC_GFX_IMG
+    * narrowing across submissions. */
+   struct hk_sync_vdm_att recent_vdm_att[HK_SYNC_RECENT_VDM_ATT];
+   uint32_t recent_vdm_att_next, recent_vdm_att_count;
+   uint64_t recent_vdm_att_evicted;
 };
 
 void hk_sync_reset(struct hk_cmd_buffer *cmd);
@@ -632,6 +663,8 @@ struct hk_cs *hk_query_command_cs(struct hk_cmd_buffer *cmd);
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_sync_vertex_images_bloom(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                 uint64_t bloom);
 void hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Every later stream of the given kinds waits on cs. */
