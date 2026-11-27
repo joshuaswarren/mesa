@@ -16437,11 +16437,25 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, gs);
 }
 
+struct hk_robust_index_batch;
+static void hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
+                                        struct hk_robust_index_batch *batch);
+
+static void
+hk_end_graphics_for_draw(struct hk_cmd_buffer *cmd,
+                         struct hk_robust_index_batch *batch)
+{
+   if (batch)
+      hk_flush_robust_index_batch(cmd, batch);
+   hk_cmd_buffer_end_graphics(cmd);
+}
+
 static __attribute__((hot)) struct hk_cs *
 hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                    struct agx_draw *draw, bool *needs_idx_robust,
                    bool *g17p_native_bind_tail_emitted,
-                   const struct agx_draw *conditional_direct)
+                   const struct agx_draw *conditional_direct,
+                   struct hk_robust_index_batch *batch)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -16494,8 +16508,11 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (unlikely(cmd->current_cs.gfx && cmd->current_cs.gfx->m5_ordered) &&
        !cmd->in_meta) {
       const char *hazard = hk_m5_ordered_draw_hazard(cmd);
-      if (hazard)
+      if (hazard) {
+         if (batch)
+            hk_flush_robust_index_batch(cmd, batch);
          hk_m5_pass_merge_end_ordered(cmd, hazard);
+      }
    }
 
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
@@ -16550,7 +16567,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       if (!succ) {
          perf_debug(cmd, "Splitting control stream due to depth bias");
 
-         hk_cmd_buffer_end_graphics(cmd);
+         hk_end_graphics_for_draw(cmd, batch);
          cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
          if (!cs)
             return NULL;
@@ -16573,7 +16590,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       if (cs->ppp_multisamplectl != ctrl) {
          perf_debug(cmd, "Splitting continued render for sample locations");
 
-         hk_cmd_buffer_end_graphics(cmd);
+         hk_end_graphics_for_draw(cmd, batch);
          cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
          if (!cs)
             return NULL;
@@ -16709,7 +16726,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                 fs->info.fs.has_input_attachments, on_chip)) {
             perf_debug(cmd, "Splitting pass for DRAM input-attachment read (lr_nir=%u lr_en=%u)",
                        fs->local_read_nir != NULL, lr_enabled);
-            hk_cmd_buffer_end_graphics(cmd);
+            hk_end_graphics_for_draw(cmd, batch);
             cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
             if (!cs)
                return NULL;
@@ -16744,7 +16761,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 
    if (unlikely(ppp_index_limit) && cs->stats.cmds > 0 &&
        hk_gfx_republishes_render_state(cmd)) {
-      hk_cmd_buffer_end_graphics(cmd);
+      hk_end_graphics_for_draw(cmd, batch);
       cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
       if (!cs)
          return NULL;
@@ -17191,6 +17208,8 @@ hk_draw_primitive_bound(const struct hk_cmd_buffer *cmd,
 struct hk_robust_index_batch {
    struct agx_ptr jobs;
    uint32_t count;
+   uint32_t capacity;
+   uint32_t chunk_size;
    struct hk_cs *cs;
    struct agx_draw draw;
    uint32_t restart_index;
@@ -17222,7 +17241,13 @@ hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
                                   draw->index_buffer_range_B, draw->restart,
                                   batch->restart_index,
                                   hk_libagx_record_chip(dev),
-                                  cmd->state.gfx.topology, draw->index_size);
+                                  cmd->state.gfx.topology, draw->index_size,
+                                  batch->count);
+   const size_t used_B =
+      (size_t)batch->count * sizeof(struct libagx_robust_index_draw);
+   batch->jobs.cpu = (uint8_t *)batch->jobs.cpu + used_B;
+   batch->jobs.gpu += used_B;
+   batch->capacity -= batch->count;
    batch->cs->stats.robust_index_dispatches++;
    batch->cs->stats.robust_index_batches++;
    batch->count = 0;
@@ -17271,7 +17296,26 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const uint32_t restart_index = hk_draw_restart_index(cmd, draw);
    cs->stats.robust_index_draws++;
    if (batch) {
-      assert(batch->count == 0 || batch->cs == cs);
+      if (batch->count > 0 && batch->cs != cs) {
+         assert(!"robust-index batch crossed graphics control stream split");
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      if (batch->count == batch->capacity)
+         hk_flush_robust_index_batch(cmd, batch);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      if (!batch->capacity) {
+         batch->jobs = hk_pool_alloc(
+            cmd,
+            (size_t)batch->chunk_size * sizeof(struct libagx_robust_index_draw),
+            8);
+         if (!batch->jobs.cpu)
+            return;
+         batch->capacity = batch->chunk_size;
+      }
+      if (unlikely(batch->count >= batch->capacity))
+         return;
       ((struct libagx_robust_index_draw *)batch->jobs.cpu)[batch->count++] =
          job;
       batch->cs = cs;
@@ -17506,7 +17550,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       struct hk_cs *cs =
          hk_flush_gfx_state(cmd, draw_id, &draw, &needs_idx_robust,
                             &g17p_native_bind_tail_emitted,
-                            conditional_direct_indexed ? &api_draw : NULL);
+                            conditional_direct_indexed ? &api_draw : NULL,
+                            batch);
       /* If we failed to allocate a control stream, we've already lost the
        * device. Just drop the draw so we don't crash.
        */
@@ -17792,7 +17837,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    struct agx_draw dummy = {.b = agx_1d(3)};
    bool robust = false, tail = false;
    struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
-                                        &tail, NULL);
+                                         &tail, NULL, NULL);
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -18116,7 +18161,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct agx_draw dummy = {.b = agx_1d(3)};
    bool robust = false, tail = false;
    struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
-                                        &tail, NULL);
+                                         &tail, NULL, NULL);
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -18715,7 +18760,8 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
    const bool m5 = agx_chip_g17_m5(chip);
    if (!native_agx3 && !m5)
       return start;
-   if (batch && (!native_agx3 || batch->cs != cs))
+   if (batch && (!native_agx3 || batch->cs != cs ||
+                 draw_count - start > batch->capacity - batch->count))
       return start;
 
    /* Prove every indirect record address in [start, draw_count) is non-zero,
@@ -19273,7 +19319,7 @@ hk_agx3_draw_indirect_gpu(struct hk_cmd_buffer *cmd, uint64_t in,
    bool needs_idx_robust = false;
    bool tail_emitted = false;
    struct hk_cs *cs = hk_flush_gfx_state(
-      cmd, 0, &first_draw, &needs_idx_robust, &tail_emitted, NULL);
+      cmd, 0, &first_draw, &needs_idx_robust, &tail_emitted, NULL, NULL);
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return true;
 
@@ -19681,17 +19727,18 @@ hk_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                           drawCount, stride);
 }
 
-/* The first record derives/flushes state through the general path. Once it
- * has reached robustness, no helper follows it. Later records can join only
- * when the existing indirect-record proof rules out all other compute work
- * and stream splits. Otherwise publish the first repair before falling back.
+/* The first record derives/flushes state through the general path. Later
+ * records join the same batch either through the hoisted indirect emitters
+ * (when eligible) or through hk_draw_impl(), flushing on any graphics control
+ * stream split so depth bias, multiview, conditional rendering, pipeline
+ * statistics, null-FS shadow passes, and G18G all coalesce empty runs too.
  * This also covers DrawIndexedIndirectCount after its count predication. */
 static bool
 hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
                           uint32_t draw_count, uint32_t stride)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_or_m5(dev->dev.chip) || draw_count <= 1)
+   if (!agx_chip_agx3_path(dev->dev.chip) || draw_count <= 1)
       return false;
 
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -19701,24 +19748,28 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
       agx_draw_indexed_indirect(buffer, buf.addr, buf.range, 0, 0);
    hk_g17p_normalize_indirect_draw(cmd, &first);
 
-   if (gfx->render.view_mask || dyn->rs.depth_bias.enable ||
-       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+   if (gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        mesa_prim_has_adjacency(
           vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
-       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
-                                       cmd->conditional_meta) ||
-       gfx->descriptors.root.draw.pipeline_stats_flags ||
        !hk_needs_index_robustness(cmd, &first, NULL))
       return false;
 
-   /* maxDrawIndirectCount is UINT16_MAX; the grid has exactly one 32-lane
-    * workgroup per record and neither the byte allocation nor grid wraps. */
+   /* maxDrawIndirectCount is UINT16_MAX; cap each job-array chunk at
+    * UINT16_MAX entries so multiview draws flush cleanly in bounded chunks
+    * without overflowing the 1D grid or pool allocations. */
    assert(draw_count <= UINT16_MAX);
+   const uint32_t views =
+      gfx->render.view_mask ? util_bitcount(gfx->render.view_mask) : 1;
+   const uint64_t total_jobs = (uint64_t)draw_count * views;
+   const uint32_t chunk_size =
+      total_jobs > UINT16_MAX ? UINT16_MAX : (uint32_t)total_jobs;
    struct hk_robust_index_batch batch = {
       .jobs = hk_pool_alloc(
-         cmd, (size_t)draw_count * sizeof(struct libagx_robust_index_draw), 8),
+         cmd, (size_t)chunk_size * sizeof(struct libagx_robust_index_draw), 8),
+      .capacity = chunk_size,
+      .chunk_size = chunk_size,
    };
    if (!batch.jobs.cpu)
       return true;
@@ -19728,9 +19779,8 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
       return true;
 
    const bool eligible =
-      batch.count == 1 && hk_g17p_indirect_records_eligible(cmd, &first, true);
-   if (!eligible)
-      hk_flush_robust_index_batch(cmd, &batch);
+      agx_chip_native_or_m5(dev->dev.chip) && batch.count == 1 &&
+      hk_g17p_indirect_records_eligible(cmd, &first, true);
 
    unsigned fast_attempts = 0;
    for (uint32_t i = 1; i < draw_count; ++i) {
@@ -19740,7 +19790,7 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
          hk_g17p_emit_indirect_record(
             cmd, i, draw, hk_gfx_republishes_render_state(cmd), i > 1, &batch);
       } else {
-         hk_draw(cmd, i, draw);
+         hk_draw_impl(cmd, i, draw, &batch);
       }
       if (vk_command_buffer_has_error(&cmd->vk))
          return true;
