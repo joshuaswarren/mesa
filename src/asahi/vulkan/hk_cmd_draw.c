@@ -4792,6 +4792,117 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    return true;
 }
 
+static bool
+hk_suspended_attachment_matches(const VkRenderingAttachmentInfo *info,
+                                const struct hk_attachment *att)
+{
+   const bool present = info != NULL && info->imageView != VK_NULL_HANDLE;
+   if (present != (att->iview != NULL))
+      return false;
+   if (!present)
+      return true;
+
+   VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+   struct hk_image_view *resolve =
+      info->resolveImageView != VK_NULL_HANDLE
+         ? hk_image_view_from_handle(info->resolveImageView)
+         : NULL;
+   return iview == att->iview && info->imageLayout == att->layout &&
+          info->storeOp == att->store_op &&
+          info->resolveMode == att->resolve_mode &&
+          resolve == att->resolve_iview &&
+          vk_get_rendering_attachment_flags(info) == att->flags;
+}
+
+/* Reopen a suspended render pass instance in the same command buffer when the
+ * immediately following instance resumes it (for example vkd3d-proton's
+ * speculative tiler suspend/resume closing with an empty RESUMING pass). That
+ * restores whole-pass end flags, covered-target load elision, precise ZLS
+ * stores, and trailing resolve folding without losing any draws in the
+ * resuming half. */
+static bool
+hk_agx3_resume_suspended_pass(struct hk_cmd_buffer *cmd,
+                              const VkRenderingInfo *info)
+{
+   struct hk_pass_merge_candidate *m = &cmd->suspended_pass;
+   struct hk_cs *cs = m->cs;
+   const struct hk_rendering_state *prev = &m->render;
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+
+   m->valid = false;
+
+   if (!(info->flags & VK_RENDERING_RESUMING_BIT) || cmd->in_meta ||
+       cmd->state.deferred_clear_count || cmd->current_cs.gfx ||
+       cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
+       cmd->state.oq_pending_render || cmd->sync.in_pass ||
+       cmd->sync.pending_start_ts.handle ||
+       list_is_empty(&cmd->control_streams) ||
+       list_last_entry(&cmd->control_streams, struct hk_cs, node) != cs ||
+       cmd->sync.next_seq != m->next_seq ||
+       cmd->sync.epoch != m->sync_epoch || cmd->current_cs.cs != m->open_cs ||
+       (m->open_cs && m->open_cs->current != m->open_cs_current) ||
+       cs->current != m->after_current || cs->end != m->end ||
+       cs->timestamp.start.handle ||
+       memcmp(&info->renderArea, &prev->area, sizeof(info->renderArea)) ||
+       info->layerCount != prev->layer_count ||
+       info->viewMask != prev->view_mask ||
+       info->colorAttachmentCount != prev->color_att_count)
+      return false;
+
+   if (!hk_suspended_attachment_matches(info->pDepthAttachment,
+                                        &prev->depth_att) ||
+       !hk_suspended_attachment_matches(info->pStencilAttachment,
+                                        &prev->stencil_att))
+      return false;
+
+   for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+      if (!hk_suspended_attachment_matches(&info->pColorAttachments[i],
+                                           &prev->color_att[i]))
+         return false;
+   }
+
+   cs->current = m->resume_current;
+   cs->cr.eot.main = prev->cr.eot.partial;
+   cs->cr.bg = prev->cr.bg;
+   cs->cr.eot.partial = prev->cr.eot.partial;
+   cs->cr.depth = prev->cr.depth;
+   cs->cr.stencil = prev->cr.stencil;
+   cs->cr.zls_control = prev->cr.zls_control;
+   cs->g17p_pass_ends = false;
+   cmd->current_cs.gfx = cs;
+
+   *render = *prev;
+   render->flags =
+      (prev->flags & ~VK_RENDERING_SUSPENDING_BIT) |
+      (info->flags &
+       (VK_RENDERING_SUSPENDING_BIT |
+        VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT));
+
+   cmd->render_pack.tail_open = false;
+   if (cmd->render_pack.head && cmd->render_pack.head_stream == cs) {
+      cmd->render_pack.head_pass.flags = render->flags;
+      cmd->render_pack.head_ended = false;
+   }
+
+   hk_sync_merge_rendering(cmd, cs);
+   hk_sync_first_render_stream(cmd, cs);
+
+   const VkRenderingAttachmentLocationInfoKHR ral_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+      .colorAttachmentCount = info->colorAttachmentCount,
+   };
+   vk_cmd_set_rendering_attachment_locations(&cmd->vk, &ral_info);
+   hk_cmd_buffer_dirty_render_pass(cmd);
+
+   if (cmd->state.gfx.descriptors.root.draw.view_index != 0) {
+      cmd->state.gfx.descriptors.root.draw.view_index = 0;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
+   }
+
+   perf_debug(cmd, "Resuming suspended render pass instance in-buffer");
+   return true;
+}
+
 /* Submit-time render packing (hk_render_pack.h): how the command buffer's
  * first render pass instance began and how its last one ended. */
 
@@ -5390,6 +5501,10 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
+
+   if (unlikely(cmd->suspended_pass.valid) &&
+       hk_agx3_resume_suspended_pass(cmd, pRenderingInfo))
+      return;
 
    hk_render_pack_begin(cmd, pRenderingInfo);
 
@@ -6374,8 +6489,17 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * ended in, before the terminator. */
    struct hk_pass_merge_candidate *merge = &cmd->pass_merge;
    merge->valid = false;
+   struct hk_pass_merge_candidate *susp = &cmd->suspended_pass;
+   susp->valid = false;
    const char *refusal = cs ? hk_m5_pass_merge_refusal(cmd, cs) : "no stream";
    const bool continuable = !refusal;
+   const bool suspend_resumable =
+      agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+      (render->flags & VK_RENDERING_SUSPENDING_BIT) && !cmd->in_meta && cs &&
+      cs == render->zls_first_cs && cmd->sync.pass_vdm == cs &&
+      cs->stats.cmds > 0 && !cmd->current_cs.pre_gfx &&
+      !cmd->current_cs.post_gfx && !cmd->state.oq_pending_render &&
+      !cmd->uses_heap && !cs->timestamp.start.handle;
 
    /* The stream the command buffer's first instance began, for submit-time
     * render packing (hk_render_pack_end_cmd()). */
@@ -6463,6 +6587,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    if (continuable)
       merge->render = *render;
+   if (suspend_resumable)
+      susp->render = *render;
 
    bool need_resolve = false;
 
@@ -6555,6 +6681,21 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * schedules its render passes like native AGX3. */
    if (!agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+
+   if (suspend_resumable && cs->end == end_before &&
+       !vk_command_buffer_has_error(&cmd->vk)) {
+      susp->cs = cs;
+      susp->resume_current = resume_current;
+      susp->after_current = cs->current;
+      susp->end = cs->end;
+      susp->next_seq = cmd->sync.next_seq;
+      susp->sync_epoch = cmd->sync.epoch;
+      susp->open_cs = cmd->current_cs.cs;
+      susp->open_cs_current =
+         cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
+      susp->ordered = false;
+      susp->valid = true;
+   }
 
    if (continuable && !need_resolve && cs->end == end_before &&
        !vk_command_buffer_has_error(&cmd->vk)) {

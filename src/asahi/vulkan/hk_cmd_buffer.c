@@ -613,6 +613,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   cmd->suspended_pass.valid = false;
    memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
@@ -1558,6 +1559,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    if (HK_PERF(dev, NOBARRIER))
       return;
+
+   cmd->suspended_pass.valid = false;
 
    perf_debug(cmd, "Pipeline barrier");
 

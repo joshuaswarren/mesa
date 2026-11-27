@@ -2339,7 +2339,7 @@ struct hk_cmd_buffer {
       bool ordered;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
-   } pass_merge;
+   } pass_merge, suspended_pass;
 
    /* How the command buffer begins and ends, for submit-time render packing
     * (hk_render_pack.h). */
