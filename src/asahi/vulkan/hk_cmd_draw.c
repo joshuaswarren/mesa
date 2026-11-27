@@ -6704,7 +6704,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    VkRenderingAttachmentInfo color[HK_MAX_RTS], depth, stencil;
    const VkRenderingInfo *taken = hk_take_deferred_clears(
       cmd, pRenderingInfo, &info, color, &depth, &stencil);
-   hk_flush_deferred_clears(cmd);
+   hk_flush_deferred_clears_before_render(cmd);
    hk_begin_rendering(commandBuffer, taken);
 }
 

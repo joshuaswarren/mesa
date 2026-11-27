@@ -6390,9 +6390,10 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * clears so a following pass that loads (or re-clears) the attachment
     * absorbs the clear directly without an extra kick. On native AGX3 / M5,
     * keep the finalized VDM render stream alive while deferred: if absorbed,
-    * hk_take_deferred_clears() drops it; if flushed unabsorbed (for example
-    * at vkEndCommandBuffer() or before a pass with different attachments),
-    * the clear stays on VDM without injecting a VDM->CDM->VDM round-trip. */
+    * hk_take_deferred_clears() drops it; if a later pass with different
+    * attachments flushes it, the clear stays on VDM instead of a compute fill
+    * between two renders (VDM->CDM->VDM); any other flush (for example
+    * vkEndCommandBuffer()) drops it and fills the image as before. */
    const bool keep_vdm =
       native_eot && cs->cr.process_empty_tiles && cs->g17p_pass_ends;
    if (hk_try_defer_empty_render_clears(cmd, cs, keep_vdm)) {
@@ -6615,14 +6616,42 @@ hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
    cmd->state.deferred_clear_hold = true;
 }
 
-void
-hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
+/* Unless a render pass follows, turn the kept clear-only VDM renders back
+ * into deferred fills: a clear-only command buffer, or a clear that compute,
+ * a transfer or a barrier flushes, is cheaper as a compute fill than as a
+ * render of its own. Every entry of a dropped render is filled. */
+static void
+hk_unkeep_deferred_clear_vdms(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *vdm[HK_MAX_DEFERRED_CLEARS];
+   unsigned vdm_count = 0;
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      if (!e->vdm_cs)
+         continue;
+      bool seen = false;
+      for (unsigned k = 0; k < vdm_count; ++k)
+         seen |= vdm[k] == e->vdm_cs;
+      if (!seen)
+         vdm[vdm_count++] = e->vdm_cs;
+      e->vdm_cs = NULL;
+   }
+   for (unsigned i = 0; i < vdm_count; ++i)
+      hk_drop_deferred_clear_vdm(cmd, vdm[i]);
+}
+
+static void
+hk_flush_deferred_clears_impl(struct hk_cmd_buffer *cmd, const char *why,
+                              bool render_follows)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;
+
+   if (!render_follows)
+      hk_unkeep_deferred_clear_vdms(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.deferred_clear_flushing = true;
@@ -6632,7 +6661,8 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
       if (e->vdm_cs) {
          /* The empty clear-only render stream is already in control_streams
           * at its recorded VDM position with its dependencies and footprints
-          * intact; leaving it there avoids a VDM->CDM->VDM crossing. */
+          * intact; the render pass that follows would otherwise wait on a
+          * compute fill between two renders (VDM->CDM->VDM). */
          if (unlikely(dev->frame_anatomy)) {
             hk_frame_anatomy_note(
                dev,
@@ -6704,6 +6734,18 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
          hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_ALL);
    }
    cmd->state.deferred_clear_flushing = false;
+}
+
+void
+hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
+{
+   hk_flush_deferred_clears_impl(cmd, why, false);
+}
+
+void
+hk_flush_deferred_clears_before_render(struct hk_cmd_buffer *cmd)
+{
+   hk_flush_deferred_clears_impl(cmd, "render pass", true);
 }
 
 /* How a pass may use a deferred clear for an attachment of the given aspect
