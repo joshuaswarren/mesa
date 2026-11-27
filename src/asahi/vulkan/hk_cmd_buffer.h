@@ -2279,8 +2279,19 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->unordered_start_ts = b->unordered_start_ts;
    }
 
-   util_dynarray_append_array(&a->compute_resources, uint8_t,
-                             b->compute_resources.data, b->compute_resources.size);
+   util_dynarray_foreach(&b->compute_resources,
+                         const struct drm_asahi_compute_program, b_entry) {
+      bool seen = false;
+      util_dynarray_foreach(&a->compute_resources,
+                            const struct drm_asahi_compute_program, a_entry) {
+         if (!memcmp(a_entry, b_entry, sizeof(*b_entry))) {
+            seen = true;
+            break;
+         }
+      }
+      if (!seen)
+         util_dynarray_append(&a->compute_resources, *b_entry);
+   }
 
    a->g17p_timestamp_query |= b->g17p_timestamp_query;
 
