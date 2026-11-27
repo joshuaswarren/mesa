@@ -4166,10 +4166,12 @@ hk_g17p_buffer_pbe_supported(const struct hk_device *dev,
  *
  * Fill is write-only and wins once the destination fills most of SLC
  * (>= 32 MiB) on G17P and M5. Copy touches both source and destination
- * (2 * size): on M5 (G17G/G17S/G17C), >= 32 MiB (64 MiB combined) strictly
- * exceeds SLC with +13% to +26% gains across queue depths d=1..8 while
- * avoiding the 24-28 MiB SLC-edge regression; G17P stays on the batched
- * compute copy path because queued PBE copies (d=4/8) serialize on G17P. */
+ * (2 * size): restrict PBE buffer copy to G17C (M5 Max), where >= 32 MiB
+ * (64 MiB combined) strictly exceeds SLC and gives +11.5% queued copy
+ * throughput at d=8 (parity at d=1/4) while avoiding the 24-28 MiB SLC-edge
+ * regression; G17P stays on the batched compute copy path because queued PBE
+ * copies (d=4/8) serialize on G17P (-2.27% / -7.14%), and other M5 SKUs
+ * (G17G/G17S/G17D) remain on the compute path until measured on hardware. */
 #define HK_G17P_FILL_PBE_MIN_SIZE (32u << 20)
 #define HK_G17P_COPY_PBE_MIN_SIZE (32u << 20)
 
@@ -4326,7 +4328,7 @@ hk_xfer_copybuffer2_range(struct hk_cmd_buffer *cmd,
    }
 
    struct hk_native_pbe_descriptor pbe;
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   if (dev->dev.chip == AGX_CHIP_G17C &&
        src && (src & 15) == 0 && size <= UINT64_MAX - src &&
        hk_g17p_buffer_pbe_supported(dev, dst_buffer, dst, dst_offset,
                                     size, HK_G17P_COPY_PBE_MIN_SIZE, &pbe) &&
