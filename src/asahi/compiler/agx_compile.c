@@ -20000,8 +20000,13 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          form_preamble ? key : NULL, info, pre_preamble_blob,
          pre_preamble_optimized, epilog_has_alu, preamble_newly_enabled,
          m5_unroll_factor, m5_unroll_widest);
-      if (post_opt_nir_out && !form_preamble)
+      if (post_opt_nir_out && !form_preamble) {
          *post_opt_nir_out = nir_shader_clone(NULL, nir);
+         /* nir->options may point at the stack-local agx3_options until it
+          * is restored below; the clone outlives this frame. */
+         if (*post_opt_nir_out)
+            (*post_opt_nir_out)->options = original_options;
+      }
    }
 
    /* Safe uniform-load speculation and if/phi folding have now exposed
