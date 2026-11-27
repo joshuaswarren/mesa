@@ -208,8 +208,8 @@ test_layered_8x_rgba32_reload(enum agx_chip chip)
       agx_instr *cc = agx_collect_to(b, sample_coord, 4);
       cc->src[0] = coords;
       cc->src[1] = layer;
-      cc->src[2] = agx_immediate(i);
-      cc->src[3] = agx_zero();
+      cc->src[2] = agx_mov_imm(b, 32, i);
+      cc->src[3] = agx_mov_imm(b, 32, 0);
 
       agx_index texel = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
       agx_texture_load_to(b, texel, sample_coord, agx_immediate(0),
