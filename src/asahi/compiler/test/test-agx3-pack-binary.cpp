@@ -49,6 +49,7 @@ extern "C" {
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 extern "C" {
 #include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
@@ -18852,7 +18853,8 @@ TEST_F(AGX3PackBinary, AGX3SignedMemoryByteOffsetLoadAndStore)
                }
                if (!is_store)
                   d.slot = 1;
-               else if (t.chip == AGX_CHIP_G17P)
+               else if (agx_chip_has_cap(t.chip,
+                                         AGX_CAP_COMPUTE_COHERENT_STORE))
                   d.coherent = true;
 
                uint8_t bytes[AGX3_MEM_MAX_LENGTH], len = 0;
@@ -19734,10 +19736,14 @@ TEST_F(AGX3PackBinary, G17PComputeDeviceStoreSetsCoherentPolicy)
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_COMPUTE, true},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_VERTEX, false},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, MESA_SHADER_COMPUTE, false},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_COMPUTE, false},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, MESA_SHADER_COMPUTE, false},
    };
    for (const auto &c : cases) {
+      EXPECT_EQ(c.expect_coherent,
+                c.stage == MESA_SHADER_COMPUTE &&
+                   agx_chip_has_cap(c.chip, AGX_CAP_COMPUTE_COHERENT_STORE));
       agx_builder *b = builder(c.enc);
       key.dev.chip = c.chip;
       b->shader->stage = c.stage;

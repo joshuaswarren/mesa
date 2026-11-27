@@ -62,6 +62,7 @@
 #include "agx3_writeout_core.h"
 #include "agx_compiler.h"
 #include "agx_debug.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "util/half_float.h"
 #include "util/u_debug.h"
 
@@ -17567,12 +17568,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t len = 0;
             if (!agx3_translate_mem(enc, I, is_store, slot, wait, &d))
                AGX3_REFUSE(I);
-            if (is_store && ctx->key->dev.chip == AGX_CHIP_G17P &&
-                ctx->stage == MESA_SHADER_COMPUTE) {
-               /* On G17P (AGX3b), setting stdev f75=1 bypasses per-core L1
-                * write-allocation and writes straight through to shared L2,
-                * keeping L1 capacity free for streaming reads across compute
-                * dispatches. */
+            if (is_store && ctx->stage == MESA_SHADER_COMPUTE &&
+                agx_chip_has_cap(ctx->key->dev.chip,
+                                 AGX_CAP_COMPUTE_COHERENT_STORE)) {
+               /* Promote non-coherent compute device stores to stdev f75=1 on
+                * chips carrying AGX_CAP_COMPUTE_COHERENT_STORE (see
+                * agx_chip_caps.h): writes bypass per-core L1 write-allocation
+                * directly into the shared L2 domain, preserving L1 capacity
+                * for streaming reads while maintaining strictly stronger store
+                * visibility for same-core and post-barrier consumers. */
                d.coherent = true;
             }
             if (g17p_vertex_load_policy && !is_store) {

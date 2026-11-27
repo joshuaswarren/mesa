@@ -186,6 +186,32 @@ enum agx_chip_cap {
     * combined with 0x1ff/0x160; +1.16% to +1.25% incremental over 0x1ff/0x160,
     * bit-identical output, 0 regressions on synchronization/memory_model CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
+
+   /* Compute device stores (`AGX_OPCODE_DEVICE_STORE` in MESA_SHADER_COMPUTE)
+    * pack with the AGX3 coherent-store bit (`stdev f75=1`, `d.coherent=true`).
+    *
+    * Why this is valid and coherent on G17P (AGX3b, Apple A18 Pro):
+    * - `stdev f75=1` is the hardware coherent-store encoding (the same bit
+    *   already emitted for NIR `ACCESS_COHERENT` stores). Rather than
+    *   write-allocating dirty lines into the executing core's private L1 cache,
+    *   the store bypasses L1 write-allocation and writes through to the shared
+    *   coherent L2 domain, keeping per-core L1 capacity available for streaming
+    *   compute reads.
+    * - Promoting non-coherent compute device stores to `f75=1` is strictly
+    *   stronger, never weaker, than `f75=0`: stores reach the shared L2 point
+    *   of coherence directly instead of staying dirty in private L1, same-core
+    *   subsequent reads remain coherent with the store buffer / L1-L2 protocol,
+    *   and cross-workgroup visibility (after `AGX3_BARRIER_SCOPE_DEVICE_FENCE`)
+    *   plus cross-dispatch / host visibility (after Vulkan memory barriers and
+    *   CDM cache flushes) continue to invalidate consumer caches against L2.
+    * - Every AGX3b `stdev` operand form encodes `f75=1` in
+    *   `agx3_mem_encode_store` (unlike AGX3d / G18G, which refuses coherent
+    *   stores).
+    *
+    * Enabled on G17P where per-commit J700 A/B and cross-workgroup /
+    * post-barrier visibility tests verify both correctness and compute
+    * performance; off on other chips until measured per generation. */
+   AGX_CAP_COMPUTE_COHERENT_STORE = 1u << 26,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -213,7 +239,7 @@ enum agx_chip_cap {
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
     AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                                      \
     AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_CDM_OVERLAP_SPLIT |        \
-    AGX_CAP_CACHED_CMD_MEMORY)
+    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_COHERENT_STORE)
 
 /* What the single-die M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
