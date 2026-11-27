@@ -854,6 +854,112 @@ ilp_max_pressure(struct sched_node **order, unsigned n,
    return max_pressure;
 }
 
+static bool
+ilp_tile_store_live_fits(struct u_sparse_bitset *live,
+                         const uint8_t *tile_width, unsigned bank,
+                         unsigned reserved, unsigned *peak_out)
+{
+   unsigned buckets[4] = {0};
+   unsigned exact_halves = 0;
+   unsigned extra_halves = 0;
+   U_SPARSE_BITSET_FOREACH_SET(live, v) {
+      const unsigned w = tile_width[v];
+      if (!w)
+         continue;
+      exact_halves += w;
+      const unsigned aligned = util_next_power_of_two(w);
+      if (aligned <= 8)
+         buckets[util_logbase2(aligned)]++;
+      else
+         extra_halves += aligned;
+   }
+   if (exact_halves > *peak_out)
+      *peak_out = exact_halves;
+   if (exact_halves > bank || extra_halves > 0)
+      return false;
+
+   uint64_t busy = reserved >= 64 ? ~0ULL :
+                   (reserved ? ((1ULL << reserved) - 1ULL) : 0ULL);
+   for (int b = 3; b >= 0; --b) {
+      const unsigned align = 1u << b;
+      const uint64_t mask = (1ULL << align) - 1ULL;
+      for (unsigned k = 0; k < buckets[b]; ++k) {
+         bool placed = false;
+         for (unsigned pos = 0; pos + align <= bank; pos += align) {
+            if ((busy & (mask << pos)) == 0) {
+               busy |= mask << pos;
+               placed = true;
+               break;
+            }
+         }
+         if (!placed)
+            return false;
+      }
+   }
+   return true;
+}
+
+static unsigned
+ilp_tile_store_bank_demand(struct sched_node **order, unsigned n,
+                           struct u_sparse_bitset *live_end,
+                           struct u_sparse_bitset *scratch,
+                           const uint8_t *tile_width, unsigned bank,
+                           unsigned reserved, bool *overflows)
+{
+   u_sparse_bitset_dup(scratch, live_end);
+   unsigned peak = 0;
+   bool ovf = !ilp_tile_store_live_fits(scratch, tile_width, bank, reserved,
+                                        &peak);
+   for (unsigned i = n; i-- > 0;) {
+      agx_liveness_ins_update(scratch, order[i]->instr);
+      ovf |= !ilp_tile_store_live_fits(scratch, tile_width, bank, reserved,
+                                       &peak);
+   }
+   *overflows = ovf;
+   return peak;
+}
+
+/* On AGX3, ST_TILE reads its payload from a bounded low-register bank
+ * (agx3_tile_store_bank(), 16/32/64 halves) with natural power-of-two
+ * alignment above agx_reserved_registers(). Reject any candidate schedule
+ * whose simultaneously live ST_TILE payloads overflow that bank (when the
+ * original order fits, or with higher peak demand than the original order). */
+static bool
+ilp_tile_store_bank_overflows(agx_context *ctx, struct sched_node **nodes,
+                              struct sched_node **order, unsigned n,
+                              struct u_sparse_bitset *live_end,
+                              struct u_sparse_bitset *scratch, void *memctx)
+{
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+      return false;
+
+   uint8_t *tile_width = NULL;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op != AGX_OPCODE_ST_TILE || I->src[0].type != AGX_INDEX_NORMAL ||
+          I->src[0].value >= ctx->alloc)
+         continue;
+      if (!tile_width) {
+         tile_width = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
+         if (!tile_width)
+            return true;
+      }
+      tile_width[I->src[0].value] = agx_index_size_16(I->src[0]);
+   }
+   if (!tile_width)
+      return false;
+
+   const unsigned bank = agx3_tile_store_bank(ctx);
+   const unsigned reserved = agx_reserved_registers(ctx);
+   bool before_ovf = false, after_ovf = false;
+   const unsigned before_peak = ilp_tile_store_bank_demand(
+      nodes, n, live_end, scratch, tile_width, bank, reserved, &before_ovf);
+   const unsigned after_peak = ilp_tile_store_bank_demand(
+      order, n, live_end, scratch, tile_width, bank, reserved, &after_ovf);
+   ralloc_free(tile_width);
+   return after_ovf && (!before_ovf || after_peak > before_peak);
+}
+
 /*
  * Loop-exit compare placement.
  *
@@ -1479,6 +1585,10 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    if (after > before + slack && (cap <= 0 || live_past_end + after > cap))
       return false;
 
+   if (ilp_tile_store_bank_overflows(ctx, nodes, order, n, &live_end, &scratch,
+                                     memctx))
+      return false;
+
    for (unsigned i = 0; i < n; ++i)
       agx_remove_instruction(order[i]->instr);
    for (unsigned i = 0; i < n; ++i) {
@@ -1599,69 +1709,6 @@ ilp_block_has_chained_loads(const agx_context *ctx, const agx_block *block,
 
    ralloc_free(from_load);
    return chained;
-}
-
-/* True when a block emits multiple ST_TILE stores to the same pixel_offset and
- * at least one of those stores carries a sample-dependent payload. On AGX3B,
- * agx3_tile_store_bank() counts each pixel_offset once under the assumption
- * that per-sample stores to one colour target are serialized and reuse one
- * register vector in r0..r7; hoisting independent sample loads across those
- * stores keeps multiple sample payloads live simultaneously and can push
- * later ST_TILE sources past the 16-half bank. */
-static bool
-ilp_block_has_multi_sample_tile_stores(const agx_context *ctx,
-                                       const agx_block *block, void *memctx)
-{
-   BITSET_WORD *sample_dep =
-      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(ctx->alloc, 1)));
-   if (!sample_dep)
-      return true;
-
-   BITSET_DECLARE(seen_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   BITSET_DECLARE(sample_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   bool result = false;
-
-   agx_foreach_instr_in_block(block, I) {
-      bool dep = ilp_is_sample(ctx, I);
-      if (!dep) {
-         agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(sample_dep, I->src[s].value)) {
-               dep = true;
-               break;
-            }
-         }
-      }
-      if (dep) {
-         agx_foreach_ssa_dest(I, d)
-            BITSET_SET(sample_dep, I->dest[d].value);
-      }
-
-      if (I->op != AGX_OPCODE_ST_TILE)
-         continue;
-
-      const bool uses_sample = I->src[0].type == AGX_INDEX_NORMAL &&
-                               BITSET_TEST(sample_dep, I->src[0].value);
-      if (I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE) {
-         if (uses_sample) {
-            result = true;
-            break;
-         }
-         continue;
-      }
-
-      if (BITSET_TEST(seen_offsets, I->pixel_offset) &&
-          (uses_sample || BITSET_TEST(sample_offsets, I->pixel_offset))) {
-         result = true;
-         break;
-      }
-
-      BITSET_SET(seen_offsets, I->pixel_offset);
-      if (uses_sample)
-         BITSET_SET(sample_offsets, I->pixel_offset);
-   }
-
-   ralloc_free(sample_dep);
-   return result;
 }
 
 /* Register halves the block's sample results occupy together. */
@@ -2323,12 +2370,6 @@ agx_ilp_schedule(agx_context *ctx)
                             &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
-                 /* On AGX3B, agx3_tile_store_bank() assumes per-sample ST_TILE
-                  * stores to the same pixel_offset are serialized in r0..r7;
-                  * skip sample hoisting when a block stores multiple samples
-                  * to one target (background reloads and unrolled MSAA FS). */
-                 !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                   ilp_block_has_multi_sample_tile_stores(ctx, block, memctx)) &&
                  ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
