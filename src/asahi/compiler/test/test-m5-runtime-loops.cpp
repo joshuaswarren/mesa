@@ -490,6 +490,70 @@ TEST(M5RuntimeLoops, GuardBounds)
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 3), (uint32_t)INT32_MIN + 1);
 }
 
+/* for (i = local_invocation_id.x; i < n; i += 32) acc += buf[i]: a loop
+ * striped over a 32-wide workgroup with a constant bound, which no
+ * invocation runs more than ceil(n / 32) times. With `pc_start` the start is
+ * a push constant instead, which may be negative. */
+static nir_shader *
+striped_loop(uint32_t n, bool pc_start)
+{
+   nir_builder b = compute_shader("striped-loop");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *start =
+      pc_start ? nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32)
+               : nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_store_var(&b, iv, start, 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, nir_imm_int(&b, n)));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 32), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   return b.shader;
+}
+
+/* The iterations per test the pass gives a striped loop at factor 8, or 0
+ * when it leaves the loop as it is. */
+static unsigned
+striped_factor(uint32_t n, bool pc_start = false)
+{
+   nir_shader *s = striped_loop(n, pc_start);
+   unsigned widest = 0;
+   const bool progress = agx_nir_unroll_runtime_loops(s, 8, 320, &widest);
+   nir_validate_shader(s, "striped loop");
+   EXPECT_EQ(count_loops(s), progress ? 2u : 1u);
+   ralloc_free(s);
+   return progress ? widest : 0;
+}
+
+TEST(M5RuntimeLoops, TripBoundLimitsFactor)
+{
+   /* At most two iterations, like a halo fill: any main loop could run at
+    * most once, so the loop stays as it is. */
+   EXPECT_EQ(striped_factor(64), 0u);
+   EXPECT_EQ(striped_factor(33), 0u);
+   /* At most 4, 15 and 16 iterations. */
+   EXPECT_EQ(striped_factor(128), 2u);
+   EXPECT_EQ(striped_factor(32 * 15), 4u);
+   EXPECT_EQ(striped_factor(32 * 16), 8u);
+   /* A start that may be negative gives no bound. */
+   EXPECT_EQ(striped_factor(64, true), 8u);
+}
+
 static nir_intrinsic_instr *
 first_intrinsic(nir_shader *s, nir_intrinsic_op op, unsigned skip)
 {

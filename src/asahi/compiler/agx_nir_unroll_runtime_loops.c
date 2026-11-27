@@ -880,6 +880,44 @@ nested_workgroup_stripe(const nir_shader *shader, const struct counted_loop *cl)
    return false;
 }
 
+/* An upper bound on the iterations of a counting-up loop with a constant
+ * bound whose induction variable starts at a value that cannot be negative,
+ * such as a local invocation index, or UINT64_MAX when there is none. A start
+ * of 0 runs longest: the test that ends that run ends every larger start's
+ * run no later, as long as the largest start does not wrap by then. */
+static uint64_t
+max_trips(nir_shader *shader, const struct counted_loop *cl)
+{
+   if ((cl->rel != REL_LT && cl->rel != REL_LE) || !nir_scalar_is_const(cl->bound))
+      return UINT64_MAX;
+
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl->loop->cf_node));
+   nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
+   if (!init)
+      return UINT64_MAX;
+
+   struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
+   const int64_t start_max =
+      nir_unsigned_upper_bound(shader, ranges, nir_get_scalar(init->src.ssa, 0));
+   _mesa_hash_table_destroy(ranges, NULL);
+
+   const int64_t max = cl->is_unsigned ? UINT32_MAX : INT32_MAX;
+   if (start_max > max)
+      return UINT64_MAX;
+
+   /* From a start of 0, test k keeps the loop running while
+    * k * step + offset < bound (<= bound for REL_LE). */
+   const int64_t bound = cl->is_unsigned ? (int64_t)nir_scalar_as_uint(cl->bound)
+                                         : nir_scalar_as_int(cl->bound);
+   const int64_t room = bound - cl->offset + (cl->rel == REL_LE ? 1 : 0);
+   const int64_t trips = room > 0 ? DIV_ROUND_UP(room, cl->step) : 0;
+   if (start_max + trips * cl->step + cl->offset > max)
+      return UINT64_MAX;
+
+   /* A rotated loop runs its body once before the first test. */
+   return trips + (cl->bottom ? 1 : 0);
+}
+
 /* The iterations per test for a counted loop, or 0 when it is not unrolled. */
 static unsigned
 choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
@@ -904,6 +942,15 @@ choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
       while (f > 4 && dwords * f > 16)
          f /= 2;
    }
+   /* The main loop runs only while f iterations remain. One that can run
+    * at most once saves at most f - 1 loop tests, and its guard and its f
+    * copies of the body cost the same whether it runs or not: keep the
+    * loop as it is. */
+   const uint64_t trips = max_trips(impl->function->shader, cl);
+   while (f >= 2 && 2 * f > trips)
+      f /= 2;
+   if (f < 2)
+      return 0;
    return (unsigned)size * f > max_instrs ? 0 : f;
 }
 
