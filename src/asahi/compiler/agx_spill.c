@@ -424,7 +424,8 @@ remat_load_elem_bytes(const agx_instr *L)
 static bool
 can_remat_load(const agx_context *ctx, const agx_instr *L)
 {
-   if (L->op != AGX_OPCODE_DEVICE_LOAD || !L->memory_can_reorder ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
+       L->op != AGX_OPCODE_DEVICE_LOAD || !L->memory_can_reorder ||
        L->memory_is_packed || ctx->is_preamble || L->nr_dests != 1 ||
        L->dest[0].type != AGX_INDEX_NORMAL || L->dest[0].memory ||
        L->mask != BITFIELD_MASK(agx_channels(L->dest[0])))
