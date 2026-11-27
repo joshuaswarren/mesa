@@ -177,6 +177,10 @@ void
 hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (!cmd->sync_pass_records.size) {
+      memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+      return;
+   }
    struct hk_cs *wait[HK_SYNC_NUM_SQ] = {0};
    util_dynarray_foreach(&cmd->sync_pass_records, struct hk_sync_pass_record, rec) {
       if (!rec->last)

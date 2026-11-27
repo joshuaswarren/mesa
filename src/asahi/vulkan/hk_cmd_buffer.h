@@ -130,6 +130,7 @@ struct hk_g17p_prepared_bind_tail {
    uint64_t dynamic_generation;
    uint64_t descriptor_generation;
    uint64_t non_push_descriptor_generation;
+   uint64_t non_dynbuf_descriptor_generation;
    uint64_t vertex_buffer_generation;
    uint64_t root;
    /* The fragment shader variant the tail launches, its published stage
@@ -594,16 +595,27 @@ static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
                               ->dynamic_buffers),
               "the dynamic buffer table is followed by its set starts");
 
+/* Categories of root-table mutations since the last hk_cmd_buffer_upload_root().
+ * When only PUSH, DYNBUF (within dynbuf_dirty_mask), and/or VB_{BASE,CLAMP}
+ * changed and neither the fragment shader nor a general root load in the
+ * vertex shader observes those bytes, the vertex launch can upload only the
+ * narrow dirty slices (or patch dynamic-buffer VAs directly in Ioto) and keep
+ * gfx->root and the HAL200 bind tail intact. */
+enum hk_root_dirty_bits {
+   HK_ROOT_DIRTY_PUSH = BITFIELD_BIT(0),
+   HK_ROOT_DIRTY_DYNBUF = BITFIELD_BIT(1),
+   HK_ROOT_DIRTY_VB_BASE = BITFIELD_BIT(2),
+   HK_ROOT_DIRTY_VB_CLAMP = BITFIELD_BIT(3),
+   HK_ROOT_DIRTY_OTHER = BITFIELD_BIT(4),
+};
+
 struct hk_descriptor_state {
    /* How root differs from the last uploaded root: read and written only
-    * through hk_root_dirty() and the other hk_root_*() helpers below.
-    * push_only is set while every change since that upload was to push
-    * constants, push_launched while the vertex launch last published reads
-    * the current push constants from an upload of their own. */
+    * through hk_root_dirty() and the other hk_root_*() helpers below. */
    struct {
-      bool dirty;
-      bool push_only;
-      bool push_launched;
+      uint8_t dirty_mask;
+      bool bypass_launched;
+      uint64_t dynbuf_dirty_mask;
    } root_change;
    uint64_t generation;
    /* Advances on every descriptor state change except hk_push_constants()
@@ -611,6 +623,11 @@ struct hk_descriptor_state {
     * restores), so push-only launches and xfer_clean can track descriptor
     * resource mutations in O(1). */
    uint64_t non_push_generation;
+   /* Advances on every descriptor state change except hk_push_constants() and
+    * pure dynamic-offset updates (unchanged sets, layout offsets, buffer end,
+    * and set contents), so root-bypass launches can prove in O(1) that no
+    * non-dynbuf descriptor state visible to the fragment stage moved. */
+   uint64_t non_dynbuf_generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
    /* Immutable command-buffer storage; reset with descriptor state. Only the
@@ -647,67 +664,129 @@ struct hk_descriptor_state {
 static inline bool
 hk_root_dirty(const struct hk_descriptor_state *desc)
 {
-   return desc->root_change.dirty;
+   return desc->root_change.dirty_mask != 0;
 }
 
 /* Whether root differs from the last uploaded root in push constants alone. */
 static inline bool
 hk_root_push_only_dirty(const struct hk_descriptor_state *desc)
 {
-   return desc->root_change.dirty && desc->root_change.push_only;
+   return desc->root_change.dirty_mask == HK_ROOT_DIRTY_PUSH;
+}
+
+/* Whether root differs from the last uploaded root only in bypassable
+ * categories (push constants, dynamic buffer offsets, and/or VB attrib
+ * bases/clamps). */
+static inline bool
+hk_root_bypass_dirty(const struct hk_descriptor_state *desc)
+{
+   const uint8_t dm = desc->root_change.dirty_mask;
+   return dm != 0 && !(dm & HK_ROOT_DIRTY_OTHER);
 }
 
 /* Whether the vertex launch last published reads every root byte a draw
- * needs: the root is as uploaded, or only push constants changed since and
- * that launch reads them from their own upload (hk_root_mark_push_launched()).
- * push_launch_fits says whether the draw could take such a launch
- * (hk_agx3_try_push_only_vs_program()). The root itself stays dirty either
- * way, so every path that reads it from the uploaded copy uploads it first. */
+ * needs: the root is as uploaded, or only bypassable categories changed since
+ * and that launch reads them directly without a root upload
+ * (hk_root_mark_bypass_launched()). bypass_launch_fits says whether the draw
+ * could take such a launch (hk_agx3_try_push_only_vs_program()). The root
+ * itself stays dirty either way, so every path that reads it from the uploaded
+ * copy uploads it first. */
 static inline bool
 hk_root_launch_current(const struct hk_descriptor_state *desc,
-                       bool push_launch_fits)
+                       bool bypass_launch_fits)
 {
-   return !desc->root_change.dirty ||
-          (push_launch_fits && desc->root_change.push_launched);
+   return !desc->root_change.dirty_mask ||
+          (bypass_launch_fits && desc->root_change.bypass_launched);
 }
 
-/* Root changed in anything but push constants, or in unknown bytes. */
+/* Root changed in anything outside the bypassable categories, or in unknown
+ * bytes. */
 static inline void
 hk_root_mark_dirty(struct hk_descriptor_state *desc)
 {
-   desc->root_change.dirty = true;
-   desc->root_change.push_only = false;
-   desc->root_change.push_launched = false;
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_OTHER;
+   desc->root_change.bypass_launched = false;
 }
 
 /* Root changed in its push constants. An earlier change of any other kind
- * since the last upload keeps the root fully dirty. */
+ * since the last upload stays recorded in dirty_mask. */
 static inline void
 hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
 {
-   if (!desc->root_change.dirty) {
-      desc->root_change.dirty = true;
-      desc->root_change.push_only = true;
-   }
-   desc->root_change.push_launched = false;
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   desc->root_change.bypass_launched = false;
 }
 
-/* The vertex program was launched over the current push constants alone,
- * and the uploaded root, which still holds older ones, was kept. */
+/* Root changed only in the dynamic_buffers[] slots named by slot_mask. */
+static inline void
+hk_root_mark_dynbuf_dirty(struct hk_descriptor_state *desc, uint64_t slot_mask)
+{
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_DYNBUF;
+   desc->root_change.dynbuf_dirty_mask |= slot_mask;
+   desc->root_change.bypass_launched = false;
+}
+
+/* Root changed only in draw.attrib_base[] and/or draw.attrib_clamps[]
+ * (with draw.attrib_strides[] unchanged). */
+static inline void
+hk_root_mark_vb_dirty(struct hk_descriptor_state *desc, bool base_changed,
+                      bool clamp_changed)
+{
+   if (base_changed)
+      desc->root_change.dirty_mask |= HK_ROOT_DIRTY_VB_BASE;
+   if (clamp_changed)
+      desc->root_change.dirty_mask |= HK_ROOT_DIRTY_VB_CLAMP;
+   desc->root_change.bypass_launched = false;
+}
+
+/* The vertex program was launched bypassing a root upload, and the uploaded
+ * root, which still holds older values for the dirty categories, was kept. */
+static inline void
+hk_root_mark_bypass_launched(struct hk_descriptor_state *desc)
+{
+   assert(hk_root_bypass_dirty(desc));
+   desc->root_change.bypass_launched = true;
+}
+
 static inline void
 hk_root_mark_push_launched(struct hk_descriptor_state *desc)
 {
    assert(hk_root_push_only_dirty(desc));
-   desc->root_change.push_launched = true;
+   hk_root_mark_bypass_launched(desc);
 }
 
 /* Root was uploaded as it is. */
 static inline void
 hk_root_mark_clean(struct hk_descriptor_state *desc)
 {
-   desc->root_change.dirty = false;
-   desc->root_change.push_only = false;
-   desc->root_change.push_launched = false;
+   desc->root_change.dirty_mask = 0;
+   desc->root_change.bypass_launched = false;
+   desc->root_change.dynbuf_dirty_mask = 0;
+}
+
+/* Whether a shader reading root_reads / dynbuf_reads cannot observe any of the
+ * root bytes currently dirty in desc. */
+static inline bool
+hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
+                           const struct hk_descriptor_state *desc)
+{
+   const uint8_t dm = desc->root_change.dirty_mask;
+   if (!dm)
+      return true;
+   if (dm & HK_ROOT_DIRTY_OTHER)
+      return false;
+   if (root_reads & HK_ROOT_READS_ADDRESS)
+      return false;
+   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH))
+      return false;
+   if ((dm & (HK_ROOT_DIRTY_VB_BASE | HK_ROOT_DIRTY_VB_CLAMP)) &&
+       (root_reads & HK_ROOT_READS_VERTEX_INPUT))
+      return false;
+   if ((dm & HK_ROOT_DIRTY_DYNBUF) &&
+       ((root_reads & HK_ROOT_READS_DYNAMIC_BUFFERS) ||
+        (dynbuf_reads & desc->root_change.dynbuf_dirty_mask)))
+      return false;
+   return true;
 }
 
 struct hk_attachment {
@@ -931,8 +1010,13 @@ enum hk_g17p_range_source {
    HK_G17P_RANGE_SOURCE_PREAMBLE_OUT = 6,
    /* Push-constant slice inside the graphics root (uniform DMA span inside
     * root.push[]). Replays from root + offset in full-root mode, or from a
-    * narrow uploaded push slice when push_only_root is set. */
+    * narrow uploaded push slice when root-bypass is active. */
    HK_G17P_RANGE_SOURCE_PUSH = 7,
+   /* Vertex attribute bases (root.draw.attrib_base[]) and clamps
+    * (root.draw.attrib_clamps[]). Replay from root + offset when clean, or
+    * from narrow uploaded slices when only VB state moved. */
+   HK_G17P_RANGE_SOURCE_ATTRIB_BASE = 8,
+   HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP = 9,
    /* Uploaded while collecting the ranges (combined-sampler pointers,
     * spilled render-target descriptors), or a buffer span the buffer does
     * not wholly cover: not re-derivable. */
@@ -954,6 +1038,9 @@ struct hk_g17p_launch {
    const struct hk_shader *s;
    const struct hk_linked_shader *linked;
    const struct hk_g17p_gfx_loader *loader;
+   /* Cached loader whose patch plan separates narrow bypass uploads (push or
+    * VB slices) from gfx->root so steady-state bypass draws patch in O(1). */
+   const struct hk_g17p_gfx_loader *bypass_loader;
    const struct hk_shader *hw_vs;
    uint16_t tile_size_px;
    uint8_t sample_size_B;
@@ -963,9 +1050,12 @@ struct hk_g17p_launch {
    uint8_t flags;
    uint8_t count;
    bool valid;
-   /* Vertex launch whose only root-backed uniform ranges lie inside
-    * root.push[push_min_B .. push_min_B + push_size_B). */
-   bool push_only_root;
+   /* Vertex launch eligible for root-upload bypass (push constants, dynamic
+    * buffer offsets, and/or VB attrib bases/clamps). */
+   bool root_bypass_ok;
+   /* True when the launch carries an opaque HK_G17P_RANGE_SOURCE_ROOT range
+    * (gated by s->info.agx3_root_reads / agx3_dynbuf_reads on bypass). */
+   bool has_general_root;
    uint16_t push_min_B;
    uint16_t push_size_B;
    uint8_t source[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
@@ -3180,6 +3270,8 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs(struct hk_cmd_buffer *cmd, bool compute)
 {
+   if (!compute && likely(cmd->current_cs.gfx != NULL))
+      return cmd->current_cs.gfx;
    struct hk_cs **ptr = compute ? &cmd->current_cs.cs : &cmd->current_cs.gfx;
    return hk_cmd_buffer_get_cs_general(cmd, ptr, compute);
 }

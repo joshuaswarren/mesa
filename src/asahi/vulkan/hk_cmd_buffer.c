@@ -1871,7 +1871,8 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    uint8_t dyn_buffer_start =
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
 
-   bool root_changed = false;
+   bool non_dynbuf_root_changed = false;
+   uint64_t dynbuf_changed_mask = 0;
    bool binding_changed = false;
    bool set_updated = false;
    uint32_t next_dyn_offset = 0;
@@ -1884,11 +1885,12 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
           ((desc->push_active | desc->buffer_active) & BITFIELD_BIT(s))) {
          binding_changed = true;
          if (set != NULL) {
-            root_changed |= desc->root.sets[s] != hk_descriptor_set_addr(set);
+            non_dynbuf_root_changed |=
+               desc->root.sets[s] != hk_descriptor_set_addr(set);
             desc->root.sets[s] = hk_descriptor_set_addr(set);
             desc->set_sizes[s] = set->size;
          } else {
-            root_changed |= desc->root.sets[s] != 0;
+            non_dynbuf_root_changed |= desc->root.sets[s] != 0;
             desc->root.sets[s] = 0;
             desc->set_sizes[s] = 0;
          }
@@ -1908,7 +1910,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       if (desc->push[s])
          hk_push_descriptor_set_reset_upload(desc->push[s]);
 
-      root_changed |=
+      non_dynbuf_root_changed |=
          desc->root.set_dynamic_buffer_start[s] != dyn_buffer_start;
       desc->root.set_dynamic_buffer_start[s] = dyn_buffer_start;
 
@@ -1922,12 +1924,15 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
                /* A null buffer stays at the zero page (hk_ubo_addr_format). */
                if (addr.size)
                   addr.base_addr += info->pDynamicOffsets[next_dyn_offset + j];
+               const unsigned slot = dyn_buffer_start + j;
                const struct hk_buffer_address *old =
-                  &desc->root.dynamic_buffers[dyn_buffer_start + j];
-               root_changed |= old->base_addr != addr.base_addr ||
-                               old->size != addr.size ||
-                               old->sparse_map_page != addr.sparse_map_page;
-               desc->root.dynamic_buffers[dyn_buffer_start + j] = addr;
+                  &desc->root.dynamic_buffers[slot];
+               if (old->base_addr != addr.base_addr ||
+                   old->size != addr.size ||
+                   old->sparse_map_page != addr.sparse_map_page) {
+                  dynbuf_changed_mask |= BITFIELD64_BIT(slot);
+                  desc->root.dynamic_buffers[slot] = addr;
+               }
             }
             next_dyn_offset += set->layout->vk.dynamic_descriptor_count;
          }
@@ -1939,22 +1944,31 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    }
    assert(dyn_buffer_start <= HK_MAX_DYNAMIC_BUFFERS);
    assert(next_dyn_offset <= info->dynamicOffsetCount);
-   root_changed |= desc->dynamic_buffer_end < dyn_buffer_start;
+   non_dynbuf_root_changed |= desc->dynamic_buffer_end < dyn_buffer_start;
    desc->dynamic_buffer_end = MAX2(desc->dynamic_buffer_end, dyn_buffer_start);
 
    hk_upload_stat(cmd, descriptor_binds, 1);
    const bool retain_root = hk_can_retain_descriptor_root(cmd, desc);
-   if (!root_changed && !binding_changed && !set_updated && retain_root) {
-      hk_upload_stat(cmd, descriptor_noops, 1);
+   if (!non_dynbuf_root_changed && !binding_changed && !set_updated &&
+       retain_root) {
+      if (!dynbuf_changed_mask) {
+         hk_upload_stat(cmd, descriptor_noops, 1);
+         return;
+      }
+      hk_root_mark_dynbuf_dirty(desc, dynbuf_changed_mask);
+      desc->generation++;
+      desc->non_push_generation++;
       return;
    }
 
    /* CPU-decoded descriptor programs retain their conservative invalidation:
     * their inputs can change in set memory without changing its address. */
-   if (root_changed || set_updated || !retain_root)
+   if (non_dynbuf_root_changed || dynbuf_changed_mask || set_updated ||
+       !retain_root)
       hk_root_mark_dirty(desc);
    desc->generation++;
    desc->non_push_generation++;
+   desc->non_dynbuf_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2099,6 +2113,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
    hk_root_mark_dirty(desc);
    desc->generation++;
    desc->non_push_generation++;
+   desc->non_dynbuf_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2145,6 +2160,7 @@ hk_bind_embedded_samplers(struct hk_cmd_buffer *cmd,
    hk_root_mark_dirty(desc);
    desc->generation++;
    desc->non_push_generation++;
+   desc->non_dynbuf_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2355,6 +2371,7 @@ hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
       hk_root_mark_dirty(desc);
       desc->generation++;
       desc->non_push_generation++;
+      desc->non_dynbuf_generation++;
    }
    desc->push_dirty = 0;
 }
@@ -3252,14 +3269,14 @@ hk_g17p_graphics_uniform_ranges(
          if (!root_ptr)
             return hk_g17p_graphics_ranges_refused(range_count, count);
 
-         sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
+         sources[count] = HK_G17P_RANGE_SOURCE_ATTRIB_BASE;
          ranges[count++] = (struct agx3_ioto_uniform_range){
             .start_halfs = uniform_base + AGX_ABI_VUNI_VBO_BASE(0),
             .size_halfs = 4 * nr_attribs,
             .address =
                root_ptr + hk_root_descriptor_offset(draw.attrib_base),
          };
-         sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
+         sources[count] = HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP;
          ranges[count++] = (struct agx3_ioto_uniform_range){
             .start_halfs = uniform_base +
                            AGX_ABI_VUNI_VBO_CLAMP(nr_attribs, 0),
@@ -3644,15 +3661,35 @@ hk_g17p_gfx_loader_emit(struct hk_cmd_buffer *cmd,
                         const struct hk_g17p_gfx_loader *l,
                         const struct agx3_ioto_uniform_range *ranges)
 {
+   struct hk_ioto_arena *arena = &cmd->ioto;
+   const uint32_t len = l->length;
+   const uint32_t mask = HK_IOTO_PROGRAM_ALIGNMENT - 1;
+
+   if (likely(len != 0 && arena->map && arena->cursor <= arena->capacity &&
+              arena->cursor <= UINT32_MAX - mask)) {
+      const uint32_t offset = (arena->cursor + mask) & ~mask;
+      if (likely(offset <= arena->capacity && len <= arena->capacity - offset)) {
+         uint8_t *dst = arena->map + offset;
+         const uint64_t va = arena->base + offset;
+         arena->cursor = offset + len;
+         arena->programs++;
+         arena->program_bytes += len;
+         if (unlikely(!hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev)))
+            agx_bo_assert_range(arena->bo, offset, len);
+         memcpy(dst, l->bytes, len);
+         hk_g17p_patch_plan_apply(&l->plan, ranges, dst);
+         return va;
+      }
+   }
+
    struct hk_ioto_reservation r;
-   if (!hk_cmd_reserve_ioto_program(cmd, l->length, "G17P graphics loader",
-                                    &r))
+   if (!hk_cmd_reserve_ioto_program_slow(cmd, len, "G17P graphics loader", &r))
       return 0;
 
-   memcpy(r.map, l->bytes, l->length);
+   memcpy(r.map, l->bytes, len);
    hk_g17p_patch_plan_apply(&l->plan, ranges, r.map);
 
-   return hk_cmd_publish_ioto_program(cmd, &r, l->length);
+   return hk_cmd_publish_ioto_program(cmd, &r, len);
 }
 
 static bool
@@ -3747,14 +3784,16 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
    const struct agx_tilebuffer_layout *tib = &gfx->render.tilebuffer;
 
    launch->valid = false;
-   launch->push_only_root = false;
+   launch->bypass_loader = NULL;
+   launch->root_bypass_ok = false;
+   launch->has_general_root = false;
    launch->push_min_B = 0;
    launch->push_size_B = 0;
    if (count > ARRAY_SIZE(launch->source))
       return;
 
    bool has_push = false;
-   bool has_non_push_root = false;
+   bool has_general_root = false;
    uint16_t push_min_B = HK_MAX_PUSH_SIZE;
    uint16_t push_max_B = 0;
 
@@ -3768,7 +3807,28 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
          break;
       case HK_G17P_RANGE_SOURCE_ROOT:
          offset = ranges[i].address - root;
-         has_non_push_root = true;
+         /* The root/set table header range at offset 0 only exposes the
+          * root_desc_addr pointer when the main body, preamble, or prolog
+          * reads it; otherwise it only supplies root.sets[], which never
+          * change on push, dynamic-buffer, or VB base/clamp updates. */
+         if (offset != 0 || !s->b.info.agx3_root_uniform_usage_valid ||
+             s->b.info.agx3_main_uses_root_uniform ||
+             s->b.info.has_preamble || linked->g17p_prolog_uses_root)
+            has_general_root = true;
+         break;
+      case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
+         offset = ranges[i].address - root;
+         if (offset != hk_root_descriptor_offset(draw.attrib_base) ||
+             2u * ranges[i].size_halfs >
+                sizeof(gfx->descriptors.root.draw.attrib_base))
+            return;
+         break;
+      case HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP:
+         offset = ranges[i].address - root;
+         if (offset != hk_root_descriptor_offset(draw.attrib_clamps) ||
+             2u * ranges[i].size_halfs >
+                sizeof(gfx->descriptors.root.draw.attrib_clamps))
+            return;
          break;
       case HK_G17P_RANGE_SOURCE_PUSH: {
          const uint64_t push_off = hk_root_descriptor_offset(push);
@@ -3841,10 +3901,11 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
    launch->provoking = gfx->provoking;
    launch->flags = flags;
    launch->count = count;
-   launch->push_only_root =
-      s->info.stage == MESA_SHADER_VERTEX && has_push && !has_non_push_root &&
-      push_max_B > push_min_B;
-   if (launch->push_only_root) {
+   launch->has_general_root = has_general_root;
+   launch->root_bypass_ok =
+      s->info.stage == MESA_SHADER_VERTEX &&
+      (!has_general_root || !(s->info.agx3_root_reads & HK_ROOT_READS_ADDRESS));
+   if (has_push && push_max_B > push_min_B) {
       launch->push_min_B = push_min_B;
       launch->push_size_B = (uint16_t)(push_max_B - push_min_B);
    }
@@ -3897,6 +3958,8 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
       switch (launch->source[i]) {
       case HK_G17P_RANGE_SOURCE_ROOT:
       case HK_G17P_RANGE_SOURCE_PUSH:
+      case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
+      case HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP:
          address = root + launch->offset[i];
          break;
       case HK_G17P_RANGE_SOURCE_DRAW_PARAMS:
@@ -4320,7 +4383,8 @@ hk_agx3_multi_draw_ioto_prepare(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
 
    const uint8_t expected_flags =
-      (gfx->root ? 1 : 0) | (uses_base_param ? 2 : 0) | (uses_draw_id ? 4 : 0);
+      (gfx->root ? 1 : 0) | (uses_base_param ? 2 : 0) |
+      (uses_draw_id ? 4 : 0) | (gfx->g17p_hoisted_preamble_va ? 32 : 0);
 
    if (s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
        !launch->valid || launch->s != s || launch->linked != linked ||
@@ -4893,37 +4957,96 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
 
    s = hk_linked_shader_source(s, linked);
    if ((!agx_chip_native_hal200(dev->dev.chip) &&
         !agx_chip_g17_m5(dev->dev.chip)) ||
        s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
-       !gfx->root || gfx->g17p_hoisted_preamble_va)
+       !gfx->root || gfx->g17p_hoisted_preamble_va ||
+       !hk_root_bypass_dirty(desc))
       return 0;
 
-   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+   struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
    const uint8_t flags = hk_g17p_launch_flags(cmd, s);
-   if (!launch->valid || !launch->push_only_root || !launch->loader ||
-       !hk_g17p_launch_matches(dev, cmd, launch, s, linked, flags, NULL) ||
-       !launch->push_size_B ||
-       (unsigned)launch->push_min_B + launch->push_size_B > HK_MAX_PUSH_SIZE)
+   if (!launch->valid || !launch->root_bypass_ok || !launch->loader ||
+       !hk_g17p_launch_matches(dev, cmd, launch, s, linked, flags, NULL))
       return 0;
 
-   const uint64_t slice_va =
-      hk_pool_upload(cmd, gfx->descriptors.root.push + launch->push_min_B,
-                     launch->push_size_B, 4);
-   if (!slice_va)
+   if (launch->has_general_root &&
+       !hk_root_reads_ignore_dirty(s->info.agx3_root_reads,
+                                   s->info.agx3_dynbuf_reads, desc))
       return 0;
+
+   const uint8_t dirty_mask = desc->root_change.dirty_mask;
+   const unsigned count = launch->count;
+   uint32_t vb_base_B = 0;
+   uint32_t vb_clamp_B = 0;
+   if (dirty_mask & (HK_ROOT_DIRTY_VB_BASE | HK_ROOT_DIRTY_VB_CLAMP)) {
+      for (unsigned i = 0; i < count; ++i) {
+         if (launch->source[i] == HK_G17P_RANGE_SOURCE_ATTRIB_BASE &&
+             (dirty_mask & HK_ROOT_DIRTY_VB_BASE))
+            vb_base_B = 2u * launch->size_halfs[i];
+         else if (launch->source[i] == HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP &&
+                  (dirty_mask & HK_ROOT_DIRTY_VB_CLAMP))
+            vb_clamp_B = 2u * launch->size_halfs[i];
+      }
+   }
+
+   const uint32_t push_B =
+      (dirty_mask & HK_ROOT_DIRTY_PUSH) ? launch->push_size_B : 0;
+   if (push_B && (unsigned)launch->push_min_B + push_B > HK_MAX_PUSH_SIZE)
+      return 0;
+
+   uint64_t vb_base_va = 0;
+   uint64_t vb_clamp_va = 0;
+   uint64_t push_slice_va = 0;
+   const uint32_t total_upload_B = vb_base_B + vb_clamp_B + push_B;
+   if (total_upload_B) {
+      /* Pack all dirty narrow slices into one contiguous pool allocation so
+       * they share a single base cluster in the Ioto patch plan. */
+      struct agx_ptr up =
+         hk_pool_alloc(cmd, total_upload_B, vb_base_B ? 8 : 4);
+      if (!up.cpu)
+         return 0;
+      uint32_t off = 0;
+      if (vb_base_B) {
+         memcpy((uint8_t *)up.cpu + off, desc->root.draw.attrib_base, vb_base_B);
+         vb_base_va = up.gpu + off;
+         off += vb_base_B;
+      }
+      if (vb_clamp_B) {
+         memcpy((uint8_t *)up.cpu + off, desc->root.draw.attrib_clamps,
+                vb_clamp_B);
+         vb_clamp_va = up.gpu + off;
+         off += vb_clamp_B;
+      }
+      if (push_B) {
+         memcpy((uint8_t *)up.cpu + off, desc->root.push + launch->push_min_B,
+                push_B);
+         push_slice_va = up.gpu + off;
+      }
+   }
 
    const uint64_t slice_origin =
       hk_root_descriptor_offset(push) + launch->push_min_B;
-   const unsigned count = launch->count;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    for (unsigned i = 0; i < count; ++i) {
       uint64_t address;
       switch (launch->source[i]) {
+      case HK_G17P_RANGE_SOURCE_ROOT:
+         address = gfx->root + launch->offset[i];
+         break;
+      case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
+         address = vb_base_va ? vb_base_va : gfx->root + launch->offset[i];
+         break;
+      case HK_G17P_RANGE_SOURCE_ATTRIB_CLAMP:
+         address = vb_clamp_va ? vb_clamp_va : gfx->root + launch->offset[i];
+         break;
       case HK_G17P_RANGE_SOURCE_PUSH:
-         address = slice_va + (launch->offset[i] - slice_origin);
+         address = push_slice_va
+                      ? push_slice_va + (launch->offset[i] - slice_origin)
+                      : gfx->root + launch->offset[i];
          break;
       case HK_G17P_RANGE_SOURCE_DRAW_PARAMS:
          address = gfx->draw_params;
@@ -4932,7 +5055,7 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          address = gfx->draw_id_ptr;
          break;
       case HK_G17P_RANGE_SOURCE_SET: {
-         const uint64_t base = gfx->descriptors.root.sets[launch->set[i]];
+         const uint64_t base = desc->root.sets[launch->set[i]];
          address = base ? base + launch->offset[i] : AGX_ZERO_PAGE_ADDRESS;
          if (address & 3)
             return 0;
@@ -4965,11 +5088,20 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       };
    }
 
-   if (!hk_g17p_patch_plan_fits(&launch->loader->plan, ranges))
-      return 0;
+   const struct hk_g17p_gfx_loader *l =
+      launch->bypass_loader ? launch->bypass_loader : launch->loader;
+   if (likely(hk_g17p_patch_plan_fits(&l->plan, ranges)))
+      return hk_g17p_gfx_loader_publish(cmd, linked, &gfx->g17p_ioto[0], l,
+                                        ranges, count);
 
-   return hk_g17p_gfx_loader_publish(cmd, linked, &gfx->g17p_ioto[0],
-                                     launch->loader, ranges, count);
+   /* Split bypass ranges (e.g. root-resident attrib_base plus pool-resident
+    * push constants) have a different cluster shape than the initial full-root
+    * loader. Build or look up a matching loader once and cache it on launch. */
+   const uint64_t published = hk_g17p_publish_gfx_loader(
+      cmd, s, linked, &gfx->g17p_ioto[0], ranges, count);
+   if (published)
+      launch->bypass_loader = gfx->g17p_ioto[0].loader;
+   return published;
 }
 
 uint64_t
