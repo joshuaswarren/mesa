@@ -1509,6 +1509,9 @@ struct hk_cs {
     * flush requested with nothing recorded since it can be elided. */
    void *strong_flush_end;
 
+   /* AGX2 CDM (AGX_CAP_CDM_DEFER_FLUSH): post-launch flush deferred. */
+   bool cdm_flush_pending;
+
    /* Likewise for the weak ordering barrier attached to a native launch. A
     * later cache-flush request upgrades this record in place instead of
     * emitting two adjacent barriers. */
