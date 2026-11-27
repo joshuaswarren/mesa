@@ -1726,6 +1726,11 @@ struct hk_cs {
     * the stream may have read or written the resolve target. */
    bool m5_non_local_src;
 
+   /* M5: an earlier continuation of this stream crossed a barrier that made
+    * attachment writes available (hk_m5_barrier_makes_att_visible()). A later
+    * ordered barrier with srcAccessMask == 0 chains visibility onto it. */
+   bool m5_att_available;
+
    /* M5: every attachment of the continued instances is in an
     * attachment-only layout, so no descriptor can access one of them and
     * descriptor sets bound for graphics need not end an ordered continuation
@@ -2459,6 +2464,9 @@ struct hk_cmd_buffer {
        * (hk_m5_pass_merge_non_local_src()), so a final-pass resolve may not
        * merge into this stream. */
       bool non_local_src;
+      /* A recorded barrier between this instance and the next made attachment
+       * writes available (hk_m5_barrier_makes_att_visible()). */
+      bool att_available;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
    } pass_merge;

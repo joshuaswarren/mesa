@@ -358,6 +358,7 @@ hk_render_pack_run_start(struct hk_render_pack_run_state *run,
    *run = (struct hk_render_pack_run_state){
       .ordered = cs->m5_ordered,
       .non_local_src = cs->m5_non_local_src,
+      .att_available = cs->m5_ordered || cs->m5_att_available,
       .att_visible = cs->m5_ordered,
       .writes_memory = cs->m5_shader_writes_memory,
       .unsafe = cs->render_pack_unsafe,
@@ -391,6 +392,19 @@ run_non_local_src(const struct hk_render_pack_run_state *run,
           b->render_pack.head_non_local_src || bs->m5_non_local_src;
 }
 
+/* Whether any barrier between or inside the run's members made attachment
+ * writes available (regardless of whether that barrier was local or ordered).
+ * A later ordered barrier with srcAccessMask == 0 chains visibility onto it. */
+static bool
+run_att_available(const struct hk_render_pack_run_state *run,
+                  const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b,
+                  const struct hk_cs *bs)
+{
+   return run->att_available || a->render_pack.tail_att_available ||
+          b->render_pack.head_att_available || bs->m5_ordered ||
+          bs->m5_att_available;
+}
+
 static bool
 run_att_visible(const struct hk_render_pack_run_state *run,
                 const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b,
@@ -402,7 +416,9 @@ run_att_visible(const struct hk_render_pack_run_state *run,
    const bool head_vis =
       b->render_pack.head_dep == HK_M5_MERGE_DEP_ORDERED &&
       !b->render_pack.head_att_not_visible;
-   return run->att_visible || tail_vis || head_vis || bs->m5_ordered;
+   const bool chained =
+      run_ordered(run, a, b, bs) && run_att_available(run, a, b, bs);
+   return run->att_visible || tail_vis || head_vis || chained || bs->m5_ordered;
 }
 const char *
 hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
@@ -461,6 +477,43 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
    return render_pack_streams_match(first, bs, eot_changes, resolving);
 }
 
+const char *
+hk_render_pack_pre_cs_refusal(const struct hk_render_pack_run_state *state,
+                              const struct hk_cs *bs_pre, unsigned run_post,
+                              uint8_t run_vdm_kinds,
+                              const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS])
+{
+   if (!bs_pre)
+      return NULL;
+
+   /* Every hoisted pre_cs runs before the packed render stream while every
+    * earlier member's post_cs runs after it, so hoisting any pre_cs past an
+    * earlier post_cs would invert their CDM order. */
+   if (run_post > 0)
+      return bs_pre->stats.calls != 0 ? "api compute after post-graphics"
+                                      : "pre-graphics after post-graphics";
+
+   if (bs_pre->stats.calls == 0)
+      return NULL;
+
+   /* Hoisting an API compute stream ahead of earlier render members in this
+    * packed run requires that earlier members only wrote attachments (no
+    * buffer/SSBO writes) and that no barrier ordered those earlier renders
+    * before this compute stream. */
+   if (state->writes_memory)
+      return "api compute after memory write";
+   if ((bs_pre->sync.dep[HK_SYNC_VDM].prior & run_vdm_kinds) ||
+       (bs_pre->sync.dep_ta[HK_SYNC_VDM].prior & run_vdm_kinds))
+      return "api compute depends on render";
+
+   const uint8_t pre_full = hk_sync_full_kinds(bs_pre->sync.kind);
+   u_foreach_bit(k, pre_full) {
+      if (run_vdm_tail_req[k] & run_vdm_kinds)
+         return "api compute ordered after render";
+   }
+   return NULL;
+}
+
 void
 hk_render_pack_run_join(struct hk_render_pack_run_state *run,
                         const struct hk_cmd_buffer *a,
@@ -468,6 +521,7 @@ hk_render_pack_run_join(struct hk_render_pack_run_state *run,
 {
    run->ordered = run_ordered(run, a, b, bs);
    run->non_local_src = run_non_local_src(run, a, b, bs);
+   run->att_available = run_att_available(run, a, b, bs);
    run->att_visible = run_att_visible(run, a, b, bs);
    run->writes_memory |= bs->m5_shader_writes_memory;
    run->unsafe |= bs->render_pack_unsafe;

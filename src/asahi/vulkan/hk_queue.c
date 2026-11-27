@@ -8044,25 +8044,10 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
          const char *why =
             hk_render_pack_boundary(&state, cmds[a], cmds[b], bs, first);
-         if (!why && bs_pre && bs_pre->stats.calls != 0) {
-            /* Hoisting an API compute stream ahead of earlier render members
-             * in this packed run requires that earlier members only wrote
-             * attachments (no buffer/SSBO writes) and that no barrier ordered
-             * those earlier renders before this compute stream. */
-            if (state.writes_memory) {
-               why = "api compute after memory write";
-            } else if ((bs_pre->sync.dep[HK_SYNC_VDM].prior & run_vdm_kinds) ||
-                       (bs_pre->sync.dep_ta[HK_SYNC_VDM].prior & run_vdm_kinds)) {
-               why = "api compute depends on render";
-            } else {
-               const uint8_t pre_full = hk_sync_full_kinds(bs_pre->sync.kind);
-               u_foreach_bit(k, pre_full) {
-                  if (run_vdm_tail_req[k] & run_vdm_kinds) {
-                     why = "api compute ordered after render";
-                     break;
-                  }
-               }
-            }
+         if (!why && bs_pre) {
+            why = hk_render_pack_pre_cs_refusal(&state, bs_pre, run_post,
+                                                run_vdm_kinds,
+                                                run_vdm_tail_req);
          }
          if (!why && bs->sync.heap_slot &&
              (used_heap_slots & BITFIELD_BIT(bs->sync.heap_slot - 1)))

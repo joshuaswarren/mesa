@@ -604,6 +604,51 @@ test_boundary(void)
    b->render_pack.head_pass.layout_proof = false;
    T("non-attachment ordered barrier packs without layout proof or push refusal",
      !boundary(a, b));
+   /* Two-barrier availability chain: a LOCAL barrier in A's tail made
+    * attachment writes available, then B's head chains an ORDERED barrier
+    * with srcAccessMask == 0 (head_att_not_visible == true). Must enforce
+    * layout_proof, aliasable, and pushed_attachment. */
+   a->render_pack.tail_att_available = true;
+   T("tail att_available + head ordered (srcAccess=0) refuses without layout proof",
+     boundary(a, b));
+   b->render_pack.head_pass.layout_proof = true;
+   T("tail att_available + head ordered (srcAccess=0) refuses pushed attachment",
+     boundary(a, b));
+   b->m5_pushed_images = NULL;
+   b->render_pack.head_pass.att[0].aliasable = true;
+   T("tail att_available + head ordered (srcAccess=0) refuses aliasable image",
+     boundary(a, b));
+   b->render_pack.head_pass.att[0].aliasable = false;
+   T("tail att_available + head ordered (srcAccess=0) packs when layout proof holds",
+     !boundary(a, b));
+   a->render_pack.tail_att_available = false;
+
+   /* Same chain from an earlier in-buffer LOCAL availability barrier on A. */
+   as->m5_att_available = true;
+   b->render_pack.head_pass.layout_proof = false;
+   T("in-buffer m5_att_available + head ordered (srcAccess=0) refuses without layout proof",
+     boundary(a, b));
+   as->m5_att_available = false;
+
+   /* Three-member chain: A->B carries LOCAL att_available, then B->C adds an
+    * ORDERED barrier with srcAccessMask == 0 (head_att_not_visible == true). */
+   struct hk_cmd_buffer *m0 = split(1), *m1 = split(2), *m2 = split(3);
+   m0->render_pack.tail_att_available = true;
+   m2->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
+   m2->render_pack.head_att_not_visible = true;
+   m2->render_pack.head_pass.layout_proof = false;
+   struct hk_render_pack_run_state chain;
+   hk_render_pack_run_start(&chain, m0, first_cs(m0));
+   T("three-member chain: A->B local att_available packs",
+     !hk_render_pack_boundary(&chain, m0, m1, first_cs(m1), first_cs(m0)));
+   hk_render_pack_run_join(&chain, m0, m1, first_cs(m1));
+   T("three-member chain: run carries att_available into B->C ordered (srcAccess=0)",
+     chain.att_available &&
+     hk_render_pack_boundary(&chain, m1, m2, first_cs(m2), first_cs(m0)) != NULL);
+   m2->render_pack.head_pass.layout_proof = true;
+   T("three-member chain: B->C packs once layout_proof holds",
+     !hk_render_pack_boundary(&chain, m1, m2, first_cs(m2), first_cs(m0)));
+
    b->render_pack.head_pass.layout_proof = true;
    b->render_pack.head_att_not_visible = false;
    b->m5_pushed_images = NULL;
@@ -1153,6 +1198,37 @@ test_pregfx_and_union_elision(void)
      hk_render_pack_member_streams(c, true, &got_pre, &got_post) == NULL);
    pre->timestamp.end.handle = 0;
    pre->render_pack_compute_internal = false;
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->stats.calls = 0;
+
+   /* Hoisting refusal gate: must refuse hoisting pre_cs past an earlier
+    * member's post_cs, memory writes, or VDM->CDM ordering dependencies. */
+   struct hk_render_pack_run_state hoist = {0};
+   uint8_t tail_req[HK_SYNC_NUM_KINDS] = {0};
+   pre->stats.calls = 1;
+   pre->sync.kind = HK_SYNC_COMPUTE;
+   T("clean API pre_cs hoists when run_post == 0",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
+   T("API pre_cs refused when earlier member has post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+   pre->stats.calls = 0;
+   T("driver pre_cs refused when earlier member has post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+   T("driver pre_cs allowed when run_post == 0",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
+   pre->stats.calls = 1;
+   hoist.writes_memory = true;
+   T("API pre_cs refused after memory-writing render",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+   hoist.writes_memory = false;
+   pre->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+   T("API pre_cs refused when depending on earlier render",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+   pre->sync.dep[HK_SYNC_VDM].prior = 0;
+   tail_req[util_logbase2(HK_SYNC_COMPUTE)] = HK_SYNC_GFX;
+   T("API pre_cs refused when earlier tail barrier orders VDM->CDM",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+   tail_req[util_logbase2(HK_SYNC_COMPUTE)] = 0;
    pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
    pre->stats.calls = 0;
 

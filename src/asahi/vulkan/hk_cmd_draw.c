@@ -4285,9 +4285,10 @@ static bool hk_m5_image_aliases_attachment(const struct hk_rendering_state *rend
 
 static void
 hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
-                          VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
-                          VkAccessFlags2 dst_access, bool buffer,
-                          bool transition, const struct vk_image *image)
+                          VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
+                          VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
+                          bool buffer, bool transition,
+                          const struct vk_image *image)
 {
    struct hk_pass_merge_candidate *m = &cmd->pass_merge;
    if (!m->valid)
@@ -4313,6 +4314,8 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
 
    if (hk_m5_pass_merge_non_local_src(src, dst))
       m->non_local_src = true;
+   if (hk_m5_barrier_makes_att_visible(src, src_access))
+      m->att_available = true;
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -4346,21 +4349,22 @@ hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       hk_m5_pass_merge_classify(cmd, "memory", b->srcStageMask,
-                                b->dstStageMask, b->dstAccessMask, false,
-                                false, NULL);
+                                b->srcAccessMask, b->dstStageMask,
+                                b->dstAccessMask, false, false, NULL);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       hk_m5_pass_merge_classify(
-         cmd, "buffer", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
+         cmd, "buffer", b->srcStageMask, b->srcAccessMask, b->dstStageMask,
+         b->dstAccessMask, true,
+         b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
    }
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
       VK_FROM_HANDLE(vk_image, image, b->image);
       hk_m5_pass_merge_classify(
-         cmd, "image", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         false,
+         cmd, "image", b->srcStageMask, b->srcAccessMask, b->dstStageMask,
+         b->dstAccessMask, false,
          b->oldLayout != b->newLayout ||
             b->srcQueueFamilyIndex != b->dstQueueFamilyIndex,
          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ? NULL : image);
@@ -4829,6 +4833,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * resolve target. */
    const bool ordered = m->ordered || cs->m5_ordered;
    const bool non_local_src = m->non_local_src || cs->m5_non_local_src;
+   const bool att_available = m->att_available || cs->m5_att_available;
    if (ordered) {
       why = any_resolve ? "resolve" : hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
@@ -4898,6 +4903,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
    cs->m5_non_local_src = non_local_src;
+   cs->m5_att_available = att_available;
    cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
@@ -5198,7 +5204,7 @@ static uint8_t
 hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
                         const struct hk_render_pack_pass *pass,
                         struct hk_render_pack_edges *e, bool *msaa_end,
-                        bool *non_local_src, bool *att_visible,
+                        bool *non_local_src, bool *att_available,
                         const char **why)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
@@ -5209,13 +5215,12 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
                                                     false);
-      if (d == HK_M5_MERGE_DEP_ORDERED &&
-          hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
-         *att_visible = true;
       dep = MAX2(dep, d);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
@@ -5223,13 +5228,12 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
       const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, true,
                                                     transfer);
-      if (d == HK_M5_MERGE_DEP_ORDERED &&
-          hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
-         *att_visible = true;
       if (d == HK_M5_MERGE_DEP_END)
          *why = "buffer ownership transfer";
       dep = MAX2(dep, d);
@@ -5248,13 +5252,12 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
          (!undef_alias || !pass || !hk_render_pack_aliases_va(pass, image));
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
                                                     transition && !transparent);
-      if (d == HK_M5_MERGE_DEP_ORDERED &&
-          hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
-         *att_visible = true;
       if (d == HK_M5_MERGE_DEP_END)
          *why = transfer ? "image ownership transfer"
                          : "transition of an image that may alias";
@@ -5320,33 +5323,41 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
          e->head_open = false;
          e->head_why = "stream";
       } else {
-         bool att_vis = false;
+         bool att_avail = false;
          const uint8_t d = hk_render_pack_classify(cmd, info, NULL, e,
                                                    &e->head_msaa_end,
                                                    &e->head_non_local_src,
-                                                   &att_vis, &e->head_why);
+                                                   &att_avail, &e->head_why);
+         e->head_att_available |= att_avail;
          if (d == HK_M5_MERGE_DEP_ORDERED) {
             if (e->head_dep < HK_M5_MERGE_DEP_ORDERED)
-               e->head_att_not_visible = !att_vis;
-            else if (att_vis)
+               e->head_att_not_visible = !e->head_att_available;
+            else if (e->head_att_available)
                e->head_att_not_visible = false;
+         } else if (e->head_att_available &&
+                    e->head_dep == HK_M5_MERGE_DEP_ORDERED) {
+            e->head_att_not_visible = false;
          }
          e->head_dep = MAX2(e->head_dep, d);
       }
    }
    if (e->tail_open) {
       bool msaa_end = false;
-      bool att_vis = false;
+      bool att_avail = false;
       const char *why = "barrier";
       const uint8_t d = hk_render_pack_classify(cmd, info, &e->tail_pass, e,
                                                 &msaa_end,
                                                 &e->tail_non_local_src,
-                                                &att_vis, &why);
+                                                &att_avail, &why);
+      e->tail_att_available |= att_avail;
       if (d == HK_M5_MERGE_DEP_ORDERED) {
          if (e->tail_dep < HK_M5_MERGE_DEP_ORDERED)
-            e->tail_att_not_visible = !att_vis;
-         else if (att_vis)
+            e->tail_att_not_visible = !e->tail_att_available;
+         else if (e->tail_att_available)
             e->tail_att_not_visible = false;
+      } else if (e->tail_att_available &&
+                 e->tail_dep == HK_M5_MERGE_DEP_ORDERED) {
+         e->tail_att_not_visible = false;
       }
       e->tail_dep = MAX2(e->tail_dep, d);
       if (msaa_end && e->tail_msaa)
@@ -5504,6 +5515,7 @@ hk_render_pack_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    e->tail_dep = cs->m5_ordered ? HK_M5_MERGE_DEP_ORDERED
                                 : HK_M5_MERGE_DEP_LOCAL;
    e->tail_non_local_src = cs->m5_non_local_src;
+   e->tail_att_available = cs->m5_ordered || cs->m5_att_available;
    e->tail_att_not_visible = false;
    e->tail_stream = cs;
    e->tail_seq = cs->sync.seq;
@@ -6913,6 +6925,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
       merge->ordered = false;
       merge->non_local_src = false;
+      merge->att_available = false;
       merge->valid = true;
    }
    /* The render state is cleared by now; the candidate kept a copy. */
