@@ -101,8 +101,10 @@ void
 hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
-   (void)cmd; (void)target; (void)address; (void)size; (void)value;
-   abort();
+   (void)cmd; (void)address; (void)size; (void)value;
+   if (!target || !*target)
+      abort();
+   (*target)->stats.cmds++;
 }
 
 struct agx_ptr
@@ -185,6 +187,30 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs, size_t space
    (void)cs;
    (void)space;
    abort();
+}
+
+bool
+hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   return false;
+}
+
+bool
+hk_cdm_visibility_flush_needed(const struct hk_device *dev,
+                               const struct hk_cs *cs, bool memory)
+{
+   (void)dev;
+   (void)cs;
+   (void)memory;
+   return false;
+}
+
+void
+hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
+{
+   (void)dev;
+   (void)cs;
 }
 
 void
@@ -1111,6 +1137,202 @@ test_oq_post_gfx_heap_promotion(void)
      r2->sync.dep[HK_SYNC_CDM].cut == post);
 }
 
+static void
+test_event_retirement_stamping(void)
+{
+   /* 1. Render followed by vkCmdSetEvent2 on G17P with COMPUTE_NO_QUERY_ACCESS:
+    *    event rides on the render's vertex-end retirement slot (slot 1) with
+    *    no standalone CDM stream, and a subsequent render barrier does not
+    *    acquire a CDM wait. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r1 = add(cmd, false);
+      uint64_t status = 0;
+      struct agx_va va = {.addr = 0x30000};
+      struct agx_bo bo = {.va = &va};
+      struct hk_event event = {
+         .base.type = VK_OBJECT_TYPE_EVENT,
+         .bo = &bo,
+         .ts_handle = 42,
+         .ts_offset_B = 16,
+         .addr = va.addr,
+         .status = &status,
+      };
+      const VkMemoryBarrier2 bar = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+      };
+      const VkDependencyInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &bar,
+      };
+      hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&event),
+                      &info);
+
+      T("stamped render SetEvent creates no extra CDM stream",
+        last_cs(cmd) == r1 && r1->oq_stamp[1].handle == 42 &&
+           r1->oq_stamp[1].offset_B == 16 && !r1->oq_stamp[3].handle);
+      T("stamped render SetEvent records HK_SYNC_STAMP without poisoning kind",
+        cmd->sync.last[util_logbase2(HK_SYNC_STAMP)][HK_SYNC_VDM] == r1 &&
+           !(r1->sync.kind & HK_SYNC_STAMP));
+
+      /* Follow with a pipeline barrier and second render: zero CDM dependency. */
+      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+      struct hk_cs *r2 = add(cmd, false);
+      T("render after stamped SetEvent has no CDM stall",
+        r2->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+      /* Follow with ResetEvent(TOP_OF_PIPE): must wait on r1 and record query
+       * access range covering the stamped slot. */
+      hk_CmdResetEvent2(hk_cmd_buffer_to_handle(cmd),
+                        hk_event_to_handle(&event),
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+      struct hk_cs *reset_cs = last_cs(cmd);
+      T("ResetEvent after stamped render waits on render and notes query range",
+        reset_cs != r2 && reset_cs->type == HK_CS_CDM &&
+           reset_cs->sync.dep[HK_SYNC_VDM].cut == r1 &&
+           reset_cs->query_access_ranges.size ==
+              sizeof(struct hk_query_access_range));
+   }
+
+   /* 2. Compute followed by vkCmdSetEvent2 on G17P: event rides on compute
+    *    ts.end, ends the compute stream, and does not set untracked query
+    *    access on the compute stream. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *c1 = add(cmd, true);
+      c1->stats.cmds = 1;
+      cmd->current_cs.cs = c1;
+      uint64_t status = 0;
+      struct agx_va va = {.addr = 0x40000};
+      struct agx_bo bo = {.va = &va};
+      struct hk_event event = {
+         .base.type = VK_OBJECT_TYPE_EVENT,
+         .bo = &bo,
+         .ts_handle = 77,
+         .ts_offset_B = 24,
+         .addr = va.addr,
+         .status = &status,
+      };
+      const VkMemoryBarrier2 bar = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      };
+      const VkDependencyInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &bar,
+      };
+      hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&event),
+                      &info);
+
+      T("stamped compute SetEvent attaches to ts.end and closes stream",
+        last_cs(cmd) == c1 && cmd->current_cs.cs == NULL &&
+           c1->timestamp.end.handle == 77 && c1->timestamp.end.offset_B == 24 &&
+           !c1->query_access_untracked);
+
+      /* WaitEvents2 on the stamped event waits on c1 and notes its range. */
+      const VkEvent eh = hk_event_to_handle(&event);
+      hk_CmdWaitEvents2(hk_cmd_buffer_to_handle(cmd), 1, &eh, &info);
+      struct hk_cs *wait_cs = last_cs(cmd);
+      T("WaitEvents2 on stamped compute waits on c1 and notes query range",
+        wait_cs != c1 && wait_cs->sync.dep[HK_SYNC_CDM].cut == c1 &&
+           wait_cs->query_access_ranges.size ==
+              sizeof(struct hk_query_access_range));
+   }
+
+   /* 3. Fallback when all three render retirement slots are already taken. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r1 = add(cmd, false);
+      r1->oq_stamp[0] = (struct agx_timestamp_req){.handle = 1, .offset_B = 0};
+      r1->oq_stamp[1] = (struct agx_timestamp_req){.handle = 1, .offset_B = 8};
+      r1->oq_stamp[2] = (struct agx_timestamp_req){.handle = 1, .offset_B = 16};
+      uint64_t status = 0;
+      struct agx_va va = {.addr = 0x50000};
+      struct agx_bo bo = {.va = &va};
+      struct hk_event event = {
+         .base.type = VK_OBJECT_TYPE_EVENT,
+         .bo = &bo,
+         .ts_handle = 99,
+         .ts_offset_B = 32,
+         .addr = va.addr,
+         .status = &status,
+      };
+      const VkMemoryBarrier2 bar = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      };
+      const VkDependencyInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &bar,
+      };
+      hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&event),
+                      &info);
+      struct hk_cs *ev_cs = last_cs(cmd);
+      T("full render slots fall back to CDM event write without using slot 3",
+        ev_cs != r1 && ev_cs->type == HK_CS_CDM && !r1->oq_stamp[3].handle &&
+           ev_cs->sync.dep[HK_SYNC_VDM].cut == r1);
+   }
+
+   /* 4. M5 stamped render SetEvent + ResetEvent clears both 32-bit halves of
+    *    the 64-bit event slot so upper timestamp bits cannot stick. */
+   {
+      test_chip = AGX_CHIP_G17G;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r1 = add(cmd, false);
+      uint64_t status = 0;
+      struct agx_va va = {.addr = 0x60000};
+      struct agx_bo bo = {.va = &va};
+      struct hk_event event = {
+         .base.type = VK_OBJECT_TYPE_EVENT,
+         .bo = &bo,
+         .ts_handle = 55,
+         .ts_offset_B = 8,
+         .addr = va.addr,
+         .status = &status,
+      };
+      const VkMemoryBarrier2 bar = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+      };
+      const VkDependencyInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &bar,
+      };
+      hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&event),
+                      &info);
+      T("M5 stamped render SetEvent attaches to slot 1",
+        last_cs(cmd) == r1 && r1->oq_stamp[1].handle == 55 &&
+           r1->oq_stamp[1].offset_B == 8);
+
+      hk_CmdResetEvent2(hk_cmd_buffer_to_handle(cmd),
+                        hk_event_to_handle(&event),
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+      struct hk_cs *reset_cs = last_cs(cmd);
+      T("M5 ResetEvent writes both 32-bit halves and notes query range",
+        reset_cs != r1 && reset_cs->type == HK_CS_CDM &&
+           reset_cs->stats.cmds == 2 &&
+           reset_cs->sync.dep[HK_SYNC_VDM].cut == r1 &&
+           reset_cs->query_access_ranges.size ==
+              sizeof(struct hk_query_access_range));
+   }
+}
+
 int
 main(void)
 {
@@ -1134,6 +1356,7 @@ main(void)
    test_no_query_access_and_m5_reverse();
    test_oq_post_gfx_stamp_kind();
    test_oq_post_gfx_heap_promotion();
+   test_event_retirement_stamping();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

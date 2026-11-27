@@ -16,6 +16,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_image.h"
+#include "hk_query_oq.h"
 #include "hk_queue.h"
 
 #include "agx_chip_caps.h"
@@ -2480,6 +2481,98 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       stamp_copies_record(cmd, cs);
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
+}
+
+/*
+ * Stamp a vkCmdSetEvent2 directly onto the last recorded stream's kernel
+ * retirement timestamp on HAL200/M5 when it covers the event's first scope
+ * and has a free host-written retirement slot. Avoids opening a standalone
+ * CDM store stream and the cross-engine VDM->CDM->VDM stalls it causes.
+ */
+bool
+hk_sync_stamp_event(struct hk_cmd_buffer *cmd, struct agx_timestamp_req req,
+                    uint8_t src_kinds)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_sync_state *st = &cmd->sync;
+
+   if (!dev || !req.handle || !src_kinds || st->in_pass ||
+       !hk_oq_render_stamps_supported(dev->dev.chip) ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS) ||
+       st->host_flush_kinds || cmd->state.oq_pending_render)
+      return false;
+
+   if (st->lead_ts.handle)
+      return false;
+
+   /* Flush any earlier stamp copies and pending top-of-pipe timestamps so
+    * tail is positioned after them before we inspect it. */
+   hk_sync_flush_stamp_copies(cmd);
+   hk_sync_flush_pending_timestamp(cmd);
+
+   struct hk_cs *tail = last_stream(cmd);
+   if (!tail)
+      return false;
+
+   if (tail->type == HK_CS_VDM) {
+      /* Only use the kernel retirement-written slots (vertex end, fragment
+       * start, vertex start); never fragment end (hk_query_oq.h). */
+      const unsigned order[] = {1, 2, 0};
+      int slot = -1;
+      for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+         const unsigned s = order[i];
+         if (tail->oq_stamp[s].handle == req.handle &&
+             tail->oq_stamp[s].offset_B == req.offset_B) {
+            slot = (int)s;
+            break;
+         }
+         if (slot >= 0)
+            continue;
+         if ((s == 0 && tail->timestamp.start.handle) ||
+             (s == 1 && tail->timestamp.vtx_end.handle) ||
+             tail->oq_stamp[s].handle)
+            continue;
+         slot = (int)s;
+      }
+      if (slot < 0)
+         return false;
+
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), tail, dep);
+      stamp_wait(cmd, tail, dep);
+      tail->oq_stamp[slot] = req;
+      cmd->pass_merge.valid = false;
+      const unsigned stamp_k = util_logbase2(HK_SYNC_STAMP);
+      st->last[stamp_k][HK_SYNC_VDM] =
+         hk_sync_later(st->last[stamp_k][HK_SYNC_VDM], tail);
+      st->epoch++;
+      return true;
+   }
+
+   if (tail->type == HK_CS_CDM) {
+      if (tail->oq_avail_deferred)
+         return false;
+      if (tail->timestamp.end.handle &&
+          (tail->timestamp.end.handle != req.handle ||
+           tail->timestamp.end.offset_B != req.offset_B))
+         return false;
+
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), tail, dep);
+      stamp_wait(cmd, tail, dep);
+      tail->timestamp.end = req;
+      const unsigned stamp_k = util_logbase2(HK_SYNC_STAMP);
+      st->last[stamp_k][HK_SYNC_CDM] =
+         hk_sync_later(st->last[stamp_k][HK_SYNC_CDM], tail);
+      st->epoch++;
+      if (tail == cmd->current_cs.cs) {
+         stamp_carrier_launch(cmd);
+         hk_cmd_buffer_end_compute(cmd);
+      }
+      return true;
+   }
+
+   return false;
 }
 
 static void

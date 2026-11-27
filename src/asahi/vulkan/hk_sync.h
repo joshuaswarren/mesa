@@ -769,6 +769,8 @@ void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
+bool hk_sync_stamp_event(struct hk_cmd_buffer *cmd,
+                         struct agx_timestamp_req req, uint8_t src_kinds);
 void hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 

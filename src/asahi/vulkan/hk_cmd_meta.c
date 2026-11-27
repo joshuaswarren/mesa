@@ -629,9 +629,11 @@ build_event_wait_shader(void)
    nir_if *valid = nir_push_if(&b, nir_ult(&b, zero, value));
    nir_loop *loop = nir_push_loop(&b);
    nir_def *status = nir_load_global(
-      &b, 1, 32, address, .align_mul = sizeof(uint32_t),
+      &b, 2, 32, address, .align_mul = sizeof(uint64_t),
       .access = ACCESS_COHERENT | ACCESS_VOLATILE);
-   nir_break_if(&b, nir_ieq(&b, status, value));
+   nir_def *nonzero =
+      nir_ior(&b, nir_channel(&b, status, 0), nir_channel(&b, status, 1));
+   nir_break_if(&b, nir_ine_imm(&b, nonzero, 0));
    nir_pop_loop(&b, loop);
    nir_pop_if(&b, valid);
 
