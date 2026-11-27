@@ -213,6 +213,14 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
       if (ins->op == AGX_OPCODE_FCMPSEL && s >= 2)
          continue;
 
+      /* AGX3C compare-select has no grounded abs/neg modifier on comparands;
+       * folding a preheader fneg/fabs into a loop select forces
+       * agx_lower_m5_alu_operands() to re-materialize it inside the loop. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && ins->op == AGX_OPCODE_FCMPSEL &&
+          s < 2 && (def->src[0].abs || def->src[0].neg || src.abs || src.neg))
+         continue;
+
       /* We can fold f2f32 into 32-bit instructions, but we can't fold f2f16
        * into 16-bit instructions, since the latter would implicitly promote to
        * a 32-bit instruction which is not exact.
