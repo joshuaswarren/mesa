@@ -7491,10 +7491,11 @@ TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
 }
 
 /*
- * Unmodified all-scalar-register F32 FFMA on AGX3B (non-G18G) preserves
- * f16 GPR sources (both SSA normal and precoloured register indices) across
- * all operand slots and packs them via agx3_falu_fma_mod_runtime(). Modified,
- * uniform-mixed, and G18G forms keep explicit f16->f32 widening.
+ * Unmodified all-scalar-register F32 FFMA on AGX3B and AGX3C (non-emit_agx3d)
+ * compute preserves f16 GPR sources (both SSA normal and precoloured register
+ * indices) across all operand slots and packs them via
+ * agx3_falu_fma_mod_runtime(). Modified, uniform-mixed, AGX3C non-compute, and
+ * emit_agx3d forms keep explicit f16->f32 widening.
  */
 TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
 {
@@ -7502,6 +7503,7 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       const char *name;
       enum agx_isa_encoding enc;
       bool emit_agx3d;
+      mesa_shader_stage stage;
       bool precoloured;
       unsigned half_mask;
       bool src_neg;
@@ -7510,26 +7512,28 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       bool expect_native;
    };
    const LowerCase cases[] = {
-      {"agx3b_src0_normal", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
-       false, false, true},
-      {"agx3b_src1_normal", AGX_ISA_ENCODING_AGX3B, false, false, 2u, false,
-       false, false, true},
-      {"agx3b_addend_normal", AGX_ISA_ENCODING_AGX3B, false, false, 4u, false,
-       false, false, true},
-      {"agx3b_dual_normal", AGX_ISA_ENCODING_AGX3B, false, false, 5u, false,
-       false, false, true},
-      {"agx3b_src0_precoloured", AGX_ISA_ENCODING_AGX3B, false, true, 1u, false,
-       false, false, true},
-      {"agx3b_neg_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, true,
-       false, false, false},
-      {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
-       true, false, false},
-      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u,
-       false, false, true, false},
-      {"agx3c_src0_widened", AGX_ISA_ENCODING_AGX3C, false, false, 1u, false,
-       false, false, false},
-      {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, false, 1u, false,
-       false, false, false},
+      {"agx3b_src0_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, false, false, false, true},
+      {"agx3b_src1_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 2u, false, false, false, true},
+      {"agx3b_addend_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 4u, false, false, false, true},
+      {"agx3b_dual_normal", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 5u, false, false, false, true},
+      {"agx3b_src0_precoloured", AGX_ISA_ENCODING_AGX3B, false,
+       MESA_SHADER_COMPUTE, true, 1u, false, false, false, true},
+      {"agx3b_neg_widened", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, true, false, false, false},
+      {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
+       false, 1u, false, true, false, false},
+      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false,
+       MESA_SHADER_COMPUTE, false, 1u, false, false, true, false},
+      {"agx3c_compute_src0_native", AGX_ISA_ENCODING_AGX3C, false,
+       MESA_SHADER_COMPUTE, false, 1u, false, false, false, true},
+      {"agx3c_vertex_src0_widened", AGX_ISA_ENCODING_AGX3C, false,
+       MESA_SHADER_VERTEX, false, 1u, false, false, false, false},
+      {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, MESA_SHADER_COMPUTE,
+       false, 1u, false, false, false, false},
    };
 
    for (const LowerCase &c : cases) {
@@ -7539,7 +7543,7 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       key.dev.encoding = c.enc;
       key.dev.emit_agx3d = c.emit_agx3d;
       b->shader->key = &key;
-      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->stage = c.stage;
 
       agx_index srcs[3];
       for (unsigned s = 0; s < 3; ++s) {

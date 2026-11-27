@@ -5825,7 +5825,9 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       bool has_full_gpr = false, src_modifier = false, full_modifier = false;
       unsigned half_uniforms = 0;
       bool all_scalar_regs =
-         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !g18g &&
+           mesa_shader_stage_is_compute(ctx->stage))) &&
          I->nr_dests == 1 && !I->dest[0].memory &&
          I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
       agx_foreach_src(I, s) {
@@ -5845,13 +5847,15 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
              I->src[s].memory || agx_channels(I->src[s]) != 1)
             all_scalar_regs = false;
       }
-      const bool agx3b_native_half_gpr = all_scalar_regs && !src_modifier;
+      const bool native_scalar_half_gpr = all_scalar_regs && !src_modifier;
       /* An AGX3C FFMA reads a half register in its own typed operand slot and
        * widens it exactly, for either destination size. Keep a half value
        * that several FFMAs read in its half register: its widened copy would
-       * occupy a full register for all of them. A value one FFMA reads stays
-       * widened, as the move issues off the FFMA's dependency chain and an
-       * FFMA on a half register is slower than one on full registers. A
+       * occupy a full register for all of them. For non-compute stages, a
+       * value one FFMA reads stays widened, while AGX3C compute keeps
+       * unmodified all-scalar-register F32 FFMA half GPR sources native
+       * (matching AGX3B and avoiding redundant f16->f32 widening moves on
+       * normflt.f16 + hmul + ffma byte-unpack and dense f16-source loops). A
        * modifier on a 32-bit register or uniform operand still takes the
        * all-F32 form: kept halves would make it a mixed FFMA, whose modifiers
        * cost a move and a bitop each below.
@@ -5867,11 +5871,12 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
              agx_channels(I->dest[0]) == 1 && has_full_gpr &&
              half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
             continue;
-         /* AGX3B encodes unmodified all-scalar-register F32 FFMA with
-          * per-operand width bits directly (agx3_falu_fma_mod_runtime),
-          * avoiding redundant f16->f32 widening moves. */
-         if (agx3b_native_half_gpr && (I->src[s].type == AGX_INDEX_NORMAL ||
-                                       I->src[s].type == AGX_INDEX_REGISTER))
+         /* AGX3B and AGX3C (non-emit_agx3d) compute encode unmodified
+          * all-scalar-register F32 FFMA with per-operand width bits directly
+          * (agx3_falu_fma_mod_runtime), avoiding redundant f16->f32 widening
+          * moves. */
+         if (native_scalar_half_gpr && (I->src[s].type == AGX_INDEX_NORMAL ||
+                                        I->src[s].type == AGX_INDEX_REGISTER))
             continue;
          if (agx3c_native_half_gpr && I->src[s].type == AGX_INDEX_NORMAL &&
              I->src[s].value < nr_values && ffma_reads[I->src[s].value] >= 2)
