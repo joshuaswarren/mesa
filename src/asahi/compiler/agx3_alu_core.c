@@ -2907,11 +2907,11 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
       /* Corpus rows 546/634 use the tied-result GPR forms 13/19. Let the
        * native predicates select them instead of growing an 8-byte select.
        * Apple's 16-bit select on a uniform comparand is endpoint 11. */
-      for (unsigned ep = d.cmp0_uniform ? 10 : 13; ep < 36; ++ep) {
-         if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, shifted ? alt_base : base,
-                               shifted ? nab : 7, f, n, out, len))
-            return true;
-      }
+      if (agx3_bind_compose_ep_range(enc, AGX3_MN_fsel,
+                                     d.cmp0_uniform ? 10 : 13, 35, -1, 0, false,
+                                     shifted ? alt_base : base,
+                                     shifted ? nab : 7, f, n, out, len))
+         return true;
    }
    return false;
 }
@@ -3025,12 +3025,9 @@ agx3_alu_fcmp_minifloat_select_half(
       {80, true_hint == AGX3_ALU_HINT_DISCARD},
       {107, wait_mask == 32}, {110, condition},
    };
-   for (unsigned ep = 20; ep < 28; ++ep)
-      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep,
-                            integer ? integer_base : float_base,
-                            integer ? 10 : 11, fields, 12, out, len))
-         return true;
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 20, 27, -1, 0, false,
+                                     integer ? integer_base : float_base,
+                                     integer ? 10 : 11, fields, 12, out, len);
 }
 
 bool
@@ -3126,13 +3123,9 @@ agx3_alu_fcmp_minifloat_select_mixed(
    if (agx3_bind_compose(enc, AGX3_MN_fsel, preferred, base, nbase, fields, n,
                          out, len))
       return true;
-   for (unsigned ep = 0; ep < 28; ++ep) {
-      if (ep != preferred &&
-          agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, nbase, fields, n, out,
-                            len))
-         return true;
-   }
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 0, 27, (int)preferred,
+                                     0, false, base, nbase, fields, n, out,
+                                     len);
 }
 
 bool
@@ -4402,10 +4395,8 @@ bool agx3_alu_fcmp_select_reg_imm(enum agx_isa_encoding enc, uint16_t dest,
       fields[n++]=(struct agx3_field_kv){cache[i],hints[i]==AGX3_ALU_HINT_CACHE};
       fields[n++]=(struct agx3_field_kv){discard[i],hints[i]==AGX3_ALU_HINT_DISCARD};
    }
-   for(unsigned ep=0;ep<36;ep++)
-      if(agx3_bind_compose(enc,AGX3_MN_fsel,ep,base,nbase,fields,n,out,len))
-         return true;
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 0, 35, -1, 0, false,
+                                     base, nbase, fields, n, out, len);
 }
 
 bool
@@ -4454,12 +4445,8 @@ agx3_alu_fcmp_select_f32_f16(enum agx_isa_encoding enc, uint16_t dest,
                                            hints[i] == AGX3_ALU_HINT_DISCARD};
    }
 
-   for (unsigned ep = 0; ep < 28; ++ep) {
-      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
-         return true;
-   }
-
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 0, 27, -1, 0, false,
+                                     base, 10, fields, n, out, len);
 }
 
 /* Compare two scalar half values and select between two full registers.
@@ -4516,11 +4503,8 @@ agx3_alu_fcmp_select_f16_f16_f32(
                                            hints[i] == AGX3_ALU_HINT_DISCARD};
    }
 
-   for (unsigned ep = 0; ep < 36; ++ep) {
-      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
-         return true;
-   }
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 0, 35, -1, 0, false,
+                                     base, 10, fields, n, out, len);
 }
 
 /* Native Metal keeps all four scalar half operands in their assigned halves:
@@ -4734,12 +4718,9 @@ agx3_alu_m5_fsel_half(uint16_t dest, const uint16_t src[4],
    }
    for (unsigned i = 0; i < 8; ++i)
       fields[n++] = (struct agx3_field_kv){78 + i, !!(wait_mask & (1u << i))};
-   for (unsigned ep = 0; ep <= 8; ++ep) {
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, ep,
-                            base, 10, fields, n, out, len))
-         return true;
-   }
-   return false;
+   return agx3_bind_compose_ep_range(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, 0,
+                                     8, -1, 0, false, base, 10, fields, n, out,
+                                     len);
 }
 
 static bool
@@ -4810,11 +4791,8 @@ agx3_alu_fminmax_half(enum agx_isa_encoding enc, uint16_t dest,
    for (unsigned i = 0; i < 6; ++i)
       fields[n++] =
          (struct agx3_field_kv){102 + i, !!(wait_mask & (1u << i))};
-   for (unsigned ep = 0; ep < 28; ++ep) {
-      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
-         return true;
-   }
-   return false;
+   return agx3_bind_compose_ep_range(enc, AGX3_MN_fsel, 0, 27, -1, 0, false,
+                                     base, 10, fields, n, out, len);
 }
 
 bool

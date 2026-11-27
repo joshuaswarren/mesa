@@ -9517,9 +9517,71 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       }
    }
 
-   nir = hk_deserialize_nested_nir(mem, shader->g17p_mono_nir,
-                                   shader->g17p_mono_nir_size,
-                                   MESA_SHADER_FRAGMENT);
+   /* Build the epilog first so trivial non-ALU epilogs can reuse the
+    * standalone fragment's post-agx_optimize_nir clone during pre-linking
+    * without deserializing or re-running late NIR optimization passes. */
+   eb = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
+   struct agx_fs_epilog_result epilog_res = {0};
+   if (inline_samples) {
+      struct agx_fs_epilog_key pixel = *ekey;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog_ex(&eb, &pixel, &epilog_res);
+   } else if (uniform_blend ||
+              (agx_chip_g17_m5(dev->dev.chip) && !ekey->link.sample_shading &&
+               !ekey->native_spills)) {
+      agx_nir_fs_epilog_ex(&eb, ekey, &epilog_res);
+   } else {
+      agx_nir_fs_epilog_g17p_ex(&eb, ekey, &epilog_res);
+   }
+   const bool preopt =
+      shader->g17p_mono_preoptimized && !inline_samples && !uniform_blend;
+   bool simple_epilog =
+      preopt && !ekey->link.sample_shading && ekey->nr_samples <= 1 &&
+      exec_list_is_empty(&eb.shader->variables) &&
+      exec_list_is_empty(&eb.impl->locals) &&
+      exec_list_is_singular(&eb.impl->body);
+   if (simple_epilog) {
+      nir_foreach_block(block, eb.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const nir_op op = nir_instr_as_alu(instr)->op;
+               if (op != nir_op_mov && op != nir_op_vec2 &&
+                   op != nir_op_vec3 && op != nir_op_vec4) {
+                  simple_epilog = false;
+                  break;
+               }
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intrin =
+                  nir_instr_as_intrinsic(instr);
+               const nir_intrinsic_op op = intrin->intrinsic;
+               if (op != nir_intrinsic_load_exported_agx &&
+                   !(op == nir_intrinsic_store_local_pixel_agx &&
+                     nir_src_is_const(intrin->src[1]) &&
+                     nir_src_as_uint(intrin->src[1]) == 0xFFu)) {
+                  simple_epilog = false;
+                  break;
+               }
+            } else if (instr->type != nir_instr_type_load_const &&
+                       instr->type != nir_instr_type_undef) {
+               simple_epilog = false;
+               break;
+            }
+         }
+         if (!simple_epilog)
+            break;
+      }
+   }
+
+   bool use_postopt = simple_epilog && shader->g17p_mono_key.no_preamble &&
+                      shader->g17p_mono_postopt_nir != NULL;
+   if (use_postopt) {
+      nir = nir_shader_clone(mem, shader->g17p_mono_postopt_nir);
+   } else {
+      nir = hk_deserialize_nested_nir(mem, shader->g17p_mono_nir,
+                                      shader->g17p_mono_nir_size,
+                                      MESA_SHADER_FRAGMENT);
+   }
    if (!nir)
       HK_MONO_FAIL("nir");
 
@@ -9559,66 +9621,73 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       }
    }
 
-   /* The epilog, exactly as the split path builds it. */
-   eb = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
-   struct agx_fs_epilog_result epilog_res = {0};
-   if (inline_samples) {
-      struct agx_fs_epilog_key pixel = *ekey;
-      pixel.link.sample_shading = false;
-      pixel.defer_monolithic_msaa = true;
-      agx_nir_fs_epilog_ex(&eb, &pixel, &epilog_res);
-      agx_nir_lower_sample_exports_to_end(nir);
-   } else if (uniform_blend ||
-              (agx_chip_g17_m5(dev->dev.chip) && !ekey->link.sample_shading &&
-               !ekey->native_spills)) {
-      agx_nir_fs_epilog_ex(&eb, ekey, &epilog_res);
-   } else {
-      agx_nir_fs_epilog_g17p_ex(&eb, ekey, &epilog_res);
+   /* Uniform exports attempt to form a new constant program, which needs the
+    * pre-preamble NIR rather than the post-agx_optimize_nir clone. */
+   if (use_postopt && uniform_exports) {
+      ralloc_free(nir);
+      use_postopt = false;
+      nir = hk_deserialize_nested_nir(mem, shader->g17p_mono_nir,
+                                      shader->g17p_mono_nir_size,
+                                      MESA_SHADER_FRAGMENT);
+      if (!nir)
+         HK_MONO_FAIL("nir");
+      impl = nir_shader_get_entrypoint(nir);
    }
-   agx_preprocess_nir(eb.shader);
-   if (!inline_samples && !uniform_blend && !ekey->link.sample_shading &&
-       (hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_store_zs_agx) > 1 ||
-        hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_sample_mask_agx) > 1))
-      NIR_PASS(_, eb.shader, agx_nir_hoist_g17p_zs_writes);
-   if (!inline_samples && !uniform_blend &&
-       (!agx_chip_g17_m5(dev->dev.chip) || ekey->nr_samples > 1))
-      NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
+
+   if (inline_samples)
+      agx_nir_lower_sample_exports_to_end(nir);
+
+   if (simple_epilog) {
+      NIR_PASS(_, eb.shader, nir_lower_alu_to_scalar, NULL, NULL);
+      NIR_PASS(_, eb.shader, nir_lower_load_const_to_scalar);
+      NIR_PASS(_, eb.shader, nir_opt_dce);
+      eb.shader->info.io_lowered = true;
+   } else {
+      agx_preprocess_nir(eb.shader);
+      if (!inline_samples && !uniform_blend && !ekey->link.sample_shading &&
+          (hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_store_zs_agx) > 1 ||
+           hk_g17p_count_intrinsics(eb.shader, nir_intrinsic_sample_mask_agx) > 1))
+         NIR_PASS(_, eb.shader, agx_nir_hoist_g17p_zs_writes);
+      if (!inline_samples && !uniform_blend &&
+          (!agx_chip_g17_m5(dev->dev.chip) || ekey->nr_samples > 1))
+         NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
+   }
 
    /* Epilog code reading uniforms (blend constants and the like) would
     * need uniforms the main's layout does not reserve. */
-   nir_foreach_block(block, eb.impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
-         if (uniform_blend && op != nir_intrinsic_load_exported_agx &&
-             op != nir_intrinsic_load_local_pixel_agx &&
-             op != nir_intrinsic_store_local_pixel_agx)
-            HK_MONO_REFUSE("uniform blend epilog has an external input or effect");
-         if (inline_samples && ekey->native_spills &&
-             (op == nir_intrinsic_bindless_image_agx ||
-              op == nir_intrinsic_bindless_image_store ||
-              (op == nir_intrinsic_load_preamble &&
-               nir_intrinsic_base(nir_instr_as_intrinsic(instr)) ==
-                  ekey->emrt_heap_base)))
-            continue;
-         if (op == nir_intrinsic_load_preamble ||
-             op == nir_intrinsic_load_blend_const_color_rgba ||
-             op == nir_intrinsic_load_blend_const_color_r_float ||
-             op == nir_intrinsic_load_blend_const_color_g_float ||
-             op == nir_intrinsic_load_blend_const_color_b_float ||
-             op == nir_intrinsic_load_blend_const_color_a_float ||
-             op == nir_intrinsic_bindless_image_agx ||
-             op == nir_intrinsic_image_store ||
-             op == nir_intrinsic_bindless_image_store)
-            HK_MONO_REFUSE("epilog uses uniforms or images");
+   if (!simple_epilog) {
+      nir_foreach_block(block, eb.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (uniform_blend && op != nir_intrinsic_load_exported_agx &&
+                op != nir_intrinsic_load_local_pixel_agx &&
+                op != nir_intrinsic_store_local_pixel_agx)
+               HK_MONO_REFUSE("uniform blend epilog has an external input or effect");
+            if (inline_samples && ekey->native_spills &&
+                (op == nir_intrinsic_bindless_image_agx ||
+                 op == nir_intrinsic_bindless_image_store ||
+                 (op == nir_intrinsic_load_preamble &&
+                  nir_intrinsic_base(nir_instr_as_intrinsic(instr)) ==
+                     ekey->emrt_heap_base)))
+               continue;
+            if (op == nir_intrinsic_load_preamble ||
+                op == nir_intrinsic_load_blend_const_color_rgba ||
+                op == nir_intrinsic_load_blend_const_color_r_float ||
+                op == nir_intrinsic_load_blend_const_color_g_float ||
+                op == nir_intrinsic_load_blend_const_color_b_float ||
+                op == nir_intrinsic_load_blend_const_color_a_float ||
+                op == nir_intrinsic_bindless_image_agx ||
+                op == nir_intrinsic_image_store ||
+                op == nir_intrinsic_bindless_image_store)
+               HK_MONO_REFUSE("epilog uses uniforms or images");
+         }
       }
    }
 
-   const bool preopt =
-      shader->g17p_mono_preoptimized && !inline_samples && !uniform_blend;
    bool epilog_has_alu = false;
-   if (preopt) {
+   if (preopt && !simple_epilog) {
       agx_prepare_preoptimized_epilog_nir(eb.shader, &shader->g17p_mono_key);
       nir_foreach_block(block, eb.impl) {
          if (block->cf_node.parent != &eb.impl->cf_node)
@@ -9661,10 +9730,15 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
 
    if (!hk_g17p_mono_resolve_exports(nir))
       HK_MONO_REFUSE("exports");
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   NIR_PASS(_, nir, nir_opt_copy_prop);
-   NIR_PASS(_, nir, nir_opt_constant_folding);
-   NIR_PASS(_, nir, nir_opt_dce);
+   if (use_postopt) {
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_dce);
+   } else {
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
    if (inline_samples) {
       struct agx_g17p_colour_layout layout;
       agx_g17p_colour_layout_init(&layout, ekey->link.loc_written,
@@ -9739,10 +9813,13 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       /* agx_compile_shader_nir frees nothing it did not allocate. */
       const bool preamble_newly_enabled =
          !key.no_preamble && shader->g17p_mono_key.no_preamble;
-      const bool compiled = preopt
-         ? agx_compile_shader_nir_preoptimized(nir, &key, part, epilog_has_alu,
-                                               preamble_newly_enabled)
-         : agx_compile_shader_nir(nir, &key, part);
+      const bool compiled = use_postopt
+         ? agx_compile_shader_nir_postopt(nir, &key, part)
+         : preopt
+            ? agx_compile_shader_nir_preoptimized(nir, &key, part,
+                                                  epilog_has_alu,
+                                                  preamble_newly_enabled)
+            : agx_compile_shader_nir(nir, &key, part);
       nir = NULL; /* consumed */
       why = !compiled ? "backend refused the monolithic program"
             : uniform_blend
