@@ -258,14 +258,14 @@ main(void)
 
    /* Implemented matrix paths are available without process flags. */
    const enum agx_chip matrix_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G, AGX_CHIP_G14X,
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
       AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(matrix_chips); ++i)
       assert(agx_chip_cooperative_matrix_supported(matrix_chips[i]));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G14X));
+   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 
    /* The M5 Max (T6050, G17C) is admitted with its four clusters only, by
     * default and on the M5 bring-up path. */
@@ -380,6 +380,18 @@ main(void)
    assert(agx_params_native_kernel_abi_supported(&bad));
    bad = g15g;
    bad.features = (UINT64_C(1) << 3) | (UINT64_C(1) << 5);
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   /* The shared g16 backend on T8122: VM status and independent queues
+    * plus the native contract, no scheduled queues (J615 feature word). */
+   bad = g15g;
+   bad.features = UINT64_C(0x10260005c06);
+   assert(agx_params_native_kernel_abi_supported(&bad));
+   bad.features &= ~DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) &
+                  ~DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) & ~DRM_ASAHI_FEATURE_VM_STATUS;
    assert(!agx_params_native_kernel_abi_supported(&bad));
 
    bad = g15g;

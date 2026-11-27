@@ -95,6 +95,7 @@ struct lower_variables_state {
     * iterating throug it.
     */
    bool add_to_direct_deref_nodes;
+   bool copies_lowered;
 
    struct nir_phi_builder *phi_builder;
 };
@@ -510,6 +511,7 @@ register_variable_uses(nir_function_impl *impl,
             nir_deref_instr *deref = nir_instr_as_deref(instr);
 
             if (deref->deref_type == nir_deref_type_var &&
+                nir_deref_mode_must_be(deref, nir_var_function_temp) &&
                 nir_deref_instr_has_complex_use(deref, 0))
                register_complex_use(deref, state);
 
@@ -561,6 +563,7 @@ lower_copies_to_load_store(struct deref_node *node,
    set_foreach(&node->copies, copy_entry) {
       nir_intrinsic_instr *copy = (void *)copy_entry->key;
 
+      state->copies_lowered = true;
       nir_lower_deref_copy_instr(&b, copy);
 
       for (unsigned i = 0; i < 2; ++i) {
@@ -808,10 +811,9 @@ nir_lower_vars_to_ssa_impl(nir_function_impl *impl)
 
    /* Build the initial deref structures and direct_deref_nodes table */
    state.add_to_direct_deref_nodes = true;
+   state.copies_lowered = false;
 
    bool progress = register_variable_uses(impl, &state);
-
-   nir_metadata_require(impl, nir_metadata_block_index);
 
    /* We're about to iterate through direct_deref_nodes.  Don't modify it. */
    state.add_to_direct_deref_nodes = false;
@@ -837,18 +839,19 @@ nir_lower_vars_to_ssa_impl(nir_function_impl *impl)
    }
 
    if (!progress) {
+      ralloc_free(state.dead_ctx);
       return nir_no_progress(impl);
    }
 
-   nir_metadata_require(impl, nir_metadata_dominance);
+   nir_metadata_require(impl, nir_metadata_block_index |
+                              nir_metadata_dominance);
 
-   /* We may have lowered some copy instructions to load/store
-    * instructions.  The uses from the copy instructions hav already been
-    * removed but we need to rescan to ensure that the uses from the newly
-    * added load/store instructions are registered.  We need this
-    * information for phi node insertion below.
+   /* If we lowered any copy instructions to load/store instructions, rescan
+    * to ensure that the uses from the newly added load/store instructions are
+    * registered for phi node insertion below.
     */
-   register_variable_uses(impl, &state);
+   if (state.copies_lowered)
+      register_variable_uses(impl, &state);
 
    state.phi_builder = nir_phi_builder_create(state.impl);
 

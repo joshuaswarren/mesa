@@ -768,6 +768,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    /* Intrinsics with divergence depending on sources */
    case nir_intrinsic_convert_alu_types:
+   case nir_intrinsic_unpack_local_pixel_agx:
    case nir_intrinsic_ddx:
    case nir_intrinsic_ddx_fine:
    case nir_intrinsic_ddx_coarse:

@@ -26,7 +26,7 @@ agx_ioto_cprog_input_offset(enum agx_chip chip,
                             const struct agx_ioto_cprog_inputs *inputs,
                             uint16_t source_half, uint16_t *offset_bytes)
 {
-   if (chip != AGX_CHIP_G17P || inputs == NULL || !inputs->known ||
+   if (!agx_chip_native_preamble(chip) || inputs == NULL || !inputs->known ||
        offset_bytes == NULL || source_half >= AGX_IOTO_CPROG_UNIFORM_HALFS)
       return false;
 
@@ -59,19 +59,10 @@ store_u16(uint8_t *bytes, uint16_t value)
 enum agx_ioto_load_encoding
 agx_ioto_load_target_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
+   switch (agx_chip_ioto_generation(chip)) {
+   case AGX_IOTO_GENERATION_GPU0:
       return AGX_IOTO_LOAD_ENCODING_GPU0;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   case AGX_IOTO_GENERATION_GPU1:
       return AGX_IOTO_LOAD_ENCODING_GPU1;
    default:
       return AGX_IOTO_LOAD_ENCODING_UNSUPPORTED;
@@ -371,7 +362,7 @@ agx_ioto_load_finish_worst_case_size_with_ops(
        ((ops->extra_copy_bound == NULL) != (ops->pack_extra_copies == NULL)))
       return false;
    if (ops != NULL && ops->pack_extra_copies != NULL) {
-      if (core->chip != AGX_CHIP_G17P || core->fast_path_enabled ||
+      if (!agx_chip_native_preamble(core->chip) || core->fast_path_enabled ||
           !core->gpu0_round_nops)
          return false;
       if (complete_round) {

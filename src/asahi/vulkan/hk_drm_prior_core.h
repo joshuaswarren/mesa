@@ -173,3 +173,37 @@ hk_drm_g17p_tiling_ordered(uint64_t base, uint32_t vdm_before, uint64_t whole,
    *cover = MAX2(*cover, whole);
    return false;
 }
+
+/* A stream's prior in the ordinals of the kernel queue it is sent to: a
+ * command of this submission keeps its offset from the submission's first
+ * ordinal; an earlier submission's command becomes every earlier command of
+ * that kernel queue, and the submission also waits for the siblings' work
+ * (*earlier). */
+static inline uint64_t
+hk_drm_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base,
+                     bool *earlier)
+{
+   if (prior == 0)
+      return 0;
+   if (prior > base)
+      return kq_base + (prior - base);
+   *earlier = true;
+   return kq_base;
+}
+
+/* One prefix of a command (the whole command's, or the tiling half's of a
+ * render that splits it) in the ordinals of the kernel queue it is sent to.
+ * A zero barrier names that kernel queue's earlier ioctls, so the submission
+ * also waits for the siblings' work. */
+static inline void
+hk_drm_sibling_prefix(uint64_t prior[2], const uint16_t barrier[2],
+                      const uint64_t base[2], const uint64_t kq_base[2],
+                      bool *earlier)
+{
+   for (unsigned sq = 0; sq < 2; ++sq) {
+      prior[sq] = hk_drm_sibling_prior(prior[sq], base[sq], kq_base[sq],
+                                       earlier);
+      if (barrier[sq] == 0)
+         *earlier = true;
+   }
+}

@@ -14,6 +14,9 @@ enum agx3_matrix_input_type {
    AGX3_MATRIX_INPUT_BF16 = 4,
 };
 
+/* matrix_type bit of an 8x8 matmad with an f16 accumulator and result */
+#define AGX3_MATRIX_ACCUM_F16 (1u << 8)
+
 struct agx3_matrix_gemm16_desc {
    uint16_t dest;
    uint16_t a;
@@ -46,6 +49,8 @@ struct agx3_matrix_mma8_desc {
    bool discard[3];
    uint8_t wait_mask;
    enum agx3_matrix_input_type input_type;
+   /* f16 C and result (f16matmad8x8, AGX3B), f16 A and B */
+   bool f16_accumulate;
 };
 
 bool agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,

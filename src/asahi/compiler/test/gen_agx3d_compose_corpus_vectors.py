@@ -10,7 +10,7 @@ SHA-256) is split into its symbols, and each symbol into instructions with the
 same first-match rule as the generated AGX3d disassembler
 (src/asahi/isa/disasm-internal.h over src/asahi/isa/AGX3d.xml). Each
 instruction is then decomposed into a field vector by the table-driven
-decoder in ../agx3_compose/agx3_table.py over ../agx3_compose/agx3d_tables.c,
+decoder in ../agx3_compose/agx3_table.py over ../agx3_compose/agx3d_tables.txt,
 trying forms of the disassembler's mnemonic first. A decoded vector always
 composes back to exactly the instruction's bytes.
 
@@ -29,7 +29,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NATIVE = os.path.join(HERE, 'native', 'g18g')
-TABLE = os.path.join(HERE, '..', 'agx3_compose', 'agx3d_tables.c')
+TABLE = os.path.join(HERE, '..', 'agx3_compose', 'agx3d_tables.txt')
 ISA_DIR = os.path.join(HERE, '..', '..', 'isa')
 
 sys.path.insert(0, os.path.join(HERE, '..', 'agx3_compose'))
@@ -108,7 +108,7 @@ def main():
     w(' * Real G18G (agx3d) instructions from the %d applegpu_g18g witness'
       % len(texts))
     w(' * texts in test/native/g18g, each decomposed into its field vector by')
-    w(' * the table-driven decoder over agx3d_tables.c. Every vector names the')
+    w(' * the table-driven decoder over agx3d_tables.txt. Every vector names the')
     w(' * committed text and byte offset its bytes were read from. Duplicate')
     w(' * (form, bytes, fields) triples are kept once: %d distinct of %d'
       % (len(cases), decoded))

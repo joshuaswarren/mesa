@@ -66,6 +66,9 @@ bool hk_query_stamps_conflict(struct hk_device *dev, struct hk_queue *queue,
                               uint64_t current_point, const struct hk_cs *cs);
 void hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
                              uint64_t point, const struct hk_cs *cs);
+void hk_query_stamps_note_req(struct hk_device *dev, struct hk_queue *queue,
+                              uint64_t point, uint32_t handle,
+                              uint32_t offset_B);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_query_pool, vk.base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)

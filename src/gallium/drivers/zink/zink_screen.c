@@ -734,6 +734,59 @@ zink_borealis_g17p(const struct zink_screen *screen)
            screen->info.props.deviceID == 0x6041);
 }
 
+/* Query Borealis's image-layout contract: when a 2D colour render target uses
+ * a compressed device layout without ATTACHMENT_FEEDBACK_LOOP usage
+ * (identicalMemoryLayout == VK_FALSE against host-transfer) and drops back to
+ * a plain layout once ATTACHMENT_FEEDBACK_LOOP is added
+ * (identicalMemoryLayout == VK_TRUE), keeping feedback-loop usage lazy lets
+ * ordinary GL colour render targets stay compressed without hardcoding chip
+ * deviceIDs.
+ */
+static bool
+zink_borealis_color_feedback_disables_compression(const struct zink_screen *screen)
+{
+   if (zink_driverid(screen) != VK_DRIVER_ID_AURORA_BOREALIS ||
+       !screen->info.have_EXT_host_image_copy ||
+       !VKSCR(GetPhysicalDeviceImageFormatProperties2))
+      return false;
+
+   const VkImageUsageFlags base_usage =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+
+   VkHostImageCopyDevicePerformanceQueryEXT plain_hic = {
+      .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT,
+   };
+   VkImageFormatProperties2 props = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      .pNext = &plain_hic,
+   };
+   VkPhysicalDeviceImageFormatInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = base_usage,
+   };
+   if (VKSCR(GetPhysicalDeviceImageFormatProperties2)(screen->pdev, &info, &props) != VK_SUCCESS)
+      return false;
+   if (plain_hic.identicalMemoryLayout)
+      return false;
+
+   VkHostImageCopyDevicePerformanceQueryEXT feedback_hic = {
+      .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT,
+   };
+   props.pNext = &feedback_hic;
+   info.usage = base_usage | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   if (VKSCR(GetPhysicalDeviceImageFormatProperties2)(screen->pdev, &info, &props) != VK_SUCCESS)
+      return false;
+
+   return feedback_hic.identicalMemoryLayout;
+}
+
 static void
 zink_init_screen_caps(struct zink_screen *screen)
 {
@@ -874,8 +927,8 @@ zink_init_screen_caps(struct zink_screen *screen)
       screen->info.feats.features.pipelineStatisticsQuery;
 
    caps->robust_buffer_access_behavior =
-      screen->info.feats.features.robustBufferAccess &&
-      (screen->info.rb2_feats.robustImageAccess2 ||
+      screen->pdev_robustness.buffer_access &&
+      (screen->pdev_robustness.image_access2 ||
        screen->driver_compiler_workarounds.lower_robustImageAccess2);
 
    caps->multi_draw_indirect = screen->info.feats.features.multiDrawIndirect;
@@ -1760,6 +1813,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       close(screen->drm_fd);
 
    slab_destroy_parent(&screen->transfer_pool);
+   simple_mtx_destroy(&screen->mfences_lock);
    ralloc_free(screen);
    glsl_type_singleton_decref();
 }
@@ -3307,11 +3361,14 @@ init_driver_workarounds(struct zink_screen *screen)
     * it and recreate an image with it before a draw or copy first reads the
     * image while writing it (zink_update_lazy_feedback_loops()).
     *
-    * Only G17P compresses on this rule; other Borealis parts keep the
-    * usage on every render target.
+    * Follow the driver's own host-image-copy layout query so every Borealis
+    * device with unified image layouts whose colour compression is disabled by
+    * ATTACHMENT_FEEDBACK_LOOP usage selects lazy feedback-loop usage, while
+    * devices without unified layouts (AGX2, G15) or without colour compression
+    * (G16) keep the usage on every render target.
     */
    screen->driver_workarounds.lazy_feedback_loop_usage =
-      zink_borealis_g17p(screen) &&
+      zink_borealis_color_feedback_disables_compression(screen) &&
       screen->driver_workarounds.general_layout &&
       screen->info.have_EXT_attachment_feedback_loop_layout;
 
@@ -3340,6 +3397,36 @@ static void
 disable_features(struct zink_screen *screen)
 {
    screen->info.mesh_feats.primitiveFragmentShadingRateMeshShader = false;
+
+   screen->pdev_robustness.buffer_access = screen->info.feats.features.robustBufferAccess;
+   screen->pdev_robustness.buffer_access2 = screen->info.rb2_feats.robustBufferAccess2;
+   screen->pdev_robustness.image_access = screen->info.rb_image_feats.robustImageAccess ||
+                                          (screen->info.have_vulkan13 && screen->info.feats13.robustImageAccess);
+   screen->pdev_robustness.image_access2 = screen->info.rb2_feats.robustImageAccess2;
+
+   /* Use VK_EXT_pipeline_robustness (promoted to Vulkan 1.4) to keep robustness
+    * disabled at device scope and enable it only on pipelines created for robust
+    * contexts. When descriptor buffers are enabled, ensure non-robust and robust
+    * descriptor sizes match so descriptor buffer allocation stays uniform.
+    */
+   bool db_robust_sizes_match =
+      !screen->info.have_EXT_descriptor_buffer ||
+      (screen->info.db_props.uniformBufferDescriptorSize ==
+       screen->info.db_props.robustUniformBufferDescriptorSize &&
+       screen->info.db_props.storageBufferDescriptorSize ==
+       screen->info.db_props.robustStorageBufferDescriptorSize &&
+       screen->info.db_props.uniformTexelBufferDescriptorSize ==
+       screen->info.db_props.robustUniformTexelBufferDescriptorSize &&
+       screen->info.db_props.storageTexelBufferDescriptorSize ==
+       screen->info.db_props.robustStorageTexelBufferDescriptorSize);
+   if (screen->info.have_EXT_pipeline_robustness && db_robust_sizes_match) {
+      screen->have_pipeline_robustness = true;
+      screen->info.feats.features.robustBufferAccess = VK_FALSE;
+      screen->info.rb2_feats.robustBufferAccess2 = VK_FALSE;
+      screen->info.rb_image_feats.robustImageAccess = VK_FALSE;
+      screen->info.feats13.robustImageAccess = VK_FALSE;
+      screen->info.rb2_feats.robustImageAccess2 = VK_FALSE;
+   }
 }
 
 static void
@@ -3532,6 +3619,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->drm_fd = -1;
+   simple_mtx_init(&screen->mfences_lock, mtx_plain);
 
    glsl_type_singleton_init_or_ref();
    zink_debug = debug_get_option_zink_debug();
@@ -3935,6 +4023,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    simple_mtx_init(&screen->free_batch_states_lock, mtx_plain);
    simple_mtx_init(&screen->active_batch_states_lock, mtx_plain);
+   simple_mtx_init(&screen->submit_lock, mtx_plain);
    simple_mtx_init(&screen->dt_lock, mtx_plain);
 
    util_idalloc_mt_init_tc(&screen->buffer_ids);

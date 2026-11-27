@@ -195,3 +195,199 @@ TEST_P(nir_serialize_all_but_one_test, single_channel)
 
    ASSERT_SWIZZLE_EQ(vec_alu, vec_alu_dup, 1, 0);
 }
+
+namespace {
+
+/* nir_deserialize() must reject a malformed blob instead of reading or
+ * writing outside its object table. Each test starts from a valid blob and
+ * changes one field.
+ */
+class nir_deserialize_malformed_test : public ::testing::Test {
+protected:
+   nir_deserialize_malformed_test()
+   {
+      glsl_type_singleton_init_or_ref();
+   }
+
+   ~nir_deserialize_malformed_test()
+   {
+      glsl_type_singleton_decref();
+   }
+
+   /* A compute shader whose main calls function `callee`, one of two. */
+   void serialize_call(unsigned callee, struct blob *out)
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &options, "call");
+      nir_function *fns[] = {
+         nir_function_create(b.shader, "f0"),
+         nir_function_create(b.shader, "f1"),
+      };
+      nir_build_call(&b, fns[callee], 0, NULL);
+      nir_iadd_imm(&b, nir_imm_int(&b, 1), 2);
+
+      blob_init(out);
+      nir_serialize(out, b.shader, false);
+      ralloc_free(b.shader);
+   }
+
+   /* Whether data deserializes, reading all of it. */
+   bool deserializes(const void *data, size_t size)
+   {
+      struct blob_reader reader;
+      blob_reader_init(&reader, data, size);
+      nir_shader *nir = nir_deserialize(NULL, &options, &reader);
+      const bool ok = nir && !reader.overrun && reader.current == reader.end;
+      ralloc_free(nir);
+      return ok;
+   }
+
+   bool deserializes_function(const void *data, size_t size)
+   {
+      void *mem = ralloc_context(NULL);
+      struct blob_reader reader;
+      blob_reader_init(&reader, data, size);
+      nir_function *fxn = nir_deserialize_function(mem, &options, &reader);
+      const bool ok = fxn && !reader.overrun && reader.current == reader.end;
+      ralloc_free(mem);
+      return ok;
+   }
+
+   static uint32_t read_u32(const struct blob *blob, size_t offset)
+   {
+      uint32_t v;
+      memcpy(&v, blob->data + offset, sizeof(v));
+      return v;
+   }
+
+   static void write_u32(struct blob *blob, size_t offset, uint32_t v)
+   {
+      memcpy(blob->data + offset, &v, sizeof(v));
+   }
+
+   const nir_shader_compiler_options options = {};
+};
+
+} // namespace
+
+TEST_F(nir_deserialize_malformed_test, object_count)
+{
+   struct blob blob;
+   serialize_call(0, &blob);
+   ASSERT_FALSE(blob.out_of_memory);
+   ASSERT_TRUE(deserializes(blob.data, blob.size));
+
+   /* The blob starts with the number of objects it holds. */
+   const uint32_t count = read_u32(&blob, 0);
+   ASSERT_GT(count, 1u);
+
+   const struct {
+      uint32_t count;
+      bool ok;
+   } cases[] = {
+      { 0, false },
+      { count - 1, false },
+      { count, true },
+      { count + 1, true },
+      { (1u << 20) + 1, false },
+      { UINT32_MAX, false },
+   };
+   for (const auto &c : cases) {
+      write_u32(&blob, 0, c.count);
+      EXPECT_EQ(deserializes(blob.data, blob.size), c.ok)
+         << "object count " << c.count << ", needs " << count;
+   }
+
+   blob_finish(&blob);
+}
+
+TEST_F(nir_deserialize_malformed_test, object_reference)
+{
+   /* The two blobs differ only in the callee's object index. */
+   struct blob a, b;
+   serialize_call(0, &a);
+   serialize_call(1, &b);
+   ASSERT_FALSE(a.out_of_memory || b.out_of_memory);
+   ASSERT_EQ(a.size, b.size);
+
+   size_t ref = a.size;
+   for (size_t i = 0; i + 4 <= a.size; i += 4) {
+      if (read_u32(&a, i) != read_u32(&b, i)) {
+         ASSERT_EQ(ref, a.size) << "blobs differ in more than one word";
+         ref = i;
+      }
+   }
+   ASSERT_LT(ref, a.size);
+
+   const uint32_t count = read_u32(&a, 0);
+   const uint32_t other = read_u32(&b, ref);
+
+   const struct {
+      uint32_t idx;
+      bool ok;
+   } cases[] = {
+      { other, true },
+      /* Read after the call: not an object yet. */
+      { count - 1, false },
+      { count, false },
+      { UINT32_MAX, false },
+   };
+   for (const auto &c : cases) {
+      write_u32(&a, ref, c.idx);
+      EXPECT_EQ(deserializes(a.data, a.size), c.ok)
+         << "callee index " << c.idx << " of " << count << " objects";
+   }
+
+   blob_finish(&a);
+   blob_finish(&b);
+}
+
+TEST_F(nir_deserialize_malformed_test, truncated)
+{
+   struct blob blob;
+   serialize_call(0, &blob);
+   ASSERT_FALSE(blob.out_of_memory);
+   ASSERT_TRUE(deserializes(blob.data, blob.size));
+
+   for (size_t size = 0; size < blob.size; ++size)
+      EXPECT_FALSE(deserializes(blob.data, size)) << "first " << size << " bytes";
+
+   blob_finish(&blob);
+}
+
+TEST_F(nir_deserialize_malformed_test, function)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                  &options, "function");
+   nir_iadd_imm(&b, nir_imm_int(&b, 1), 2);
+
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize_function(&blob, b.impl->function);
+   ralloc_free(b.shader);
+   ASSERT_FALSE(blob.out_of_memory);
+   ASSERT_TRUE(deserializes_function(blob.data, blob.size));
+
+   const uint32_t count = read_u32(&blob, 0);
+   ASSERT_GT(count, 1u);
+
+   for (size_t size = 0; size < blob.size; ++size)
+      EXPECT_FALSE(deserializes_function(blob.data, size)) << "first " << size << " bytes";
+
+   const struct {
+      uint32_t count;
+      bool ok;
+   } cases[] = {
+      { 0, false },
+      { count - 1, false },
+      { count, true },
+      { (1u << 20) + 1, false },
+   };
+   for (const auto &c : cases) {
+      write_u32(&blob, 0, c.count);
+      EXPECT_EQ(deserializes_function(blob.data, blob.size), c.ok)
+         << "object count " << c.count << ", needs " << count;
+   }
+
+   blob_finish(&blob);
+}

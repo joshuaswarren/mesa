@@ -2,14 +2,9 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Shared "template + override" helper over the generated AGX3 encoder.
- *
- * Most AGX3 forms carry a fixed set of selector/context field values plus a
- * handful of operand fields. A binder starts from a per-form baseline (the
- * constants, recovered by decoding a witnessed instruction), overrides the
- * operand fields with the caller's values, and asks the composer to encode. The
- * composer fails closed on any contradiction, so a wrong override cannot
- * silently produce a valid-looking instruction.
+ * Template-plus-override helper over the generated AGX3 composer: applies
+ * caller operand overrides to a per-form baseline and fails closed on any
+ * field contradiction.
  */
 
 #pragma once
@@ -49,16 +44,16 @@ struct agx3_field_kv {
  * AGX_ISA_ENCODING_AGX3D (G18G) takes the same Apple field ids but its own
  * encoding points and lengths, so it is encoded only with
  * ep == AGX3_BIND_APPLE_ORDER, from a field vector a core encoder has
- * grounded against Apple's G18G output, and only in builds that link
- * agx3_compose/agx3d_tables.c and define AGX3_HAVE_AGX3D_TABLE. Any other
- * AGX3D request returns false.
+ * grounded against Apple's G18G output, and only in builds that define
+ * AGX3_HAVE_AGX3D_TABLE. Any other AGX3D request returns false.
  */
 /* Byte length of form `mnemonic.ep` for `encoding`, or 0 if there is none. */
 unsigned agx3_bind_form_size(enum agx_isa_encoding encoding,
-                             const char *mnemonic, int ep);
+                             enum agx3_mnemonic mnemonic, int ep);
 
-bool agx3_bind_compose(enum agx_isa_encoding encoding, const char *mnemonic,
-                       int ep, const struct agx3_field_kv *baseline,
+bool agx3_bind_compose(enum agx_isa_encoding encoding,
+                       enum agx3_mnemonic mnemonic, int ep,
+                       const struct agx3_field_kv *baseline,
                        unsigned nbaseline,
                        const struct agx3_field_kv *overrides,
                        unsigned noverrides, uint8_t *out, uint8_t *len);

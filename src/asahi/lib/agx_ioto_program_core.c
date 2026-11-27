@@ -200,19 +200,7 @@ static const uint8_t g17s_minimal_compute_copies[] = {
 static bool
 agx_ioto_program_target_gpu0(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_ioto_generation(chip) == AGX_IOTO_GENERATION_GPU0;
 }
 
 /* GPU0 EslBuilder appends the AGX3b LDDEV instruction directly rather than

@@ -22,6 +22,7 @@
 #include "agx3_sr_core.h"
 #include "agx_bg_eot_key.h"
 #include "agx_abi.h"
+#include "agx_chip.h"
 #include "agx_compile.h"
 #include "agx_debug.h"
 #include "agx_linker.h"
@@ -1813,6 +1814,163 @@ test_wide_samples(void)
    return 0;
 }
 
+/* Direct EOT MSAA resolve from mixed/subset MRT tilebuffers: both a single
+ * resolved target at a non-zero sample offset (the 5-RT deferred local-read
+ * shape) and a multi-target resolve-only EOT emit 2D resolving IMGWBLK
+ * selectors (low nibble 5, wire-width bit 1 clear) rather than MS store. */
+static int
+test_multisample_direct_resolve_eot(void)
+{
+   /* Single resolved RGBA8 target at byte offset 20 in a 24 B/sample tile. */
+   {
+      const enum pipe_format fmt = PIPE_FORMAT_R8G8B8A8_UNORM;
+      const uint8_t offset = 20;
+      struct agx_shader_key key = {
+         .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+         .no_preamble = true,
+         .g17p_rt0_eot_multisample = false,
+      };
+      agx_g17p_configure_rt0_eot_key(fmt, &key);
+      struct agx_shader_part part = {0};
+      CHECK(compile_eot(1, &fmt, &offset, &key, &part));
+      CHECK(part.info.binary_size == 68);
+      CHECK(part.info.nr_gprs == 8);
+      CHECK(part.info.agx3_staging_known && part.info.agx3_staging_halfs == 8);
+      CHECK(((const uint8_t *)part.binary)[61] == 0x75);
+      free(part.binary);
+   }
+
+   /* Two resolved targets (RGBA8 + RGBA16F) in a mixed MSAA tilebuffer. */
+   {
+      const enum pipe_format fmts[2] = {
+         PIPE_FORMAT_R8G8B8A8_UNORM,
+         PIPE_FORMAT_R16G16B16A16_FLOAT,
+      };
+      const uint8_t offsets[2] = {20, 8};
+      struct agx_shader_key key = {
+         .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+         .no_preamble = true,
+         .g17p_rt0_eot_multisample = false,
+         .g17p_mrt_eot_count = 2,
+         .g17p_mrt_eot_selectors = {
+            agx_g17p_mrt_eot_selector(fmts[0]),
+            agx_g17p_mrt_eot_selector(fmts[1]),
+         },
+      };
+      agx_g17p_configure_rt0_eot_key(fmts[0], &key);
+      struct agx_shader_part part = {0};
+      CHECK(compile_eot(2, fmts, offsets, &key, &part));
+      CHECK(part.info.binary_size == 32 + 44 * 2);
+      CHECK(part.info.nr_gprs == 8);
+      CHECK(part.info.agx3_staging_known && part.info.agx3_staging_halfs == 16);
+      const uint8_t *bin = part.binary;
+      CHECK(bin[92 + 9] == 0x75);
+      CHECK(bin[104 + 9] == 0x15);
+      CHECK((bin[92 + 8] & 0x80) != 0);
+      CHECK((bin[104 + 8] & 0x80) != 0);
+      free(part.binary);
+   }
+
+   return 0;
+}
+
+/* End-to-end compile-and-pack check for single-RT 4-sample background and
+ * sample-shaded fragment shaders on AGX3B (G17P/G16G), verifying both r32f
+ * and rg32f unrolled per-sample txf+st_tile shaders compile without scratch
+ * or tile-store bank refusal. (The RA bank-overflow regression itself is
+ * asserted directly in compiler/test/test-bg-shader-schedule.cpp.) */
+static int
+test_multisample_background_load(void)
+{
+   const enum agx_chip chips[] = { AGX_CHIP_G17P, AGX_CHIP_G16G };
+   const struct {
+      enum pipe_format format;
+      unsigned channels;
+   } cases[] = {
+      { PIPE_FORMAT_R32_FLOAT, 1 },
+      { PIPE_FORMAT_R32G32_FLOAT, 2 },
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
+      const enum agx_chip chip = chips[i];
+      for (unsigned c = 0; c < ARRAY_SIZE(cases); ++c) {
+         for (unsigned bg = 0; bg < 2; ++bg) {
+            enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+               cases[c].format,
+            };
+            struct agx_tilebuffer_layout tib =
+               agx_build_tilebuffer_layout(formats, 1, 4, false);
+
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_FRAGMENT, &agx_nir_options,
+               "AGX3B 4x multisample tile store");
+            b.shader->info.fs.untyped_color_outputs = true;
+            b.shader->info.fs.uses_sample_shading = true;
+
+            nir_def *coord = nir_u2u32(&b, nir_load_pixel_coord(&b));
+            nir_def *tex = nir_txf(&b, coord, .ms_index = nir_load_sample_id(&b),
+                                   .texture_index = 0, .dim = GLSL_SAMPLER_DIM_MS,
+                                   .is_array = false, .dest_type = nir_type_uint32,
+                                   .backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP);
+            nir_def *value = nir_trim_vector(&b, tex, cases[c].channels);
+
+            nir_store_output(&b, value, nir_imm_int(&b, 0),
+                             .write_mask = BITFIELD_MASK(cases[c].channels),
+                             .src_type = nir_type_uint32,
+                             .io_semantics.location = FRAG_RESULT_DATA0,
+                             .io_semantics.num_slots = 1);
+            b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+            agx_nir_lower_texture(b.shader);
+            agx_preprocess_nir(b.shader);
+            unsigned bindless_base = 0;
+            NIR_PASS(_, b.shader, agx_nir_lower_tilebuffer_with_conversions, &tib,
+                     NULL, &bindless_base, NULL, NULL, false, false, false, false,
+                     true, false);
+            NIR_PASS(_, b.shader, agx_nir_lower_monolithic_msaa, tib.nr_samples);
+            NIR_PASS(_, b.shader, agx_nir_lower_multisampled_image_store);
+            NIR_PASS(_, b.shader, agx_nir_lower_texture);
+            NIR_PASS(_, b.shader, nir_shader_intrinsics_pass, lower_tex_handle_to_u0,
+                     nir_metadata_control_flow, NULL);
+            bool progress;
+            do {
+               progress = false;
+               NIR_PASS(progress, b.shader, nir_lower_vars_to_ssa);
+               NIR_PASS(progress, b.shader, nir_opt_copy_prop);
+               NIR_PASS(progress, b.shader, nir_opt_constant_folding);
+               NIR_PASS(progress, b.shader, nir_opt_loop_unroll);
+               NIR_PASS(progress, b.shader, nir_opt_dead_cf);
+               NIR_PASS(progress, b.shader, nir_opt_dce);
+            } while (progress);
+            NIR_PASS(_, b.shader, agx_nir_lower_g17p_tile_samples, tib.nr_samples);
+
+            struct agx_shader_key key = {
+               .dev = {
+                  .chip = chip,
+                  .encoding = agx_chip_isa_encoding(chip),
+                  .shader_quad_control = chip == AGX_CHIP_G17P,
+               },
+               .fs.ignore_tib_dependencies = true,
+               .fs.background = bg != 0,
+               .fs.nr_samples = tib.nr_samples,
+               .g17p_mrt_bg = false,
+               .no_preamble = true,
+            };
+            struct agx_shader_part part = {0};
+            const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+            ralloc_free(b.shader);
+            CHECK(ok);
+            CHECK(part.info.uses_txf);
+            CHECK(!part.info.scratch_size);
+            CHECK(part.info.binary_size > 0);
+            free(part.binary);
+         }
+      }
+   }
+
+   return 0;
+}
+
 int
 main(void)
 {
@@ -1821,9 +1979,10 @@ main(void)
        test_background_programs() || test_epilogs() ||
        test_reused_mrt_payloads() ||
        test_subset_epilogs() || test_octa_subset_epilogs() ||
-       test_multisample_eot_witnesses() || test_multisample_epilogs() ||
+       test_multisample_eot_witnesses() ||
+       test_multisample_direct_resolve_eot() || test_multisample_epilogs() ||
        test_blended_epilogs() || test_preserved_blended_epilogs() ||
-       test_wide_samples())
+       test_wide_samples() || test_multisample_background_load())
       return 1;
 
    printf("G17P mixed-format MRT: %u checks PASS\n", checks);

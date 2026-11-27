@@ -31,7 +31,7 @@ agx3_m5_mrt_eot_staging_halfs(unsigned targets)
 }
 
 static bool
-m5_mrt_append(uint8_t *bytes, size_t *size, const char *op,
+m5_mrt_append(uint8_t *bytes, size_t *size, enum agx3_mnemonic op,
               const struct agx3_field_kv *fields, unsigned count,
               uint8_t ep, uint8_t expected_length)
 {
@@ -61,7 +61,7 @@ m5_mrt_wire(uint8_t *bytes, size_t *size, unsigned rt, unsigned targets,
       pack[count++] = (struct agx3_field_kv)KV(44, 4);
       pack[count++] = (struct agx3_field_kv)KV(55, rt + 1 == targets);
    }
-   if (!m5_mrt_append(bytes, size, "pack_imgwir", pack, count, 0, 14))
+   if (!m5_mrt_append(bytes, size, AGX3_MN_pack_imgwir, pack, count, 0, 14))
       return false;
    if (targets == 1)
       return true;
@@ -72,7 +72,7 @@ m5_mrt_wire(uint8_t *bytes, size_t *size, unsigned rt, unsigned targets,
          KV(16, xy ? 0 : 2), KV(23, 2), KV(24, 2),
          KV(25, !last), KV(27, last), KV(28, 1), KV(29, 35),
       };
-      if (!m5_mrt_append(bytes, size, "copy", copy, AGX_MRT_ARRAY_SIZE(copy),
+      if (!m5_mrt_append(bytes, size, AGX3_MN_copy, copy, AGX_MRT_ARRAY_SIZE(copy),
                            rt == 0 ? 0 : 1, rt == 0 ? 4 : 8))
          return false;
    }
@@ -94,7 +94,7 @@ m5_mrt_store(uint8_t *bytes, size_t *size, unsigned rt, uint8_t selector,
    unsigned count = 18;
    if (layered)
       img[count++] = (struct agx3_field_kv)KV(31, 2);
-   return m5_mrt_append(bytes, size, "imgwblk", img, count, 0, 12);
+   return m5_mrt_append(bytes, size, AGX3_MN_imgwblk, img, count, 0, 12);
 }
 
 /* Reuse the qualified RT0 array encoding: SR12 is the tile layer, packed
@@ -117,7 +117,7 @@ m5_mrt_layer(uint8_t *bytes, size_t *size)
       KV(23, 2), KV(24, 1), KV(27, 1), KV(38, 1), KV(51, 1),
       KV(52, 2), KV(56, 3), KV(57, 118), KV(59, 1), KV(74, 4),
    };
-   return m5_mrt_append(bytes, size, "pack_imgwir", fields,
+   return m5_mrt_append(bytes, size, AGX3_MN_pack_imgwir, fields,
                         AGX_MRT_ARRAY_SIZE(fields), 0, 14);
 }
 
@@ -306,7 +306,7 @@ agx3_tile_store_f13(enum agx_isa_encoding enc, uint16_t data,
    ov[n++] = (struct agx3_field_kv)KV(57, tile_off);
    n = sample_overrides(sample, ov, n);
    n = wait_overrides(enc, wait_mask, ov, n);
-   if (!agx3_bind_compose(enc, "lstcol", agx3_bind_ep(enc, 0),
+   if (!agx3_bind_compose(enc, AGX3_MN_lstcol, agx3_bind_ep(enc, 0),
                           is_b(enc) ? base_b : base_c, is_b(enc) ? 7 : 8, ov,
                           n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
@@ -329,6 +329,159 @@ agx3_tile_store_f13_g18g(enum agx_isa_encoding enc, uint16_t data,
                               wait_mask,
                               f13 || (!is_b(enc) && !sample.g17_register),
                               out, len);
+}
+
+bool
+agx3_tile_store_explicit(enum agx_isa_encoding enc, uint16_t data,
+                         enum agx3_tile_width width, uint8_t chan_mask,
+                         uint16_t tile_off, uint16_t coords, bool last,
+                         uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len)
+{
+   if (out == NULL || len == NULL)
+      return false;
+   memset(out, 0, AGX3_TILE_MAX_LENGTH);
+   *len = 0;
+
+   /* 8-bit lanes one or four at a time, or one 32-bit word, each at an offset
+    * aligned to the lane; the coordinate pair starts on a 32-bit register. */
+   const bool shape =
+      (width == AGX3_TILE_W8 && (chan_mask == 1 || chan_mask == 15)) ||
+      (width == AGX3_TILE_W32 && chan_mask == 1 && (tile_off % 4) == 0 &&
+       (data & 1) == 0);
+   if (!is_b(enc) || !shape || data >= 192 || coords >= 192 ||
+       (coords & 1) || tile_off > UINT8_MAX)
+      return false;
+
+   /* f30 names the coordinate halves; f41 releases the imageblock write
+    * transaction after the last store. The rest is the fragment store's
+    * whole-pixel form without its implicit-pixel fields. */
+   const struct agx3_field_kv base[] = {KV(9, 2),  KV(13, 1), KV(37, 2),
+                                        KV(38, 1), KV(43, 1), KV(51, 1),
+                                        KV(52, 1), KV(65, 1), KV(66, 1)};
+   const struct agx3_field_kv ov[] = {
+      KV(2, data),     KV(10, width), KV(26, chan_mask),
+      KV(57, tile_off), KV(30, coords), KV(41, last),
+   };
+   if (!agx3_bind_compose(enc, AGX3_MN_lstcol, 0, base, AGX_MRT_ARRAY_SIZE(base),
+                          ov, AGX_MRT_ARRAY_SIZE(ov), out, len) ||
+       *len != 12) {
+      memset(out, 0, AGX3_TILE_MAX_LENGTH);
+      *len = 0;
+      return false;
+   }
+   return true;
+}
+
+int
+agx3_block_store_lane_class(enum agx3_tile_width width, bool f16)
+{
+   if (width == AGX3_TILE_W8 && !f16)
+      return 3;
+   if (width == AGX3_TILE_W16 && f16)
+      return 1;
+   if (width == AGX3_TILE_W32 && !f16)
+      return 2;
+   return -1;
+}
+
+static bool
+block_store_append(uint8_t *out, size_t *len, enum agx3_mnemonic op,
+                   const struct agx3_field_kv *fields, unsigned count,
+                   uint8_t expected)
+{
+   uint8_t instruction[16], length = 0;
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, op, 0, fields, count, NULL,
+                          0, instruction, &length) ||
+       length != expected ||
+       length > AGX3_BLOCK_STORE_MAX_LENGTH - *len)
+      return false;
+   memcpy(out + *len, instruction, length);
+   *len += length;
+   return true;
+}
+
+bool
+agx3_block_store_compute(enum agx_isa_encoding enc,
+                         const struct agx3_block_store_desc *d,
+                         uint8_t out[AGX3_BLOCK_STORE_MAX_LENGTH], size_t *len)
+{
+   if (out == NULL || len == NULL)
+      return false;
+   *len = 0;
+   if (!is_b(enc) || d == NULL || d->lane_class < 0 || d->lane_class > 3 ||
+       d->x >= 192 || d->y >= 192 || (d->x & 1) || (d->y & 1) ||
+       (d->base_uniform & 3) || d->base_uniform >= 512 ||
+       (d->index_kind == AGX3_BLOCK_STORE_INDEX_UNIFORM && d->index >= 512) ||
+       (d->index_kind == AGX3_BLOCK_STORE_INDEX_REGISTER && d->index >= 192))
+      return false;
+
+   /* Staging halves 4..5: the imageblock byte offset and the layer, both the
+    * immediate zero of a single-layer tile at the imageblock's start. */
+   const struct agx3_field_kv pack[] = {
+      KV(5, 4),  KV(9, 5),  KV(10, 2), KV(12, 1), KV(23, 1),
+      KV(24, 1), KV(37, 1), KV(38, 1), KV(51, 1), KV(52, 2),
+      KV(74, 8), KV(75, 16), KV(76, 7), KV(77, 24),
+   };
+   if (!block_store_append(out, len, AGX3_MN_pack_imgwir, pack,
+                           AGX_MRT_ARRAY_SIZE(pack), 12))
+      goto fail;
+
+   /* Staging halves 0..1 and 2..3: the tile origin, one 32-bit word each. f27
+    * is the source's last read, f25 keeps it. */
+   for (unsigned xy = 0; xy < 2; ++xy) {
+      const bool kill = xy ? d->y_kill : d->x_kill;
+      const struct agx3_field_kv copy[] = {
+         KV(5, 2 * xy), KV(9, 5),  KV(10, 2), KV(12, 1),
+         KV(16, xy ? d->y : d->x), KV(23, 2), KV(24, 2),
+         KV(kill ? 27 : 25, 1),
+      };
+      if (!block_store_append(out, len, AGX3_MN_copy, copy,
+                              AGX_MRT_ARRAY_SIZE(copy), 4))
+         goto fail;
+   }
+
+   /* The block store from staging half 0. f28 is the compute form; f39 the
+    * uniform holding the descriptor heap base; f51/f53/f52 the descriptor
+    * index as an immediate, a uniform or a register (f59/f60 its kind, f63
+    * the register's last read). */
+   struct agx3_field_kv img[20] = {
+      KV(9, 5),  KV(12, 1), KV(13, 1), KV(28, 1),
+      KV(29, d->lane_class), KV(30, 1), KV(32, 1), KV(45, 3),
+      KV(46, 3), KV(39, d->base_uniform), KV(73, 1),
+   };
+   unsigned n = 11;
+   switch (d->index_kind) {
+   case AGX3_BLOCK_STORE_INDEX_IMMEDIATE:
+      img[n++] = (struct agx3_field_kv)KV(59, 1);
+      img[n++] = (struct agx3_field_kv)KV(60, 1);
+      img[n++] = (struct agx3_field_kv)KV(51, d->index);
+      img[n++] = (struct agx3_field_kv)KV(17, 1);
+      break;
+   case AGX3_BLOCK_STORE_INDEX_UNIFORM:
+      img[n++] = (struct agx3_field_kv)KV(59, 3);
+      img[n++] = (struct agx3_field_kv)KV(60, 2);
+      img[n++] = (struct agx3_field_kv)KV(53, d->index);
+      img[n++] = (struct agx3_field_kv)KV(17, 1);
+      break;
+   case AGX3_BLOCK_STORE_INDEX_REGISTER:
+      img[n++] = (struct agx3_field_kv)KV(59, 2);
+      img[n++] = (struct agx3_field_kv)KV(60, 2);
+      img[n++] = (struct agx3_field_kv)KV(52, d->index);
+      img[n++] = (struct agx3_field_kv)KV(22, 1);
+      if (d->index_kill)
+         img[n++] = (struct agx3_field_kv)KV(63, 1);
+      break;
+   default:
+      goto fail;
+   }
+   if (!block_store_append(out, len, AGX3_MN_imgwblk, img, n, 12))
+      goto fail;
+   return true;
+
+fail:
+   memset(out, 0, AGX3_BLOCK_STORE_MAX_LENGTH);
+   *len = 0;
+   return false;
 }
 
 bool
@@ -364,18 +517,8 @@ agx3_tile_load(enum agx_isa_encoding enc, uint16_t dest,
          (chan_mask != 15 || (tile_off % (4u << width))))))
       return false;
 
-   /* G17G R8/RG8 framebuffer-fetch witnesses carry f26=1/3 with the
-    * same native load fields as RGBA8. G17P additionally has RGB565.
-    * Fresh applegpu_g17p RG8, RG16{Float,Unorm,Snorm,Uint,Sint}, and
-    * RG32{Float,Uint,Sint} render-pipeline witnesses isolate mask3 in f26 at
-    * every width. A B5G6R5Unorm framebuffer-fetch witness independently
-    * isolates mask7 in f26 for W16:
-    *
-    *    670e54000000019a02000000
-    *
-    * G17G's B5G6R5Unorm framebuffer fetch takes the same mask7 at W16
-    * (port/fbwit: 270105000187bc02000040d82000).
-    *
+   /* Framebuffer-fetch channel masks in f26: mask 1 (R8), mask 3 (RG8/RG16/
+    * RG32 at all widths), and mask 7 (RGB565/B5G6R5 at W16 on G17P and G17G).
     * None carries an incoming wait. */
    if (!common_ok(dest, width, chan_mask, sample, enc, wait_mask, tile_off) ||
        (chan_mask != 15 && chan_mask != 1 && chan_mask != 3 &&
@@ -400,7 +543,7 @@ agx3_tile_load(enum agx_isa_encoding enc, uint16_t dest,
    ov[n++] = (struct agx3_field_kv)KV(78, first ? 1 : 0);
    if (!is_b(enc))
       ov[n++] = (struct agx3_field_kv)KV(74, last ? 2 : 0);
-   if (!agx3_bind_compose(enc, "lldcol", 0, is_b(enc) ? base_b : base_c,
+   if (!agx3_bind_compose(enc, AGX3_MN_lldcol, 0, is_b(enc) ? base_b : base_c,
                           is_b(enc) ? 7 : 8, ov, n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
@@ -443,7 +586,7 @@ agx3_tile_store_lifetime(enum agx_isa_encoding enc, uint16_t data,
    ov[n++] = (struct agx3_field_kv)KV(57, tile_off);
    n = sample_overrides(sample, ov, n);
    n = wait_overrides(enc, wait_mask, ov, n);
-   if (!agx3_bind_compose(enc, "lstcol", agx3_bind_ep(enc, 0), base_c, 8, ov,
+   if (!agx3_bind_compose(enc, AGX3_MN_lstcol, agx3_bind_ep(enc, 0), base_c, 8, ov,
                           n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
@@ -490,7 +633,7 @@ agx3_tile_load_g18_mixed(enum agx_isa_encoding enc, uint16_t dest,
    n = sample_overrides(sample, ov, n);
    ov[n++] = (struct agx3_field_kv)KV(78, first ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(74, last ? 2 : 0);
-   if (!agx3_bind_compose(enc, "lldcol", 0, base_c, 8, ov, n, out, len)) {
+   if (!agx3_bind_compose(enc, AGX3_MN_lldcol, 0, base_c, 8, ov, n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
       return false;

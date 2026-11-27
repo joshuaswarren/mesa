@@ -2,22 +2,12 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 varying / interpolation encoders.
- *
- *   iter     -> f32interp : scalar per-channel linear interpolation of a
- *               fragment input coefficient. Perspective is done in software
- *               (interp RHW, rcp, interp channel, mul), so this is the bare
- *               linear iterator.
- *   at-sample -> itrcoords + f32interp : compute an explicit sample's
- *               coordinate token once, then consume it for each coefficient.
- *   centroid -> itrcoords + f32interp : the same token chain, with
- *               ITRCOORDS deriving the centroid from the coverage word.
- *   ldcf     -> ldcfr     : raw <A,B,C> coefficient load.
- *   st_vary  -> uvsw      : unified-vertex-store write of one 32-bit component.
- *
- * Composer-driven; reproduces Apple's witnessed bytes exactly. Center and
- * centroid locations are explicit; the scheduling/hazard marker fields are
- * emitted zero, which is table-valid but remains unproven on hardware.
+ * AGX3 varying and interpolation encoders:
+ *   iter -> f32interp (linear; perspective divides by interpolated RHW in SW),
+ *   at-sample / centroid -> itrcoords + f32interp,
+ *   ldcf -> ldcfr (<A,B,C> coefficient load), st_vary -> uvsw (32-bit write).
+ * Scheduling/hazard marker fields are emitted zero (table-valid; unproven on
+ * hardware).
  */
 
 #pragma once

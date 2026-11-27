@@ -540,6 +540,14 @@ agx_pack_alu(struct util_dynarray *emission, agx_instr *I)
    else if (info.immediates & (AGX_IMMEDIATE_FCOND | AGX_IMMEDIATE_ICOND))
       raw |= (uint64_t)(I->fcond) << 61;
 
+   /* AGX2 hardware matrix multiply-accumulate requires bit 63 set and does not
+    * support saturate. */
+   if (I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16) {
+      pack_assert(I, !I->saturate);
+      raw |= (uint64_t)1 << 63;
+   }
+
    /* Determine length bit */
    unsigned length = encoding.length_short;
    if (I->op == AGX_OPCODE_MOV_IMM && I->dest[0].size == AGX_SIZE_16)

@@ -7,10 +7,13 @@
  * exact address (the texture's tail offset counts only texture coordinates),
  * and a view of a sparse-residency buffer names the buffer's residency map,
  * from which the shader reads non-resident texels as zero. The views lie in
- * a sparse-residency buffer, which needs no memory.
+ * a sparse-residency buffer, which needs no memory. On M5 (argument "m5")
+ * a storage buffer descriptor of an address in that buffer names the same
+ * map in its sparse map page word; elsewhere that word stays zero.
  * Nothing executes on the GPU, so the test also runs under the no-op DRM
  * shim.
  */
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +33,7 @@
 
 static VkDevice dev;
 static PFN_vkGetDescriptorEXT get_descriptor;
+static PFN_vkGetBufferOpaqueCaptureDescriptorDataEXT get_buffer_capture_data;
 static unsigned failures, checks;
 
 #define EXPECT(cond, ...)                                                      \
@@ -79,8 +83,10 @@ texel_descriptor(VkDescriptorType type, VkDeviceAddress address,
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   const bool m5 = argc > 1 && !strcmp(argv[1], "m5");
+
    const VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .apiVersion = VK_API_VERSION_1_3,
@@ -107,9 +113,11 @@ main(void)
       .pNext = &buffer_features,
    };
    vkGetPhysicalDeviceFeatures2(pdev, &features);
-   if (!buffer_features.descriptorBuffer || !features.features.sparseBinding ||
+   if (!buffer_features.descriptorBuffer ||
+       !buffer_features.descriptorBufferCaptureReplay ||
+       !features.features.sparseBinding ||
        !features.features.sparseResidencyBuffer) {
-      fprintf(stderr, "descriptorBuffer or sparse buffers missing\n");
+      fprintf(stderr, "descriptorBuffer, captureReplay, or sparse buffers missing\n");
       return 1;
    }
 
@@ -133,11 +141,13 @@ main(void)
    VkPhysicalDeviceVulkan12Features enabled12 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
       .bufferDeviceAddress = VK_TRUE,
+      .bufferDeviceAddressCaptureReplay = VK_TRUE,
    };
    VkPhysicalDeviceDescriptorBufferFeaturesEXT enabled_buffer = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
       .pNext = &enabled12,
       .descriptorBuffer = VK_TRUE,
+      .descriptorBufferCaptureReplay = VK_TRUE,
    };
    const VkPhysicalDeviceFeatures2 enabled = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -166,6 +176,9 @@ main(void)
    CHECK(vkCreateDevice(pdev, &device_info, NULL, &dev));
    get_descriptor =
       (PFN_vkGetDescriptorEXT)vkGetDeviceProcAddr(dev, "vkGetDescriptorEXT");
+   get_buffer_capture_data =
+      (PFN_vkGetBufferOpaqueCaptureDescriptorDataEXT)vkGetDeviceProcAddr(
+         dev, "vkGetBufferOpaqueCaptureDescriptorDataEXT");
 
    const VkDeviceSize elements = 1ull << 24;
    const VkBufferCreateInfo buffer_info = {
@@ -186,6 +199,7 @@ main(void)
    const VkDeviceAddress address = vkGetBufferDeviceAddress(dev, &address_info);
 
    uint8_t desc[256];
+   uint32_t map_page = 0;
    const struct {
       const char *name;
       VkDescriptorType type;
@@ -220,9 +234,246 @@ main(void)
                 (sparse & AGX_G17P_BUFFER_TEXTURE_SPARSE_ELSIZE_MASK) == 2,
              "%s view: sparse word 0x%x, not a residency map with "
              "4-byte texels", name, sparse);
+      map_page = sparse >> AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT;
+   }
+
+   /* A storage buffer descriptor inside the buffer: base address, size,
+    * then the residency map page (hk_buffer_address). */
+   const VkDescriptorAddressInfoEXT ssbo_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+      .address = address + 4 * 1000,
+      .range = 4096,
+   };
+   const VkDescriptorGetInfoEXT ssbo_get = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+      .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .data.pStorageBuffer = &ssbo_info,
+   };
+   if (props.robustStorageBufferDescriptorSize < 16 ||
+       props.robustStorageBufferDescriptorSize > sizeof(desc)) {
+      EXPECT(0, "storage buffer descriptor size %zu",
+             props.robustStorageBufferDescriptorSize);
+   } else {
+      memset(desc, 0xcd, sizeof(desc));
+      get_descriptor(dev, &ssbo_get, props.robustStorageBufferDescriptorSize,
+                     desc);
+      EXPECT(word64(desc, 0) == ssbo_info.address,
+             "storage buffer: address 0x%llx",
+             (unsigned long long)word64(desc, 0));
+      const uint32_t expected = m5 ? map_page : 0;
+      EXPECT(map_page != 0 && word32(desc, 12) == expected,
+             "storage buffer: map page 0x%x, expected 0x%x", word32(desc, 12),
+             expected);
+
+      /* A binding-only sparse buffer has no residency map (sparse_map == NULL)
+       * even though it sits on sparse_buffers.list. */
+      const VkBufferCreateInfo binding_only_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT,
+         .size = 65536,
+         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+      };
+      VkBuffer binding_only_buf;
+      CHECK(vkCreateBuffer(dev, &binding_only_info, NULL, &binding_only_buf));
+      const VkBufferDeviceAddressInfo binding_only_addr_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = binding_only_buf,
+      };
+      const VkDescriptorAddressInfoEXT bo_ssbo_info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+         .address = vkGetBufferDeviceAddress(dev, &binding_only_addr_info) + 4096,
+         .range = 4096,
+      };
+      const VkDescriptorGetInfoEXT bo_ssbo_get = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .data.pStorageBuffer = &bo_ssbo_info,
+      };
+      memset(desc, 0xcd, sizeof(desc));
+      get_descriptor(dev, &bo_ssbo_get, props.robustStorageBufferDescriptorSize,
+                     desc);
+      EXPECT(word64(desc, 0) == bo_ssbo_info.address,
+             "binding-only storage buffer: address 0x%llx",
+             (unsigned long long)word64(desc, 0));
+      EXPECT(word32(desc, 12) == 0,
+             "binding-only storage buffer: map page 0x%x, expected 0",
+             word32(desc, 12));
+      vkDestroyBuffer(dev, binding_only_buf, NULL);
    }
 
    vkDestroyBuffer(dev, buffer, NULL);
+
+   /* Capture/replay of a sparse-residency buffer must preserve both the
+    * buffer's VA and its residency map's VA so captured texel-buffer (G17P/M5)
+    * and storage-buffer (M5) descriptors still name the live residency map
+    * after replay. */
+   if (props.bufferCaptureReplayDescriptorDataSize == 0 ||
+       props.bufferCaptureReplayDescriptorDataSize > 256 ||
+       !get_buffer_capture_data) {
+      EXPECT(0, "bufferCaptureReplayDescriptorDataSize %zu",
+             props.bufferCaptureReplayDescriptorDataSize);
+   } else {
+      const VkBufferCreateInfo cr_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
+                  VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                  VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |
+                  VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT,
+         .size = elements * 4,
+         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                  VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+      };
+      VkBuffer orig_buf;
+      CHECK(vkCreateBuffer(dev, &cr_info, NULL, &orig_buf));
+
+      const VkBufferDeviceAddressInfo orig_addr_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = orig_buf,
+      };
+      const VkDeviceAddress orig_addr =
+         vkGetBufferDeviceAddress(dev, &orig_addr_info);
+
+      uint8_t capture_data[256] = {0};
+      const VkBufferCaptureDescriptorDataInfoEXT cap_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CAPTURE_DESCRIPTOR_DATA_INFO_EXT,
+         .buffer = orig_buf,
+      };
+      CHECK(get_buffer_capture_data(dev, &cap_info, capture_data));
+
+      const VkDeviceAddress cr_view = orig_addr + 4 * 1000;
+      uint8_t orig_utex[256], orig_stex[256], orig_ssbo[256];
+      texel_descriptor(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, cr_view, 4096,
+                       orig_utex, types[0].size);
+      texel_descriptor(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, cr_view, 4096,
+                       orig_stex, types[1].size);
+
+      const uint32_t orig_utex_sparse =
+         word32(orig_utex, AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET);
+      const uint32_t orig_stex_sparse =
+         word32(orig_stex, AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET);
+      const uint32_t orig_map_page =
+         orig_utex_sparse >> AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT;
+      EXPECT(orig_map_page != 0 && orig_utex_sparse == orig_stex_sparse,
+             "capture/replay sparse texel words 0x%x / 0x%x",
+             orig_utex_sparse, orig_stex_sparse);
+
+      const VkDescriptorAddressInfoEXT cr_ssbo_info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+         .address = cr_view,
+         .range = 4096,
+      };
+      const VkDescriptorGetInfoEXT cr_ssbo_get = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .data.pStorageBuffer = &cr_ssbo_info,
+      };
+      memset(orig_ssbo, 0xcd, sizeof(orig_ssbo));
+      get_descriptor(dev, &cr_ssbo_get, props.robustStorageBufferDescriptorSize,
+                     orig_ssbo);
+      EXPECT(word32(orig_ssbo, 12) == (m5 ? orig_map_page : 0),
+             "capture/replay orig ssbo map page 0x%x, expected 0x%x",
+             word32(orig_ssbo, 12), m5 ? orig_map_page : 0);
+
+      /* Replaying while the original buffer still holds the addresses must
+       * fail cleanly with VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS. */
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT replay_ext = {
+         .sType = VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT,
+         .opaqueCaptureDescriptorData = capture_data,
+      };
+      VkBufferCreateInfo replay_info = cr_info;
+      replay_info.pNext = &replay_ext;
+      VkBuffer conflict_buf = VK_NULL_HANDLE;
+      EXPECT(vkCreateBuffer(dev, &replay_info, NULL, &conflict_buf) ==
+                VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+             "replaying live capture/replay buffer must fail with "
+             "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS");
+
+      /* Colliding only on the residency map VA (leaving buffer VA zero) must
+       * also fail cleanly with VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS. */
+      uint8_t map_only_capture[256];
+      memcpy(map_only_capture, capture_data,
+             props.bufferCaptureReplayDescriptorDataSize);
+      memset(map_only_capture, 0, sizeof(uint64_t));
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT map_conflict_ext = {
+         .sType = VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT,
+         .opaqueCaptureDescriptorData = map_only_capture,
+      };
+      VkBufferCreateInfo map_conflict_info = cr_info;
+      map_conflict_info.pNext = &map_conflict_ext;
+      EXPECT(vkCreateBuffer(dev, &map_conflict_info, NULL, &conflict_buf) ==
+                VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+             "replaying live sparse map VA must fail with "
+             "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS");
+
+      /* Destroy the original and allocate a decoy sparse-residency buffer to
+       * perturb ordinary VA/BO allocations before replaying. */
+      vkDestroyBuffer(dev, orig_buf, NULL);
+      VkBuffer decoy_buf;
+      CHECK(vkCreateBuffer(dev, &buffer_info, NULL, &decoy_buf));
+
+      /* Also chain VkBufferOpaqueCaptureAddressCreateInfo ahead of
+       * VkOpaqueCaptureDescriptorDataCreateInfoEXT to ensure both structs are
+       * honoured together in release builds. */
+      const VkBufferOpaqueCaptureAddressCreateInfo bda_ext = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO,
+         .pNext = &replay_ext,
+         .opaqueCaptureAddress = orig_addr,
+      };
+      replay_info.pNext = &bda_ext;
+      VkBuffer replayed_buf;
+      CHECK(vkCreateBuffer(dev, &replay_info, NULL, &replayed_buf));
+
+      const VkBufferDeviceAddressInfo replayed_addr_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = replayed_buf,
+      };
+      EXPECT(vkGetBufferDeviceAddress(dev, &replayed_addr_info) == orig_addr,
+             "replayed buffer VA 0x%llx != orig 0x%llx",
+             (unsigned long long)vkGetBufferDeviceAddress(dev, &replayed_addr_info),
+             (unsigned long long)orig_addr);
+
+      uint8_t replayed_capture[256] = {0};
+      const VkBufferCaptureDescriptorDataInfoEXT replay_cap_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CAPTURE_DESCRIPTOR_DATA_INFO_EXT,
+         .buffer = replayed_buf,
+      };
+      CHECK(get_buffer_capture_data(dev, &replay_cap_info, replayed_capture));
+      EXPECT(memcmp(capture_data, replayed_capture,
+                    props.bufferCaptureReplayDescriptorDataSize) == 0,
+             "replayed capture descriptor data differs from original");
+
+      uint8_t replay_utex[256], replay_stex[256], replay_ssbo[256];
+      texel_descriptor(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, cr_view, 4096,
+                       replay_utex, types[0].size);
+      texel_descriptor(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, cr_view, 4096,
+                       replay_stex, types[1].size);
+      memset(replay_ssbo, 0xcd, sizeof(replay_ssbo));
+      get_descriptor(dev, &cr_ssbo_get, props.robustStorageBufferDescriptorSize,
+                     replay_ssbo);
+
+      EXPECT(memcmp(orig_utex, replay_utex, types[0].size) == 0,
+             "replayed uniform texel descriptor mismatch (orig sparse 0x%x, "
+             "replayed 0x%x)",
+             orig_utex_sparse,
+             word32(replay_utex, AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET));
+      EXPECT(memcmp(orig_stex, replay_stex, types[1].size) == 0,
+             "replayed storage texel descriptor mismatch (orig sparse 0x%x, "
+             "replayed 0x%x)",
+             orig_stex_sparse,
+             word32(replay_stex, AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET));
+      EXPECT(memcmp(orig_ssbo, replay_ssbo,
+                    props.robustStorageBufferDescriptorSize) == 0,
+             "replayed storage buffer descriptor mismatch (orig page 0x%x, "
+             "replayed 0x%x)",
+             word32(orig_ssbo, 12), word32(replay_ssbo, 12));
+
+      vkDestroyBuffer(dev, replayed_buf, NULL);
+      vkDestroyBuffer(dev, decoy_buf, NULL);
+   }
+
    vkDestroyDevice(dev, NULL);
    vkDestroyInstance(instance, NULL);
    printf("%u checks, %u failures\n", checks, failures);

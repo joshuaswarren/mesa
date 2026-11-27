@@ -52,6 +52,45 @@ hk_rt_group_from_create_info(struct hk_ray_tracing_group *out,
    return true;
 }
 
+static bool
+hk_rt_index_valid(uint32_t index, uint32_t stage_count)
+{
+   return index == VK_SHADER_UNUSED_KHR || index < stage_count;
+}
+
+bool
+hk_rt_group_indices_valid(const struct hk_ray_tracing_group *group,
+                          uint32_t stage_count)
+{
+   return hk_rt_index_valid(group->recursive_index, stage_count) &&
+          hk_rt_index_valid(group->ahit_index, stage_count) &&
+          hk_rt_index_valid(group->isec_index, stage_count);
+}
+
+static bool
+hk_rt_slot_takes(uint32_t index, const VkShaderStageFlagBits *stages,
+                 VkShaderStageFlags allowed)
+{
+   return index == VK_SHADER_UNUSED_KHR || (stages[index] & allowed);
+}
+
+bool
+hk_rt_group_stages_valid(const struct hk_ray_tracing_group *group,
+                         uint32_t stage_count,
+                         const VkShaderStageFlagBits *stages)
+{
+   return hk_rt_group_indices_valid(group, stage_count) &&
+          hk_rt_slot_takes(group->recursive_index, stages,
+                           VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                              VK_SHADER_STAGE_MISS_BIT_KHR |
+                              VK_SHADER_STAGE_CALLABLE_BIT_KHR |
+                              VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) &&
+          hk_rt_slot_takes(group->ahit_index, stages,
+                           VK_SHADER_STAGE_ANY_HIT_BIT_KHR) &&
+          hk_rt_slot_takes(group->isec_index, stages,
+                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR);
+}
+
 struct hk_ray_tracing_group
 hk_rt_group_rebase(struct hk_ray_tracing_group src, uint32_t stage_base)
 {
@@ -180,17 +219,20 @@ void
 hk_rt_launch_group_count(uint32_t width, uint32_t height, uint32_t depth,
                          uint32_t out[3])
 {
-   const uint32_t local[3] = {
-      HK_RT_WORKGROUP_SIZE_X,
-      HK_RT_WORKGROUP_SIZE_Y,
-      HK_RT_WORKGROUP_SIZE_Z,
-   };
-   const uint32_t dim[3] = {width, height, depth};
-
-   for (unsigned i = 0; i < 3; ++i) {
-      /* Round up without overflowing: a launch of 0xffffffff rays is refused
-       * by maxRayDispatchInvocationCount long before it gets here, but the
-       * arithmetic must not wrap even so. */
-      out[i] = dim[i] / local[i] + (dim[i] % local[i] ? 1 : 0);
+   /* Round up without overflowing: a launch of 0xffffffff rays is refused
+    * by maxRayDispatchInvocationCount long before it gets here, but the
+    * arithmetic must not wrap even so.  2D/3D launches (height > 1) use 8x4
+    * tiles per 32-lane workgroup; 1D launches (height <= 1) keep 32x1 strips. */
+   if (height > 1) {
+      out[0] = (width >> HK_RT_TILE_2D_X_LOG2) +
+               ((width & (HK_RT_TILE_2D_X - 1)) ? 1u : 0u);
+      out[1] = (height >> HK_RT_TILE_2D_Y_LOG2) +
+               ((height & (HK_RT_TILE_2D_Y - 1)) ? 1u : 0u);
+      out[2] = depth;
+   } else {
+      out[0] = (width >> HK_RT_WORKGROUP_SIZE_X_LOG2) +
+               ((width & (HK_RT_WORKGROUP_SIZE_X - 1)) ? 1u : 0u);
+      out[1] = height;
+      out[2] = depth;
    }
 }

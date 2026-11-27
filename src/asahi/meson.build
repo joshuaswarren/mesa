@@ -57,6 +57,205 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  # Shader-object binaries: an exported binary imports and exports again
+  # unchanged; one whose root prefix or root metadata was edited and resealed
+  # is refused. M5 and G17P binaries carry the trimmed root prefix.
+  foreach chip : [['g17s', ['--expect-root-size']],
+                  ['g17p', ['--expect-root-size']], ['g13g', []]]
+    test(
+      'hk-' + chip[0] + '-shader-binary-root',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_shader_binary_root,
+      ] + chip[1],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip[0],
+        'MESA_SHADER_CACHE_DISABLE=true',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # A draw with a pipeline fast-linked from libraries compiles nothing.
+  test(
+    'hk-g17p-gpl-fast-link',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_gpl_fast_link,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'MESA_SHADER_CACHE_DISABLE=true',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
+  # state changes (scissor, viewport, cull mode, depth op, color blend).
+  test(
+    'hk-g17p-bind-tail-state-change',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3,4',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Vertex-only push-constant changes with a root-using FS that does not read
+  # push constants must reuse the prior fragment root and elide both the full
+  # bind tail and the incremental 28B FS PPP update.
+  test(
+    'hk-g17p-bind-tail-vs-only-push',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+      '--vs-only-push',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,0,4',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk-g16g-bind-tail-vs-only-push',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+      '--vs-only-push',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16g',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,0,4',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Ray tracing pipeline binaries: an exported binary creates the pipeline
+  # again; one whose shader groups were edited and resealed is refused.
+  # G17P with a kernel that admits render ray queries has ray tracing
+  # pipelines and loads their binaries natively.
+  test(
+    'hk-g17p-rt-binary-groups',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_rt_binary_groups,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_RENDER_RAY_QUERY=1',
+      'MESA_SHADER_CACHE_DISABLE=true',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # HAL200 2x/4x depth compression with zink's feedback-loop usage and
+  # sample-location flag, through vkCreateImage and the host-copy query.
+  foreach chip : ['g17p', 'g16g']
+    test(
+      'hk-' + chip + '-msaa-depth-compression',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hal200_vulkan_msaa_depth_compression,
+        '--expect-1x-compressed',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # AGX3 multi-draw indirect recording fast path across HAL200, G15 and
+  # HAL300/M5 (fixed loader reuse, dynamic DRAW_PARAMS/DRAW_ID relocs,
+  # robust-index batching, empty draws, VDM chunk rollover and Ioto growth).
+  foreach chip : ['g17p', 'g16g', 'g15s', 'g17s-kernel']
+    test(
+      'hk-' + chip + '-indirect-multi',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        g17p_vulkan_indirect_multi,
+        '--shim',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'ASAHI_MESA_DEBUG=verify',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # Static G17P VDM stream validation on the CPU-encoded non-indexed multi-draw
+  # indirect cases (bind-tail elision, dynamic relocs, and VDM chunk rollover).
+  # Indexed robust-batch slots are written by libagx_draw_robust_index_batch on
+  # the GPU and remain zeroed under drm-shim, so they are verified on hardware
+  # and via ASAHI_MESA_DEBUG=verify above.
+  test(
+    'hk-g17p-indirect-multi-stream',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_indirect_multi,
+      '--shim',
+      '--non-indexed-only',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(
@@ -121,6 +320,48 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g17p-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g16s-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16s',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Batched software tessellation (hk_tess_batch.h): its compute streams put
   # the direct launches of a stage back to back, which the validator admits;
   # encoded and stream-validated, not executed.
@@ -137,6 +378,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
       'ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK=1',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # An indirect tessellated draw is not batched: its tessellation launches
+  # are indirect precompiled dispatches that ask for AGX_BARRIER_ALL, so each
+  # must end in the strong cache flush its consumer relies on.
+  test(
+    'hk-g17p-tess-indirect-stream',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim, vulkan_tess_batch_order, '--shim', '--indirect',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
+      'ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER=1',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
     depends : [_dev_icd, libvulkan_asahi],
@@ -183,39 +446,44 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
-  # Descriptor buffer sizes and strides as vkd3d-proton lays out its heaps.
-  test(
-    'hk-g17p-descriptor-buffer-sizes',
-    prog_python,
-    args : [
-      files('../gallium/drivers/asahi/tests/run-shim.py'),
-      libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_sizes,
-    ],
-    env : [
-      'ASAHI_SHIM_CHIP=g17p',
-      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
-    ],
-    depends : [_dev_icd, libvulkan_asahi],
-    suite : ['asahi'],
-  )
+  foreach chip : ['g15g', 'g15s', 'g15c', 'g16g', 'g17p', 'g17s']
+    # Descriptor buffer sizes and strides as vkd3d-proton lays out its heaps.
+    test(
+      'hk-' + chip + '-descriptor-buffer-sizes',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_descriptor_buffer_sizes,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 
-  # Texel buffer descriptors from vkGetDescriptorEXT: their software metadata.
-  test(
-    'hk-g17p-descriptor-buffer-texel',
-    prog_python,
-    args : [
-      files('../gallium/drivers/asahi/tests/run-shim.py'),
-      libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_texel,
-    ],
-    env : [
-      'ASAHI_SHIM_CHIP=g17p',
-      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
-    ],
-    depends : [_dev_icd, libvulkan_asahi],
-    suite : ['asahi'],
-  )
+  foreach chip : ['g17p', 'g17s']
+    # Texel and storage buffer descriptors from vkGetDescriptorEXT: their
+    # software metadata.
+    test(
+      'hk-' + chip + '-descriptor-buffer-texel',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_descriptor_buffer_texel,
+      ] + (chip == 'g17s' ? ['m5'] : []),
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 
   # A render on one queue read by compute on another, ordered by timeline
   # semaphores, including waits made by submissions without command buffers;

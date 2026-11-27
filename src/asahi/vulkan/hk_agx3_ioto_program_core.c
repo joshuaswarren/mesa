@@ -151,15 +151,129 @@ hk_agx3_format_needs_shader_resolve(enum pipe_format format)
 bool
 hk_agx3_g17p_direct_color_resolve_supported(
    struct agx_tilebuffer_layout *tib, unsigned color_attachment_count,
-   bool has_resolve_target, bool average_resolve, bool store_source)
+   bool has_resolve_target, bool average_resolve, bool store_source,
+   bool r11g11b10_own_class)
 {
-   if (!tib || hk_agx3_format_needs_shader_resolve(tib->logical_format[0]))
+   /* When the device does not store R11G11B10_FLOAT through its own PBE class
+    * (hk_eot_r11g11b10_own_class(), false on G15x and G16G without the own
+    * class), the EOT PBE uses raw R32_UINT and averages raw bit patterns
+    * instead of packed float fields. Keep samples for shader resolve there;
+    * chips with the own class (G17P) average accurately in EOT. */
+   if (!tib || hk_agx3_format_needs_shader_resolve(tib->logical_format[0]) ||
+       (tib->logical_format[0] == PIPE_FORMAT_R11G11B10_FLOAT &&
+        !r11g11b10_own_class))
       return false;
 
    return (tib->nr_samples == 2 || tib->nr_samples == 4) &&
           color_attachment_count == 1 && has_resolve_target &&
           average_resolve && !store_source &&
           hk_agx3_g17p_rt0_tile_layout_supported(tib);
+}
+
+bool
+hk_agx3_g17p_mixed_direct_color_resolve_supported(
+   const struct agx_tilebuffer_layout *framebuffer_tib,
+   const struct hk_agx3_g17p_mixed_resolve_target *stored_targets,
+   unsigned stored_count, bool partial_render, bool incomplete_render_area,
+   bool suspend_resume, bool any_unstored_resolve,
+   unsigned color_and_resolve_views)
+{
+   if (!framebuffer_tib || !stored_targets || stored_count == 0 ||
+       stored_count > AGX_MAX_RENDER_TARGETS)
+      return false;
+
+   /* Partial renders and suspended/resumed dynamic rendering instances must
+    * not direct-resolve: suspended halves keep unresolved samples for resume,
+    * and resumed halves return early from hk_begin_rendering() before
+    * loaded_resolve/process_empty_tiles are configured so a direct-resolving
+    * EOT could miss tiles drawn only by the suspended half. Mixed BG has no
+    * preserve_resolve_outside path for incomplete render areas (partial
+    * renderArea or sparse multiview viewMask). Direct resolve also sets the
+    * pass-wide g17p_direct_color_resolve flag, so every resolving attachment
+    * must be stored in-tile (no spills, no unstored resolves) and retained
+    * color+resolve views must leave headroom for depth and stencil within the
+    * kernel's fragment write-range budget. */
+   if (partial_render || incomplete_render_area || suspend_resume ||
+       any_unstored_resolve ||
+       (framebuffer_tib->nr_samples != 2 && framebuffer_tib->nr_samples != 4) ||
+       agx_tilebuffer_spills((struct agx_tilebuffer_layout *)framebuffer_tib) ||
+       color_and_resolve_views > HK_AGX3_G17P_MAX_COLOR_RESOLVE_WRITE_RANGES)
+      return false;
+
+   for (unsigned i = 0; i < stored_count; ++i) {
+      const struct hk_agx3_g17p_mixed_resolve_target *t = &stored_targets[i];
+      if (!t->has_resolve_target || !t->average_resolve || t->store_source ||
+          !t->resolve_pbe_valid || !t->resolve_format_matches ||
+          t->resolve_samples != 1)
+         return false;
+
+      /* Check the unmapped API/view format as well as the EOT key format:
+       * on chips with hk_eot_r11g11b10_own_class() (G17P, see hk_image.h),
+       * hk_eot_key_format() remaps R11G11B10_FLOAT to R10G10B10A2_UNORM and
+       * selects the format's own PBE class, which averages packed floats
+       * accurately; on chips without it (G15x, and G16G without the own
+       * class), the PBE uses raw R32_UINT and averages raw bits. Refusing
+       * R11G11B10_FLOAT via both formats here is required on raw-class chips
+       * and conservative (forgoing the mixed-MRT fast path) on G17P. Also
+       * exclude sRGB and pure integer formats via the unmapped view format so
+       * mixed direct resolve never depends on hk_eot_key_format() leaving them
+       * intact. */
+      if (t->format == PIPE_FORMAT_NONE ||
+          t->view_format == PIPE_FORMAT_NONE ||
+          hk_agx3_format_needs_shader_resolve(t->format) ||
+          hk_agx3_format_needs_shader_resolve(t->view_format) ||
+          t->format == PIPE_FORMAT_R11G11B10_FLOAT ||
+          t->view_format == PIPE_FORMAT_R11G11B10_FLOAT ||
+          util_format_is_srgb(t->format) ||
+          util_format_is_srgb(t->view_format) ||
+          util_format_is_pure_integer(t->format) ||
+          util_format_is_pure_integer(t->view_format))
+         return false;
+   }
+
+   return true;
+}
+
+bool
+hk_agx3_g17p_store_and_resolve_supported(
+   const struct agx_tilebuffer_layout *tib,
+   const struct hk_agx3_g17p_store_and_resolve_target *target)
+{
+   if (!tib || !target)
+      return false;
+
+   /* The program writes both outputs from the same tile at the end of the
+    * pass: the samples through a multisample PBE and their average through a
+    * single-sample one. A partial render must keep the samples for its
+    * reload and must not resolve yet. The resolve writes whole tiles, so the
+    * render area must cover the attachments exactly: there is no background
+    * merge for the area outside it, unlike the resolve-only program
+    * (agx_bg_eot_key::preserve_resolve_outside). The layered and spilled
+    * forms of the two-output program are not built (agx_bg_eot.c). */
+   if (target->color_attachment_count != 1 || !target->final_store ||
+       !target->whole_attachments || !target->store_source ||
+       !target->has_resolve_target || !target->average_resolve ||
+       target->resolve_samples != 1 || !target->resolve_format_matches ||
+       !target->source_pbe_valid || !target->resolve_pbe_valid ||
+       tib->layered || agx_tilebuffer_spills(tib))
+      return false;
+
+   /* The resolve averages the tile lanes as the resolve-only program does,
+    * so the same formats keep their samples for a resolve after the pass:
+    * raw 32-bit float lanes and RGB9E5 words, and an R11G11B10 tile kept as
+    * one raw word (hk_eot_key_format() moves it to its own lane class where
+    * the PBE averages it). AVERAGE never applies to integer formats. */
+   const enum pipe_format format = tib->logical_format[0];
+   if (format == PIPE_FORMAT_NONE ||
+       hk_agx3_format_needs_shader_resolve(format) ||
+       format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       util_format_is_pure_integer(format))
+      return false;
+
+   /* The stored half is the unresolved multisample store. */
+   struct agx_tilebuffer_layout layout = *tib;
+   return hk_agx3_g17p_multisample_store_supported(&layout, 1, true,
+                                                   target->source_samples);
 }
 
 bool
@@ -351,16 +465,17 @@ hk_agx3_g17p_indexed_storage_pointers(
 
 bool
 hk_agx3_g17p_root_range(uint16_t start_halfs, uint8_t set_count,
-                        uint64_t root_va,
+                        uint64_t root_va, uint32_t root_size_B,
                         struct agx3_ioto_uniform_range *range)
 {
+   const uint32_t size_halfs = 4 * (1 + (uint32_t)set_count);
    if (!range || root_va == 0 || (start_halfs & 1) != 0 ||
-       set_count > HK_AGX3_G17P_MAX_ROOT_SETS)
+       set_count > HK_AGX3_G17P_MAX_ROOT_SETS || size_halfs * 2 > root_size_B)
       return false;
 
    *range = (struct agx3_ioto_uniform_range){
       .start_halfs = start_halfs,
-      .size_halfs = 4 * (1 + set_count),
+      .size_halfs = size_halfs,
       .address = root_va,
    };
    return true;
@@ -554,7 +669,7 @@ hk_agx3_g17g_basic_graphics_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
    struct hk_agx3_g17p_graphics_program *program)
 {
-   if ((chip != AGX_CHIP_G17G && chip != AGX_CHIP_G18G) || !desc || !program)
+   if (!agx_chip_m5_paths(chip) || !desc || !program)
       return false;
    const struct agx3_g17p_graphics_program_desc shared_desc =
       hk_agx3_g17p_shared_graphics_desc(desc);

@@ -74,12 +74,13 @@ read_cmp(const void *pa, const void *pb)
    if ((u) != (v))                                                            \
       return (u) < (v) ? -1 : 1
    CMP(a->load->intrinsic, b->load->intrinsic);
+   CMP(a->load->def.bit_size, b->load->def.bit_size);
    CMP(a->base->index, b->base->index);
    CMP(nir_intrinsic_access(a->load), nir_intrinsic_access(b->load));
    int t = lin_cmp_terms(&a->offset, &b->offset);
    if (t)
       return t;
-   CMP(a->offset.constant, b->offset.constant);
+   CMP((int32_t)a->offset.constant, (int32_t)b->offset.constant);
    CMP(a->load->instr.index, b->load->instr.index);
 #undef CMP
    return 0;
@@ -88,7 +89,9 @@ read_cmp(const void *pa, const void *pb)
 static bool
 same_record(const struct word_read *a, const struct word_read *b)
 {
-   return a->load->intrinsic == b->load->intrinsic && a->base == b->base &&
+   return a->load->intrinsic == b->load->intrinsic &&
+          a->load->def.bit_size == b->load->def.bit_size &&
+          a->base == b->base &&
           nir_intrinsic_access(a->load) == nir_intrinsic_access(b->load) &&
           !lin_cmp_terms(&a->offset, &b->offset);
 }
@@ -122,8 +125,78 @@ all_execute(nir_instr *first, nir_instr *last, bool reorderable)
 }
 
 static bool
+block_in_any_loop(nir_block *block)
+{
+   for (nir_cf_node *p = block->cf_node.parent; p; p = p->parent) {
+      if (p->type == nir_cf_node_loop)
+         return true;
+   }
+   return false;
+}
+
+/* Soft-fault robust buffer loads (hk_shader.c:lower_load_global_constant_offset_instr)
+ * lower load_global[_constant]_bounded to a plain load_global at base + u2u64(off)
+ * followed by a per-load bounds check (bounds_agx for 32-bit, bcsel(..., val, 0) for
+ * 8/16-bit) with nir_uadd_sat(off, size) on non-constant offsets. Such loads may
+ * legally carry a wrapping 32-bit offset (e.g. X - 4 at X = 0 wraps to 0xFFFFFFFC)
+ * where channel 0 is OOB (zeroed) while channel 1 (at X = 0) is in-bounds. Merging
+ * them into one vector load at base + u2u64(X - 4) would read channel 1 from
+ * base + 2^32 instead of base + 0, so keep per-channel addresses for bounded reads. */
+static bool
+load_feeds_bounds_check(nir_intrinsic_instr *load, nir_scalar offset_scalar)
+{
+   nir_foreach_use(src, &load->def) {
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(use);
+         if (alu->op == nir_op_bounds_agx)
+            return true;
+         if (alu->op == nir_op_bcsel) {
+            nir_scalar s1 =
+               nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+            nir_scalar s2 =
+               nir_scalar_resolved(alu->src[2].src.ssa, alu->src[2].swizzle[0]);
+            if ((nir_scalar_is_const(s1) && nir_scalar_as_uint(s1) == 0) ||
+                (nir_scalar_is_const(s2) && nir_scalar_as_uint(s2) == 0))
+               return true;
+         }
+      }
+   }
+   if (offset_scalar.def) {
+      nir_foreach_use(src, offset_scalar.def) {
+         nir_instr *use = nir_src_use_instr(src);
+         if (use->type == nir_instr_type_alu &&
+             nir_instr_as_alu(use)->op == nir_op_uadd_sat)
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+u8_load_has_free_unpack(nir_intrinsic_instr *load)
+{
+   if (list_is_empty(&load->def.uses))
+      return false;
+   nir_foreach_use_including_if(src, &load->def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_alu)
+         return false;
+      nir_op op = nir_instr_as_alu(use)->op;
+      if (op != nir_op_u2f32 && op != nir_op_u2f16 &&
+          op != nir_op_i2f32 && op != nir_op_i2f16 &&
+          op != nir_op_u2u32 && op != nir_op_i2i32)
+         return false;
+   }
+   return true;
+}
+
+static bool
 merge_block(nir_block *block, struct util_dynarray *reads)
 {
+   const bool in_loop = block_in_any_loop(block);
    util_dynarray_clear(reads);
    nir_foreach_instr(instr, block) {
       if (instr->type != nir_instr_type_intrinsic)
@@ -131,14 +204,22 @@ merge_block(nir_block *block, struct util_dynarray *reads)
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
       if ((in->intrinsic != nir_intrinsic_load_global &&
            in->intrinsic != nir_intrinsic_load_global_constant) ||
-          in->num_components != 1 || in->def.bit_size != 32 ||
+          in->num_components != 1 ||
+          (in->def.bit_size != 8 && in->def.bit_size != 16 && in->def.bit_size != 32) ||
           (nir_intrinsic_access(in) &
            (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_CAN_SPECULATE)) ||
-          nir_intrinsic_align(in) < 4)
+          nir_intrinsic_align(in) < in->def.bit_size / 8)
+         continue;
+      /* Merging 8-bit loads inside loops into vector loads requires scalar
+       * unpacking per byte; only profitable when every byte flows directly
+       * into a float conversion (which folds byte extraction) or outside loops. */
+      if (in->def.bit_size == 8 && in_loop && !u8_load_has_free_unpack(in))
          continue;
 
       struct word_read r = {.load = in};
       if (!split_address(in->src[0].ssa, &r.base, &r.offset_scalar))
+         continue;
+      if (load_feeds_bounds_check(in, r.offset_scalar))
          continue;
       r.offset = (struct lin){.valid = true};
       lin_parse(&r.offset, r.offset_scalar, 1, 12);
@@ -156,11 +237,47 @@ merge_block(nir_block *block, struct util_dynarray *reads)
    qsort(r, n, sizeof(*r), read_cmp);
 
    bool progress = false;
+
+   /* Deduplicate identical readonly loads at the same linear address so they
+    * neither execute redundantly nor fragment contiguous vector runs. */
+   unsigned out_n = 0;
    for (unsigned i = 0; i < n;) {
+      unsigned end = i + 1;
+      while (end < n && same_record(&r[i], &r[end]) &&
+             r[end].offset.constant == r[i].offset.constant)
+         end++;
+      if (end - i == 1) {
+         r[out_n++] = r[i];
+         i = end;
+         continue;
+      }
+      unsigned first = i;
+      for (unsigned j = i + 1; j < end; j++) {
+         if (r[j].load->instr.index < r[first].load->instr.index)
+            first = j;
+      }
+      r[out_n++] = r[first];
+      for (unsigned j = i; j < end; j++) {
+         if (j == first)
+            continue;
+         bool reorder = nir_intrinsic_can_reorder(r[first].load) &&
+                        nir_intrinsic_can_reorder(r[j].load);
+         if (all_execute(&r[first].load->instr, &r[j].load->instr, reorder)) {
+            nir_def_replace(&r[j].load->def, &r[first].load->def);
+            progress = true;
+         } else {
+            r[out_n++] = r[j];
+         }
+      }
+      i = end;
+   }
+   n = out_n;
+   for (unsigned i = 0; i < n;) {
+      const unsigned elem_bytes = r[i].load->def.bit_size / 8;
       unsigned count = 1;
       while (i + count < n && count < 4 && same_record(&r[i], &r[i + count]) &&
              r[i + count].offset.constant ==
-                r[i + count - 1].offset.constant + 4)
+                r[i + count - 1].offset.constant + elem_bytes)
          count++;
 
       if (count < 2) {
@@ -201,11 +318,12 @@ merge_block(nir_block *block, struct util_dynarray *reads)
       nir_intrinsic_instr *proto = r[i].load;
       nir_def *vec;
       if (proto->intrinsic == nir_intrinsic_load_global_constant)
-         vec = nir_load_global_constant(&b, count, 32, addr,
-                                        .align_mul = 4,
+         vec = nir_load_global_constant(&b, count, proto->def.bit_size, addr,
+                                        .align_mul = elem_bytes,
                                         .access = nir_intrinsic_access(proto));
       else
-         vec = nir_load_global(&b, count, 32, addr, .align_mul = 4,
+         vec = nir_load_global(&b, count, proto->def.bit_size, addr,
+                               .align_mul = elem_bytes,
                                .access = nir_intrinsic_access(proto));
 
       for (unsigned j = 0; j < count; j++) {

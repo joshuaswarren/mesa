@@ -7,6 +7,7 @@
 #include "asahi_clc.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/compiler/agx_nir.h"
 #include "compiler/glsl_types.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -69,10 +70,8 @@ target_chip(const char *target)
       return AGX_CHIP_G15G;
    else if (!strcmp(target, "g16g"))
       return AGX_CHIP_G16G;
-   /* G18G compiles as G17G (agx3c) and re-encodes its code as agx3d, exactly
-    * as the driver's own compiles do (agx_device_key::emit_agx3d). */
    else if (!strcmp(target, "g18g"))
-      return AGX_CHIP_G17G;
+      return AGX_CHIP_G18G;
    else if (!strcmp(target, "g13x"))
       return AGX_CHIP_G13X;
    else
@@ -86,13 +85,30 @@ target_is_native_agx3(const char *target)
    return agx_chip_native_agx3(target_chip(target));
 }
 
-/* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
- * one. */
+/* Whether a target runs the native AGX3 path with the HAL200 command stream. */
+static bool
+target_is_native_hal200(const char *target)
+{
+   return agx_chip_native_hal200(target_chip(target));
+}
+
+/* Whether a target executes AGX3 code. */
 static bool
 target_is_agx3(const char *target)
 {
+   return agx_encoding_is_agx3(agx_chip_isa_encoding(target_chip(target)));
+}
+
+/* Whether a target decompresses spilled compressed colour attachments in place
+ * (libagx_agx3_decompress, and libagx_reset_compression_metadata for the
+ * attachments a pass discards): native HAL200, and the chips with private
+ * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). */
+static bool
+target_has_spill_decompress(const char *target)
+{
    const enum agx_chip chip = target_chip(target);
-   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+   return agx_chip_native_hal200(chip) ||
+          agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION);
 }
 
 static const struct spirv_to_nir_options spirv_options = {
@@ -246,10 +262,18 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
    return nir;
 }
 
-static void
+static bool
 print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
              struct agx_shader_part *p, uint16_t printf_uniform)
 {
+   if (p->info.scratch_size > UINT16_MAX ||
+       p->info.agx3_spectpr_scratch_size > UINT16_MAX) {
+      fprintf(stderr,
+              "Failed to compact %s for %s: scratch size (%u/%u B) exceeds uint16_t\n",
+              name, suffix, p->info.scratch_size,
+              p->info.agx3_spectpr_scratch_size);
+      return false;
+   }
    struct agx_precompiled_kernel_info info = agx_compact_kernel_info(&p->info);
    info.printf_uniform = printf_uniform;
    size_t sz_B = sizeof(info) + p->info.binary_size;
@@ -261,6 +285,7 @@ print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
 
    nir_precomp_print_blob(fp, name, suffix, variant, mem, sz_B, true);
    free(mem);
+   return true;
 }
 
 static bool
@@ -327,6 +352,8 @@ target_supports_program(const char *target, const nir_function *func)
 {
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
+   if (!strcmp(func->name, "libagx_agx3_decompress"))
+      return target_has_spill_decompress(target);
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
@@ -343,7 +370,7 @@ target_supports_program(const char *target, const nir_function *func)
     *
     * G18G launches these through the G17G-family compute profile; it takes
     * the qualified list below, without fast clear and with the hardware
-    * tessellator. target_is_agx3() covers it: its target chip is G17G.
+    * tessellator.
     *
     * Tessellation runs as libagx_tess_isoline/tri/quad (libagx_tessellate is
     * only the tessellator.h macro choosing one), qualified below for every
@@ -358,9 +385,9 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
-          /* Native G17P AS copies relocate child slots and then restore the
-           * instance-record slots which can resemble node markers. */
-          (!strcmp(target, "g17p") &&
+          /* Native HAL200 Gen1 AS copies relocate child slots and then
+           * restore the instance-record slots which can resemble node markers. */
+          (target_is_native_hal200(target) &&
            (!strcmp(func->name, "libagx_gen1_as_rebase") ||
             !strcmp(func->name, "libagx_gen1_as_restore_records"))) ||
           !strcmp(func->name, "libagx_gen1_as_serialize") ||
@@ -369,11 +396,19 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_gen1_as_empty") ||
           (strcmp(target, "g18g") &&
            !strcmp(func->name, "libagx_fast_clear")) ||
+          (target_has_spill_decompress(target) &&
+           !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||
+          !strcmp(func->name, "libagx_mipmap_unorm8x4_2level") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4_odd") ||
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||
+          !strcmp(func->name, "libagx_build_indirect_vdm") ||
+          /* Runtime VDM stream truncation for drawIndirectCount: one
+           * invocation, binary search over constant spans, save/restore of one
+           * 8-byte VDM record header with a pre-packed VDM_STREAM_LINK. */
+          !strcmp(func->name, "libagx_patch_vdm_indirect_count") ||
           /* VK_KHR_ray_tracing_pipeline's indirect trace-rays setup.  One
            * invocation, three constant loads, three global stores and a shift
            * -- no atomics, no barriers, no printf, no scratch.  Its ARITHMETIC
@@ -406,6 +441,9 @@ target_supports_program(const char *target, const nir_function *func)
            * heap allocation and global stores into the task record. */
           (!strcmp(target, "g17p") &&
            !strcmp(func->name, "libagx_task_setup")) ||
+          (!strcmp(target, "g18g") &&
+           (!strcmp(func->name, "libagx_g18_noop") ||
+            !strcmp(func->name, "libagx_g18_indirect_launch"))) ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
           !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||
@@ -417,6 +455,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_write_u32s") ||
           !strcmp(func->name, "libagx_reset_query") ||
           !strcmp(func->name, "libagx_copy_uchar") ||
+          !strcmp(func->name, "libagx_copy_uint") ||
           !strcmp(func->name, "libagx_copy_uint4") ||
           !strcmp(func->name, "libagx_fill") ||
           !strcmp(func->name, "libagx_copy_xfb_counters") ||
@@ -427,7 +466,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_copy_query_gl") ||
           !strcmp(func->name, "libagx_increment_cs_invocations") ||
           !strcmp(func->name, "libagx_setup_indirect_dispatch") ||
-          !strcmp(func->name, "libagx_copy_timestamp") ||
+          !strcmp(func->name, "libagx_copy_timestamps") ||
           !strcmp(func->name, "libagx_increment_statistic") ||
           /* Software tessellation */
           !strcmp(func->name, "libagx_tess_setup_indirect") ||
@@ -689,19 +728,7 @@ main(int argc, char **argv)
                .has_scratch = target_is_agx3(*target),
             };
 
-            key.dev.encoding = !strcmp(*target, "g17g")
-                                  ? AGX_ISA_ENCODING_AGX3C
-                                  : target_is_native_agx3(*target)
-                                  ? AGX_ISA_ENCODING_AGX3B
-                                  : AGX_ISA_ENCODING_AGX2;
-            key.dev.chip = target_chip(*target);
-
-            if (!strcmp(*target, "g18g")) {
-               /* The device key agx_gather_device_key() builds for G18G. */
-               key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-               key.dev.chip = AGX_CHIP_G17G;
-               key.dev.emit_agx3d = true;
-            }
+            agx_device_key_set_target(&key.dev, target_chip(*target));
 
             if (has_atomic) {
                key.dev.needs_g13x_coherency =
@@ -719,7 +746,8 @@ main(int argc, char **argv)
                key.reserved_preamble += AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
             }
 
-            if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f")) {
+            if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f") ||
+                !strcmp(libfunc->name, "libagx_agx3_decompress")) {
                key.g17p_texture_uniform_base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
                NIR_PASS(_, clone, nir_shader_intrinsics_pass,
                         lower_m5_decompress_load, nir_metadata_none, NULL);
@@ -777,8 +805,12 @@ main(int argc, char **argv)
             }
             if (!strcmp(*target, "g18g"))
                nr_compiled++;
-            print_shader(fp_c, libfunc->name, *target, v, &compiled,
-                         printf_uniform);
+            if (!print_shader(fp_c, libfunc->name, *target, v, &compiled,
+                              printf_uniform)) {
+               free(compiled.binary);
+               ralloc_free(clone);
+               return 1;
+            }
             free(compiled.binary);
             ralloc_free(clone);
 

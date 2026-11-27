@@ -145,11 +145,11 @@ hk_agx3_g17g_vertex_program_info(
       compiler_info->uvs_size == 5 && compiler_info->psiz_off == 4 &&
       compiler_info->layer_viewport_off == 5 && compiler_info->clip_off == 5 &&
       compiler_info->uvs_written == 0;
-   /* Native applegpu_g17g color and color+point-size vertex pipelines report
-    * __GPU_LD_MD root.field1.field3 = 8/9 with field4 absent. This is the
-    * same all-f32 VsStateConfig footprint consumed by the shared encoder,
-    * with HAL300's pre-HAL300 flags absent. Fragment coefficient state is
-    * validated independently before any draw can be submitted.
+   /* Admitted G17G vertex profiles (covered in test-hk-agx3-vdm-decode.c):
+    * position (4 words), position_psiz (5 words), and all-f32 color
+    * (m5_color_vertex: layer_viewport_off == 8; m5_color_point_vertex: 9,
+    * with pre-HAL300 flags absent). Fragment coefficient state is validated
+    * independently before draw submission.
     */
    const bool color = compiler_info &&
       compiler_info->user_size == 4 &&
@@ -158,7 +158,7 @@ hk_agx3_g17g_vertex_program_info(
       (compiler_info->layer_viewport_off == 8 ||
        compiler_info->layer_viewport_off == 9) &&
       compiler_info->clip_off == compiler_info->layer_viewport_off;
-   if ((chip != AGX_CHIP_G17G && chip != AGX_CHIP_G18G) || !compiler_info ||
+   if (!agx_chip_hal300_records(chip) || !compiler_info ||
        (chip == AGX_CHIP_G17G &&
         (!color && ((!position && !position_psiz) ||
                     compiler_info->user_size != 0)))) {

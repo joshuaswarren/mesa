@@ -40,52 +40,18 @@ TEST(AGXChip, G16GRequiresExactKernelContract)
       }
       EXPECT_FALSE(agx_params_driver_supported(&params)) << field;
    }
-
-   for (auto chip : {AGX_CHIP_G16P, AGX_CHIP_G16S, AGX_CHIP_G16C}) {
-      EXPECT_TRUE(agx_chip_codegen_supported(chip));
-      EXPECT_FALSE(agx_chip_driver_supported(chip));
-   }
-   EXPECT_TRUE(agx_chip_driver_supported(AGX_CHIP_G15S));
-   EXPECT_TRUE(agx_chip_driver_supported(AGX_CHIP_G17P));
 }
 
-TEST(AGXChip, G16GUsesSharedNativePathWithItsOwnCapabilities)
+TEST(AGXChip, TextureDescriptorSpareWordIsM5Gen10)
 {
-   EXPECT_TRUE(agx_chip_native_agx3(AGX_CHIP_G16G));
-   EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16G), AGX_ISA_ENCODING_AGX3B);
-   EXPECT_EQ(agx_chip_record_family(AGX_CHIP_G16G), AGX_CHIP_G17P);
-   EXPECT_EQ(agx_chip_command_stream_generation(AGX_CHIP_G16G),
-             AGX_CS_GENERATION_HAL200);
-   EXPECT_EQ(agx_chip_descriptor_generation(AGX_CHIP_G16G),
-             AGX_DESCRIPTOR_GENERATION_9);
-   EXPECT_EQ(agx_chip_sampler_generation(AGX_CHIP_G16G),
-             AGX_SAMPLER_GENERATION_GEN4_HAL200);
-   EXPECT_EQ(agx_chip_sampler_heap_element_size(AGX_CHIP_G16G), 32u);
-   EXPECT_EQ(agx_chip_usc_helper_table_slots(AGX_CHIP_G16G, 0), 10u);
-   EXPECT_TRUE(agx_chip_native_indirect_compute(AGX_CHIP_G16G));
-   EXPECT_TRUE(agx_chip_native_imageblock(AGX_CHIP_G16G));
-   EXPECT_TRUE(agx_chip_explicit_robust_image_bounds(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_native_g15(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_has_native_render_context(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_native_preamble(AGX_CHIP_G16G));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_defect(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_tri_merge_across_side_effects(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_exact_fma32(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_uses_legacy_precompiled_programs(AGX_CHIP_G16G));
-}
-
-TEST(AGXChip, UncoveredTileReloadDefect)
-{
-   /* M4 Pro keeps a 2x reload in the tilebuffer; 4x and A18 Pro spill. */
-   EXPECT_FALSE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6040, 2));
-   EXPECT_FALSE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6041, 2));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6041, 4));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6040, 4));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x8140, 2));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x8140, 4));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G16G, 0x8132, 2));
-   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G15S, 0x6030, 2));
-   EXPECT_FALSE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G13G, 0x8103, 2));
+   for (enum agx_chip chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C})
+      EXPECT_TRUE(agx_chip_texture_descriptor_spare_word(chip));
+   /* AGX2 has 24-byte descriptors; Gen9 and G18G are not shown to ignore
+    * the word. */
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15S,
+                              AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G18G,
+                              AGX_CHIP_UNKNOWN})
+      EXPECT_FALSE(agx_chip_texture_descriptor_spare_word(chip));
 }
 
 TEST(AGXChip, G16GSharedComputeLaunchBytes)

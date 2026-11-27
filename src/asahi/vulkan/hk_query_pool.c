@@ -95,34 +95,6 @@ hk_reports_per_query(struct hk_query_pool *pool)
    }
 }
 
-/*
- * Prepare the compute stream a query command (reset, result copy) records
- * into. Query state is updated in submission order without application
- * barriers (Vulkan 1.3, 17 "Queries": vkCmdCopyQueryPoolResults sees every
- * earlier vkCmdResetQueryPool on the queue, and vkCmdBeginQuery requires the
- * query to be unavailable, which an earlier reset in the same command buffer
- * provides). The stream therefore waits on every earlier stream, and it is
- * never the stream carrying a pending end timestamp. On G17P, both start
- * and end timestamps reach query memory at command retirement, so neither
- * producer may contain the query command or be merged back into it. The caller
- * marks later streams as ordered after it where the command's semantics require
- * that.
- */
-static struct hk_cs *
-hk_query_command_cs(struct hk_cmd_buffer *cmd)
-{
-   hk_sync_flush_pending_timestamp(cmd);
-   hk_sync_end_cs_if_timestamped(cmd);
-
-   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
-   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-              agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
-      cs->g17p_timestamp_query = true;
-   return cs;
-}
-
 static uint64_t
 hk_query_available_size(const struct hk_query_pool *pool)
 {
@@ -304,7 +276,7 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * buffer, when it is no longer current: a post-graphics dispatch would
     * open a new stream after every later command, a query copy or reset
     * included. Write into the stream itself, as native AGX3 does. */
-   const bool pin = agx_native_graphics(&dev->dev) ||
+   const bool pin = agx_chip_native_agx3(dev->dev.chip) ||
                     (cs != cmd->current_cs.post_gfx && cs != cmd->current_cs.cs);
    if (pin) {
       /* End-of-stream writes belong to this exact post-graphics stream.
@@ -330,6 +302,45 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX, params);
    hk_note_dispatched_imm_write_queries(cs);
+}
+
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   assert(cs->type == HK_CS_CDM && count > 0);
+   assert(cs == cmd->current_cs.cs);
+
+   perf_debug(cmd, "Timestamp copies");
+
+   struct agx_ptr params =
+      hk_pool_alloc(cmd, count * sizeof(struct libagx_timestamp_copy), 16);
+   if (!params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   struct libagx_timestamp_copy *pairs = params.cpu;
+   for (unsigned i = 0; i < count; ++i) {
+      pairs[i] = (struct libagx_timestamp_copy){
+         .dest = copies[i].dst.addr,
+         .src = copies[i].src.addr,
+      };
+   }
+
+   /* One launch, then one flush for all of them. */
+   libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL, params.gpu);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   /* Both words are query memory the launch accesses. */
+   struct hk_cs *launch = cmd->current_cs.cs;
+   for (unsigned i = 0; i < count; ++i) {
+      hk_cmd_note_query_range(cmd, launch, copies[i].src.handle,
+                              copies[i].src.offset_B, sizeof(uint64_t));
+      hk_cmd_note_query_range(cmd, launch, copies[i].dst.handle,
+                              copies[i].dst.offset_B, sizeof(uint64_t));
+   }
 }
 
 void
@@ -364,7 +375,7 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued write");
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       hk_g17p_meta_fill_addr(cmd, &cmd->current_cs.cs, address,
                              sizeof(value), value);
       return;
@@ -415,14 +426,36 @@ static void
 hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                          uint32_t query)
 {
-   const uint32_t render_seq = cmd->current_cs.gfx->sync.seq;
+   struct hk_cs *render = cmd->current_cs.gfx;
+   const uint64_t offset_B = hk_query_available_offset(pool, query);
+
+   /* Fast path: stage up to 3 availability writes inline on the active render
+    * stream so single-render command buffers never allocate and discard a
+    * post_gfx CDM stream and its 64 KiB control-stream root. */
+   if (!cmd->current_cs.post_gfx &&
+       (!cmd->state.oq_pending_render ||
+        cmd->state.oq_pending_render == render) &&
+       render->oq_pending_count < ARRAY_SIZE(render->oq_pending) &&
+       offset_B <= UINT32_MAX) {
+      render->oq_pending[render->oq_pending_count++] = (struct hk_oq_pending){
+         .avail_addr = hk_query_available_addr(pool, query),
+         .handle = pool->handle,
+         .offset_B = (uint32_t)offset_B,
+         .avail_size = (uint8_t)hk_query_available_size(pool),
+      };
+      cmd->state.oq_pending_render = render;
+      return;
+   }
+
+   hk_flush_oq_pending(cmd);
+
+   const uint32_t render_seq = render->sync.seq;
    hk_queue_query_available_write(cmd, pool, query, 1, true);
 
    struct hk_cs *cs = cmd->current_cs.post_gfx;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   const uint64_t offset_B = hk_query_available_offset(pool, query);
    if (offset_B > UINT32_MAX)
       return;
 
@@ -578,7 +611,7 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Query pool zero");
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       emit_zero_queries_g17p(cmd, pool, first_index, num_queries,
                              set_available);
       return;
@@ -755,7 +788,7 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
 
    /* See hk_oq_submission_done(): only the native AGX3 path needs the
     * submission point. */
-   if (occlusion_queries && agx_native_graphics(&dev->dev)) {
+   if (occlusion_queries && agx_chip_native_agx3(dev->dev.chip)) {
       pool->oq_submit =
          vk_zalloc2(&dev->vk.alloc, pAllocator,
                     sizeof(*pool->oq_submit) * occlusion_queries, 8,
@@ -842,8 +875,10 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->sync.kind_override = HK_SYNC_ALL;
    cmd->state.query_reset_recording = true;
    struct hk_cs *cs = hk_query_command_cs(cmd);
-   if (cs)
+   if (cs) {
+      cmd->sync.has_gpu_query_reset = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+   }
    cmd->state.query_reset_recording = false;
    cmd->sync.kind_override = 0;
    if (!cs)
@@ -1032,7 +1067,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    }
 
    case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
       cmd->state.gfx.descriptors.root.mesh_prims_query =
          end ? 0 : hk_query_report_addr(dev, pool, query);
       graphics = true;
@@ -1041,7 +1076,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
       struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
 
       root->draw.pipeline_stats =
          end ? 0 : hk_query_report_addr(dev, pool, query);
@@ -1163,19 +1198,6 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
       p_atomic_set(&s->point, 0);
       p_atomic_set(&s->queue, queue);
       p_atomic_set(&s->point, point);
-   }
-}
-
-static void
-hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
-{
-   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
-   while (seen < point) {
-      const uint64_t prev =
-         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
-      if (prev == seen)
-         break;
-      seen = prev;
    }
 }
 
@@ -1630,6 +1652,19 @@ hk_query_stamps_note_one_locked(struct hk_device *dev, struct hk_queue *queue,
 }
 
 void
+hk_query_stamps_note_req(struct hk_device *dev, struct hk_queue *queue,
+                         uint64_t point, uint32_t handle, uint32_t offset_B)
+{
+   if (!handle || !dev->query_stamps.ready ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS))
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   hk_query_stamps_note_one_locked(dev, queue, point, handle, offset_B);
+   simple_mtx_unlock(&dev->query_stamps.lock);
+}
+
+void
 hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
                         uint64_t point, const struct hk_cs *cs)
 {
@@ -1880,7 +1915,8 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
     * Finish the producing streams before creating a waiting consumer so it
     * cannot spin ahead of its own availability write. Do this before
     * hk_query_command_cs attaches dependencies to the consumer stream. */
-   if (agx_native_graphics(&dev->dev) && (flags & VK_QUERY_RESULT_WAIT_BIT)) {
+   if (agx_chip_native_agx3(dev->dev.chip) &&
+       (flags & VK_QUERY_RESULT_WAIT_BIT)) {
       hk_cmd_buffer_end_graphics(cmd);
       hk_cmd_buffer_end_compute(cmd);
    }
@@ -1893,7 +1929,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
 
    perf_debug(cmd, "Query pool copy");
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       if ((pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
            pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
            pool->vk.query_type != VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT &&

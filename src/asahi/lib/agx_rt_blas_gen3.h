@@ -4,23 +4,13 @@
 
 #include "agx_rt_bvh.h"
 
-/* Native M5 Gen3, one unindexed opaque triangle in geometry zero. This is a
- * deliberately narrow serialization primitive, not the Vulkan AS builder.
- * The root, QTB and geometry are computed from the input. The fixed descriptor
- * trailer is the one-geometry/no-instancing form captured in candidate8.
- * Keep its unassigned words literal until their general contracts are known.
- * Native reference: AS 0x10000058400, 504 bytes, original64 trace, 2026-10-11.
- */
+/* Narrow Gen3 BLAS serializer for one unindexed opaque triangle in geometry 0;
+ * unassigned descriptor trailer words are kept literal. */
 #define AGX_RT_BLAS_GEN3_SINGLE_TRIANGLE_SIZE 504u
 
-/* Native explicit-ID, single-geometry triangle envelope. The traversal graph
- * occupies slots [3, end_slot); this only writes the outer header and the
- * 184-byte descriptor after that graph, leaving all node bytes untouched.
- * opaque_build_word is the captured word at 0xb8. Its general meaning is not
- * assigned here; keeping it explicit avoids disguising a guessed heuristic.
- * The descriptor's reciprocal half-surface area is independently matched to
- * the 2/4/8/64-triangle native captures. Degenerate bounds are not covered by
- * this narrow serializer yet. */
+/* Write the Gen3 single-geometry triangle envelope (header and 184-byte
+ * trailing descriptor) around traversal graph slots [3, end_slot).
+ * `opaque_build_word` is placed at offset 0xb8; degenerate bounds fail. */
 static inline bool
 agx_rt_blas_gen3_envelope(void *packed, size_t available, uint64_t gpu_va,
                          uint32_t end_slot, uint32_t primitive_count,

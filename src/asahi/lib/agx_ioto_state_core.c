@@ -5,6 +5,7 @@
 
 #include "agx_ioto_state_core.h"
 
+#include "agx_bytes.h"
 #include "agx_ioto_core.h"
 
 #include <stdlib.h>
@@ -24,19 +25,10 @@ static const uint8_t agx_ioto_e4[4] = {2, 0, 1, 3};
 static enum agx_ioto_state_encoding
 agx_ioto_state_target_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
+   switch (agx_chip_ioto_generation(chip)) {
+   case AGX_IOTO_GENERATION_GPU0:
       return AGX_IOTO_STATE_ENCODING_GPU0;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   case AGX_IOTO_GENERATION_GPU1:
       return AGX_IOTO_STATE_ENCODING_GPU1;
    default:
       return AGX_IOTO_STATE_ENCODING_UNSUPPORTED;
@@ -336,11 +328,7 @@ agx_ioto_state_pack_record(enum agx_chip chip,
       staged[i * 2 + 1] = (uint8_t)(words[i] >> 8);
    }
 
-   /* encode() has already validated every semantic field and writes the
-    * fixed opcode bits for this exact kind.  Re-decoding the bytes here only
-    * repeats the same prefix checks and copies them through a temporary
-    * record.  The decoder remains the independent oracle in the exhaustive
-    * packer tests and for externally supplied streams. */
+   /* encode() validates all fields and writes the fixed opcode bits. */
    (void)kind;
    memcpy(output, staged, size);
    return true;
@@ -410,25 +398,10 @@ agx_ioto_g17p_fragment_speclm_build(
          sample_size_B * samples * imageblock->tile_size_px > 32768u)))
       return false;
 
-   /* The SPECLM word holds the stride, in eight-byte units, as a five-bit
-    * field at bit 35, so a sample may hold up to 248 bytes; Apple's own
-    * fragments store eight RGBA32Float targets, 128 bytes a sample.
-    *
-    * The imageblock bound here is structural -- a tile larger than 32 KiB has
-    * nowhere to live. Which tile a given format and sample count actually gets
-    * is agx_select_tile_size()'s policy, and that stays one byte more
-    * conservative than this, so nothing reaches exactly 32768.
-    */
-
-   /* Fresh HAL200 LdShdrTransformFragment witnesses recover three complete
-    * one-sample, eight-byte geometry records.  The low six bits of word 2
-    * distinguish the native 32x32, 32x16 and 16x16 layouts but remain opaque
-    * to the anonymous semantic map, so keep the exact records as seeds.
-    *
-    * The SPECLM word then carries the byte stride in f22 (eight
-    * byte granularity) and log2(samples) in f21.  Patch only those named bit
-    * slices, retaining every opaque geometry and fragment-profile bit.
-    */
+   /* SPECLM encodes the sample stride in 8-byte units (5-bit field at bit 35,
+    * max 248 B/sample) and log2(samples) in word 1 bits 7..8. The tile cannot
+    * exceed 32 KiB. Patch only those fields onto the per-tile-geometry seeds,
+    * preserving the opaque geometry bits in word 2[5:0]. */
    static const uint8_t imageblock_32x32[AGX_IOTO_SPECLM_SIZE] = {
       0x77, 0x00, 0x2a, 0x43, 0x4b, 0x00, 0x00, 0x00,
    };
@@ -554,13 +527,10 @@ agx_ioto_g17p_compiler_ldshdr_pack(
       (uint16_t)(((shader_va >> 47) & 1) |
                  ((uint16_t)agx_ioto_e4[fetch_span] << 1)),
    };
-   uint8_t staged[AGX_IOTO_LDSHDR_SIZE];
-   for (unsigned i = 0; i < 5; ++i) {
-      staged[2 * i] = (uint8_t)words[i];
-      staged[2 * i + 1] = (uint8_t)(words[i] >> 8);
-   }
+   uint8_t *dst = output;
+   for (unsigned i = 0; i < 5; ++i)
+      agx_store_le16(&dst[2 * i], words[i]);
 
-   memcpy(output, staged, sizeof(staged));
    return true;
 }
 
@@ -617,16 +587,8 @@ agx_ioto_g17p_runtime_compute_tail_build_shared(
                                                   &staged))
       return false;
 
-   /* EXP-0024's static sweep encodes `(bytes << 2) | 0x80` in the
-    * second SPECLM dword: byte-size f18 plus enable f24. Vulkan CTS
-    * workgroup_memory_explicit_layout.size.{4096,16384,32768} validates
-    * accesses across the complete allocation on G17P with this encoding.
-    *
-    * Do not apply j700 cb7295b7596's GL-probe-derived fourfold scaling
-    * globally: its 16320-byte limit rejects Vulkan's passing 16/32 KiB
-    * cases. The discrepancy with that probe remains unexplained; it is
-    * not evidence that this Vulkan-qualified allocation is too small.
-    */
+   /* Encode `(bytes << 2) | 0x80` in the second SPECLM dword via byte-size
+    * f18 and enable f24 (supports up to 32 KiB threadgroup memory). */
    struct agx_ioto_state speclm = {0};
    speclm.f[18] = threadgroup_memory_size_B;
    speclm.f[24] = 1;
@@ -695,13 +657,10 @@ agx_ioto_g17p_compiler_spectpr_pack(
                  ((spill_quads & 0x3f) << 10)),
       (uint16_t)((spill_quads >> 6) & 0x3ff),
    };
-   uint8_t staged[AGX_IOTO_SPECTPR_SIZE];
-   for (unsigned i = 0; i < 5; ++i) {
-      staged[2 * i] = (uint8_t)words[i];
-      staged[2 * i + 1] = (uint8_t)(words[i] >> 8);
-   }
+   uint8_t *dst = output;
+   for (unsigned i = 0; i < 5; ++i)
+      agx_store_le16(&dst[2 * i], words[i]);
 
-   memcpy(output, staged, sizeof(staged));
    return true;
 }
 
