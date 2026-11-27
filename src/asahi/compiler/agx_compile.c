@@ -12089,17 +12089,125 @@ agx_nir_shrink_memory_loads_impl(nir_function_impl *impl)
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
+/* A load whose leading channels are never read starts at its first read
+ * channel instead: the AGX3 load's immediate byte offset (added after the
+ * index is scaled) absorbs the skipped elements, so reading only .y or .z of
+ * a vec4 fetches one element rather than two or four.
+ */
+static bool
+agx_shrink_memory_load_start(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_agx &&
+       intr->intrinsic != nir_intrinsic_load_constant_agx)
+      return false;
+
+   const unsigned nr = intr->def.num_components;
+   if (nr <= 1 || !agx_memory_load_format_shrinkable(intr))
+      return false;
+
+   if (nir_intrinsic_access(intr) &
+       (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE))
+      return false;
+
+   if (!agx_def_only_scalar_alu_uses(&intr->def, 0))
+      return false;
+
+   const unsigned mask = nir_def_components_read(&intr->def);
+   if (!mask || (mask & 1))
+      return false;
+
+   const unsigned first = ffs(mask) - 1;
+   const unsigned last = util_last_bit(mask);
+   const unsigned elem_B =
+      util_format_get_blocksize(nir_intrinsic_format(intr));
+   const uint32_t base = nir_intrinsic_base(intr);
+   const int32_t offset_B =
+      (int16_t)(base >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT) + first * elem_B;
+   if (offset_B > INT16_MAX)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   const unsigned new_base =
+      (base & ~AGX_NIR_MEMORY_BYTE_OFFSET_MASK) |
+      ((uint32_t)(uint16_t)offset_B << AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
+   nir_intrinsic_instr *load =
+      nir_intrinsic_instr_create(b->shader, intr->intrinsic);
+   load->num_components = last - first;
+   nir_def_init(&load->instr, &load->def, last - first, intr->def.bit_size);
+   load->src[0] = nir_src_for_ssa(intr->src[0].ssa);
+   load->src[1] = nir_src_for_ssa(intr->src[1].ssa);
+   nir_intrinsic_copy_const_indices(load, intr);
+   nir_intrinsic_set_base(load, new_base);
+   nir_builder_instr_insert(b, &load->instr);
+
+   nir_def *undef = nir_undef(b, 1, intr->def.bit_size);
+   nir_def *chans[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < nr; ++i) {
+      chans[i] = (i >= first && i < last) ? nir_channel(b, &load->def, i - first)
+                                          : undef;
+   }
+
+   nir_def_rewrite_uses(&intr->def, nir_vec(b, chans, nr));
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+agx_nir_shrink_memory_load_starts_impl(nir_function_impl *impl)
+{
+   struct util_dynarray loads;
+   util_dynarray_init(&loads, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (agx_intrinsic_is_memory_load(intr))
+            util_dynarray_append(&loads, intr);
+      }
+   }
+
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+   unsigned count = util_dynarray_num_elements(&loads, nir_intrinsic_instr *);
+   nir_intrinsic_instr **items = (nir_intrinsic_instr **)loads.data;
+
+   for (unsigned i = 0; i < count; ++i) {
+      /* Like the trailing trim, keep loads of a shared address at one shape
+       * so later CSE and select_load can still merge them. */
+      bool shared = false;
+      for (unsigned j = 0; j < count && !shared; ++j)
+         shared = i != j && agx_memory_loads_match(items[i], items[j]);
+
+      if (!shared)
+         progress |= agx_shrink_memory_load_start(&b, items[i]);
+   }
+
+   util_dynarray_fini(&loads);
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
 bool
-agx_nir_shrink_memory_loads(nir_shader *nir)
+agx_nir_shrink_memory_loads(nir_shader *nir, bool byte_offsets)
 {
    nir_divergence_analysis(nir);
 
-   bool progress = false;
+   bool progress = false, start_progress = false;
    nir_foreach_function_impl(impl, nir) {
       progress |= agx_nir_shrink_memory_loads_impl(impl);
+      if (byte_offsets)
+         start_progress |= agx_nir_shrink_memory_load_starts_impl(impl);
    }
 
-   return progress;
+   /* Fold the channel selects through the placeholder vectors. */
+   if (start_progress) {
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
+   return progress || start_progress;
 }
 
 /* Whether a compile with a preamble size forms its preamble. Internal shaders
@@ -12585,7 +12693,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * select_load, and CSE so identical-address loads merge before trimming and
     * uniform vec4->vec3 / divergent power-of-two shrinking saves uniform slots
     * or GPRs without breaking vector register affinity. */
-   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
+   NIR_PASS(_, nir, agx_nir_shrink_memory_loads, byte_indices || m5);
 
    NIR_PASS(sub_progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
    if (g18_scans)
