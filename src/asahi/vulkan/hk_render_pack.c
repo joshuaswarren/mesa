@@ -205,29 +205,21 @@ static bool
 attachment_set_merge(struct hk_drm_attachment_set *dst,
                      const struct hk_drm_attachment_set *src, bool apply)
 {
-   unsigned count = dst->count;
-   for (unsigned i = 0; i < src->count; ++i) {
-      const struct drm_asahi_attachment att = src->list[i];
-      bool found = false;
-      for (unsigned j = 0; j < count; ++j) {
-         if (dst->list[j].pointer == att.pointer &&
-             dst->list[j].size == att.size) {
-            found = true;
-            break;
-         }
-      }
-      if (found)
-         continue;
-      if (count >= ARRAY_SIZE(dst->list))
+   struct hk_drm_attachment_set merged;
+   hk_drm_attachment_set_init(&merged);
+   merged.complete = dst->complete && src->complete;
+   for (unsigned i = 0; i < dst->count; ++i) {
+      if (!hk_drm_attachment_set_add(&merged, dst->list[i].pointer,
+                                     dst->list[i].size))
          return false;
-      if (apply)
-         dst->list[count] = att;
-      count++;
    }
-   if (apply) {
-      dst->count = count;
-      dst->complete &= src->complete;
+   for (unsigned i = 0; i < src->count; ++i) {
+      if (!hk_drm_attachment_set_add(&merged, src->list[i].pointer,
+                                     src->list[i].size))
+         return false;
    }
+   if (apply)
+      *dst = merged;
    return true;
 }
 

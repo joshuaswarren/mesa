@@ -641,6 +641,58 @@ test_boundary(void)
    as->m5_non_local_src = false;
    struct hk_cmd_buffer *c_after = split(5);
    T("no member continues after a resolving tail", boundary(b, c_after));
+
+   /* Near-full attachment set with multiple resolve targets and poisoned
+    * unused list slots: dry-run boundary() and real hk_render_pack_add() must
+    * compute the exact same coalesced union via hk_drm_attachment_set_add(). */
+   struct hk_cmd_buffer *fa = split(10), *fb = split(20);
+   struct hk_cs *fas = first_cs(fa), *fbs = first_cs(fb);
+   fas->cr.whole_attachments = fbs->cr.whole_attachments = true;
+   fb->render_pack.head_pass.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   fb->render_pack.head_pass.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   fb->render_pack.tail = false;
+   hk_drm_attachment_set_init(&fas->fragment_attachments);
+   hk_drm_attachment_set_init(&fbs->fragment_attachments);
+   for (unsigned i = 0; i < HK_DRM_MAX_FRAGMENT_ATTACHMENTS - 2; ++i) {
+      const uint64_t addr = UINT64_C(0x100000) + (uint64_t)i * 0x10000;
+      hk_drm_attachment_set_add(&fas->fragment_attachments, addr, 0x4000);
+   }
+   /* Poison unused slots in A with the 3rd resolve target to verify dry-run
+    * never scans unwritten slots beyond A's count. */
+   const uint64_t r0 = UINT64_C(0x500000);
+   const uint64_t r1 = UINT64_C(0x600000);
+   const uint64_t r2 = UINT64_C(0x700000);
+   fas->fragment_attachments.list[HK_DRM_MAX_FRAGMENT_ATTACHMENTS - 2] =
+      (struct drm_asahi_attachment){.pointer = r2, .size = 0x4000};
+   fas->fragment_attachments.list[HK_DRM_MAX_FRAGMENT_ATTACHMENTS - 1] =
+      (struct drm_asahi_attachment){.pointer = r1, .size = 0x4000};
+
+   /* B has 2 new disjoint resolve targets plus 1 span overlapping A's first
+    * attachment (3 entries in B; 18 + 3 > 20 without coalescing, but 20 with
+    * hk_drm_attachment_set_add() overlap coalescing). */
+   hk_drm_attachment_set_add(&fbs->fragment_attachments, r0, 0x4000);
+   hk_drm_attachment_set_add(&fbs->fragment_attachments, r1, 0x4000);
+   hk_drm_attachment_set_add(&fbs->fragment_attachments, UINT64_C(0x102000),
+                             0x4000);
+   T("near-full attachment set with coalescing resolve targets packs",
+     !boundary(fa, fb));
+   struct hk_cmd_buffer *fpkt = new_cmd();
+   struct hk_cs *fcs = test_alloc(sizeof(*fcs));
+   util_dynarray_init(&fcs->render_resources, NULL);
+   struct hk_cmd_buffer *fab[] = {fa, fb};
+   hk_render_pack_init(fpkt, fcs, fab, 2);
+   uint8_t fprec = 0;
+   T("near-full attachment set folds cleanly at submit",
+     hk_render_pack_add(fpkt, fcs, fa, fas, true, false, &fprec) &&
+        hk_render_pack_add(fpkt, fcs, fb, fbs, false, true, &fprec) &&
+        fcs->fragment_attachments.count == HK_DRM_MAX_FRAGMENT_ATTACHMENTS &&
+        fcs->fragment_attachments.complete);
+
+   /* Adding a 3rd disjoint resolve target overflows even though A's unused
+    * slot was poisoned with r2. */
+   hk_drm_attachment_set_add(&fbs->fragment_attachments, r2, 0x4000);
+   T("near-full attachment set overflowing with 3rd resolve target refuses",
+     boundary(fa, fb));
 }
 
 /* The tails a submission writes, and that every later submission writes
@@ -994,13 +1046,6 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
    (void)cmd; (void)size; (void)alignment;
    abort();
-}
-
-void
-hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
-{
-   memset(set, 0, sizeof(*set));
-   set->complete = true;
 }
 
 void
