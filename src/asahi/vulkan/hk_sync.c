@@ -561,9 +561,10 @@ void
 hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
-   /* Graphics scope includes availability writes staged on the render.
-    * Materialize their post-graphics stream before taking the CDM cut. */
-   if ((src_kinds & HK_SYNC_GFX) && unlikely(cmd->state.oq_pending_render))
+   /* Query, timestamp, and event scopes include availability writes staged on
+    * the render (HK_SYNC_STAMP). Materialize their post-graphics stream before
+    * taking the CDM cut. */
+   if ((src_kinds & HK_SYNC_STAMP) && unlikely(cmd->state.oq_pending_render))
       hk_flush_oq_pending(cmd);
 
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
@@ -863,6 +864,8 @@ brl_sync_transition_prepare(struct hk_cmd_buffer *cmd, uint8_t src_kinds)
 void
 brl_sync_transition_begin(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    assert(!st->brl_transition_active && !st->kind_override);
    st->brl_transition_active = true;
@@ -2505,8 +2508,18 @@ hk_sync_heap_used(struct hk_cmd_buffer *cmd)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.gfx);
    if (cmd->current_cs.pre_gfx)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.pre_gfx);
-   if (cmd->current_cs.post_gfx)
-      hk_sync_stream_wait_all(cmd, cmd->current_cs.post_gfx);
+   if (cmd->current_cs.post_gfx) {
+      /* A post-graphics stream opened for query availability alone carries
+       * HK_SYNC_STAMP. Once this pass uses the geometry heap, hk_heap()
+       * appends the heap-reset write to it, so promote it to HK_SYNC_GFX so
+       * later heap passes and graphics barriers wait for the reset. */
+      struct hk_cs *post = cmd->current_cs.post_gfx;
+      if (!(post->sync.kind & HK_SYNC_GFX)) {
+         post->sync.kind |= HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+         note_last(cmd, post);
+      }
+      hk_sync_stream_wait_all(cmd, post);
+   }
 }
 
 void

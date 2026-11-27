@@ -3491,8 +3491,11 @@ hk_flush_oq_pending(struct hk_cmd_buffer *cmd)
    if (!count)
       return;
 
+   const uint8_t saved_kind = cmd->sync.kind_override;
+   cmd->sync.kind_override = HK_SYNC_STAMP;
    struct hk_cs *cs =
       hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.post_gfx, true);
+   cmd->sync.kind_override = saved_kind;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
