@@ -2112,6 +2112,49 @@ main(int argc, char **argv)
       plan_on(cbs, 2, 0, false, runs, &rc);
       T("two bounded looping members pack into one packet",
         rc == 1 && runs[0].count == 2);
+
+      /* Observed-duration looping budget (HK_PACK_MAX_OBS_NS). */
+      struct hk_pack_member obs_m[4] = {0};
+      struct hk_cmd_buffer *obs_cbs[4] = {
+         looping(), looping(), looping(), looping(),
+      };
+      struct hk_sync_queue obs_sync = {0};
+      hk_pack_describe_submit(obs_m, device(), &obs_sync, obs_cbs, 4, terminate,
+                              false);
+      const struct hk_pack_limits obs_lim = {
+         .max_attachments = UINT32_MAX,
+         .overhead = 16,
+      };
+      unsigned obs_pm = 0;
+      size_t obs_tot = 0;
+      struct hk_pack_run obs_runs[4];
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = 10ull * 1000000; /* 10 ms each -> 3 fit in 32 ms */
+      unsigned obs_rc =
+         hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping members pack up to HK_PACK_MAX_OBS_NS and split",
+        obs_rc == 1 && obs_runs[0].first == 0 && obs_runs[0].count == 3);
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = 15ull * 1000000; /* 15 ms each -> 2+2 */
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping members form multiple budgeted packets",
+        obs_rc == 2 && obs_runs[0].count == 2 && obs_runs[1].count == 2);
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = HK_PACK_MAX_OBS_NS + 1;
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping member over HK_PACK_MAX_OBS_NS does not pack",
+        obs_rc == 0);
+
+      obs_m[0].obs_ns = 5ull * 1000000;
+      obs_m[1].obs_ns = 0; /* unobserved */
+      obs_m[2].obs_ns = 5ull * 1000000;
+      obs_m[3].obs_ns = 5ull * 1000000;
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("unobserved looping member does not join observed looping packet",
+        obs_rc == 1 && obs_runs[0].first == 2 && obs_runs[0].count == 2);
    }
 
    test_packet_reuse(false);

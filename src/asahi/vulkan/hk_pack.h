@@ -37,6 +37,9 @@ struct hk_sync_queue;
 #define HK_PACK_MAX_DISPATCHES 256u
 #define HK_PACK_MAX_THREADS (UINT64_C(1) << 28)
 #define HK_PACK_MAX_STATIC_WORK (UINT64_C(1) << 35)
+#define HK_PACK_MAX_OBS_NS (UINT64_C(32) * 1000000)
+#define HK_PACK_OBS_ADMIT_NS (UINT64_C(200) * 1000000)
+#define HK_PACK_OBS_BACKOFF_NS (UINT64_C(150) * 1000000)
 #define HK_PACK_CDM_TERMINATE_MAX 8u
 
 /* One command buffer of a submission, as the planner sees it. */
@@ -45,6 +48,9 @@ struct hk_pack_member {
    const struct hk_cs *cs;
    /* Stream bytes before the terminate. */
    size_t bytes;
+   /* Observed conservative upper-bound duration (ns) for a looping member
+    * from completed queue history; 0 when unobserved (at most one per run). */
+   uint64_t obs_ns;
    /* Synchronization kinds of the stream. */
    uint8_t kinds;
    /* Render (VDM) kinds the stream itself waits for, and per stream kind k

@@ -303,6 +303,7 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
    return cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
           cs->pack_threads <= HK_PACK_MAX_THREADS &&
           cs->pack_static_work <= HK_PACK_MAX_STATIC_WORK &&
+          (!cs->pack_loops || m->obs_ns <= HK_PACK_MAX_OBS_NS) &&
           m->bytes <= UINT32_MAX - limits->overhead &&
           cs->compute_resources.size <= UINT16_MAX &&
           cs->compute_attachments.count <= limits->max_attachments;
@@ -335,7 +336,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    size_t resources = 0;
    uint32_t attachments = 0;
    uint8_t kinds = 0, waits = 0, tails[HK_SYNC_NUM_KINDS] = {0};
-   bool loops = false;
+   bool unbounded_loops = false;
+   uint64_t obs_ns = 0;
 
    *packed_members = 0;
    *total = 0;
@@ -343,12 +345,16 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    for (unsigned i = 0; i <= n; ++i) {
       const struct hk_pack_member *m = i < n ? &members[i] : NULL;
       const struct hk_cs *cs = m ? m->cs : NULL;
+      const bool m_unbounded = cs && cs->pack_loops && !m->obs_ns;
+      const uint64_t m_obs = (cs && cs->pack_loops) ? m->obs_ns : 0;
 
       const bool fits = cs && run.count &&
          !(m->render_ran && (m->kinds & ~kinds)) &&
          !((m->render_waits | hk_pack_tail(tails, kinds | m->kinds)) &
            ~waits) &&
-         !(loops && cs->pack_loops) &&
+         !(unbounded_loops && cs->pack_loops) &&
+         !(m_unbounded && obs_ns > 0) &&
+         m_obs <= HK_PACK_MAX_OBS_NS - obs_ns &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
          cs->pack_threads <= HK_PACK_MAX_THREADS - threads &&
          cs->pack_static_work <= HK_PACK_MAX_STATIC_WORK - work &&
@@ -367,7 +373,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          kinds |= m->kinds;
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
             tails[k] |= m->render_tail[k];
-         loops |= cs->pack_loops;
+         unbounded_loops |= m_unbounded;
+         obs_ns += m_obs;
          continue;
       }
 
@@ -383,6 +390,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       dispatches = threads = work = 0;
       resources = 0;
       attachments = 0;
+      unbounded_loops = false;
+      obs_ns = 0;
 
       /* Start a new run with this member when it is within the bounds. */
       if (cs && hk_pack_within_bounds(m, limits)) {
@@ -395,7 +404,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          kinds = m->kinds;
          waits = m->render_waits;
          memcpy(tails, m->render_tail, sizeof(tails));
-         loops = cs->pack_loops;
+         unbounded_loops = m_unbounded;
+         obs_ns = m_obs;
       }
    }
 

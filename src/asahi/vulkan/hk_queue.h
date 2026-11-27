@@ -16,6 +16,19 @@ struct hk_device;
 struct hk_packed_submit;
 struct hk_render_packet;
 
+#define HK_PACK_OBS_SLOTS 8u
+
+struct hk_pack_obs_entry {
+   uint64_t hash;
+   uint64_t pending_pt;
+   uint64_t submit_ns;
+   uint64_t obs_per_loop_ns;
+   uint64_t lru_tick;
+   uint32_t cb_count;
+   uint32_t loop_count;
+   bool in_flight_packed;
+};
+
 /* Queues advertised per family when the kernel reports independent queues
  * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
  * device that keep a kernel queue of their own (hk_queue_independent_budget()).
@@ -60,6 +73,9 @@ struct hk_queue {
        * signalled, updated monotonically via hk_queue_note_signalled(). Every
        * value at or below it is complete. */
       uint64_t signalled_value;
+      /* Monotonic timestamp (ns) when signalled_value was last observed
+       * advancing while an observed-duration packing measurement was pending. */
+      uint64_t signalled_ns;
 
       /* Latest timeline point that received the waits of a submission
        * without control streams (queue_submit_empty()), 0 once it is known
@@ -131,6 +147,12 @@ struct hk_queue {
       struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
+      /* Observed completion durations for repeated multi-CB looping
+       * submissions, used to budget packets safely below firmware timeouts. */
+      struct hk_pack_obs_entry obs[HK_PACK_OBS_SLOTS];
+      uint32_t obs_pending;
+      uint64_t obs_epoch;
+      uint64_t obs_tick;
    } pack;
 
    /* Reusable scratch and packets for submit-time render packing
