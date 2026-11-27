@@ -325,6 +325,14 @@ enum vk_sync_flags {
 struct vk_sync {
    const struct vk_sync_type *type;
    enum vk_sync_flags flags;
+
+   /** Lower bound on the pending timeline value (or 1 for binary) already
+    * submitted or signaled in the underlying primitive for a non-shareable,
+    * non-shared sync.  Updated with release semantics after the backend
+    * signal/submit succeeds, and cleared before any reset, move, or
+    * import/export operation.
+    */
+   uint64_t pending_value;
 };
 
 /* See VkSemaphoreSubmitInfo */
@@ -424,6 +432,13 @@ VkResult MUST_CHECK vk_sync_set_win32_export_params(struct vk_device *device,
 VkResult MUST_CHECK vk_sync_move(struct vk_device *device,
                                  struct vk_sync *dst,
                                  struct vk_sync *src);
+
+void vk_sync_note_pending(struct vk_sync *sync, uint64_t value);
+
+void vk_sync_clear_pending(struct vk_sync *sync);
+
+bool vk_sync_wait_is_known_pending(struct vk_sync *sync,
+                                   uint64_t wait_value);
 
 struct vk_sync_timeline_point;
 

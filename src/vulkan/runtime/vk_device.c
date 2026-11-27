@@ -803,6 +803,9 @@ vk_device_copy_semaphore_payloads(struct vk_device *device,
                                           signal_count, signals);
       if (result != VK_SUCCESS)
          goto fail;
+
+      for (uint32_t i = 0; i < signal_count; i++)
+         vk_sync_note_pending(signals[i].sync, signals[i].signal_value);
    }
 
    /* Reset any syncs which were waited on but not signaled */
