@@ -117,3 +117,68 @@ hk_m5_pass_merge_non_local_src(VkPipelineStageFlags2 src_stages,
       hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
    return from_non_local_gfx && to_gfx;
 }
+
+/* Whether a vkCmdPipelineBarrier2 dependency's first synchronization scope
+ * covers fragment-shader image reads (either directly or through a logically
+ * later graphics or global stage). Folding a trailing vkCmdResolveImage2 into
+ * the preceding render pass's EOT when its fragment shaders read images would
+ * otherwise allow finished tiles to write the resolve destination while other
+ * tiles still sample it. */
+static inline bool
+hk_resolve_fold_barrier_orders_fs(const VkDependencyInfo *info)
+{
+   const VkPipelineStageFlags2 fs_stages =
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      if (info->pMemoryBarriers[i].srcStageMask & fs_stages)
+         return true;
+   }
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      if (info->pBufferMemoryBarriers[i].srcStageMask & fs_stages)
+         return true;
+   }
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      if (info->pImageMemoryBarriers[i].srcStageMask & fs_stages)
+         return true;
+   }
+   return false;
+}
+
+static inline bool
+hk_resolve_fold_fs_hazard(bool fs_reads_images, bool fs_barrier_seen)
+{
+   return fs_reads_images && fs_barrier_seen;
+}
+
+/* Resulting rendering flags when hk_agx3_resume_suspended_pass() reopens a
+ * suspended render pass instance in place in the same command buffer. */
+static inline VkRenderingFlagBits
+hk_agx3_resumed_render_flags(VkRenderingFlagBits prev_flags,
+                             VkRenderingFlags resume_flags)
+{
+   return (prev_flags & ~VK_RENDERING_SUSPENDING_BIT) |
+          (resume_flags &
+           (VK_RENDERING_SUSPENDING_BIT |
+            VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT));
+}
+
+/* Whether a render pass instance must stay off G17P direct colour resolve
+ * (and preserve_resolve_outside). A pass that is suspending or resuming cannot
+ * direct-resolve, and a pass reopened in-CB after beginning suspended
+ * (resumed_in_cb) lacked begin-time direct-resolve setup (loaded_resolve ->
+ * process_empty_tiles, fragment attachment tracking, and sync footprint), so
+ * end-of-pass BG/EOT rebuilds must keep it on the post-pass resolve path. */
+static inline bool
+hk_render_forbids_direct_resolve(VkRenderingFlags flags, bool resumed_in_cb)
+{
+   return resumed_in_cb ||
+          (flags & (VK_RENDERING_SUSPENDING_BIT |
+                    VK_RENDERING_RESUMING_BIT)) != 0;
+}

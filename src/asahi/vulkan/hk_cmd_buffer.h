@@ -885,6 +885,11 @@ struct hk_render_registers {
 struct hk_rendering_state {
    VkRenderingFlagBits flags;
 
+   /* Reopened in-CB from a suspended instance (hk_agx3_resume_suspended_pass).
+    * Begin-time direct-resolve setup was skipped while suspended, so late EOT
+    * rebuilds must not switch into g17p_direct_color_resolve. */
+   bool resumed_in_cb;
+
    /* May have written storage memory/XFB anywhere in this API pass, including
     * before a physical render split. Used only for conservative barriers. */
    bool barrier_shader_writes;

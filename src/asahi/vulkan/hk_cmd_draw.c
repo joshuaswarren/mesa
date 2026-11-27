@@ -511,8 +511,8 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
       }
 
       const bool suspend_resume =
-         (render->flags &
-          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+         hk_render_forbids_direct_resolve(render->flags,
+                                          render->resumed_in_cb);
       bool any_unstored_resolve = false;
       unsigned color_and_resolve_views = 0;
       for (unsigned rt = 0; rt < info->colorAttachmentCount; ++rt) {
@@ -1148,8 +1148,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    const bool r11g11b10_own_class = hk_eot_r11g11b10_own_class(&dev->dev);
    const bool suspend_resume =
-      (render->flags &
-       (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+      hk_render_forbids_direct_resolve(render->flags, render->resumed_in_cb);
    /* Single-target direct resolve supports partial renderArea via
     * preserve_resolve_outside, while refusing sparse multiview viewMask.
     * Both are false whenever incomplete_render_area is false. */
@@ -1824,9 +1823,8 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
       .layers = cmd->state.gfx.render.cr.layers,
       .color_attachment_count = info->colorAttachmentCount,
       .incomplete_render_area = incomplete_render_area,
-      .suspend_resume =
-         (cmd->state.gfx.render.flags &
-          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0,
+      .suspend_resume = hk_render_forbids_direct_resolve(
+         cmd->state.gfx.render.flags, cmd->state.gfx.render.resumed_in_cb),
    };
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
@@ -3549,6 +3547,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area, NULL);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
+   assert(!(render->resumed_in_cb && !m5 && render->g17p_direct_color_resolve));
 
    cs->render_pack_full_bg_main = cs->cr.bg.main;
    cs->render_pack_full_eot_main = cs->cr.eot.main;
@@ -4901,6 +4900,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 
    *render = *prev;
    render->flags = info->flags;
+   render->resumed_in_cb = false;
 
    if (color_eot_changed) {
       render->g17p_direct_color_resolve = false;
@@ -5161,11 +5161,8 @@ hk_agx3_resume_suspended_pass(struct hk_cmd_buffer *cmd,
    cmd->current_cs.gfx = cs;
 
    *render = *prev;
-   render->flags =
-      (prev->flags & ~VK_RENDERING_SUSPENDING_BIT) |
-      (info->flags &
-       (VK_RENDERING_SUSPENDING_BIT |
-        VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT));
+   render->flags = hk_agx3_resumed_render_flags(prev->flags, info->flags);
+   render->resumed_in_cb = true;
 
    cmd->render_pack.tail_open = false;
    if (cmd->render_pack.head && cmd->render_pack.head_stream == cs) {
@@ -7346,7 +7343,7 @@ hk_try_fold_msaa_resolve(struct hk_cmd_buffer *cmd,
        list_last_entry(&cmd->control_streams, struct hk_cs, node) != cs ||
        cmd->sync.next_seq != p.next_seq ||
        cs->timestamp.start.handle || cs->timestamp.end.handle ||
-       (cs->fs_reads_images && p.fs_barrier_seen) ||
+       hk_resolve_fold_fs_hazard(cs->fs_reads_images, p.fs_barrier_seen) ||
        info->regionCount != 1)
       return false;
 

@@ -1631,22 +1631,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass) {
-      const VkPipelineStageFlags2 fs_stages =
-         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
-         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
-         VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-      bool fs_bar = false;
-      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->memoryBarrierCount; ++i)
-         fs_bar = (pDependencyInfo->pMemoryBarriers[i].srcStageMask & fs_stages) != 0;
-      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->bufferMemoryBarrierCount; ++i)
-         fs_bar = (pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask & fs_stages) != 0;
-      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->imageMemoryBarrierCount; ++i)
-         fs_bar = (pDependencyInfo->pImageMemoryBarriers[i].srcStageMask & fs_stages) != 0;
-      if (fs_bar)
-         cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
-   }
+   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass &&
+       hk_resolve_fold_barrier_orders_fs(pDependencyInfo))
+      cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
 
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
