@@ -383,6 +383,7 @@ struct hk_shader {
     * draw's colour epilog inlined. NULL when the shape is not eligible. */
    void *g17p_mono_nir;
    size_t g17p_mono_nir_size;
+   struct nir_shader *g17p_mono_postopt_nir;
    struct agx_shader_key g17p_mono_key;
    bool g17p_mono_preoptimized;
 

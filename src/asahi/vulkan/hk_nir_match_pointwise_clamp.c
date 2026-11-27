@@ -397,7 +397,11 @@ hk_nir_match_pointwise_clamp(const nir_shader *shader,
        shader->info.workgroup_size_variable ||
        !shader->info.workgroup_size[0] ||
        shader->info.workgroup_size[1] != 1 ||
-       shader->info.workgroup_size[2] != 1)
+       shader->info.workgroup_size[2] != 1 ||
+       shader->info.shared_size != 0 ||
+       shader->info.num_images > 0 ||
+       shader->info.num_textures > 0 ||
+       shader->info.num_ubos > 0)
       return false;
 
    nir_function_impl *impl = NULL;

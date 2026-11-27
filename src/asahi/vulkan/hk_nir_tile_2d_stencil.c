@@ -6159,7 +6159,9 @@ hk_nir_match_2d_stencil(const nir_shader *orig_nir, uint32_t set_layout_count,
        orig_nir->info.workgroup_size[0] == 0 ||
        orig_nir->info.workgroup_size[1] == 0 ||
        orig_nir->info.workgroup_size[2] != 1 ||
-       orig_nir->info.ray_queries > 0)
+       orig_nir->info.ray_queries > 0 ||
+       orig_nir->info.num_images > 0 || orig_nir->info.num_textures > 0 ||
+       orig_nir->info.num_ubos > 0)
       return false;
 
    nir_foreach_variable_in_shader(var, orig_nir) {
