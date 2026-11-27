@@ -12787,7 +12787,14 @@ pre_preamble:
             (agx3b || m5) ? move_all : move_all & ~nir_move_load_ssbo);
    if ((agx3b || m5) && !g18_scans)
       NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
-   NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
+   /* Do not move inputs/UBOs down into the tilebuffer interlock critical
+    * section (load_local_pixel_agx / wait_pix #8 .. pixrel). */
+   nir_move_options move_late = move_all & ~nir_move_load_ssbo;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       nir->info.fs.uses_fbfetch_output)
+      move_late &= ~(nir_move_load_input | nir_move_load_frag_coord |
+                     nir_move_load_ubo);
+   NIR_PASS(_, nir, nir_opt_move, move_late);
    NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
 
    /* After lowering phis to scalar, we must copy prop/DCE for correctness. RA
@@ -16834,7 +16841,12 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
                        nir_move_alu);
 
       NIR_PASS(_, nir, nir_opt_sink, move_all);
-      NIR_PASS(_, nir, nir_opt_move, move_all);
+      nir_move_options move_pre = move_all;
+      if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+          nir->info.fs.uses_fbfetch_output)
+         move_pre &= ~(nir_move_load_input | nir_move_load_frag_coord |
+                       nir_move_load_ubo);
+      NIR_PASS(_, nir, nir_opt_move, move_pre);
    }
    /* Local-memory offsets are narrowed before the key-dependent optimizer so
     * conversion lowering and cleanup remain part of the normal pipeline.
