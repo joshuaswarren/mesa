@@ -87,9 +87,9 @@ enum agx_chip_cap {
 
    /* Register allocation tie-breaks co-read GPR pairs across the three 32-bit
     * register banks ((reg / 2) % 3) and coalesces single-use loop RMW
-    * accumulator chains on non-preamble shaders. Enabled on G17P (HAL200); off
-    * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
-    * hardware A/B and CTS rows are collected. */
+    * accumulator chains on non-preamble shaders. Measured and qualified on
+    * G17P (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G18G,
+    * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 
    /* Private Gen10 colour and depth compression. In Gallium: single-level,
@@ -163,6 +163,20 @@ enum agx_chip_cap {
     * reuse, push-descriptor elision, and direct fragment-root comparisons
     * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
+
+   /* Compute shaders skip the bottom-up register-pressure scheduler: it
+    * moves each load next to its use, which serializes the memory round
+    * trips of small compute kernels (the LLM decode chain). The ILP
+    * scheduler still runs. Measured on G13G and G13X (+1.7% tokens/s,
+    * bit-identical results); other generations keep the scheduler until
+    * they are measured. */
+   AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED = 1u << 23,
+
+   /* Constant deltas between a block's shared-memory accesses fold into the
+    * lload/lstore index immediate (4 elements of the access type per unit).
+    * Measured on G13G and G13X; other generations keep the unfolded
+    * addresses until they are measured. */
+   AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -170,11 +184,17 @@ enum agx_chip_cap {
    (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
     AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
 
+/* What the measured G13 chips (G13G, G13X) add over the AGX2 set. */
+#define AGX_CAPS_G13                                                           \
+   (AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |                      \
+    AGX_CAP_FOLD_SHARED_OFFSETS)
+
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
    (AGX_CAP_NATIVE_INDIRECT_COMPUTE | AGX_CAP_NATIVE_IMAGEBLOCK |              \
     AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
-    AGX_CAP_DESCRIPTOR_BUFFER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_MOD3_REG_BANK_RA |                     \
+    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
@@ -182,18 +202,18 @@ enum agx_chip_cap {
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_BINDING |           \
     AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
-    AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
-    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |                                    \
-    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
+    AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                                      \
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_CDM_OVERLAP_SPLIT |        \
     AGX_CAP_CACHED_CMD_MEMORY)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
-    AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
+    AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS |            \
+    AGX_CAP_COOPERATIVE_MATRIX | AGX_CAP_SPARSE_BINDING |                      \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |      \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN10_2D_COMPRESSION |              \
+    AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |             \
     AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY)
 
 /*
@@ -204,8 +224,8 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
+   X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \

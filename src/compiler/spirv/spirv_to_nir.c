@@ -4862,6 +4862,21 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    SpvMemorySemanticsMask after_semantics;
    vtn_split_barrier_semantics(b, semantics, &before_semantics, &after_semantics);
 
+   /* MakeTexelAvailable and MakeTexelVisible apply to the texel of this very
+    * access, unlike MakeAvailable on a release atomic. The split above puts
+    * MakeAvailable before the operation and MakeVisible after it, which is
+    * right for atomics but leaves a MakeTexelAvailable write outside its own
+    * availability operation and a MakeTexelVisible read unordered after it.
+    * Image reads and writes carry no Acquire/Release bits, so swap the sides:
+    * a write is made available after it, a read is made visible before it.
+    */
+   if (opcode == SpvOpImageRead || opcode == SpvOpImageSparseRead ||
+       opcode == SpvOpImageWrite) {
+      SpvMemorySemanticsMask tmp = before_semantics;
+      before_semantics = after_semantics;
+      after_semantics = tmp;
+   }
+
    if (before_semantics)
       vtn_emit_memory_barrier(b, scope, before_semantics);
 

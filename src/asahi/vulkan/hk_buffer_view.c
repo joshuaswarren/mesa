@@ -86,6 +86,12 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
    return features;
 }
 
+static bool
+hk_texel_rgb32(enum pipe_format format)
+{
+   return ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -102,9 +108,9 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    enum pipe_format format = hk_format_to_pipe_format(view->vk.format);
    const struct util_format_description *desc = util_format_description(format);
+   const unsigned blocksize_B = util_format_get_blocksize(format);
    const bool g17p = agx_chip_agx3_path(device->dev.chip);
-   const bool rgb32 =
-      ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
+   const bool rgb32 = hk_texel_rgb32(format);
 
    uint8_t format_swizzle[4] = {
       desc->swizzle[0],
@@ -141,18 +147,36 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
     */
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
-   uint32_t tail_offset_B = view->vk.offset & 0xf;
+   const uint32_t tail_offset_B = view->vk.offset & 0xf;
    /* The G17P metadata names the view's exact address
-    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits component-aligned
-    * offsets, which cannot in general be expressed as a whole-texel tail, and
-    * it reads only that address; its unused hardware texture stays aligned.
+    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits 4-byte
+    * component-aligned offsets, which cannot in general be expressed as a
+    * whole-texel tail: G17P reads metadata_base directly, while AGX2 keeps the
+    * 16-byte-aligned descriptor address and stores the 4-byte word tail (0..3)
+    * in buffer_offset_sw for libagx_texture_load_rgb32(). In both cases the
+    * unused hardware 2D texture stays aligned with no whole-texel tail.
     */
    const uint64_t metadata_base = sampled_base + tail_offset_B;
-   if (g17p && rgb32)
-      tail_offset_B = 0;
-   uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
-   assert(tail_offset_el * util_format_get_blocksize(format) == tail_offset_B &&
-          "must be texel aligned");
+   uint32_t tail_offset_el = 0;
+   uint32_t texture_buffer_offset_sw = 0;
+   if (rgb32) {
+      assert(tail_offset_B % 4 == 0 && "must be component aligned");
+      texture_buffer_offset_sw = tail_offset_B / 4;
+   } else {
+      tail_offset_el = tail_offset_B / blocksize_B;
+      assert(tail_offset_el * blocksize_B == tail_offset_B &&
+             "must be texel aligned");
+      texture_buffer_offset_sw = tail_offset_el;
+   }
+
+   if (view->vk.elements > AGX_TEXTURE_BUFFER_MAX_SIZE - tail_offset_el) {
+      vk_buffer_view_destroy(&device->vk, pAllocator, &view->vk);
+      return vk_error(device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
+   const uint32_t height =
+      MAX2(DIV_ROUND_UP(view->vk.elements + tail_offset_el,
+                        AGX_TEXTURE_BUFFER_WIDTH),
+           1);
 
    const unsigned generation =
       agx_chip_descriptor_generation(device->dev.chip);
@@ -169,20 +193,19 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
 
       texture.width = AGX_TEXTURE_BUFFER_WIDTH;
-      texture.height = DIV_ROUND_UP(view->vk.elements, texture.width);
+      texture.height = height;
       texture.first_level = texture.last_level = 0;
 
       texture.address = sampled_base;
       texture.buffer_size_sw = view->vk.elements;
-      texture.buffer_offset_sw = tail_offset_el;
+      texture.buffer_offset_sw = texture_buffer_offset_sw;
 
       texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
       texture.srgb_2_channel =
          texture.srgb && util_format_colormask(desc) == 0x3;
 
       texture.depth = 1;
-      texture.stride =
-         (texture.width * util_format_get_blocksize(format)) - 16;
+      texture.stride = (texture.width * blocksize_B) - 16;
    }
    if (g17p && rgb32) {
       texture.channels = AGX_CHANNELS_R32;
@@ -195,8 +218,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * fetches (AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET); leave zero for
        * non-power-of-two emulated RGB32, which uses raw loads.
        */
-      const uint32_t sparse = hk_buffer_sparse_texel_word(
-         buffer, util_format_get_blocksize(format));
+      const uint32_t sparse = hk_buffer_sparse_texel_word(buffer, blocksize_B);
 
       view->buffer_metadata = (struct hk_g17p_buffer_texture_metadata){
          .elements = view->vk.elements,
@@ -209,8 +231,6 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * explicit metadata, while hardware sees the aligned base texture.
        */
       texture.buffer_offset_sw = 0;
-      texture.height = DIV_ROUND_UP(view->vk.elements + tail_offset_el,
-                                    texture.width);
    }
    if (!hk_pack_native_texture(generation, &view->tex, &texture)) {
       vk_buffer_view_destroy(&device->vk, pAllocator, &view->vk);
@@ -242,15 +262,18 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       pbe.buffer_offset_sw = tail_offset_el;
 
       pbe.width = AGX_TEXTURE_BUFFER_WIDTH;
-      pbe.height = DIV_ROUND_UP(view->vk.elements, pbe.width);
+      pbe.height = height;
       pbe.level = 0;
-      pbe.stride = (pbe.width * util_format_get_blocksize(format)) - 4;
+      pbe.stride = (pbe.width * blocksize_B) - 4;
       pbe.layers = 1;
       pbe.levels = 1;
    }
 
    if (hk_native_pbe_supported(generation)) {
-      hk_pack_native_pbe(generation, &view->pbe, &pbe);
+      if (rgb32)
+         hk_set_null_native_pbe(generation, &view->pbe);
+      else
+         hk_pack_native_pbe(generation, &view->pbe, &pbe);
    } else if (agx_chip_agx3_path(device->dev.chip)) {
       /* AGX3's linear PBE is architectural and has no software tail field,
        * exactly like the texture above: the store lowering adds the tail from
@@ -259,7 +282,6 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * null PBE.
        */
       pbe.buffer_offset_sw = 0;
-      pbe.height = DIV_ROUND_UP(view->vk.elements + tail_offset_el, pbe.width);
       if (!hk_pack_native_pbe(generation, &view->pbe, &pbe))
          hk_set_null_native_pbe(generation, &view->pbe);
    } else {
@@ -333,12 +355,6 @@ struct hk_texel_windows {
    /* hk_texel_window_key -> heap index */
    struct hash_table *dedicated;
 };
-
-static bool
-hk_texel_rgb32(enum pipe_format format)
-{
-   return ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
-}
 
 /* The buffer texture hk_CreateBufferView() builds for G17P, over `height`
  * rows of AGX_TEXTURE_BUFFER_WIDTH texels at `base`. */
@@ -639,82 +655,92 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
          const struct util_format_description *desc =
             util_format_description(format);
          const unsigned blocksize_B = util_format_get_blocksize(format);
+         const bool rgb32 = hk_texel_rgb32(format);
          const uint64_t elements = info->range / blocksize_B;
          const uint64_t rw_base = info->address & ~UINT64_C(0xf);
          const uint32_t tail_offset_B = info->address & 0xf;
-         const uint32_t tail_offset_el = tail_offset_B / blocksize_B;
+         const bool aligned =
+            rgb32 ? (tail_offset_B % 4 == 0) : (tail_offset_B % blocksize_B == 0);
+         const uint32_t tail_offset_el = rgb32 ? 0 : tail_offset_B / blocksize_B;
+         const uint32_t buffer_offset_sw =
+            rgb32 ? tail_offset_B / 4 : tail_offset_el;
          const uint64_t sampled_base =
             hk_sparse_address_is_sparse(dev, info->address)
                ? rw_base + dev->dev.sparse_ro_offset
                : rw_base;
+         const bool in_bounds =
+            elements <= AGX_TEXTURE_BUFFER_MAX_SIZE - tail_offset_el;
 
-         uint8_t format_swizzle[4] = {
-            desc->swizzle[0],
-            desc->swizzle[1],
-            desc->swizzle[2],
-            desc->swizzle[3],
-         };
-         if (util_format_is_depth_or_stencil(format)) {
-            format_swizzle[0] = 0;
-            format_swizzle[1] = 0;
-            format_swizzle[2] = 0;
-            format_swizzle[3] = 0;
-         }
-
-         struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
-         texture.dimension = AGX_TEXTURE_DIMENSION_2D;
-         texture.layout = AGX_LAYOUT_LINEAR;
-         texture.channels = ail_pixel_format[format].channels;
-         texture.type = ail_pixel_format[format].type;
-         texture.swizzle_r = agx_channel_from_pipe(format_swizzle[0]);
-         texture.swizzle_g = agx_channel_from_pipe(format_swizzle[1]);
-         texture.swizzle_b = agx_channel_from_pipe(format_swizzle[2]);
-         texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
-         texture.width = AGX_TEXTURE_BUFFER_WIDTH;
-         texture.height =
-            MAX2(DIV_ROUND_UP(elements, AGX_TEXTURE_BUFFER_WIDTH), 1);
-         texture.first_level = texture.last_level = 0;
-         texture.address = sampled_base;
-         texture.buffer_size_sw = elements;
-         texture.buffer_offset_sw = tail_offset_el;
-         texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
-         texture.srgb_2_channel =
-            texture.srgb && util_format_colormask(desc) == 0x3;
-         texture.depth = 1;
-         texture.stride = (texture.width * blocksize_B) - 16;
-
-         ok = (tail_offset_B % blocksize_B == 0) &&
-              texture.height <= AGX_TEXTURE_BUFFER_MAX_HEIGHT &&
-              hk_pack_native_texture(generation, &tex, &texture);
-         if (ok && storage) {
-            struct AGX_PBE pbe_cfg = {AGX_PBE_header};
-            pbe_cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
-            pbe_cfg.layout = AGX_LAYOUT_LINEAR;
-            pbe_cfg.channels = ail_pixel_format[format].channels;
-            pbe_cfg.type = ail_pixel_format[format].type;
-            pbe_cfg.srgb = util_format_is_srgb(format);
-            for (unsigned i = 0; i < desc->nr_channels; ++i) {
-               if (desc->swizzle[i] == 0)
-                  pbe_cfg.swizzle_r = i;
-               else if (desc->swizzle[i] == 1)
-                  pbe_cfg.swizzle_g = i;
-               else if (desc->swizzle[i] == 2)
-                  pbe_cfg.swizzle_b = i;
-               else if (desc->swizzle[i] == 3)
-                  pbe_cfg.swizzle_a = i;
+         if (aligned && in_bounds) {
+            const uint32_t height =
+               MAX2(DIV_ROUND_UP(elements + tail_offset_el,
+                                 AGX_TEXTURE_BUFFER_WIDTH),
+                    1);
+            uint8_t format_swizzle[4] = {
+               desc->swizzle[0],
+               desc->swizzle[1],
+               desc->swizzle[2],
+               desc->swizzle[3],
+            };
+            if (util_format_is_depth_or_stencil(format)) {
+               format_swizzle[0] = 0;
+               format_swizzle[1] = 0;
+               format_swizzle[2] = 0;
+               format_swizzle[3] = 0;
             }
-            pbe_cfg.buffer = rw_base;
-            pbe_cfg.buffer_offset_sw = tail_offset_el;
-            pbe_cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
-            pbe_cfg.height = texture.height;
-            pbe_cfg.level = 0;
-            pbe_cfg.stride = (pbe_cfg.width * blocksize_B) - 4;
-            pbe_cfg.layers = 1;
-            pbe_cfg.levels = 1;
-            if (!hk_pack_native_pbe(generation, &pbe, &pbe_cfg))
+
+            struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
+            texture.dimension = AGX_TEXTURE_DIMENSION_2D;
+            texture.layout = AGX_LAYOUT_LINEAR;
+            texture.channels = ail_pixel_format[format].channels;
+            texture.type = ail_pixel_format[format].type;
+            texture.swizzle_r = agx_channel_from_pipe(format_swizzle[0]);
+            texture.swizzle_g = agx_channel_from_pipe(format_swizzle[1]);
+            texture.swizzle_b = agx_channel_from_pipe(format_swizzle[2]);
+            texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
+            texture.width = AGX_TEXTURE_BUFFER_WIDTH;
+            texture.height = height;
+            texture.first_level = texture.last_level = 0;
+            texture.address = sampled_base;
+            texture.buffer_size_sw = elements;
+            texture.buffer_offset_sw = buffer_offset_sw;
+            texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
+            texture.srgb_2_channel =
+               texture.srgb && util_format_colormask(desc) == 0x3;
+            texture.depth = 1;
+            texture.stride = (texture.width * blocksize_B) - 16;
+
+            ok = hk_pack_native_texture(generation, &tex, &texture);
+            if (ok && storage && !rgb32) {
+               struct AGX_PBE pbe_cfg = {AGX_PBE_header};
+               pbe_cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+               pbe_cfg.layout = AGX_LAYOUT_LINEAR;
+               pbe_cfg.channels = ail_pixel_format[format].channels;
+               pbe_cfg.type = ail_pixel_format[format].type;
+               pbe_cfg.srgb = util_format_is_srgb(format);
+               for (unsigned i = 0; i < desc->nr_channels; ++i) {
+                  if (desc->swizzle[i] == 0)
+                     pbe_cfg.swizzle_r = i;
+                  else if (desc->swizzle[i] == 1)
+                     pbe_cfg.swizzle_g = i;
+                  else if (desc->swizzle[i] == 2)
+                     pbe_cfg.swizzle_b = i;
+                  else if (desc->swizzle[i] == 3)
+                     pbe_cfg.swizzle_a = i;
+               }
+               pbe_cfg.buffer = rw_base;
+               pbe_cfg.buffer_offset_sw = tail_offset_el;
+               pbe_cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
+               pbe_cfg.height = height;
+               pbe_cfg.level = 0;
+               pbe_cfg.stride = (pbe_cfg.width * blocksize_B) - 4;
+               pbe_cfg.layers = 1;
+               pbe_cfg.levels = 1;
+               if (!hk_pack_native_pbe(generation, &pbe, &pbe_cfg))
+                  hk_set_null_native_pbe(generation, &pbe);
+            } else {
                hk_set_null_native_pbe(generation, &pbe);
-         } else {
-            hk_set_null_native_pbe(generation, &pbe);
+            }
          }
       }
 

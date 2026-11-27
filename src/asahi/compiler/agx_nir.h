@@ -131,6 +131,10 @@ bool agx_nir_lower_word_bounds(struct nir_shader *s);
 bool agx_nir_share_bounds(struct nir_shader *s, bool size_below_u32_max);
 bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
 bool agx_nir_opt_canonical_minmax(struct nir_shader *s);
+bool agx_nir_lower_fdiv(struct nir_shader *s);
+bool agx_nir_lower_fdiv_late(struct nir_shader *s);
+bool agx_nir_lower_log(struct nir_shader *s);
+bool agx_nir_lower_sincos(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_bound_image_atomics(struct nir_shader *s);
@@ -423,6 +427,7 @@ bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
 bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
                                        bool no_textures);
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
+bool agx_nir_shrink_memory_loads(struct nir_shader *nir);
 
 bool agx_nir_merge_global_words(struct nir_shader *shader);
 bool agx_nir_hoist_readonly_loop_loads(struct nir_shader *shader);
@@ -442,5 +447,7 @@ bool agx_nir_fold_const_select_alu(struct nir_shader *shader);
 bool agx_nir_opt_narrow_u8_fadd_tree(struct nir_shader *shader);
 
 bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
+bool agx_nir_opt_shared_index_sort(struct nir_shader *shader);
+bool agx_nir_opt_top2_min(struct nir_shader *shader);
 bool agx_nir_opt_shared_flat_phase_cse(struct nir_shader *shader);
 bool agx_nir_opt_shared_vec2(struct nir_shader *shader);

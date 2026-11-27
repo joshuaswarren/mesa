@@ -107,6 +107,7 @@ struct hk_g17p_loader {
    uint32_t scratch_size;
    uint32_t compiler_d;
    uint32_t threadgroup_memory_size_B;
+   uint16_t imageblock_stride_B;
    uint32_t constant_program_size;
    uint16_t nr_gprs;
    bool compiler_d_valid;
@@ -285,6 +286,7 @@ hk_g17p_loader_matches(const struct hk_g17p_loader *l,
        l->compiler_d_valid != d->compiler_d_valid ||
        l->compiler_d != d->compiler_d ||
        l->threadgroup_memory_size_B != d->threadgroup_memory_size_B ||
+       l->imageblock_stride_B != d->imageblock_stride_B ||
        l->launch_sources.ti_spill_bytes != d->launch_sources.ti_spill_bytes ||
        l->launch_sources.ti_largest_ipr_bytes !=
           d->launch_sources.ti_largest_ipr_bytes ||
@@ -346,6 +348,7 @@ hk_g17p_loader_create(struct hk_device *dev,
       .scratch_size = desc->scratch_size,
       .compiler_d = desc->compiler_d,
       .threadgroup_memory_size_B = desc->threadgroup_memory_size_B,
+      .imageblock_stride_B = desc->imageblock_stride_B,
       .constant_program_size = desc->constant_program.code_size,
       .nr_gprs = desc->nr_gprs,
       .compiler_d_valid = desc->compiler_d_valid,
@@ -604,7 +607,8 @@ hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
 }
 
 static void
-hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+hk_cdm_flush_impl(struct hk_device *dev, struct hk_cs *cs, bool memory,
+                  bool pure_ssbo)
 {
    assert(cs->type == HK_CS_CDM);
    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
@@ -616,21 +620,26 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
          return;
 
       {
-         /* The only Borealis AGX2 barrier-word path: the reduced word on
-          * the dies it was measured on (hk_device::cdm_barrier_default_mask,
-          * agx2_cdm_barrier_default_word()), the full word on every other
-          * chip, under fullcdmbarrier, and once the device holds a sparse
-          * resource -- the reduced set leaves page remappings behind the
-          * launches unordered. Gallium keeps agx_cdm_barrier()'s full
-          * record. */
+         /* The only Borealis AGX2 barrier-word path: pure compute-to-compute
+          * SSBO dependencies inside an open stream derive 0x160 from the
+          * device's measured 0x1ff default word (dropping bit 3 USC cache
+          * inval and PBE/texture bits); all other barriers use the device
+          * default word. Sparse resources and fullcdmbarrier upgrade to the
+          * full word (0xfffff). */
+         const uint32_t base_word =
+            pure_ssbo ? agx2_cdm_barrier_ssbo_word(
+                           dev->cdm_barrier_default_mask)
+                      : dev->cdm_barrier_default_mask;
          const uint32_t mask = agx2_cdm_barrier_emit_word(
-            dev->cdm_barrier_default_mask, p_atomic_read(&dev->sparse_used),
+            base_word, p_atomic_read(&dev->sparse_used),
             HK_PERF(dev, FULLCDMBARRIER));
 
          uint32_t *word = cs->current;
          *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
          cs->current = word + 1;
-         cs->strong_flush_end = cs->current;
+         if (!pure_ssbo || mask == dev->cdm_barrier_default_mask ||
+             mask == AGX_CDM_BARRIER_FULL_WORD)
+            cs->strong_flush_end = cs->current;
 
          /* A sparse resource created between recording and submission
           * still upgrades this record at submit. */
@@ -718,6 +727,12 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    cs->stats.flushes++;
 }
 
+static void
+hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+{
+   hk_cdm_flush_impl(dev, cs, memory, false);
+}
+
 void
 hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 {
@@ -788,6 +803,22 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* A dependency declared but not yet emitted on AGX2 lands on the
+    * trailing edge of the closing compute stream. Every stream close
+    * funnels here, so no caller can end the compute stream with a declared
+    * dependency left unemitted. This also keeps the drain out of
+    * hk_cmd_buffer.h: standalone test binaries stub this function. */
+   if (cs == cmd->current_cs.cs) {
+      cmd->state.cs.cdm_stream_has_images = false;
+      if (cmd->state.cs.cdm_barrier_pending) {
+         cmd->state.cs.cdm_barrier_pending = false;
+         cmd->state.cs.cdm_barrier_full_needed = false;
+         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+         hk_cdm_cache_flush(dev, cs);
+      }
+   }
+
+
    /* A dependency recorded while no compute stream holding work is open
     * records no flush: the first barrier of a command buffer, or one after a
     * timestamp closed the stream. The writes of this stream may then be read
@@ -809,6 +840,62 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    if (!alias_scope)
       hk_cdm_note_alias_site(cmd, cs);
+}
+
+bool
+hk_cdm_record_pipeline_barrier(struct hk_cmd_buffer *cmd,
+                               const VkDependencyInfo *dep)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool track =
+      agx_chip_command_stream_generation(dev->dev.chip) ==
+         AGX_CS_GENERATION_AGX2 &&
+      !HK_PERF(dev, FULLCDMBARRIER);
+   const bool gfx_open = cmd->current_cs.gfx ||
+                         cmd->current_cs.pre_gfx ||
+                         cmd->current_cs.post_gfx;
+
+   if (track) {
+      if (!cmd->state.cs.cdm_barrier_pending) {
+         cmd->state.cs.cdm_barrier_pending = true;
+         cmd->state.cs.cdm_barrier_full_needed = false;
+      }
+      if (gfx_open || !cmd->current_cs.cs ||
+          cmd->current_cs.cs->stats.cmds == 0 ||
+          cmd->state.cs.cdm_stream_has_images ||
+          !hk_dependency_is_pure_compute_ssbo(dep)) {
+         cmd->state.cs.cdm_barrier_full_needed = true;
+      }
+   }
+
+   return !track || gfx_open;
+}
+
+static void
+hk_cdm_narrow_trailing_barrier(struct hk_device *dev, struct hk_cs *cs)
+{
+   assert(cs->type == HK_CS_CDM);
+   assert(agx_chip_command_stream_generation(dev->dev.chip) ==
+          AGX_CS_GENERATION_AGX2);
+
+   const uint32_t base_word =
+      agx2_cdm_barrier_ssbo_word(dev->cdm_barrier_default_mask);
+   const uint32_t mask = agx2_cdm_barrier_emit_word(
+      base_word, p_atomic_read(&dev->sparse_used),
+      HK_PERF(dev, FULLCDMBARRIER));
+
+   if (cs->strong_flush_end && cs->current == cs->strong_flush_end) {
+      if (mask != dev->cdm_barrier_default_mask &&
+          mask != AGX_CDM_BARRIER_FULL_WORD) {
+         uint32_t *word = (uint32_t *)cs->current - 1;
+         *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->strong_flush_end = NULL;
+      }
+      return;
+   }
+
+   hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
+   hk_cdm_flush_impl(dev, cs, false, true);
 }
 
 void
@@ -843,8 +930,28 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
       return;
    }
 
+   if (cs == cs->cmd->current_cs.cs && !HK_PERF(dev, FULLCDMBARRIER) &&
+       cs->cmd->state.cs.cdm_barrier_pending) {
+      /* The app declared a memory dependency since the last launch. Because
+       * every launch ends with the conservative default barrier word, a pure
+       * compute-to-compute SSBO boundary narrows that preceding trailing
+       * barrier in place to 0x160 before any chunk switch; every other
+       * boundary keeps the default word. */
+      const bool pure_ssbo =
+         !cs->cmd->state.cs.cdm_barrier_full_needed && cs->stats.cmds > 0;
+      cs->cmd->state.cs.cdm_barrier_pending = false;
+      cs->cmd->state.cs.cdm_barrier_full_needed = false;
+      if (pure_ssbo) {
+         hk_cdm_narrow_trailing_barrier(dev, cs);
+      } else {
+         hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
+         hk_cdm_cache_flush(dev, cs);
+      }
+   }
+
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
+
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
@@ -865,6 +972,12 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cfg.preshader_register_count = info->nr_preamble_gprs;
    }
 
+   if (info->stage != MESA_SHADER_COMPUTE || info->texture_state_count != 0 ||
+       info->sampler_state_count != 0 || info->uses_sampler_heap ||
+       info->uses_txf) {
+      cs->cmd->state.cs.cdm_barrier_full_needed = true;
+      cs->cmd->state.cs.cdm_stream_has_images = true;
+   }
    hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
 }
 
@@ -999,7 +1112,7 @@ hk_g17p_internal_graphics_uniform_ranges(
    if (s->info.agx3_uses_root || s->info.set_count) {
       if (count >= HK_G17P_COMPUTE_MAX_RANGES ||
           !hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr,
-                                   &ranges[count]))
+                                   hk_shader_root_size(s), &ranges[count]))
          return false;
       count++;
    }
@@ -1063,7 +1176,8 @@ hk_g17p_compute_uniform_ranges(
       (s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
        s->info.agx3_indexed_storage_valid) ? AGX_G17P_STORAGE_ROOT_HALFS :
       texture_pointers ? AGX_G17P_TXF_ROOT_HALFS : 0;
-   if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr, &ranges[0]))
+   if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr,
+                                hk_shader_root_size(s), &ranges[0]))
       return false;
 
    size_t count = 1;
@@ -1167,6 +1281,7 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
       .threadgroup_memory_size_B =
          s->b.info.local_size ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
                               : 0,
+      .imageblock_stride_B = s->b.info.imageblock_stride,
       .launch_sources = launch_sources,
       .ldshdr_f1 = kind,
       .constant_program = constant_program,
@@ -3349,7 +3464,7 @@ hk_fused_compute_uniform_ranges(
 
    const unsigned root_uniform = s->info.agx3_root_uniform;
    if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, p->root_va,
-                                &ranges[0]))
+                                hk_shader_root_size(s), &ranges[0]))
       return false;
 
    size_t count = 1;
@@ -5000,12 +5115,15 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
             : 256u;
       const uint64_t min_wgs =
          MAX2(256ull, 4ull * agx_get_num_cores(&dev->dev));
-      uint16_t coalesced[3];
+      uint16_t reshaped[3];
       if (hk_coalesce_workgroup_size_ex(
              selected->b.info.workgroup_size, grid.count,
              dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
-             target_wg, min_wgs, coalesced)) {
-         local_size = agx_workgroup(coalesced[0], coalesced[1], coalesced[2]);
+             target_wg, min_wgs, reshaped) ||
+          hk_split_workgroup_size_ex(
+             selected->b.info.workgroup_size, grid.count,
+             2ull * agx_get_num_cores(&dev->dev), reshaped)) {
+         local_size = agx_workgroup(reshaped[0], reshaped[1], reshaped[2]);
       }
    }
 
@@ -5238,6 +5356,8 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
    const bool conditional_active = cmd->state.conditional.active;
    cmd->state.conditional.active = false;
 
+   cmd->state.cs.cdm_barrier_full_needed = true;
+   cmd->state.cs.cdm_stream_has_images = true;
    dispatch(cmd, grid);
 
    cmd->state.conditional.active = conditional_active;
@@ -5247,7 +5367,13 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
    *rt = cmd->state.cs.descriptors;
    rt->root.cs.trace_rays_addr = 0;
 
+   const bool cdm_barrier_pending = cmd->state.cs.cdm_barrier_pending;
+   const bool cdm_barrier_full_needed = cmd->state.cs.cdm_barrier_full_needed;
+   const bool cdm_stream_has_images = cmd->state.cs.cdm_stream_has_images;
    cmd->state.cs = saved;
+   cmd->state.cs.cdm_barrier_pending = cdm_barrier_pending;
+   cmd->state.cs.cdm_barrier_full_needed = cdm_barrier_full_needed;
+   cmd->state.cs.cdm_stream_has_images = cdm_stream_has_images;
    hk_root_mark_dirty(&cmd->state.cs.descriptors);
 }
 

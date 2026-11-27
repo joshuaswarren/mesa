@@ -169,13 +169,10 @@ invert_affine(mat3x4 otw)
    return wto;
 }
 
-void
-store64(uint64_t address, uint64_t value)
-{
-   store32(address, uint(value));
-   store32(address + 4ul, uint(value >> 32));
-}
-
+/* An instance's native record, its transform and its pointer pair, each
+ * written as whole 16-byte words: every one starts 16-byte aligned (the
+ * image and the transform table are 64-byte aligned, with 64-byte record
+ * and transform strides and a 16-byte pointer stride). */
 void
 encode_instance(hk_agx3_leaf_job job, uint lane, uint64_t transforms,
                 uint64_t pointers)
@@ -187,33 +184,43 @@ encode_instance(hk_agx3_leaf_job job, uint lane, uint64_t transforms,
    uint64_t record = job.output_bvh + record_offset;
    uint index = DEREF(src).instance_id;
    uint64_t transform = transforms + uint64_t(index) * 64ul;
+   uint custom_and_mask = DEREF(src).custom_instance_and_mask;
+   uint sbt = DEREF(src).sbt_offset_and_flags;
    mat3x4 otw = DEREF(src).otw_matrix;
    mat3x4 wto = invert_affine(otw);
-   for (uint i = 0; i < 32; ++i)
-      store32(record + uint64_t(i) * 4ul, 0);
-   store32(record, 26);
-   store32(record + 4ul, DEREF(REF(uint32_t)(blas + 176ul)));
-   store32(record + 8ul, DEREF(src).sbt_offset_and_flags >> 24);
-   store32(record + 12ul, DEREF(src).custom_instance_and_mask >> 24);
+   /* Both matrices go out a column at a time: word 3 * c + r of 12. */
+   uint w[12], t[12];
    for (uint c = 0; c < 4; ++c)
       for (uint r = 0; r < 3; ++r) {
-         uint offset = 4u * (c * 3u + r);
-         store32(record + 16ul + uint64_t(offset), floatBitsToUint(wto[r][c]));
-         store32(job.output_bvh + transform + uint64_t(offset),
-                 floatBitsToUint(otw[r][c]));
+         w[c * 3u + r] = floatBitsToUint(wto[r][c]);
+         t[c * 3u + r] = floatBitsToUint(otw[r][c]);
       }
+   uint bounds[6];
    for (uint i = 0; i < 6; ++i)
-      store32(record + 64ul + uint64_t(i) * 4ul,
-              DEREF(REF(uint32_t)(blas + 80ul + uint64_t(i) * 4ul)));
-   store64(record + 88ul, blas);
-   store32(record + 96ul, DEREF(src).custom_instance_and_mask & 0xffffffu);
-   /* Native Metal user_instance_id reads this independent32-bit field. */
-   store32(record + 100ul, index);
-   /* Vulkan-only metadata lives outside the native128-byte instance record. */
-   store32(job.output_bvh + transform + 48ul, DEREF(src).sbt_offset_and_flags);
-   store64(record + 104ul, transform - record_offset);
-   store64(job.output_bvh + pointers + 16ul * uint64_t(index), record_offset + 4ul);
-   store64(job.output_bvh + pointers + 16ul * uint64_t(index) + 8ul, 1ul);
+      bounds[i] = DEREF(REF(uint32_t)(blas + 80ul + uint64_t(i) * 4ul));
+   uvec2 blas_words = unpackUint2x32(blas);
+   uvec2 relative = unpackUint2x32(transform - record_offset);
+   store128(record, uvec4(26u, DEREF(REF(uint32_t)(blas + 176ul)), sbt >> 24,
+                          custom_and_mask >> 24));
+   store128(record + 16ul, uvec4(w[0], w[1], w[2], w[3]));
+   store128(record + 32ul, uvec4(w[4], w[5], w[6], w[7]));
+   store128(record + 48ul, uvec4(w[8], w[9], w[10], w[11]));
+   store128(record + 64ul, uvec4(bounds[0], bounds[1], bounds[2], bounds[3]));
+   store128(record + 80ul, uvec4(bounds[4], bounds[5], blas_words.x, blas_words.y));
+   /* The instance index is a 32-bit word of its own, at 100. */
+   store128(record + 96ul, uvec4(custom_and_mask & 0xffffffu, index,
+                                 relative.x, relative.y));
+   store128(record + 112ul, uvec4(0u));
+   /* Vulkan-only metadata lives outside the native 128-byte instance
+    * record: the transform, then the instance's SBT word at 48. */
+   uint64_t transform_address = job.output_bvh + transform;
+   store128(transform_address, uvec4(t[0], t[1], t[2], t[3]));
+   store128(transform_address + 16ul, uvec4(t[4], t[5], t[6], t[7]));
+   store128(transform_address + 32ul, uvec4(t[8], t[9], t[10], t[11]));
+   store32(transform_address + 48ul, sbt);
+   uvec2 pointer = unpackUint2x32(record_offset + 4ul);
+   store128(job.output_bvh + pointers + 16ul * uint64_t(index),
+            uvec4(pointer.x, pointer.y, 1u, 0u));
 }
 
 void

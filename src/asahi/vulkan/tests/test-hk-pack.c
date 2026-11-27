@@ -1942,6 +1942,47 @@ test_liveness_tracker(void)
      !hk_pack_liveness_covers(&st, &overflow_iv));
 }
 
+static void
+test_loop_work_scaling(void)
+{
+   static const struct {
+      uint64_t instrs, work;
+      uint32_t divisor;
+      bool fits;
+      uint64_t scaled;
+   } cases[] = {
+      {1, 1, 3, true, 1},
+      {UINT32_MAX, UINT32_MAX, UINT32_MAX, true, UINT64_C(0x1fffffffe)},
+      {UINT64_C(1) << 32, UINT64_C(1) << 32, 3, true,
+       UINT64_C(0xaaaaaaaaaaaaaaab)},
+      {UINT64_MAX, 1, 2, true, UINT64_MAX},
+      {UINT64_MAX, 1, 1, false, 0},
+      {UINT64_MAX, UINT64_MAX, UINT32_MAX, false, 0},
+      /* The doubling wraps and rounding carries into the high limb. */
+      {UINT64_MAX, (UINT64_C(1) << 63) + 1, 3, true,
+       UINT64_C(0x5555555555555555)},
+      /* Rounding also wraps if the doubled numerator ends at 2^128 - 4. */
+      {UINT64_MAX - 1, (UINT64_C(1) << 63) + 1, 5, true, 0},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      const uint64_t instrs = cases[i].instrs;
+      const uint64_t work = cases[i].work;
+      const uint32_t divisor = cases[i].divisor;
+      uint64_t scaled = 0;
+      const bool fits = hk_pack_scale_instrs_portable(instrs, work, divisor,
+                                                     &scaled);
+      T("portable loop work scaling fits and rounds correctly",
+        fits == cases[i].fits && (!fits || scaled == cases[i].scaled));
+#if defined(__SIZEOF_INT128__)
+      const __uint128_t native =
+         ((__uint128_t)2u * instrs * work + divisor - 1u) / divisor;
+      T("portable loop work scaling matches native 128-bit arithmetic",
+        fits == (native <= UINT64_MAX) && (!fits || scaled == native));
+#endif
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1949,6 +1990,7 @@ main(int argc, char **argv)
    test_context = ralloc_context(NULL);
    if (!test_context)
       return EXIT_FAILURE;
+   test_loop_work_scaling();
    if (negctl) {
       test_packet_reuse(true);
       test_fused_packet_reuse(true);
@@ -2070,6 +2112,142 @@ main(int argc, char **argv)
       plan_on(cbs, 2, 0, false, runs, &rc);
       T("two bounded looping members pack into one packet",
         rc == 1 && runs[0].count == 2);
+
+      /* Observed-duration looping budget (HK_PACK_MAX_OBS_NS). */
+      struct hk_pack_member obs_m[4] = {0};
+      struct hk_cmd_buffer *obs_cbs[4] = {
+         looping(), looping(), looping(), looping(),
+      };
+      struct hk_sync_queue obs_sync = {0};
+      hk_pack_describe_submit(obs_m, device(), &obs_sync, obs_cbs, 4, terminate,
+                              false);
+      const struct hk_pack_limits obs_lim = {
+         .max_attachments = UINT32_MAX,
+         .overhead = 16,
+      };
+      unsigned obs_pm = 0;
+      size_t obs_tot = 0;
+      struct hk_pack_run obs_runs[4];
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = 10ull * 1000000; /* 10 ms each -> 3 fit in 32 ms */
+      unsigned obs_rc =
+         hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping members pack up to HK_PACK_MAX_OBS_NS and split",
+        obs_rc == 1 && obs_runs[0].first == 0 && obs_runs[0].count == 3);
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = 15ull * 1000000; /* 15 ms each -> 2+2 */
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping members form multiple budgeted packets",
+        obs_rc == 2 && obs_runs[0].count == 2 && obs_runs[1].count == 2);
+
+      for (unsigned i = 0; i < 4; ++i)
+         obs_m[i].obs_ns = HK_PACK_MAX_OBS_NS + 1;
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("observed looping member over HK_PACK_MAX_OBS_NS does not pack",
+        obs_rc == 0);
+
+      obs_m[0].obs_ns = 5ull * 1000000;
+      obs_m[1].obs_ns = 0; /* unobserved */
+      obs_m[2].obs_ns = 5ull * 1000000;
+      obs_m[3].obs_ns = 5ull * 1000000;
+      obs_rc = hk_pack_plan(obs_m, 4, &obs_lim, obs_runs, &obs_pm, &obs_tot);
+      T("unobserved looping member does not join observed looping packet",
+        obs_rc == 1 && obs_runs[0].first == 2 && obs_runs[0].count == 2);
+   }
+
+   /* Observed-duration retirement and signalled_ns point tagging. */
+   {
+      const uint64_t ms = 1000000ull;
+      struct hk_queue *q = test_alloc(sizeof(*q));
+
+      /* 1. Progress/query path advancing signalled_value past P updates both
+       * signalled_ns and signalled_ns_point so retire measures real completion
+       * time (40 ms), not an earlier partial-query timestamp (0.2 ms). */
+      q->pack.obs[0] = (struct hk_pack_obs_entry){
+         .hash = 0x1111,
+         .pending_pt = 10,
+         .submit_ns = 1000 * ms,
+         .cb_count = 4,
+         .loop_count = 4,
+         .in_flight_packed = false,
+      };
+      q->pack.obs_pending = 1;
+      hk_queue_note_signalled_at(q, 9, 1000 * ms + 200000ull); /* +0.2 ms */
+      hk_queue_note_signalled_at(q, 10, 1040 * ms);            /* +40 ms */
+      /* Late older note must not regress signalled_ns or signalled_ns_point. */
+      hk_queue_note_signalled_at(q, 9, 1000 * ms + 300000ull);
+      T("hk_queue_note_signalled_at advances monotonically",
+        q->drm.signalled_value == 10 && q->drm.signalled_ns_point == 10 &&
+           q->drm.signalled_ns == 1040 * ms);
+
+      hk_pack_obs_retire_entries(q->pack.obs, HK_PACK_OBS_SLOTS,
+                                 &q->pack.obs_pending, &q->pack.obs_epoch,
+                                 q->drm.signalled_value,
+                                 q->drm.signalled_ns_point,
+                                 q->drm.signalled_ns, 1500 * ms);
+      T("obs retire uses signalled_ns when sig_point covers pending_pt",
+        q->pack.obs[0].pending_pt == 0 && q->pack.obs_pending == 0 &&
+           q->pack.obs[0].obs_per_loop_ns == 10 * ms &&
+           q->pack.obs_epoch == 1);
+
+      /* 2. Untimestamped advance of signalled_value (sig_point < pending_pt):
+       * stale signalled_ns (0.2 ms) must NOT be used; falls back to now_ns
+       * (300 ms > HK_PACK_OBS_ADMIT_NS) and rejects admission. */
+      memset(q, 0, sizeof(*q));
+      q->pack.obs[0] = (struct hk_pack_obs_entry){
+         .hash = 0x2222,
+         .pending_pt = 20,
+         .submit_ns = 1000 * ms,
+         .cb_count = 4,
+         .loop_count = 4,
+         .in_flight_packed = false,
+      };
+      q->pack.obs_pending = 1;
+      hk_queue_note_signalled_at(q, 19, 1000 * ms + 200000ull);
+      /* Simulate an untimestamped advance of signalled_value to 20. */
+      p_atomic_set(&q->drm.signalled_value, 20);
+      hk_pack_obs_retire_entries(q->pack.obs, HK_PACK_OBS_SLOTS,
+                                 &q->pack.obs_pending, &q->pack.obs_epoch,
+                                 q->drm.signalled_value,
+                                 q->drm.signalled_ns_point,
+                                 q->drm.signalled_ns, 1300 * ms);
+      T("obs retire ignores stale signalled_ns when sig_point < pending_pt",
+        q->pack.obs[0].pending_pt == 0 && q->pack.obs_pending == 0 &&
+           q->pack.obs[0].obs_per_loop_ns == 0 && q->pack.obs_epoch == 0);
+
+      /* 3. Monitored packed run: backoff above 150 ms, fail-closed above 200 ms. */
+      q->pack.obs[0] = (struct hk_pack_obs_entry){
+         .hash = 0x3333,
+         .pending_pt = 30,
+         .submit_ns = 2000 * ms,
+         .obs_per_loop_ns = 10 * ms,
+         .cb_count = 4,
+         .loop_count = 4,
+         .in_flight_packed = true,
+      };
+      q->pack.obs_pending = 1;
+      hk_queue_note_signalled_at(q, 30, 2160 * ms); /* +160 ms -> backoff */
+      hk_pack_obs_retire_entries(q->pack.obs, HK_PACK_OBS_SLOTS,
+                                 &q->pack.obs_pending, &q->pack.obs_epoch,
+                                 q->drm.signalled_value,
+                                 q->drm.signalled_ns_point,
+                                 q->drm.signalled_ns, 2200 * ms);
+      T("obs retire raises per-loop budget on packed run > 150 ms",
+        q->pack.obs[0].obs_per_loop_ns == 40 * ms && q->pack.obs_epoch == 1);
+
+      q->pack.obs[0].pending_pt = 31;
+      q->pack.obs[0].submit_ns = 3000 * ms;
+      q->pack.obs_pending = 1;
+      hk_queue_note_signalled_at(q, 31, 3250 * ms); /* +250 ms -> fail closed */
+      hk_pack_obs_retire_entries(q->pack.obs, HK_PACK_OBS_SLOTS,
+                                 &q->pack.obs_pending, &q->pack.obs_epoch,
+                                 q->drm.signalled_value,
+                                 q->drm.signalled_ns_point,
+                                 q->drm.signalled_ns, 3300 * ms);
+      T("obs retire resets packed run to unobserved above 200 ms",
+        q->pack.obs[0].obs_per_loop_ns == 0 && q->pack.obs_epoch == 2);
    }
 
    test_packet_reuse(false);

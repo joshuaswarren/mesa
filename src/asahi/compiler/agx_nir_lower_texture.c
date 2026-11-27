@@ -592,7 +592,8 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex, bool buffer_metadata,
                        nir_channel(b, rgb, 2),
                        is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1));
    } else {
-      rgb32 = libagx_texture_load_rgb32(b, desc, coord, nir_imm_bool(b, is_float));
+      rgb32 = libagx_texture_load_rgb32(b, desc, view_coord,
+                                        nir_imm_bool(b, is_float));
    }
    rgb32 = nir_trim_vector(b, rgb32, nir_tex_instr_result_size(tex));
 

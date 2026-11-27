@@ -13,13 +13,14 @@ unsigned hk_nir_root_size(const nir_shader *nir, unsigned full_size);
 bool hk_nir_root_reads_range(const nir_shader *nir, uint64_t start_B,
                              uint64_t end_B, unsigned full_size);
 
-/* True when a compute NIR shader with API workgroup size <= 256 (multiple of
- * 32) observes only global invocation ID / base_group (no shared memory,
- * barriers, local/workgroup/subgroup/quad/tile/ray/cmat intrinsics, calls, or
- * implicit derivatives), so direct zero-base dispatches may coalesce adjacent
- * workgroups without altering invocation coordinates or semantics.
- * Callers must also verify the shader never reads root.cs.group_count_addr via
- * hk_nir_root_reads_range(). */
+/* True when a compute NIR shader with API workgroup size <= 1024 (multiple of
+ * 32) observes only global invocation ID, base_group, API num_workgroups, and
+ * API workgroup_size (no shared memory, barriers, local/workgroup/subgroup/
+ * quad/tile/ray/cmat intrinsics, calls, or implicit derivatives), so direct
+ * zero-base dispatches may coalesce or split workgroups without altering
+ * invocation coordinates or semantics. On direct dispatches,
+ * root.cs.group_count_addr holds the unreshaped API group count and
+ * load_workgroup_size folds to the compile-time API local size. */
 bool hk_nir_can_coalesce_workgroup(const nir_shader *nir);
 
 /* Coalesce a pure-global API workgroup shape (<= 256, multiple of 32) up to
@@ -43,29 +44,53 @@ bool hk_coalesce_workgroup_size(const uint16_t api_local[3],
                                 uint32_t max_wg_threads,
                                 uint16_t out_local[3]);
 
+/* Split a pure-global multi-subgroup API workgroup shape (multiple of 32,
+ * >= 64 threads) along the outermost axis with extent > 1 when the dispatch
+ * has fewer than min_workgroups workgroups, increasing parallelism on wide
+ * multi-core GPUs while preserving exact 32-invocation subgroup membership.
+ * Returns true if out_local differs from api_local. */
+bool hk_split_workgroup_size_ex(const uint16_t api_local[3],
+                                const uint32_t grid_threads[3],
+                                uint64_t min_workgroups,
+                                uint16_t out_local[3]);
+
 static inline bool
 hk_nir_dispatch_zero_base(const uint32_t base_group[3])
 {
    return base_group[0] == 0 && base_group[1] == 0 && base_group[2] == 0;
 }
 
-/* Compute the trimmed root descriptor upload size for a shader stage.
- * Uniform lowering loads the root pointer and set bases separately, so retain
- * that prefix.  Hardware VS and FS prologs/epilogs access only the draw arm
- * preceding push constants, so flooring graphics stages at push_offset
- * preserves every driver-synthesized root load while trimming unused
- * push-constant, dynamic-buffer, and trailing tail bytes. */
+/* The part of the root every launch of a stage reads, whatever its NIR.
+ * Uniform lowering loads the root pointer and set bases separately, and the
+ * root uniform range loads both (8 * (1 + set_count) bytes from the root), so
+ * retain that prefix.  Hardware VS and FS prologs/epilogs access only the
+ * draw arm preceding push constants, so flooring graphics stages at
+ * push_offset preserves every driver-synthesized root load. */
+static inline uint32_t
+hk_shader_root_descriptor_floor(mesa_shader_stage sw_stage,
+                                unsigned set_count, unsigned sets_offset,
+                                unsigned push_offset, unsigned full_size)
+{
+   unsigned bytes = sets_offset + set_count * (unsigned)sizeof(uint64_t);
+   if (sw_stage != MESA_SHADER_COMPUTE)
+      bytes = MAX2(bytes, push_offset);
+   return MIN2(ALIGN_POT(bytes, 16), full_size);
+}
+
+/* Compute the trimmed root descriptor upload size for a shader stage: its
+ * floor (above) and every root byte the shader itself reads, trimming
+ * unused push-constant, dynamic-buffer, and trailing tail bytes. */
 static inline uint32_t
 hk_shader_root_descriptor_size(const nir_shader *nir,
                                mesa_shader_stage sw_stage,
                                unsigned set_count, unsigned sets_offset,
                                unsigned push_offset, unsigned full_size)
 {
-   unsigned bytes = hk_nir_root_size(nir, full_size);
-   bytes = MAX2(bytes, sets_offset + set_count * (unsigned)sizeof(uint64_t));
-   if (sw_stage != MESA_SHADER_COMPUTE)
-      bytes = MAX2(bytes, push_offset);
-   return MIN2(ALIGN_POT(bytes, 16), full_size);
+   const unsigned bytes = hk_nir_root_size(nir, full_size);
+   return MAX2(MIN2(ALIGN_POT(bytes, 16), full_size),
+               hk_shader_root_descriptor_floor(sw_stage, set_count,
+                                               sets_offset, push_offset,
+                                               full_size));
 }
 
 /* Active graphics root prefix: maximum of the bound VS and optional FS

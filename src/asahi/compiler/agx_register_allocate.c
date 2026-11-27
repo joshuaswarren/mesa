@@ -140,13 +140,14 @@ struct ra_ctx {
    BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
 
-   /* Optional loop-accumulator RMW chain target: phi_web root + 1 (0 = none). */
-   const uint32_t *rmw_web;
+   /* Optional loop-header phi target for back-edge sources and RMW chains. */
+   agx_instr *const *rmw_phi;
 
-   /* Registers owned by loop-header phis in the current block; avoid stealing
-    * them for unrelated temps or bank-conflict detours when another free
-    * register below the high-water mark is available. */
+   /* Registers owned by enclosing loop-header phis for the current block;
+    * avoid stealing them for unrelated temps or bank-conflict detours. */
    const BITSET_WORD *loop_phi_targets;
+   /* Per-header output bitset populated after assigning phis in a loop header. */
+   BITSET_WORD *loop_header_phi_out;
 
    /* Matrix operand groups, and for each phi web root its group plus one
     * (zero for none).
@@ -1375,19 +1376,24 @@ g17p_build_coread_table(agx_context *ctx, const uint8_t *ncomps,
    uint16_t *alu_uses = calloc(ctx->alloc, sizeof(uint16_t));
    uint32_t *split_parent = malloc(ctx->alloc * sizeof(uint32_t));
    uint8_t *split_offset = calloc(ctx->alloc, sizeof(uint8_t));
+   uint32_t *phi_init = malloc(ctx->alloc * sizeof(uint32_t));
    struct g17p_coread_entry *table =
       calloc(ctx->alloc, sizeof(struct g17p_coread_entry));
-   if (!in_loop || !alu_uses || !split_parent || !split_offset || !table) {
+   if (!in_loop || !alu_uses || !split_parent || !split_offset || !phi_init ||
+       !table) {
       free(in_loop);
       free(alu_uses);
       free(split_parent);
       free(split_offset);
+      free(phi_init);
       free(table);
       return NULL;
    }
 
-   for (unsigned i = 0; i < ctx->alloc; ++i)
+   for (unsigned i = 0; i < ctx->alloc; ++i) {
       split_parent[i] = UINT32_MAX;
+      phi_init[i] = UINT32_MAX;
+   }
 
    bool any_loop = false;
    agx_foreach_block(ctx, block) {
@@ -1396,6 +1402,26 @@ g17p_build_coread_table(agx_context *ctx, const uint8_t *ncomps,
             any_loop = true;
             for (unsigned i = succ->index; i <= block->index && i < nr_blocks; ++i)
                in_loop[i] = true;
+         }
+      }
+      if (block->loop_header) {
+         agx_foreach_phi_in_block(block, phi) {
+            if (phi->dest[0].type != AGX_INDEX_NORMAL || phi->dest[0].memory ||
+                classes[phi->dest[0].value] != RA_GPR)
+               continue;
+            unsigned pred_idx = 0;
+            agx_foreach_predecessor(block, pred) {
+               if ((*pred)->index < block->index && pred_idx < phi->nr_srcs) {
+                  agx_index s = phi->src[pred_idx];
+                  if (s.type == AGX_INDEX_NORMAL && !s.memory &&
+                      classes[s.value] == RA_GPR &&
+                      ncomps[s.value] == ncomps[phi->dest[0].value]) {
+                     phi_init[phi->dest[0].value] = s.value;
+                     break;
+                  }
+               }
+               pred_idx++;
+            }
          }
       }
    }
@@ -1430,11 +1456,73 @@ g17p_build_coread_table(agx_context *ctx, const uint8_t *ncomps,
    }
 
    agx_foreach_block(ctx, block) {
-      const uint16_t base_w =
-         (block->index < nr_blocks && in_loop[block->index]) ? 8u : 1u;
+      const bool block_in_loop = block->index < nr_blocks && in_loop[block->index];
+      const uint16_t base_w = block_in_loop ? 8u : 1u;
+      unsigned prev_dst = UINT32_MAX;
+      unsigned prev_acc = UINT32_MAX;
 
       agx_foreach_instr_in_block(block, I) {
-         if (!agx_is_alu(I) || I->nr_srcs < 2)
+         if (!agx_is_alu(I)) {
+            prev_dst = UINT32_MAX;
+            prev_acc = UINT32_MAX;
+            continue;
+         }
+
+         /* Avoid clustering consecutive independent 3-source ALU streams
+          * (e.g. ffma/imad accumulator chains) into the same mod-3 register
+          * bank, which serializes back-to-back bank ports on pipelined G17/M5
+          * hardware. Leave 1/2-source address/index ALU temps untouched so
+          * they do not scatter into vector-aligned slots. */
+         unsigned curr_dst = UINT32_MAX;
+         unsigned curr_acc = UINT32_MAX;
+         if (I->nr_srcs >= 3) {
+            if (I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+                !I->dest[0].memory && classes[I->dest[0].value] == RA_GPR &&
+                ncomps[I->dest[0].value] <= 2) {
+               curr_dst = I->dest[0].value;
+            }
+            if (I->src[2].type == AGX_INDEX_NORMAL && !I->src[2].memory &&
+                classes[I->src[2].value] == RA_GPR &&
+                ncomps[I->src[2].value] <= 2) {
+               curr_acc = I->src[2].value;
+            }
+         }
+         if (curr_dst != UINT32_MAX && prev_dst != UINT32_MAX &&
+             prev_dst != curr_dst) {
+            bool depends = false;
+            agx_foreach_ssa_src(I, s) {
+               if (I->src[s].value == prev_dst) {
+                  depends = true;
+                  break;
+               }
+            }
+            if (!depends) {
+               uint16_t aw = block_in_loop ? (base_w * 2u) : 2u;
+               g17p_coread_add_edge(table, prev_dst, curr_dst, 0, aw);
+               g17p_coread_add_edge(table, curr_dst, prev_dst, 0, aw);
+            }
+         }
+         if (block_in_loop && curr_acc != UINT32_MAX &&
+             prev_acc != UINT32_MAX && prev_acc != curr_acc) {
+            unsigned a = phi_init[prev_acc] != UINT32_MAX ? phi_init[prev_acc]
+                                                          : prev_acc;
+            unsigned b = phi_init[curr_acc] != UINT32_MAX ? phi_init[curr_acc]
+                                                          : curr_acc;
+            if (a != b) {
+               uint16_t aw = base_w * 2u;
+               g17p_coread_add_edge(table, a, b, 0, aw);
+               g17p_coread_add_edge(table, b, a, 0, aw);
+            }
+         }
+         if (I->nr_srcs >= 3) {
+            prev_dst = curr_dst;
+            prev_acc = curr_acc;
+         } else {
+            prev_dst = UINT32_MAX;
+            prev_acc = UINT32_MAX;
+         }
+
+         if (I->nr_srcs < 2)
             continue;
 
          unsigned gpr_srcs[6];
@@ -1486,6 +1574,7 @@ g17p_build_coread_table(agx_context *ctx, const uint8_t *ncomps,
    free(alu_uses);
    free(split_parent);
    free(split_offset);
+   free(phi_init);
    return table;
 }
 
@@ -1533,11 +1622,12 @@ static unsigned
 g17p_pick_bank_free_reg(const struct ra_ctx *rctx, unsigned ssa,
                         unsigned count, unsigned align, unsigned lo,
                         unsigned limit, unsigned first_reg,
-                        const BITSET_WORD *avoid_mask)
+                        const BITSET_WORD *avoid_mask, bool avoid_loop_phis)
 {
+   const BITSET_WORD *phi_targets =
+      avoid_loop_phis ? rctx->loop_phi_targets : NULL;
    const bool check_phi_targets =
-      count <= 2 && rctx->loop_phi_targets &&
-      BITSET_TEST_COUNT(rctx->loop_phi_targets, first_reg, count);
+      phi_targets && BITSET_TEST_COUNT(phi_targets, first_reg, count);
    const bool has_coread = rctx->g17p_coread && rctx->g17p_coread[ssa].nr > 0;
    if (!has_coread && !check_phi_targets)
       return first_reg;
@@ -1559,13 +1649,15 @@ g17p_pick_bank_free_reg(const struct ra_ctx *rctx, unsigned ssa,
           (avoid_mask && BITSET_TEST_COUNT(avoid_mask, cand, count)))
          continue;
       uint32_t c = has_coread ? g17p_coread_bank_cost(rctx, ssa, cand) : 0;
-      bool hits_phi = count <= 2 && rctx->loop_phi_targets &&
-                      BITSET_TEST_COUNT(rctx->loop_phi_targets, cand, count);
+      bool hits_phi = phi_targets && BITSET_TEST_COUNT(phi_targets, cand, count);
       bool splits_vec4 = count <= 4 && g17p_align8_block_is_empty(rctx, cand);
-      if (c < best_cost ||
-          (c == best_cost && best_hits_phi && !hits_phi) ||
-          (c == best_cost && hits_phi == best_hits_phi &&
-           best_splits_vec4 && !splits_vec4)) {
+      /* Never steal an enclosing loop-header phi target for a bank-conflict
+       * detour: breaking loop-phi coalescing inserts permanent mov1 copies on
+       * every loop iteration. */
+      if ((best_hits_phi && !hits_phi) ||
+          (hits_phi == best_hits_phi &&
+           (c < best_cost ||
+            (c == best_cost && best_splits_vec4 && !splits_vec4)))) {
          best_cost = c;
          best_reg = cand;
          best_hits_phi = hits_phi;
@@ -1575,13 +1667,13 @@ g17p_pick_bank_free_reg(const struct ra_ctx *rctx, unsigned ssa,
       }
    }
 
-   if (best_cost == 0)
+   if (best_cost == 0 && !best_hits_phi)
       return best_reg;
 
-   /* In straight-line shaders with no loops, each instruction runs at most once
-    * per thread; keep bank-free tie-breaking within the existing high-water
+   /* In straight-line shaders with no loops, or for low-weight outside-loop
+    * conflicts, keep bank-free tie-breaking within the existing high-water
     * mark above without growing the shader's GPR footprint. */
-   if (!rctx->g17p_has_loop)
+   if (!rctx->g17p_has_loop || best_cost < 8u)
       return best_reg;
 
    /* Still conflicted in a hot loop: allow at most 2 extra aligned steps
@@ -1607,14 +1699,13 @@ g17p_pick_bank_free_reg(const struct ra_ctx *rctx, unsigned ssa,
           BITSET_TEST_COUNT(rctx->used_regs[RA_GPR], cand, count) ||
           (avoid_mask && BITSET_TEST_COUNT(avoid_mask, cand, count)))
          continue;
-      uint32_t c = g17p_coread_bank_cost(rctx, ssa, cand);
-      bool hits_phi = count <= 2 && rctx->loop_phi_targets &&
-                      BITSET_TEST_COUNT(rctx->loop_phi_targets, cand, count);
+      uint32_t c = has_coread ? g17p_coread_bank_cost(rctx, ssa, cand) : 0;
+      bool hits_phi = phi_targets && BITSET_TEST_COUNT(phi_targets, cand, count);
       bool splits_vec4 = count <= 4 && g17p_align8_block_is_empty(rctx, cand);
-      if (c < best_cost ||
-          (c == best_cost && best_hits_phi && !hits_phi) ||
-          (c == best_cost && hits_phi == best_hits_phi &&
-           best_splits_vec4 && !splits_vec4)) {
+      if ((best_hits_phi && !hits_phi) ||
+          (hits_phi == best_hits_phi &&
+           (c < best_cost ||
+            (c == best_cost && best_splits_vec4 && !splits_vec4)))) {
          best_cost = c;
          best_reg = cand;
          best_hits_phi = hits_phi;
@@ -1659,7 +1750,8 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
          const unsigned hi =
             high_bank ? MIN2(*rctx->count[cls], limit) : limit;
          reg = g17p_pick_bank_free_reg(rctx, I->dest[dest_idx].value, count,
-                                       align, lo, hi, reg, NULL);
+                                       align, lo, hi, reg, NULL,
+                                       I->op != AGX_OPCODE_PHI);
       }
       return reg;
    } else if (cls != RA_GPR) {
@@ -2227,8 +2319,9 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
       if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count) &&
           !BITSET_TEST_COUNT(claimed, reg, count)) {
          if (cls == RA_GPR && rctx->g17p_coread) {
-            reg = g17p_pick_bank_free_reg(rctx, I->dest[d].value, count, align,
-                                          minimum, limit, reg, claimed);
+            reg = g17p_pick_bank_free_reg(rctx, I->dest[d].value, count,
+                                          align, minimum, limit, reg, claimed,
+                                          false);
          }
          *out = reg;
          return true;
@@ -2292,27 +2385,26 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
                          dest_limit(rctx, I, d));
    }
 
+   /* For a loop-header phi back-edge source or intermediate RMW chain node,
+    * stay in the loop-header phi's actual assigned register whenever it is
+    * free so loop-carried values coalesce cleanly across the back edge
+    * without permutation copies (even when the pre-header source remains live
+    * across the loop so phi_web[root].reg points elsewhere). */
+   if (cls == RA_GPR && rctx->rmw_phi && rctx->rmw_phi[idx.value]) {
+      const agx_instr *hdr_phi = rctx->rmw_phi[idx.value];
+      if (hdr_phi->dest[0].has_reg) {
+         unsigned reg = hdr_phi->dest[0].reg;
+         if ((reg % align) == 0 && reg + count <= rctx->bound[cls] &&
+             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
+            return reg;
+      }
+   }
+
    if (rctx->phi_web[phi_idx].assigned) {
       unsigned reg = rctx->phi_web[phi_idx].reg;
       if ((reg % align) == 0 && reg + align <= rctx->bound[cls] &&
           !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align))
          return reg;
-   }
-
-   /* For intermediate nodes in a loop-accumulator RMW chain, prefer staying in
-    * the header phi's register whenever it is free and introduces no G17P
-    * mod-3 co-read bank conflict; if it would conflict, let find_regs pick a
-    * conflict-free register without clobbering other loop-header phi targets. */
-   if (cls == RA_GPR && rctx->rmw_web && rctx->rmw_web[idx.value]) {
-      unsigned rmw_root = phi_web_find(rctx->phi_web, rctx->rmw_web[idx.value] - 1);
-      if (rctx->phi_web[rmw_root].assigned) {
-         unsigned reg = rctx->phi_web[rmw_root].reg;
-         if ((reg % align) == 0 && reg + align <= rctx->bound[cls] &&
-             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align) &&
-             (!rctx->g17p_coread ||
-              g17p_coread_bank_cost(rctx, idx.value, reg) == 0))
-            return reg;
-      }
    }
 
    /* Try to allocate moves compatibly with their sources */
@@ -2895,7 +2987,11 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       memset(ssa_to_reg, 0, rctx->shader->alloc * sizeof(uint16_t));
    rctx->used_regs[RA_GPR] = used_regs_gpr;
    rctx->used_regs[RA_MEM] = used_regs_mem;
-   rctx->loop_phi_targets = NULL;
+   bool recorded_header_phis = false;
+   if (rctx->loop_phi_targets) {
+      memcpy(loop_phi_targets, rctx->loop_phi_targets, sizeof(loop_phi_targets));
+      rctx->loop_phi_targets = loop_phi_targets;
+   }
    memset(rctx->reg_to_ssa, 0xFF, sizeof(rctx->reg_to_ssa));
 
    reserve_live_in(rctx);
@@ -3204,7 +3300,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
        * because of the SSA form.
        */
       if (I->op != AGX_OPCODE_PHI && block->loop_header &&
-          rctx->g17p_coread && !rctx->loop_phi_targets) {
+          rctx->g17p_coread && !recorded_header_phis) {
+         recorded_header_phis = true;
          bool any_phi_target = false;
          agx_foreach_phi_in_block(block, phi) {
             if (phi->dest[0].type == AGX_INDEX_NORMAL && !phi->dest[0].memory &&
@@ -3213,6 +3310,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
                unsigned nr = rctx->ncomps[phi->dest[0].value];
                if (reg + nr <= AGX_NUM_REGS) {
                   BITSET_SET_COUNT(loop_phi_targets, reg, nr);
+                  if (rctx->loop_header_phi_out)
+                     BITSET_SET_COUNT(rctx->loop_header_phi_out, reg, nr);
                   any_phi_target = true;
                }
             }
@@ -3274,6 +3373,20 @@ agx_ra_assign_local(struct ra_ctx *rctx)
 
    U_SPARSE_BITSET_FOREACH_SET(&block->live_out, i) {
       block->reg_to_ssa_out[rctx->classes[i]][rctx->ssa_to_reg[i]] = i;
+   }
+
+   /* Also record phi targets if a loop header contained only phis. */
+   if (block->loop_header && rctx->g17p_coread && !recorded_header_phis &&
+       rctx->loop_header_phi_out) {
+      agx_foreach_phi_in_block(block, phi) {
+         if (phi->dest[0].type == AGX_INDEX_NORMAL && !phi->dest[0].memory &&
+             phi->dest[0].has_reg) {
+            unsigned reg = phi->dest[0].reg;
+            unsigned nr = rctx->ncomps[phi->dest[0].value];
+            if (reg + nr <= AGX_NUM_REGS)
+               BITSET_SET_COUNT(rctx->loop_header_phi_out, reg, nr);
+         }
+      }
    }
 
    /* Also set the sources for the phis in our successors, since that logically
@@ -4175,16 +4288,19 @@ agx_ra(agx_context *ctx)
       }
    }
 
-   uint32_t *rmw_web = NULL;
+   agx_instr **rmw_phi = NULL;
+   unsigned *loop_last = NULL;
    if (any_loop_header) {
-      rmw_web = calloc(ctx->alloc, sizeof(uint32_t));
+      rmw_phi = calloc(ctx->alloc, sizeof(*rmw_phi));
+      loop_last = calloc(MAX2(nr_blocks, 1u), sizeof(unsigned));
       int32_t *innermost_hdr = malloc(MAX2(nr_blocks, 1u) * sizeof(int32_t));
       unsigned *innermost_span = malloc(MAX2(nr_blocks, 1u) * sizeof(unsigned));
       agx_instr **rmw_defs = calloc(ctx->alloc, sizeof(*rmw_defs));
       unsigned *def_blk = calloc(ctx->alloc, sizeof(unsigned));
       uint32_t *use_cnt = calloc(ctx->alloc, sizeof(uint32_t));
-      if (rmw_web && innermost_hdr && innermost_span && rmw_defs && def_blk &&
-          use_cnt) {
+      uint32_t *in_loop_use_cnt = calloc(ctx->alloc, sizeof(uint32_t));
+      if (rmw_phi && loop_last && innermost_hdr && innermost_span && rmw_defs &&
+          def_blk && use_cnt && in_loop_use_cnt) {
          for (unsigned i = 0; i < MAX2(nr_blocks, 1u); ++i) {
             innermost_hdr[i] = -1;
             innermost_span[i] = UINT_MAX;
@@ -4202,6 +4318,8 @@ agx_ra(agx_context *ctx)
             }
             if (!has_back)
                continue;
+            if (header->index < nr_blocks)
+               loop_last[header->index] = last;
             unsigned span = last - header->index;
             for (unsigned i = header->index; i <= last && i < nr_blocks; ++i) {
                if (span < innermost_span[i]) {
@@ -4234,6 +4352,12 @@ agx_ra(agx_context *ctx)
                      if (nr_seen < ARRAY_SIZE(seen))
                         seen[nr_seen++] = v;
                      use_cnt[v]++;
+                     if (rmw_defs[v] && rmw_defs[v]->op == AGX_OPCODE_PHI) {
+                        unsigned h = def_blk[v];
+                        if (h < nr_blocks && block->index >= h &&
+                            block->index <= loop_last[h])
+                           in_loop_use_cnt[v]++;
+                     }
                   }
                }
             }
@@ -4244,8 +4368,7 @@ agx_ra(agx_context *ctx)
                continue;
             agx_foreach_phi_in_block(header, phi) {
                agx_index pd = phi->dest[0];
-               if (pd.type != AGX_INDEX_NORMAL || pd.memory ||
-                   agx_channels(pd) != 1 || use_cnt[pd.value] != 1)
+               if (pd.type != AGX_INDEX_NORMAL || pd.memory)
                   continue;
 
                unsigned pred_idx = 0;
@@ -4254,8 +4377,20 @@ agx_ra(agx_context *ctx)
                       pred_idx < phi->nr_srcs) {
                      agx_index back = phi->src[pred_idx];
                      if (back.type == AGX_INDEX_NORMAL && !back.memory &&
-                         back.size == pd.size && agx_channels(back) == 1 &&
+                         back.size == pd.size &&
+                         agx_channels(back) == agx_channels(pd) &&
                          back.value != pd.value) {
+                        if (!rmw_phi[back.value] ||
+                            (def_blk[back.value] < nr_blocks &&
+                             innermost_hdr[def_blk[back.value]] ==
+                                (int32_t)header->index))
+                           rmw_phi[back.value] = phi;
+
+                        if (agx_channels(pd) != 1 ||
+                            in_loop_use_cnt[pd.value] != 1) {
+                           pred_idx++;
+                           continue;
+                        }
                         /* Walk the unique 1-use tree backwards from `back` to
                          * `pd.value` within this loop's direct blocks. */
                         unsigned stack_ssa[64];
@@ -4307,7 +4442,9 @@ agx_ra(agx_context *ctx)
                                  if (src.type != AGX_INDEX_NORMAL ||
                                      src.memory || src.size != pd.size ||
                                      agx_channels(src) != 1 ||
-                                     use_cnt[src.value] != 1)
+                                     (src.value == pd.value
+                                         ? in_loop_use_cnt[src.value] != 1
+                                         : use_cnt[src.value] != 1))
                                     continue;
                                  stack_src[sp] = s + 1;
                                  if (src.value == pd.value) {
@@ -4334,10 +4471,9 @@ agx_ra(agx_context *ctx)
                            --sp;
                         }
 
-                        if (found && sp >= 1 && rmw_web) {
-                           unsigned root = phi_web_find(phi_web, pd.value);
+                        if (found && sp >= 1 && rmw_phi) {
                            for (unsigned k = 1; k <= sp; ++k)
-                              rmw_web[stack_ssa[k]] = root + 1;
+                              rmw_phi[stack_ssa[k]] = phi;
                         }
                      }
                   }
@@ -4351,6 +4487,7 @@ agx_ra(agx_context *ctx)
       free(rmw_defs);
       free(def_blk);
       free(use_cnt);
+      free(in_loop_use_cnt);
    }
 
    /* Group the phi webs that make up the operands of matrix multiplies */
@@ -4763,6 +4900,11 @@ agx_ra(agx_context *ctx)
    uint16_t *pred_ssa_to_reg =
       list_length(&ctx->blocks) > 1 ? malloc(ctx->alloc * sizeof(uint16_t))
                                     : NULL;
+   BITSET_WORD *hdr_phi_targets =
+      (any_loop_header && g17p_coread && loop_last && nr_blocks)
+         ? calloc((size_t)nr_blocks * BITSET_WORDS(AGX_NUM_REGS),
+                  sizeof(BITSET_WORD))
+         : NULL;
 
    /* Everything assign_local reads below was allocated above, and nothing the
     * cleanup reads is changed after this point, so it survives a longjmp. */
@@ -4777,6 +4919,21 @@ agx_ra(agx_context *ctx)
    const unsigned mem_bound = any_mem ? agx_ra_mem_bound(ctx) : 0;
 
    agx_foreach_block(ctx, block) {
+      BITSET_DECLARE(enclosing_phi_targets, AGX_NUM_REGS) = {0};
+      bool has_enclosing_phis = false;
+      if (hdr_phi_targets && block->index < nr_blocks) {
+         for (unsigned h = 0; h < block->index; ++h) {
+            if (loop_last[h] >= block->index) {
+               const BITSET_WORD *src =
+                  &hdr_phi_targets[(size_t)h * BITSET_WORDS(AGX_NUM_REGS)];
+               for (unsigned w = 0; w < BITSET_WORDS(AGX_NUM_REGS); ++w) {
+                  enclosing_phi_targets[w] |= src[w];
+                  if (src[w])
+                     has_enclosing_phis = true;
+               }
+            }
+         }
+      }
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
          .block = block,
@@ -4786,7 +4943,13 @@ agx_ra(agx_context *ctx)
          .src_to_collect_phi = src_to_collect_phi,
          .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
-         .rmw_web = rmw_web,
+         .rmw_phi = rmw_phi,
+         .loop_phi_targets = has_enclosing_phis ? enclosing_phi_targets : NULL,
+         .loop_header_phi_out =
+            (hdr_phi_targets && block->loop_header && block->index < nr_blocks)
+               ? &hdr_phi_targets[(size_t)block->index *
+                                  BITSET_WORDS(AGX_NUM_REGS)]
+               : NULL,
          .matrix_groups = matrix_groups.data,
          .web_matrix_group = web_matrix_group,
          .ncomps = ncomps,
@@ -4967,7 +5130,9 @@ cleanup:
    free(ssa_to_reg);
    free(pred_ssa_to_reg);
    free(phi_web);
-   free(rmw_web);
+   free(rmw_phi);
+   free(loop_last);
+   free(hdr_phi_targets);
    free(g17p_coread);
    util_dynarray_fini(&matrix_groups);
    free(web_matrix_group);

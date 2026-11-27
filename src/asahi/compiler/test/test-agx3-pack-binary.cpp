@@ -16,6 +16,7 @@ extern "C" {
 #include "compiler/nir/nir_builder.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -23,6 +24,7 @@ extern "C" {
 #include "agx3_alu_core.h"
 #include "agx3_isel_core.h"
 #include "agx3_atomic_core.h"
+#include "agx3_binder.h"
 #include "agx3_cf_core.h"
 #include "agx3_copy_core.h"
 #include "agx3_falu_mod_core.h"
@@ -48,6 +50,7 @@ extern "C" {
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
 extern "C" {
+#include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
 }
 #include "probes/g17p-sparse-mrt.h"
@@ -3939,7 +3942,8 @@ TEST_F(AGX3PackBinary, LocalAtomicReturnedImmediateAddressG17P)
 
    agx_instr immediate_form = {};
    immediate_form.op = AGX_OPCODE_LOCAL_ATOMIC;
-   EXPECT_TRUE(agx_allows_16bit_immediate(&immediate_form));
+   EXPECT_TRUE(
+      agx_allows_16bit_immediate(&immediate_form, AGX_ISA_ENCODING_AGX3B));
 
    const struct agx3_local_atomic_desc d = {
       .op = AGX3_ATOMIC_XCHG,
@@ -19327,4 +19331,336 @@ TEST_F(AGX3PackBinary, FragmentTexelFetchUsesReservedSamplerZeroOnAgx3c)
                 code.end())
          << "unexpected AGX3c fragment fetch with sampler_value=1";
    }
+}
+
+/* Trimmed 16-bit vec3 loads (6 bytes) from global and global-constant memory
+ * (the lowered load_agx and load_constant_agx forms) must shrink before
+ * emission and encode/pack as a 3-component W16 load on AGX2, AGX3B, AGX3C,
+ * and G18G (AGX3D). */
+TEST_F(AGX3PackBinary, TrimmedF16Vec3MemoryLoadsPack)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+
+   for (bool is_ubo : {false, true}) {
+      for (const auto &t : targets) {
+         SCOPED_TRACE(::testing::Message()
+                      << "is_ubo=" << is_ubo << " chip=" << t.chip
+                      << " agx3d=" << t.agx3d);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "f16_vec3_shrink");
+         nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *gid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+         nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, gid, 3)));
+         nir_def *loaded =
+            is_ubo
+               ? agx_test_load_global_constant(&b, 4, 16, addr, 8,
+                                               (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER))
+               : nir_load_global(&b, 4, 16, addr, .align_mul = 8);
+         nir_def *sum = nir_fadd(&b,
+            nir_fadd(&b, nir_channel(&b, loaded, 0), nir_channel(&b, loaded, 1)),
+            nir_channel(&b, loaded, 2));
+         nir_store_global(&b, sum, nir_iadd_imm(&b, addr, 4096), .align_mul = 2);
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key k = {};
+         k.dev.encoding = t.enc;
+         k.dev.chip = t.chip;
+         k.dev.emit_agx3d = t.agx3d;
+         k.no_preamble = true;
+         k.reserved_preamble = 16;
+
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &k, &part));
+         EXPECT_GT(part.info.stats.instrs, 0u);
+         ASSERT_GT(part.info.main_size, 0u);
+
+         const nir_intrinsic_op expect_op =
+            is_ubo ? nir_intrinsic_load_constant_agx : nir_intrinsic_load_agx;
+         unsigned trimmed_nir_loads = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  if (intr->intrinsic == expect_op) {
+                     EXPECT_EQ(intr->def.bit_size, 16u);
+                     EXPECT_EQ(intr->def.num_components, 3u);
+                     trimmed_nir_loads++;
+                  }
+               }
+            }
+         }
+         EXPECT_EQ(trimmed_nir_loads, 1u);
+
+         const uint8_t *code =
+            static_cast<const uint8_t *>(part.binary) + part.info.main_offset;
+         unsigned w16_vec3_loads = 0;
+         unsigned w16_vec4_loads = 0;
+         unsigned off = 0;
+
+         while (off < part.info.main_size) {
+            const char *display = NULL;
+            const size_t avail = part.info.main_size - off;
+            if (t.enc == AGX_ISA_ENCODING_AGX2) {
+               if (avail >= 2 && code[off] == 0x08 && code[off + 1] == 0x00)
+                  break;
+               signed len = agx2_instr_length(code + off, avail, &display);
+               ASSERT_GT(len, 0);
+               if (display && strncmp(display, "load", 4) == 0 &&
+                   (display[4] == '\0' || display[4] == ' ')) {
+                  ASSERT_GE(len, 6);
+                  uint64_t raw = 0;
+                  memcpy(&raw, code + off, std::min<size_t>(len, sizeof(raw)));
+                  unsigned fmt = (((raw >> 48) & 1u) << 3) | ((raw >> 7) & 0x7u);
+                  unsigned mask = (raw >> 52) & 0xfu;
+                  if (fmt == AGX_FORMAT_I16) {
+                     if (mask == 0x7)
+                        w16_vec3_loads++;
+                     else if (mask == 0xf)
+                        w16_vec4_loads++;
+                  }
+               }
+               off += (unsigned)len;
+               continue;
+            }
+
+            signed len = 0;
+            const agx3_table *table = NULL;
+            if (t.enc == AGX_ISA_ENCODING_AGX3B) {
+               len = agx3b_instr_length(code + off, avail, &display);
+               table = &agx3b_table;
+            } else if (t.agx3d) {
+               len = agx3d_instr_length(code + off, avail, &display);
+               table = &agx3d_table;
+            } else {
+               len = agx3c_instr_length(code + off, avail, &display);
+               table = &agx3c_table;
+            }
+            ASSERT_GT(len, 0);
+            uint64_t fields[AGX3_MAX_FIELDS] = {};
+            if (agx3_decode(table, code + off, (unsigned)len, AGX3_MN_lddev,
+                            fields) >= 0 &&
+                fields[10] == AGX3_MEM_W16) {
+               if (fields[73] == 0x7)
+                  w16_vec3_loads++;
+               else if (fields[73] == 0xf)
+                  w16_vec4_loads++;
+            }
+            off += (unsigned)len;
+         }
+
+         EXPECT_EQ(w16_vec3_loads, 1u);
+         EXPECT_EQ(w16_vec4_loads, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+/*
+ * Compute imageblock stores, the imageblock barrier and the block store. The
+ * field vectors are the documented meanings of each instruction's fields
+ * (agx3_tile_core.h, agx3_pack.c), recovered by compiling our own imageblock
+ * compute kernels for the G16G and comparing the results field by field; the
+ * expected bytes are composed from the in-tree AGX3B tables.
+ */
+static std::vector<uint8_t>
+compose_b(enum agx3_mnemonic op, std::vector<struct agx3_field_kv> fields)
+{
+   uint8_t bytes[16], length = 0;
+   EXPECT_TRUE(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, op, 0, fields.data(),
+                                 fields.size(), NULL, 0, bytes, &length));
+   return std::vector<uint8_t>(bytes, bytes + length);
+}
+
+TEST(AGX3ComputeImageblock, TileStoreFieldMap)
+{
+   const struct {
+      uint16_t data;
+      enum agx3_tile_width width;
+      uint8_t mask;
+      uint16_t offset, coords;
+      bool last;
+   } cases[] = {
+      /* Four 8-bit lanes from two fltnorm halves, the whole pixel. */
+      {0, AGX3_TILE_W8, 15, 0, 4, true},
+      /* One 8-bit lane at byte 3, not the last store. */
+      {8, AGX3_TILE_W8, 1, 3, 2, false},
+      /* One 32-bit word at byte 4. */
+      {6, AGX3_TILE_W32, 1, 4, 0, true},
+   };
+   for (const auto &c : cases) {
+      uint8_t got[AGX3_TILE_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, c.data,
+                                           c.width, c.mask, c.offset, c.coords,
+                                           c.last, got, &len));
+      const std::vector<uint8_t> want = compose_b(AGX3_MN_lstcol, {
+         {2, c.data},  {9, 2},   {10, c.width}, {13, 1},  {26, c.mask},
+         {30, c.coords}, {37, 2}, {38, 1}, {41, c.last}, {43, 1}, {51, 1},
+         {52, 1}, {57, c.offset}, {65, 1}, {66, 1},
+      });
+      EXPECT_EQ(std::vector<uint8_t>(got, got + len), want);
+      EXPECT_EQ(len, 12);
+   }
+
+   uint8_t out[AGX3_TILE_MAX_LENGTH], len = 0;
+   /* Other shapes and encodings are refused. */
+   EXPECT_FALSE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3C, 0,
+                                         AGX3_TILE_W8, 15, 0, 4, true, out,
+                                         &len));
+   EXPECT_FALSE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, 0,
+                                         AGX3_TILE_W16, 15, 0, 4, true, out,
+                                         &len));
+   EXPECT_FALSE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, 0,
+                                         AGX3_TILE_W8, 3, 0, 4, true, out,
+                                         &len));
+   EXPECT_FALSE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, 0,
+                                         AGX3_TILE_W8, 15, 0, 5, true, out,
+                                         &len));
+   EXPECT_FALSE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, 1,
+                                         AGX3_TILE_W32, 1, 0, 4, true, out,
+                                         &len));
+}
+
+static std::vector<uint8_t>
+block_store_b(uint16_t x, uint16_t y, bool kill, int lane_class,
+              uint16_t base, enum agx3_block_store_index kind, uint16_t index,
+              bool index_kill)
+{
+   std::vector<uint8_t> v = compose_b(AGX3_MN_pack_imgwir, {
+      {5, 4}, {9, 5}, {10, 2}, {12, 1}, {23, 1}, {24, 1}, {37, 1}, {38, 1},
+      {51, 1}, {52, 2}, {74, 8}, {75, 16}, {76, 7}, {77, 24},
+   });
+   for (unsigned xy = 0; xy < 2; ++xy) {
+      const std::vector<uint8_t> copy = compose_b(AGX3_MN_copy, {
+         {5, 2u * xy}, {9, 5}, {10, 2}, {12, 1}, {16, xy ? y : x}, {23, 2},
+         {24, 2}, {kill ? (uint16_t)27 : (uint16_t)25, 1},
+      });
+      v.insert(v.end(), copy.begin(), copy.end());
+   }
+   std::vector<struct agx3_field_kv> img = {
+      {9, 5}, {12, 1}, {13, 1}, {28, 1}, {29, (uint64_t)lane_class}, {30, 1},
+      {32, 1}, {45, 3}, {46, 3}, {39, base}, {73, 1},
+   };
+   if (kind == AGX3_BLOCK_STORE_INDEX_IMMEDIATE)
+      img.insert(img.end(), {{59, 1}, {60, 1}, {51, index}, {17, 1}});
+   else if (kind == AGX3_BLOCK_STORE_INDEX_UNIFORM)
+      img.insert(img.end(), {{59, 3}, {60, 2}, {53, index}, {17, 1}});
+   else
+      img.insert(img.end(), {{59, 2}, {60, 2}, {52, index}, {22, 1},
+                             {63, index_kill}});
+   const std::vector<uint8_t> store = compose_b(AGX3_MN_imgwblk, img);
+   v.insert(v.end(), store.begin(), store.end());
+   return v;
+}
+
+TEST(AGX3ComputeImageblock, BlockStoreFieldMap)
+{
+   const struct {
+      enum agx3_block_store_index kind;
+      uint16_t index;
+      bool index_kill, kill;
+      int lane_class;
+   } cases[] = {
+      {AGX3_BLOCK_STORE_INDEX_REGISTER, 12, true, true, 3},
+      {AGX3_BLOCK_STORE_INDEX_REGISTER, 14, false, false, 2},
+      {AGX3_BLOCK_STORE_INDEX_IMMEDIATE, 5, false, true, 1},
+      {AGX3_BLOCK_STORE_INDEX_UNIFORM, 40, false, true, 3},
+   };
+   for (const auto &c : cases) {
+      const struct agx3_block_store_desc d = {
+         .x = 8, .y = 10, .x_kill = c.kill, .y_kill = c.kill,
+         .lane_class = c.lane_class, .base_uniform = 12,
+         .index_kind = c.kind, .index = c.index, .index_kill = c.index_kill,
+      };
+      uint8_t got[AGX3_BLOCK_STORE_MAX_LENGTH];
+      size_t len = 0;
+      ASSERT_TRUE(agx3_block_store_compute(AGX_ISA_ENCODING_AGX3B, &d, got,
+                                           &len));
+      EXPECT_EQ(std::vector<uint8_t>(got, got + len),
+                block_store_b(8, 10, c.kill, c.lane_class, 12, c.kind,
+                              c.index, c.index_kill));
+   }
+
+   const struct agx3_block_store_desc bad_base = {
+      .x = 8, .y = 10, .lane_class = 3, .base_uniform = 6,
+      .index_kind = AGX3_BLOCK_STORE_INDEX_IMMEDIATE,
+   };
+   uint8_t out[AGX3_BLOCK_STORE_MAX_LENGTH];
+   size_t len = 0;
+   EXPECT_FALSE(agx3_block_store_compute(AGX_ISA_ENCODING_AGX3B, &bad_base,
+                                         out, &len));
+   EXPECT_FALSE(agx3_block_store_compute(AGX_ISA_ENCODING_AGX3C, &bad_base,
+                                         out, &len));
+   EXPECT_EQ(agx3_block_store_lane_class(AGX3_TILE_W8, false), 3);
+   EXPECT_EQ(agx3_block_store_lane_class(AGX3_TILE_W16, true), 1);
+   EXPECT_EQ(agx3_block_store_lane_class(AGX3_TILE_W32, false), 2);
+   EXPECT_EQ(agx3_block_store_lane_class(AGX3_TILE_W16, false), -1);
+}
+
+TEST(AGX3ComputeImageblock, ImageblockBarrierFieldMap)
+{
+   struct agx3_encoded_scoped_barrier got;
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
+                                        AGX3_BARRIER_SCOPE_IMAGEBLOCK, &got));
+   EXPECT_EQ(std::vector<uint8_t>(got.bytes, got.bytes + got.length),
+             compose_b(AGX3_MN_barrier, {{27, 1}, {29, 1}, {30, 2}, {39, 1}}));
+   EXPECT_FALSE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
+                                         AGX3_BARRIER_SCOPE_IMAGEBLOCK, &got));
+}
+
+/* A compute kernel's imageblock store, imageblock barrier and block store pack
+ * to those encoders' output: the store is the program's last imageblock store,
+ * the block store's heap is a uniform and its record index a register. */
+TEST_F(AGX3PackBinary, ComputeImageblockBlockStorePacks)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G16G;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index data = agx_register(0, AGX_SIZE_16);
+   data.channels_m1 = 1;
+   agx_index coords = agx_register(4, AGX_SIZE_16);
+   coords.channels_m1 = 1;
+   agx_st_tile(b, data, agx_immediate(1), coords, AGX_FORMAT_U8NORM, 0xf, 0,
+               true, 0);
+   agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_IMAGEBLOCK);
+   agx_index origin = agx_register(8, AGX_SIZE_32);
+   origin.channels_m1 = 1;
+   agx_block_image_store(b, agx_uniform(12, AGX_SIZE_64),
+                         agx_register(12, AGX_SIZE_32), agx_immediate(0),
+                         origin, AGX_FORMAT_U8NORM, AGX_DIM_2D, true);
+   agx_stop(b);
+
+   std::vector<uint8_t> want;
+   uint8_t tile[AGX3_TILE_MAX_LENGTH], tile_len = 0;
+   ASSERT_TRUE(agx3_tile_store_explicit(AGX_ISA_ENCODING_AGX3B, 0,
+                                        AGX3_TILE_W8, 15, 0, 4, true, tile,
+                                        &tile_len));
+   append(want, tile, tile_len);
+   struct agx3_encoded_scoped_barrier barrier;
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
+                                        AGX3_BARRIER_SCOPE_IMAGEBLOCK,
+                                        &barrier));
+   append(want, barrier.bytes, barrier.length);
+   const std::vector<uint8_t> store =
+      block_store_b(8, 10, false, 3, 12, AGX3_BLOCK_STORE_INDEX_REGISTER, 12,
+                    false);
+   want.insert(want.end(), store.begin(), store.end());
+   struct agx3_encoded_end end;
+   ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
+   append(want, end.bytes, end.length);
+   EXPECT_EQ(pack(b), want);
 }

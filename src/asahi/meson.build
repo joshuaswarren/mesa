@@ -57,6 +57,47 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  # Shader-object binaries: an exported binary imports and exports again
+  # unchanged; one whose root prefix or root metadata was edited and resealed
+  # is refused. M5 and G17P binaries carry the trimmed root prefix.
+  foreach chip : [['g17s', ['--expect-root-size']],
+                  ['g17p', ['--expect-root-size']], ['g13g', []]]
+    test(
+      'hk-' + chip[0] + '-shader-binary-root',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_shader_binary_root,
+      ] + chip[1],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip[0],
+        'MESA_SHADER_CACHE_DISABLE=true',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # A draw with a pipeline fast-linked from libraries compiles nothing.
+  test(
+    'hk-g17p-gpl-fast-link',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_gpl_fast_link,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'MESA_SHADER_CACHE_DISABLE=true',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
   # state changes (scissor, viewport, cull mode, depth op, color blend).
   test(
@@ -117,6 +158,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,0,4',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Ray tracing pipeline binaries: an exported binary creates the pipeline
+  # again; one whose shader groups were edited and resealed is refused.
+  # G17P with a kernel that admits render ray queries has ray tracing
+  # pipelines and loads their binaries natively.
+  test(
+    'hk-g17p-rt-binary-groups',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_rt_binary_groups,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_RENDER_RAY_QUERY=1',
+      'MESA_SHADER_CACHE_DISABLE=true',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
     depends : [_dev_icd, libvulkan_asahi],

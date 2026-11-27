@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
 /* Exact mirror of libagx_trace_rays_group_count() in src/asahi/libagx/draws.cl
  * used by libagx_trace_rays_indirect_setup, libagx_trace_rays_select_setup,
  * and libagx_trace_rays_select_launch. */
@@ -145,9 +149,71 @@ check_bijection(uint32_t w, uint32_t h, uint32_t d)
    free(seen);
 }
 
+/* Group indices and slot stages, as creation and the binary/cache loader
+ * check them (hk_rt_group_indices_valid(), hk_rt_group_stages_valid()). */
+static void
+check_group_validation(void)
+{
+   const VkShaderStageFlagBits stages[] = {
+      VK_SHADER_STAGE_RAYGEN_BIT_KHR,       VK_SHADER_STAGE_MISS_BIT_KHR,
+      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,  VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+      VK_SHADER_STAGE_INTERSECTION_BIT_KHR, VK_SHADER_STAGE_CALLABLE_BIT_KHR,
+   };
+   const uint32_t n = ARRAY_SIZE(stages);
+   const uint32_t unused = VK_SHADER_UNUSED_KHR;
+   const struct hk_ray_tracing_group valid[] = {
+      {.recursive_index = 0, .ahit_index = unused, .isec_index = unused},
+      {.recursive_index = 1, .ahit_index = unused, .isec_index = unused},
+      {.recursive_index = 5, .ahit_index = unused, .isec_index = unused},
+      {.recursive_index = 2, .ahit_index = 3, .isec_index = unused},
+      {.recursive_index = 2, .ahit_index = 3, .isec_index = 4},
+      {.recursive_index = unused, .ahit_index = unused, .isec_index = 4},
+      {.recursive_index = unused, .ahit_index = unused, .isec_index = unused},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(valid); ++i) {
+      assert(hk_rt_group_indices_valid(&valid[i], n));
+      assert(hk_rt_group_stages_valid(&valid[i], n, stages));
+   }
+
+   /* Every slot: one past the end, further, and the largest index that is
+    * not VK_SHADER_UNUSED_KHR. */
+   const uint32_t past[] = {n, n + 1, unused - 1};
+   for (unsigned i = 0; i < ARRAY_SIZE(past); ++i) {
+      for (unsigned slot = 0; slot < 3; ++slot) {
+         struct hk_ray_tracing_group g = valid[4];
+         uint32_t *index = slot == 0   ? &g.recursive_index
+                           : slot == 1 ? &g.ahit_index
+                                       : &g.isec_index;
+         *index = past[i];
+         assert(!hk_rt_group_indices_valid(&g, n));
+         assert(!hk_rt_group_stages_valid(&g, n, stages));
+      }
+   }
+
+   /* No index is in range of an empty stage array. */
+   assert(!hk_rt_group_indices_valid(&valid[0], 0));
+   assert(hk_rt_group_indices_valid(&valid[6], 0));
+
+   /* In range, but a shader of a stage the slot does not take. */
+   const struct hk_ray_tracing_group wrong[] = {
+      {.recursive_index = 3, .ahit_index = unused, .isec_index = unused},
+      {.recursive_index = 4, .ahit_index = unused, .isec_index = unused},
+      {.recursive_index = 2, .ahit_index = 0, .isec_index = unused},
+      {.recursive_index = 2, .ahit_index = 4, .isec_index = unused},
+      {.recursive_index = 2, .ahit_index = 3, .isec_index = 2},
+      {.recursive_index = 2, .ahit_index = 3, .isec_index = 3},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(wrong); ++i) {
+      assert(hk_rt_group_indices_valid(&wrong[i], n));
+      assert(!hk_rt_group_stages_valid(&wrong[i], n, stages));
+   }
+}
+
 int
 main(void)
 {
+   check_group_validation();
+
    /* Zero dimensions produce zero workgroups on the zero axis. */
    check_groups(0, 0, 0, 0, 0, 0);
    check_groups(0, 1080, 1, 0, 270, 1);
