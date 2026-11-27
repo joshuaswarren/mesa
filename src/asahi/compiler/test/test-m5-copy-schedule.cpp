@@ -642,7 +642,7 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
    const unsigned coord_comps =
       (dim == AGX_DIM_CUBE_ARRAY) ? 4
       : (dim == AGX_DIM_2D_ARRAY || dim == AGX_DIM_3D || dim == AGX_DIM_CUBE ||
-         dim == AGX_DIM_2D_MS)
+         dim == AGX_DIM_2D_MS || dim == AGX_DIM_2D_MS_ARRAY)
          ? 3
          : 2;
    for (unsigned i = 0; i < 5; ++i) {
