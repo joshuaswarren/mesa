@@ -2480,6 +2480,12 @@ struct hk_cmd_buffer {
          VkImageAspectFlags aspects;
          VkClearValue value;
          bool from_gfx;
+         /* Finalized clear-only VDM stream kept alive when an empty clear
+          * pass is deferred on native AGX3 / M5. Dropped if every cleared
+          * attachment it owns is absorbed or superseded; otherwise left in
+          * control_streams on flush so the clear stays on VDM without a
+          * VDM->CDM->VDM crossing. */
+         struct hk_cs *vdm_cs;
          struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
