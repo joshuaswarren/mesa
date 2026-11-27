@@ -1,0 +1,59 @@
+{
+  "scope": "Apple compiler reference only; no GPU execution",
+  "hardware_execution": false,
+  "mesa_execution": false,
+  "arch": "applegpu_g14g",
+  "encoding": "AGX2",
+  "provenance": {
+    "archive_sha256": "9319cd0a72bc6997ca82d8303bd75f6dc634f64ae47aac5b3aa6b13f773ae40e",
+    "inner_gpu_object_sha256": "e2d398c710b2a2d1a02f0ef8c9dbf8304cad3657145cca2eafcd2c8a52166d4d"
+  },
+  "texts": {
+    "probe.scoreprobe-reference.scoreprobe.g14g.bin": {
+      "corpus": "probe",
+      "source": "scoreprobe-reference.metal",
+      "config": "scoreprobe-reference.mtlp-json",
+      "function": "scoreprobe",
+      "stage": "compute",
+      "arch": "applegpu_g14g",
+      "layout": "checked-in fixture holds _agc.main alone (30 bytes); the full 94-byte __TEXT,__text section in the provenance archive puts _agc.main.constant_program at offset 0 and _agc.main at 0x40",
+      "symbols": {
+        "_agc.main.constant_program": 0,
+        "_agc.main": 64
+      },
+      "size": 30,
+      "agc_main": {
+        "offset": 64,
+        "size": 30,
+        "hex": "720510040501200e00c0120038001a81c00200014501240e00c012008800",
+        "decode": [
+          {
+            "offset": "0x40",
+            "asm": "mov      r1, thread_in_grid_x"
+          },
+          {
+            "offset": "0x44",
+            "asm": "load     r0, du0, r1, i32, x, a"
+          },
+          {
+            "offset": "0x4c",
+            "asm": "wait     a"
+          },
+          {
+            "offset": "0x4e",
+            "asm": "fmul     r0, ^r0, 2.0"
+          },
+          {
+            "offset": "0x54",
+            "asm": "store    r0, du2, r1, i32, x, a"
+          },
+          {
+            "offset": "0x5c",
+            "asm": "stop"
+          }
+        ]
+      },
+      "note": "Only Apple-emitted bytes are checked in. The constant-program half of the archive section is arch-specific and not reconstructed here; drop the full 94-byte section in place to cover it -- the test decodes from the right offset either way."
+    }
+  }
+}
