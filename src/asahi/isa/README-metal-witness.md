@@ -129,8 +129,11 @@ count, termination form).  Anything the decoder cannot settle -- for example
 staging order once the streams' instruction counts diverge, or the meaning of
 bytes the decoder leaves unnamed -- is printed as unestablished, never
 inferred.  Buffer bases read through `load_preamble` encode as `du` slots in
-the driver uniform area; established on this witness: the `du` index is half
-the preamble base (preamble base 0 loads as `du0`, base 4 as `du2`).
+the driver uniform area; established on our side: our `du` index is half the
+preamble base (preamble base 0 loads as `du0`, base 4 as `du2`).  On Apple's
+side the witness shows the `load` on `du0` and the `store` on `du2`; whether
+Apple derives the index the same way is unestablished -- its base values
+live in the constant program, which the checked-in fixture does not carry.
 
 To run just this comparison:
 
