@@ -1107,6 +1107,7 @@ test_postopt_fs_inline_equivalence(void)
 {
    nir_shader *src = build_test_fs_main(false);
    nir_shader *ref_src = nir_shader_clone(NULL, src);
+   const nir_shader_compiler_options *src_options = src->options;
 
    struct agx_shader_key cap_key = g17p_key(true);
    struct agx_shader_part standalone_part = {0};
@@ -1118,6 +1119,12 @@ test_postopt_fs_inline_equivalence(void)
       src, &cap_key, &standalone_part, &pre_preamble_blob, &post_opt_nir);
    ralloc_free(src);
    ok &= post_opt_nir != NULL && pre_preamble_blob.size > 0;
+   /* The capture outlives the compile: it must not keep the compiler's
+    * stack-local per-encoding options. */
+   if (post_opt_nir && post_opt_nir->options != src_options) {
+      fprintf(stderr, "postopt capture kept transient compiler options\n");
+      ok = false;
+   }
 
    struct agx_shader_part ref_part = {0}, fast_part = {0};
    if (ok) {
