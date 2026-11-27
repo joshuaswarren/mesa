@@ -7947,14 +7947,14 @@ hk_render_pack_link_target(struct hk_device *dev, struct hk_cmd_buffer *cmd,
 static void
 hk_render_pack_note_boundary(struct hk_device *dev,
                              struct hk_cmd_buffer *const *cmds, unsigned a,
-                             unsigned m, const char *why)
+                             unsigned m, bool first, const char *why)
 {
    struct hk_render_pack_edges *e = &cmds[a]->render_pack;
    if (likely(!dev->frame_anatomy) || !e->tail ||
        !cmds[a + 1]->render_pack.head)
       return;
    e->next_who = why ? 0 : m == a ? 1 : 2;
-   e->next_why = why ? why : hk_render_pack_member_refusal(cmds[m]);
+   e->next_why = why ? why : hk_render_pack_member_refusal_for(cmds[m], first);
    hk_frame_anatomy_note(dev, "pass-merge render pack: cb %u -> %u: %s%s",
                          a, a + 1,
                          e->next_who == 1 ? "this: "
@@ -8000,7 +8000,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    for (unsigned i = 0; targets && runs && i < n;) {
       const struct hk_cs *first_pre = NULL, *first_post = NULL;
       const struct hk_cs *first =
-         hk_render_pack_member_streams(cmds[i], &first_pre, &first_post);
+         hk_render_pack_member_streams(cmds[i], true, &first_pre, &first_post);
       struct hk_render_pack_run run = {
          .first = i, .count = 1, .scissor = first, .zbias = first,
       };
@@ -8010,6 +8010,15 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          first && first->sync.heap_slot
             ? BITFIELD_BIT(first->sync.heap_slot - 1)
             : 0;
+      uint8_t run_vdm_kinds = first ? first->sync.kind : 0;
+      uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS] = {0};
+      if (first) {
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+            if (cmds[i]->sync.req[k][HK_SYNC_VDM].cut)
+               run_vdm_tail_req[k] |= first->sync.kind;
+            run_vdm_tail_req[k] |= cmds[i]->sync.req[k][HK_SYNC_VDM].prior;
+         }
+      }
       unsigned run_pre = first_pre ? 1 : 0;
       unsigned run_post = first_post ? 1 : 0;
       struct hk_render_pack_run_state state;
@@ -8019,22 +8028,27 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       if (unlikely(dev->frame_anatomy))
          cmds[i]->render_pack.next_why = NULL;
       if (!first && i + 1 < n)
-         hk_render_pack_note_boundary(dev, cmds, i, i, NULL);
+         hk_render_pack_note_boundary(dev, cmds, i, i, true, NULL);
 
       while (first && i + run.count < n) {
          const unsigned a = i + run.count - 1, b = a + 1;
          const struct hk_cs *bs_pre = NULL, *bs_post = NULL;
          const struct hk_cs *bs =
-            hk_render_pack_member_streams(cmds[b], &bs_pre, &bs_post);
+            hk_render_pack_member_streams(cmds[b], false, &bs_pre, &bs_post);
          if (unlikely(dev->frame_anatomy))
             cmds[b]->render_pack.next_why = NULL;
          if (!bs) {
-            hk_render_pack_note_boundary(dev, cmds, a, b, NULL);
+            hk_render_pack_note_boundary(dev, cmds, a, b, false, NULL);
             break;
          }
 
          const char *why =
             hk_render_pack_boundary(&state, cmds[a], cmds[b], bs, first);
+         if (!why && bs_pre) {
+            why = hk_render_pack_pre_cs_refusal(&state, bs_pre, run_post,
+                                                run_vdm_kinds,
+                                                run_vdm_tail_req);
+         }
          if (!why && bs->sync.heap_slot &&
              (used_heap_slots & BITFIELD_BIT(bs->sync.heap_slot - 1)))
             why = "heap slot";
@@ -8063,7 +8077,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (!why && !target)
             why = "stream link";
          if (why) {
-            hk_render_pack_note_boundary(dev, cmds, a, b, why);
+            hk_render_pack_note_boundary(dev, cmds, a, b, false, why);
             break;
          }
 
@@ -8076,6 +8090,12 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             dbias = bs->cr.dbias_is_int;
          if (bs->sync.heap_slot)
             used_heap_slots |= BITFIELD_BIT(bs->sync.heap_slot - 1);
+         run_vdm_kinds |= bs->sync.kind;
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+            if (cmds[b]->sync.req[k][HK_SYNC_VDM].cut)
+               run_vdm_tail_req[k] |= bs->sync.kind;
+            run_vdm_tail_req[k] |= cmds[b]->sync.req[k][HK_SYNC_VDM].prior;
+         }
          if (bs_pre)
             run_pre++;
          if (bs_post)
@@ -8119,6 +8139,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       uint8_t cdm_preceding = 0;
       uint8_t carried_req[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ] = {0};
       bool cdm_req_cut[HK_SYNC_NUM_KINDS] = {false};
+      bool pre_needs_cdm_cut[HK_RENDER_PACK_MAX_PRE] = {false};
       unsigned n_pre = 0, n_post = 0;
       bool ok = true;
       for (unsigned m = 0; ok && m < run->count; ++m) {
@@ -8129,6 +8150,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             item = list_first_entry(&source->control_streams, struct hk_cs, node);
          if (pre) {
             assert(n_pre < HK_RENDER_PACK_MAX_PRE);
+            const unsigned pre_idx = n_pre;
             struct hk_cs *dst = &p->pre_cs[n_pre++];
             *dst = *pre;
             list_inithead(&dst->node);
@@ -8146,6 +8168,14 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   dst->sync.dep[sq].prior |= carried_req[k][sq];
                   dst->sync.dep_ta[sq].prior |= carried_req[k][sq];
                }
+            }
+            if (pre_idx > 0 &&
+                ((dst->sync.dep[HK_SYNC_CDM].prior & cdm_preceding) ||
+                 (dst->sync.dep_ta[HK_SYNC_CDM].prior & cdm_preceding)))
+               pre_needs_cdm_cut[pre_idx] = true;
+            u_foreach_bit(k, pre_carry) {
+               if (pre_idx > 0 && cdm_req_cut[k])
+                  pre_needs_cdm_cut[pre_idx] = true;
             }
             cdm_preceding |= pre->sync.kind;
          }
@@ -8187,6 +8217,10 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          uint32_t seq = 0;
          for (unsigned j = 0; j < n_pre; ++j) {
             p->pre_cs[j].sync.seq = ++seq;
+            if (j > 0 && pre_needs_cdm_cut[j]) {
+               p->pre_cs[j].sync.dep[HK_SYNC_CDM].cut = &p->pre_cs[j - 1];
+               p->pre_cs[j].sync.dep_ta[HK_SYNC_CDM].cut = &p->pre_cs[j - 1];
+            }
             list_addtail(&p->pre_cs[j].node, &p->cmd.control_streams);
             u_foreach_bit(k, p->pre_cs[j].sync.kind)
                p->cmd.sync.last[k][HK_SYNC_CDM] = &p->pre_cs[j];
