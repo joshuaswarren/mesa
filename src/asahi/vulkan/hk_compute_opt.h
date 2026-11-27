@@ -21,6 +21,7 @@ enum hk_compute_opt_kind {
    HK_COMPUTE_OPT_CANNY_HYSTERESIS_U8 = 1,
    HK_COMPUTE_OPT_CANNY_NMS_U8 = 2,
    HK_COMPUTE_OPT_CANNY_FINALIZE_U8 = 3,
+   HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 = 4,
 };
 
 struct hk_compute_opt_binding {
@@ -39,7 +40,7 @@ struct hk_compute_opt_plan {
    uint32_t orig_wg_size[3];
 
    /* Push-constant byte offsets (all 32-bit fields). */
-   uint16_t pc_off[6];
+   uint16_t pc_off[8];
 
    /* Kernel-specific scalar parameters captured verbatim from matched NIR.
     * - RGBA8_TO_GRAY_U8:    u32[0..2] = (w_r, w_g, w_b), u32[3] = shr

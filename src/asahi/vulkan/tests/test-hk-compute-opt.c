@@ -14,6 +14,7 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -615,6 +616,683 @@ test_canny_finalize(void)
    free(layout);
 }
 
+static void
+emit_test_mirror_border(nir_builder *b, nir_deref_instr *dst, nir_def *x,
+                        nir_def *y, nir_def *val, nir_def *dw, nir_def *dh,
+                        nir_def *ds, nir_def *border)
+{
+   nir_def *y_row = nir_imul(b, nir_iadd(b, y, border), ds);
+   nir_def *px = nir_iadd(b, x, border);
+   nir_store_deref(b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, y_row, px)),
+                   val, 0x1);
+
+   nir_def *x_lo = nir_isub(b, nir_iadd_imm(b, dw, -2), border);
+   nir_def *x_hi = nir_iadd_imm(b, dw, -1);
+   nir_def *y_lo = nir_isub(b, nir_iadd_imm(b, dh, -2), border);
+   nir_def *y_hi = nir_iadd_imm(b, dh, -1);
+   nir_def *xl = nir_uge(b, border, x);
+   nir_def *xr = nir_iand(b, nir_ult(b, x_lo, x), nir_ult(b, x, x_hi));
+   nir_def *yt = nir_uge(b, border, y);
+   nir_def *yb = nir_iand(b, nir_ult(b, y_lo, y), nir_ult(b, y, y_hi));
+   nir_def *ya = nir_ior(b, yt, yb);
+
+   nir_push_if(b, nir_ior(b, nir_ior(b, xl, xr), ya));
+   {
+      nir_def *xl_nz = nir_iand(b, nir_ine_imm(b, x, 0), xl);
+      nir_def *yt_nz = nir_iand(b, nir_ine_imm(b, y, 0), yt);
+      nir_def *ry_t = nir_imul(b, nir_isub(b, border, y), ds);
+      nir_def *ry_b = nir_imul(
+         b,
+         nir_isub(b, nir_iadd(b, nir_ishl_imm(b, dh, 1),
+                              nir_iadd_imm(b, border, -2)),
+                  y),
+         ds);
+      nir_push_if(b, xl_nz);
+      {
+         nir_def *rx_l = nir_isub(b, border, x);
+         nir_store_deref(
+            b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, y_row, rx_l)),
+            val, 0x1);
+         nir_push_if(b, ya);
+         {
+            nir_push_if(b, yt_nz);
+            nir_store_deref(
+               b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_t, rx_l)),
+               val, 0x1);
+            nir_pop_if(b, NULL);
+            nir_push_if(b, yb);
+            nir_store_deref(
+               b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_b, rx_l)),
+               val, 0x1);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+      nir_push_if(b, yt_nz);
+      nir_store_deref(
+         b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_t, px)), val, 0x1);
+      nir_pop_if(b, NULL);
+      nir_push_if(b, xr);
+      {
+         nir_def *rx_r = nir_isub(
+            b, nir_iadd(b, nir_ishl_imm(b, dw, 1), nir_iadd_imm(b, border, -2)),
+            x);
+         nir_store_deref(
+            b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, y_row, rx_r)),
+            val, 0x1);
+         nir_push_if(b, ya);
+         {
+            nir_push_if(b, yt_nz);
+            nir_store_deref(
+               b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_t, rx_r)),
+               val, 0x1);
+            nir_pop_if(b, NULL);
+            nir_push_if(b, yb);
+            nir_store_deref(
+               b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_b, rx_r)),
+               val, 0x1);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+      nir_push_if(b, yb);
+      nir_store_deref(
+         b, nir_build_deref_ptr_as_array(b, dst, nir_iadd(b, ry_b, px)), val, 0x1);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+static nir_shader *
+build_test_bilinear_resize_border(bool wrong_clamp)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &test_nir_options, "resize_border_test");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 8;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 2;
+
+   nir_deref_instr *src = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+   nir_deref_instr *dst = make_ssbo_base(&b, 1, glsl_uint8_t_type(), 1);
+
+   nir_def *sw_sh = nir_load_push_constant(&b, 2, 32, nir_imm_int(&b, 0),
+                                           .base = 0, .range = 8);
+   nir_def *sw = nir_channel(&b, sw_sh, 0);
+   nir_def *sh = nir_channel(&b, sw_sh, 1);
+   nir_def *ss = make_pc_i32(&b, 8);
+   nir_def *dst_p = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0),
+                                           .base = 12, .range = 16);
+   nir_def *dw = nir_channel(&b, dst_p, 0);
+   nir_def *dh = nir_channel(&b, dst_p, 1);
+   nir_def *ds = nir_channel(&b, dst_p, 2);
+   nir_def *border = nir_channel(&b, dst_p, 3);
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *gx0 = nir_channel(&b, gid, 0);
+   nir_def *gy0 = nir_channel(&b, gid, 1);
+   nir_def *nwg = nir_load_num_workgroups(&b);
+   nir_def *step_x = nir_ishl_imm(&b, nir_channel(&b, nwg, 0), 5);
+   nir_def *step_y = nir_ishl_imm(&b, nir_channel(&b, nwg, 1), 3);
+
+   nir_push_if(&b, nir_ior(&b, nir_ine(&b, sw, dw), nir_ine(&b, sh, dh)));
+   {
+      nir_def *sx_sc = nir_fmul(&b, nir_i2f32(&b, sw), nir_frcp(&b, nir_i2f32(&b, dw)));
+      nir_def *sy_sc = nir_fmul(&b, nir_i2f32(&b, sh), nir_frcp(&b, nir_i2f32(&b, dh)));
+      nir_def *swm1 = nir_iadd_imm(&b, sw, -1);
+      nir_def *shm1 = nir_iadd_imm(&b, sh, -1);
+
+      nir_variable *yv = nir_local_variable_create(b.impl, glsl_int_type(), "ry");
+      nir_store_var(&b, yv, gy0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, yv);
+         nir_push_if(&b, nir_uge(&b, y, dh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_def *sy = nir_fmul(&b, nir_u2f32(&b, y), sy_sc);
+         nir_def *fy = nir_fsub(&b, sy, nir_ftrunc(&b, sy));
+         nir_def *iy = nir_f2i32(&b, sy);
+         nir_def *y0 = nir_imin(&b, nir_imax(&b, iy, nir_imm_int(&b, 0)), shm1);
+         nir_def *y1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, iy, 1), nir_imm_int(&b, 0)), shm1);
+         nir_def *r0 = nir_imul(&b, y0, ss);
+         nir_def *r1 = nir_imul(&b, y1, ss);
+
+         nir_variable *xv = nir_local_variable_create(b.impl, glsl_int_type(), "rx");
+         nir_store_var(&b, xv, gx0, 0x1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, xv);
+            nir_push_if(&b, nir_uge(&b, x, dw));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+
+            nir_def *sx = nir_fmul(&b, nir_u2f32(&b, x), sx_sc);
+            nir_def *fx = nir_fsub(&b, sx, nir_ftrunc(&b, sx));
+            nir_def *ix = nir_f2i32(&b, sx);
+            nir_def *x0 = nir_imin(&b, nir_imax(&b, ix, nir_imm_int(&b, 0)), swm1);
+            nir_def *x1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, ix, 1), nir_imm_int(&b, 0)), swm1);
+            nir_def *p00 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, r0, x0))));
+            nir_def *p01 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, r0, x1))));
+            nir_def *p10 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, r1, x0))));
+            nir_def *p11 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, r1, x1))));
+            nir_def *top = nir_ffma(&b, fx, nir_fsub(&b, p01, p00), p00);
+            nir_def *bot = nir_ffma(&b, fx, nir_fsub(&b, p11, p10), p10);
+            nir_def *val = nir_ffma(&b, fy, nir_fsub(&b, bot, top), top);
+            nir_def *cl = nir_fmin(&b, nir_fmax(&b, val, nir_imm_float(&b, 0.0f)),
+                                   nir_imm_float(&b, wrong_clamp ? 128.0f : 255.0f));
+            nir_def *out = nir_u2u8(&b, nir_f2i32(&b, cl));
+            emit_test_mirror_border(&b, dst, x, y, out, dw, dh, ds, border);
+            nir_store_var(&b, xv, nir_iadd(&b, x, step_x), 0x1);
+         }
+         nir_pop_loop(&b, NULL);
+         nir_store_var(&b, yv, nir_iadd(&b, y, step_y), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+   }
+   nir_push_else(&b, NULL);
+   {
+      nir_variable *yv = nir_local_variable_create(b.impl, glsl_int_type(), "cy");
+      nir_store_var(&b, yv, gy0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, yv);
+         nir_push_if(&b, nir_uge(&b, y, dh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_variable *xv = nir_local_variable_create(b.impl, glsl_int_type(), "cx");
+         nir_store_var(&b, xv, gx0, 0x1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, xv);
+            nir_push_if(&b, nir_uge(&b, x, dw));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+
+            nir_def *v = nir_load_deref(
+               &b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y, ss), x)));
+            emit_test_mirror_border(&b, dst, x, y, v, dw, dh, ds, border);
+            nir_store_var(&b, xv, nir_iadd(&b, x, step_x), 0x1);
+         }
+         nir_pop_loop(&b, NULL);
+         nir_store_var(&b, yv, nir_iadd(&b, y, step_y), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_validate_shader(b.shader, "build_test_bilinear_resize_border");
+   return b.shader;
+}
+
+static void
+test_bilinear_resize_border(void)
+{
+   struct hk_descriptor_set_layout *layout = make_test_layout(2, false);
+   struct vk_descriptor_set_layout *layouts[1] = {&layout->vk};
+
+   nir_shader *s = build_test_bilinear_resize_border(false);
+   struct hk_compute_opt_plan plan = {0};
+   assert(hk_nir_match_compute_opt(s, 1, layouts, &plan));
+   assert(plan.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+   assert(plan.tile_w == 128 && plan.tile_h == 8);
+   assert(plan.pc_off[0] == 12 && plan.pc_off[1] == 16 &&
+          plan.pc_off[2] == 20 && plan.pc_off[3] == 24 &&
+          plan.pc_off[4] == 0 && plan.pc_off[5] == 4 && plan.pc_off[6] == 8);
+
+   nir_shader *opt = hk_nir_build_compute_opt(
+      NULL, s, &plan, nir_address_format_64bit_bounded_global);
+   assert(opt != NULL);
+   ralloc_free(opt);
+
+   struct hk_buffer_address addrs[2] = {
+      {.base_addr = 0x100000, .size = 1024 * 768},
+      {.base_addr = 0x500000, .size = 1056 * 800},
+   };
+   struct hk_descriptor_state desc;
+   struct hk_descriptor_set ds;
+   setup_desc_state(&desc, &ds, layout, addrs, 2);
+   set_push_i32(&desc, 0, 1024);
+   set_push_i32(&desc, 4, 768);
+   set_push_i32(&desc, 8, 1024);
+   set_push_i32(&desc, 12, 800);
+   set_push_i32(&desc, 16, 600);
+   set_push_i32(&desc, 20, 832);
+   set_push_i32(&desc, 24, 16);
+
+   uint32_t gx = 0, gy = 0;
+   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                4, 4, 1, &gx, &gy));
+   assert(gx == 7 && gy == 75);
+
+   /* Reject border=0 with width < 2 (guards against dst_w - 2 - border underflow). */
+   set_push_i32(&desc, 12, 1);
+   set_push_i32(&desc, 24, 0);
+   assert(!hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
+                                                 1, 1, 1, &gx, &gy));
+   ralloc_free(s);
+
+   nir_shader *bad = build_test_bilinear_resize_border(true);
+   assert(!hk_nir_match_compute_opt(bad, 1, layouts, &plan));
+   ralloc_free(bad);
+
+   /* Verify pre-lowered GB6 form: in-arm primary stores, dst reload at primary
+    * index, (1 - t) * a + t * b lerp, and 4 direct sibling mirror border ifs. */
+   for (unsigned bad_reload = 0; bad_reload < 2; bad_reload++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &test_nir_options, "resize_prelower");
+      b.shader->info.internal = false;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 2;
+
+      nir_deref_instr *src = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+      nir_deref_instr *dst = make_ssbo_base(&b, 1, glsl_uint8_t_type(), 1);
+      nir_def *sw = make_pc_i32(&b, 0);
+      nir_def *sh = make_pc_i32(&b, 4);
+      nir_def *ss = make_pc_i32(&b, 8);
+      nir_def *dw = make_pc_i32(&b, 12);
+      nir_def *dh = make_pc_i32(&b, 16);
+      nir_def *ds = make_pc_i32(&b, 20);
+      nir_def *border = make_pc_i32(&b, 24);
+      nir_def *gid = nir_load_global_invocation_id(&b, 32);
+      nir_def *bwg = nir_load_base_workgroup_id(&b, 32);
+      nir_def *nwg = nir_load_num_workgroups(&b);
+      nir_def *gx0 = nir_iadd(&b, nir_channel(&b, gid, 0),
+                              nir_ishl_imm(&b, nir_channel(&b, bwg, 0), 5));
+      nir_def *gy0 = nir_iadd(&b, nir_channel(&b, gid, 1),
+                              nir_channel(&b, bwg, 1));
+      nir_def *step_x = nir_ishl_imm(&b, nir_channel(&b, nwg, 0), 5);
+      nir_def *step_y = nir_channel(&b, nwg, 1);
+      nir_def *sx_scale =
+         nir_fmul(&b, nir_i2f32(&b, sw), nir_frcp(&b, nir_i2f32(&b, dw)));
+      nir_def *sy_scale =
+         nir_fmul(&b, nir_i2f32(&b, sh), nir_frcp(&b, nir_i2f32(&b, dh)));
+
+      nir_variable *yv = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_store_var(&b, yv, gy0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, yv);
+         nir_push_if(&b, nir_uge(&b, y, dh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_variable *xv = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+         nir_store_var(&b, xv, gx0, 0x1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, xv);
+            nir_push_if(&b, nir_uge(&b, x, dw));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+            nir_def *do_res = nir_ior(&b, nir_ine(&b, sw, dw), nir_ine(&b, sh, dh));
+            nir_def *y_row = nir_imul(&b, nir_iadd(&b, y, border), ds);
+            nir_def *px = nir_iadd(&b, x, border);
+            nir_def *prim_idx = nir_iadd(&b, y_row, px);
+            nir_push_if(&b, do_res);
+            {
+               nir_def *sx = nir_fmul(&b, nir_u2f32(&b, x), sx_scale);
+               nir_def *sy = nir_fmul(&b, nir_u2f32(&b, y), sy_scale);
+               nir_def *fx = nir_fsub(&b, sx, nir_ftrunc(&b, sx));
+               nir_def *fy = nir_fsub(&b, sy, nir_ftrunc(&b, sy));
+               nir_def *ix = nir_f2i32(&b, sx);
+               nir_def *iy = nir_f2i32(&b, sy);
+               nir_def *x0 = nir_imin(&b, nir_imax(&b, ix, nir_imm_int(&b, 0)), nir_iadd_imm(&b, sw, -1));
+               nir_def *x1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, ix, 1), nir_imm_int(&b, 0)), nir_iadd_imm(&b, sw, -1));
+               nir_def *y0 = nir_imin(&b, nir_imax(&b, iy, nir_imm_int(&b, 0)), nir_iadd_imm(&b, sh, -1));
+               nir_def *y1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, iy, 1), nir_imm_int(&b, 0)), nir_iadd_imm(&b, sh, -1));
+               nir_def *p00 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y0, ss), x0)))));
+               nir_def *p01 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y0, ss), x1)))));
+               nir_def *p10 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x0)))));
+               nir_def *p11 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x1)))));
+               nir_def *omfx = nir_fsub(&b, nir_imm_float(&b, 1.0f), fx);
+               nir_def *omfy = nir_fsub(&b, nir_imm_float(&b, 1.0f), fy);
+               nir_def *t = nir_fadd(&b, nir_fmul(&b, omfx, p00), nir_fmul(&b, fx, p01));
+               nir_def *bt = nir_fadd(&b, nir_fmul(&b, omfx, p10), nir_fmul(&b, fx, p11));
+               nir_def *v = nir_fadd(&b, nir_fmul(&b, omfy, t), nir_fmul(&b, fy, bt));
+               nir_def *v8 = nir_u2u8(&b, nir_f2i32(&b, nir_fmin(&b, nir_fmax(&b, v, nir_imm_float(&b, 0.0f)), nir_imm_float(&b, 255.0f))));
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, prim_idx), v8, 0x1);
+            }
+            nir_push_else(&b, NULL);
+            {
+               nir_def *v8 = nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y, ss), x)));
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, prim_idx), v8, 0x1);
+            }
+            nir_pop_if(&b, NULL);
+
+            nir_def *ridx = bad_reload ? nir_iadd_imm(&b, prim_idx, 1) : prim_idx;
+            nir_def *val = nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, dst, ridx));
+            nir_def *x_lo = nir_iadd(&b, nir_iadd_imm(&b, dw, -2), nir_ineg(&b, border));
+            nir_def *x_hi = nir_iadd_imm(&b, dw, -1);
+            nir_def *y_lo = nir_iadd(&b, nir_iadd_imm(&b, dh, -2), nir_ineg(&b, border));
+            nir_def *y_hi = nir_iadd_imm(&b, dh, -1);
+            nir_def *xl_nz = nir_iand(&b, nir_ine_imm(&b, x, 0), nir_uge(&b, border, x));
+            nir_def *yt_nz = nir_iand(&b, nir_ine_imm(&b, y, 0), nir_uge(&b, border, y));
+            nir_def *xr = nir_iand(&b, nir_ult(&b, x, x_hi), nir_ult(&b, x_lo, x));
+            nir_def *yb = nir_iand(&b, nir_ult(&b, y, y_hi), nir_ult(&b, y_lo, y));
+            nir_def *ry_t = nir_imul(&b, nir_iadd(&b, border, nir_ineg(&b, y)), ds);
+            nir_def *ry_b = nir_imul(&b, nir_iadd(&b, nir_iadd(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, dh, 1), -2), border), nir_ineg(&b, y)), ds);
+
+            nir_push_if(&b, xl_nz);
+            {
+               nir_def *rx_l = nir_iadd(&b, border, nir_ineg(&b, x));
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, y_row, rx_l)), val, 0x1);
+               nir_push_if(&b, yt_nz);
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_t, rx_l)), val, 0x1);
+               nir_pop_if(&b, NULL);
+               nir_push_if(&b, yb);
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_b, rx_l)), val, 0x1);
+               nir_pop_if(&b, NULL);
+            }
+            nir_pop_if(&b, NULL);
+            nir_push_if(&b, yt_nz);
+            nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_t, px)), val, 0x1);
+            nir_pop_if(&b, NULL);
+            nir_push_if(&b, xr);
+            {
+               nir_def *rx_r = nir_iadd(&b, nir_iadd(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, dw, 1), -2), border), nir_ineg(&b, x));
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, y_row, rx_r)), val, 0x1);
+               nir_push_if(&b, yt_nz);
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_t, rx_r)), val, 0x1);
+               nir_pop_if(&b, NULL);
+               nir_push_if(&b, yb);
+               nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_b, rx_r)), val, 0x1);
+               nir_pop_if(&b, NULL);
+            }
+            nir_pop_if(&b, NULL);
+            nir_push_if(&b, yb);
+            nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, nir_iadd(&b, ry_b, px)), val, 0x1);
+            nir_pop_if(&b, NULL);
+
+            nir_store_var(&b, xv, nir_iadd(&b, x, step_x), 0x1);
+         }
+         nir_pop_loop(&b, NULL);
+         nir_store_var(&b, yv, nir_iadd(&b, y, step_y), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_lower_vars_to_ssa(b.shader);
+      nir_validate_shader(b.shader, "resize_prelower");
+      struct hk_compute_opt_plan p3 = {0};
+      bool matched = hk_nir_match_compute_opt(b.shader, 1, layouts, &p3);
+      assert(matched == !bad_reload);
+      if (matched)
+         assert(p3.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+      ralloc_free(b.shader);
+   }
+
+   /* Also verify un-unswitched in-loop `if (do_resize)` form. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &test_nir_options, "resize_inloop");
+      b.shader->info.internal = false;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 8;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 2;
+
+      nir_deref_instr *src = make_ssbo_base(&b, 0, glsl_uint8_t_type(), 1);
+      nir_deref_instr *dst = make_ssbo_base(&b, 1, glsl_uint8_t_type(), 1);
+      nir_def *sw = make_pc_i32(&b, 0);
+      nir_def *sh = make_pc_i32(&b, 4);
+      nir_def *ss = make_pc_i32(&b, 8);
+      nir_def *dw = make_pc_i32(&b, 12);
+      nir_def *dh = make_pc_i32(&b, 16);
+      nir_def *ds = make_pc_i32(&b, 20);
+      nir_def *border = make_pc_i32(&b, 24);
+      nir_def *gid = nir_load_global_invocation_id(&b, 32);
+      nir_def *bwg = nir_load_base_workgroup_id(&b, 32);
+      nir_def *nwg = nir_load_num_workgroups(&b);
+      nir_def *gx0 = nir_iadd(&b, nir_channel(&b, gid, 0),
+                              nir_ishl_imm(&b, nir_channel(&b, bwg, 0), 5));
+      nir_def *gy0 = nir_iadd(&b, nir_channel(&b, gid, 1),
+                              nir_ishl_imm(&b, nir_channel(&b, bwg, 1), 3));
+      nir_def *step_x = nir_ishl_imm(&b, nir_channel(&b, nwg, 0), 5);
+      nir_def *step_y = nir_ishl_imm(&b, nir_channel(&b, nwg, 1), 3);
+      nir_def *sx_scale = nir_fmul(&b, nir_i2f32(&b, sw), nir_frcp(&b, nir_i2f32(&b, dw)));
+      nir_def *sy_scale = nir_fmul(&b, nir_i2f32(&b, sh), nir_frcp(&b, nir_i2f32(&b, dh)));
+      nir_def *do_res = nir_ior(&b, nir_ine(&b, sw, dw), nir_ine(&b, sh, dh));
+
+      nir_variable *yv = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_store_var(&b, yv, gy0, 0x1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, yv);
+         nir_push_if(&b, nir_uge(&b, y, dh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_variable *xv = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+         nir_store_var(&b, xv, gx0, 0x1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, xv);
+            nir_push_if(&b, nir_uge(&b, x, dw));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+            nir_variable *vv = nir_local_variable_create(b.impl, glsl_uint8_t_type(), "v");
+            nir_push_if(&b, do_res);
+            {
+               nir_def *sy = nir_fmul(&b, nir_u2f32(&b, y), sy_scale);
+               nir_def *fy = nir_fsub(&b, sy, nir_ftrunc(&b, sy));
+               nir_def *iy = nir_f2i32(&b, sy);
+               nir_def *y0 = nir_imin(&b, nir_imax(&b, iy, nir_imm_int(&b, 0)), nir_iadd_imm(&b, sh, -1));
+               nir_def *y1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, iy, 1), nir_imm_int(&b, 0)), nir_iadd_imm(&b, sh, -1));
+               nir_def *sx = nir_fmul(&b, nir_u2f32(&b, x), sx_scale);
+               nir_def *fx = nir_fsub(&b, sx, nir_ftrunc(&b, sx));
+               nir_def *ix = nir_f2i32(&b, sx);
+               nir_def *x0 = nir_imin(&b, nir_imax(&b, ix, nir_imm_int(&b, 0)), nir_iadd_imm(&b, sw, -1));
+               nir_def *x1 = nir_imin(&b, nir_imax(&b, nir_iadd_imm(&b, ix, 1), nir_imm_int(&b, 0)), nir_iadd_imm(&b, sw, -1));
+               nir_def *p00 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y0, ss), x0))));
+               nir_def *p01 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y0, ss), x1))));
+               nir_def *p10 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x0))));
+               nir_def *p11 = nir_u2f32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x1))));
+               nir_def *t = nir_ffma(&b, fx, nir_fsub(&b, p01, p00), p00);
+               nir_def *bt = nir_ffma(&b, fx, nir_fsub(&b, p11, p10), p10);
+               nir_def *v = nir_ffma(&b, fy, nir_fsub(&b, bt, t), t);
+               nir_def *v8 = nir_u2u8(&b, nir_f2i32(&b, nir_fmin(&b, nir_fmax(&b, v, nir_imm_float(&b, 0.0f)), nir_imm_float(&b, 255.0f))));
+               nir_store_var(&b, vv, v8, 0x1);
+            }
+            nir_push_else(&b, NULL);
+            {
+               nir_def *v8 = nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y, ss), x)));
+               nir_store_var(&b, vv, v8, 0x1);
+            }
+            nir_pop_if(&b, NULL);
+            emit_test_mirror_border(&b, dst, x, y, nir_load_var(&b, vv), dw, dh, ds, border);
+            nir_store_var(&b, xv, nir_iadd(&b, x, step_x), 0x1);
+         }
+         nir_pop_loop(&b, NULL);
+         nir_store_var(&b, yv, nir_iadd(&b, y, step_y), 0x1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_lower_vars_to_ssa(b.shader);
+      nir_validate_shader(b.shader, "resize_inloop");
+      struct hk_compute_opt_plan p2 = {0};
+      assert(hk_nir_match_compute_opt(b.shader, 1, layouts, &p2));
+      assert(p2.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+      ralloc_free(b.shader);
+   }
+
+   /* Exact pixel-compare between scalar reference and vectorized 128x8
+    * quad_int + fast_u8x2 + mirrored border semantics across copy, downscale,
+    * upscale, non-multiple-of-4 widths, and borders (0, 1, 3, 19). */
+   {
+      struct {
+         uint32_t sw, sh, ss, dw, dh, ds, border;
+      } cases[] = {
+         {64, 48, 64, 64, 48, 70, 3},
+         {137, 93, 144, 137, 93, 180, 19},
+         {137, 93, 144, 114, 77, 156, 19},
+         {79, 53, 80, 66, 44, 66, 0},
+         {31, 29, 32, 47, 41, 51, 1},
+         {100, 60, 100, 29, 17, 37, 3},
+      };
+      for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ci++) {
+         const uint32_t sw = cases[ci].sw, sh = cases[ci].sh, ss = cases[ci].ss;
+         const uint32_t dw = cases[ci].dw, dh = cases[ci].dh, ds = cases[ci].ds;
+         const uint32_t bd = cases[ci].border;
+         const uint32_t dh_pad = dh + 2u * bd;
+         uint8_t *src = calloc(sh * ss, 1);
+         uint8_t *ref = calloc(dh_pad * ds, 1);
+         uint8_t *vec = calloc(dh_pad * ds, 1);
+         assert(src && ref && vec);
+         memset(ref, 0xA5, dh_pad * ds);
+         memset(vec, 0xA5, dh_pad * ds);
+         for (uint32_t y = 0; y < sh; y++)
+            for (uint32_t x = 0; x < sw; x++)
+               src[y * ss + x] = (uint8_t)((x * 37u + y * 131u + ci * 17u) & 0xffu);
+
+         const bool do_res = (sw != dw) || (sh != dh);
+         const float sx_sc = (float)(int32_t)sw * (1.0f / (float)(int32_t)dw);
+         const float sy_sc = (float)(int32_t)sh * (1.0f / (float)(int32_t)dh);
+
+         /* Scalar reference with full mirrored border writes. */
+         for (uint32_t y = 0; y < dh; y++) {
+            float sy = (float)y * sy_sc;
+            float fy = sy - truncf(sy);
+            int32_t iy = (int32_t)sy;
+            int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
+            int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
+            for (uint32_t x = 0; x < dw; x++) {
+               uint8_t v8;
+               if (do_res) {
+                  float sx = (float)x * sx_sc;
+                  float fx = sx - truncf(sx);
+                  int32_t ix = (int32_t)sx;
+                  int32_t x0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
+                  int32_t x1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
+                  float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)x0];
+                  float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)x1];
+                  float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)x0];
+                  float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)x1];
+                  float t = fmaf(fx, p01 - p00, p00);
+                  float bt = fmaf(fx, p11 - p10, p10);
+                  float v = fmaf(fy, bt - t, t);
+                  v = fminf(fmaxf(v, 0.0f), 255.0f);
+                  v8 = (uint8_t)(int32_t)v;
+               } else {
+                  v8 = src[y * ss + x];
+               }
+               uint32_t yrow = (y + bd) * ds, px = x + bd;
+               ref[yrow + px] = v8;
+               bool xl = (x != 0 && x <= bd);
+               bool xr = (x + bd + 2u > dw && x + 1u < dw);
+               bool yt = (y != 0 && y <= bd);
+               bool yb = (y + bd + 2u > dh && y + 1u < dh);
+               uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
+               uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
+               if (xl) {
+                  ref[yrow + ryl] = v8;
+                  if (yt) ref[ryt + ryl] = v8;
+                  if (yb) ref[ryb + ryl] = v8;
+               }
+               if (yt) ref[ryt + px] = v8;
+               if (xr) {
+                  ref[yrow + ryr] = v8;
+                  if (yt) ref[ryt + ryr] = v8;
+                  if (yb) ref[ryb + ryr] = v8;
+               }
+               if (yb) ref[ryb + px] = v8;
+            }
+         }
+
+         /* Vectorized 4-pixel-per-lane simulation matching emitted NIR. */
+         uint32_t x_lim_lo = dw - 2u - bd;
+         uint32_t y_lim_lo = dh - 2u - bd;
+         for (uint32_t y = 0; y < dh; y++) {
+            float sy = (float)y * sy_sc;
+            float fy = sy - truncf(sy);
+            int32_t iy = (int32_t)sy;
+            int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
+            int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
+            for (uint32_t x0 = 0; x0 < dw; x0 += 4u) {
+               bool qint = (bd < y && y <= y_lim_lo && bd < x0 && x0 + 3u <= x_lim_lo);
+               if (qint) {
+                  uint8_t out[4];
+                  if (do_res) {
+                     uint32_t ix3 = (uint32_t)(int32_t)((float)(x0 + 3u) * sx_sc);
+                     bool fast = ix3 < sw - 1u;
+                     for (uint32_t k = 0; k < 4u; k++) {
+                        float sx = (float)(x0 + k) * sx_sc;
+                        float fx = sx - truncf(sx);
+                        int32_t ix = (int32_t)sx;
+                        uint32_t c0 = fast ? (uint32_t)ix : (uint32_t)(ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix));
+                        uint32_t c1 = fast ? (uint32_t)(ix + 1) : (uint32_t)(ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1));
+                        float p00 = (float)src[(uint32_t)y0 * ss + c0];
+                        float p01 = (float)src[(uint32_t)y0 * ss + c1];
+                        float p10 = (float)src[(uint32_t)y1 * ss + c0];
+                        float p11 = (float)src[(uint32_t)y1 * ss + c1];
+                        float t = fmaf(fx, p01 - p00, p00);
+                        float bt = fmaf(fx, p11 - p10, p10);
+                        out[k] = (uint8_t)(int32_t)fmaf(fy, bt - t, t);
+                     }
+                  } else {
+                     memcpy(out, &src[y * ss + x0], 4);
+                  }
+                  memcpy(&vec[(y + bd) * ds + (x0 + bd)], out, 4);
+               } else {
+                  for (uint32_t k = 0; k < 4u; k++) {
+                     uint32_t x = x0 + k;
+                     if (x >= dw)
+                        continue;
+                     uint8_t v8;
+                     if (do_res) {
+                        float sx = (float)x * sx_sc;
+                        float fx = sx - truncf(sx);
+                        int32_t ix = (int32_t)sx;
+                        int32_t c0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
+                        int32_t c1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
+                        float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)c0];
+                        float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)c1];
+                        float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)c0];
+                        float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)c1];
+                        float t = fmaf(fx, p01 - p00, p00);
+                        float bt = fmaf(fx, p11 - p10, p10);
+                        v8 = (uint8_t)(int32_t)fmaf(fy, bt - t, t);
+                     } else {
+                        v8 = src[y * ss + x];
+                     }
+                     uint32_t yrow = (y + bd) * ds, px = x + bd;
+                     vec[yrow + px] = v8;
+                     bool xl = (x != 0 && x <= bd);
+                     bool xr = (x + bd + 2u > dw && x + 1u < dw);
+                     bool yt = (y != 0 && y <= bd);
+                     bool yb = (y + bd + 2u > dh && y + 1u < dh);
+                     uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
+                     uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
+                     if (xl) {
+                        vec[yrow + ryl] = v8;
+                        if (yt) vec[ryt + ryl] = v8;
+                        if (yb) vec[ryb + ryl] = v8;
+                     }
+                     if (yt) vec[ryt + px] = v8;
+                     if (xr) {
+                        vec[yrow + ryr] = v8;
+                        if (yt) vec[ryt + ryr] = v8;
+                        if (yb) vec[ryb + ryr] = v8;
+                     }
+                     if (yb) vec[ryb + px] = v8;
+                  }
+               }
+            }
+         }
+         assert(memcmp(ref, vec, dh_pad * ds) == 0);
+         free(src);
+         free(ref);
+         free(vec);
+      }
+   }
+   free(layout);
+}
+
 int
 main(void)
 {
@@ -623,6 +1301,7 @@ main(void)
    test_canny_hysteresis();
    test_canny_nms();
    test_canny_finalize();
+   test_bilinear_resize_border();
    glsl_type_singleton_decref();
    printf("hk_compute_opt: all unit tests passed\n");
    return 0;
