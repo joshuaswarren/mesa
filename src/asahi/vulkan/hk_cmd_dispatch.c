@@ -5049,9 +5049,9 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                            ? UINT64_MAX : cs->sib_threads + threads;
 
       uint64_t work = 0;
-      cs->pack_loops |= hk_pack_account_dispatch_work_eff(
-         threads, selected->b.info.stats.instrs,
-         selected->b.info.has_loops, loop_bound, &work);
+      cs->pack_loops |= hk_pack_account_dispatch_work_eff_limit(
+         threads, selected->b.info.stats.instrs, selected->b.info.has_loops,
+         loop_bound, hk_pack_max_static_work(hk_cmd_buffer_device(cmd)), &work);
       cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
                             ? UINT64_MAX : cs->pack_threads + threads;
       cs->pack_static_work = work > UINT64_MAX - cs->pack_static_work

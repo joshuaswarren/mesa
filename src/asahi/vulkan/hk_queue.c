@@ -4951,6 +4951,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       .max_attachments = hk_pack_attachment_limit(dev),
       .overhead =
          terminate_size + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
+      .max_static_work = hk_pack_max_static_work(dev),
    };
    const bool trace = hk_pack_trace();
    const int64_t t0_ns = trace ? os_time_get_nano() : 0;
@@ -5631,14 +5632,16 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                                 fused_params,
                                                 &fused_eff_instrs);
                uint64_t fused_work = 0;
-               const bool fused_loops = hk_pack_account_dispatch_work_eff(
+               const bool fused_loops = hk_pack_account_dispatch_work_eff_limit(
                   fused_threads, cand->b.info.stats.instrs,
-                  cand->b.info.has_loops, fused_eff_instrs, &fused_work);
+                  cand->b.info.has_loops, fused_eff_instrs,
+                  limits.max_static_work, &fused_work);
 
-               if (!hk_pack_fusion_fits_run(eff_run_work, eff_run_loops,
-                                            replaced_work, replaced_loops,
-                                            fused_work, fused_loops,
-                                            &new_run_work, &new_run_loops))
+               if (!hk_pack_fusion_fits_run_limit(eff_run_work, eff_run_loops,
+                                                  replaced_work, replaced_loops,
+                                                  fused_work, fused_loops,
+                                                  limits.max_static_work,
+                                                  &new_run_work, &new_run_loops))
                   continue;
 
                fused = cand;

@@ -63,6 +63,9 @@ struct hk_pack_limits {
    uint32_t max_attachments;
    /* Bytes a packet needs beyond its members' streams. */
    size_t overhead;
+   /* Per-packet static thread-instruction budget; 0 uses
+    * HK_PACK_MAX_STATIC_WORK. */
+   uint64_t max_static_work;
 };
 
 struct hk_pack_run {
@@ -95,18 +98,41 @@ enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
 size_t hk_pack_cdm_terminate(enum agx_chip chip,
                              uint8_t out[HK_PACK_CDM_TERMINATE_MAX]);
 
+/* Per-packet static work budget scaled by GPU core count (1x at <=20 cores,
+ * linear up to 4x at >=80 cores) so wall-clock packet duration stays uniform
+ * across small and wide GPUs. */
+uint64_t hk_pack_max_static_work_for_cores(unsigned cores);
+uint64_t hk_pack_max_static_work(const struct hk_device *dev);
+
 bool hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
                                    bool has_loops, uint64_t loop_bound,
                                    uint64_t *work_out);
+
+bool hk_pack_account_dispatch_work_limit(uint64_t threads, uint64_t instrs,
+                                         bool has_loops, uint64_t loop_bound,
+                                         uint64_t max_work, uint64_t *work_out);
 
 bool hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
                                        bool has_loops, uint64_t eff_instrs,
                                        uint64_t *work_out);
 
+bool hk_pack_account_dispatch_work_eff_limit(uint64_t threads, uint64_t instrs,
+                                             bool has_loops,
+                                             uint64_t eff_instrs,
+                                             uint64_t max_work,
+                                             uint64_t *work_out);
+
 bool hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
                              uint64_t replaced_work, unsigned replaced_loops,
                              uint64_t fused_work, bool fused_loops,
                              uint64_t *new_work_out, unsigned *new_loops_out);
+
+bool hk_pack_fusion_fits_run_limit(uint64_t run_work, unsigned run_loops,
+                                   uint64_t replaced_work,
+                                   unsigned replaced_loops, uint64_t fused_work,
+                                   bool fused_loops, uint64_t max_work,
+                                   uint64_t *new_work_out,
+                                   unsigned *new_loops_out);
 
 /* Whether a member may end with a strong flush without memory scope, as an
  * application barrier at the end of a command buffer leaves it: at every
