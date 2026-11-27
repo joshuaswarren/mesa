@@ -817,6 +817,7 @@ if with_tests
          'test/test-cprog-cleanup.cpp',
          'test/test-m5-packed-lod.cpp',
          'test/test-preamble-half-exports.cpp',
+         'test/test-preamble-half-loop-operands.cpp',
          'test/test-demote-early-kill.cpp',
          'test/test-preamble-half-word-exports.cpp',
          'test/test-preamble-hoist.cpp',

@@ -541,6 +541,46 @@ avoid_instr(const nir_instr *instr, const void *data)
    return false;
 }
 
+static bool
+in_loop(const nir_block *block)
+{
+   for (const nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
+      if (n->type == nir_cf_node_loop)
+         return true;
+   }
+   return false;
+}
+
+/*
+ * On the AGX3B encoding, a 16-bit float ALU instruction that reads a 16-bit
+ * operand from the uniform file runs slower than one that reads it from a
+ * register, while 32-bit operands read from the uniform file cost nothing
+ * extra. Compiled for every AGX3B GPU, our own fp16 FMA loop kernels read
+ * their 16-bit loop-invariant operands from registers and their 32-bit ones
+ * from the uniform file.
+ *
+ * So a 16-bit float value that code inside a loop reads is computed in the
+ * shader, once per invocation into a register, instead of being stored to
+ * the uniform file by the preamble. Its own inputs can still come from the
+ * preamble.
+ */
+static bool
+keep_half_loop_operand_in_registers(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size != 16 ||
+       nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) !=
+          nir_type_float)
+      return false;
+   nir_foreach_use(src, &alu->def) {
+      if (in_loop(nir_src_use_instr(src)->block))
+         return true;
+   }
+   return false;
+}
+
 static const nir_opt_preamble_options preamble_options = {
    .drawid_uniform = true,
    .subgroup_size_uniform = true,
@@ -1059,9 +1099,12 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
-   /* Every AGX3B chip: the uniform file it fills is the encoding's. */
+   /* The AGX3B encoding: the uniform file the preamble fills is the
+    * encoding's. */
+   const bool agx3b = g17p && !agx3c;
    struct set *branches = NULL;
-   if (g17p && !agx3c) {
+   if (agx3b) {
+      options.avoid_instr_cb = keep_half_loop_operand_in_registers;
       branches = surviving_branches(nir, &options, sizes, flatten);
       options.cb_data = branches;
    }
