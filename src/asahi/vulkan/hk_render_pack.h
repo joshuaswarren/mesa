@@ -224,12 +224,17 @@ const char *hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
                                     const struct hk_cs *bs,
                                     const struct hk_cs *first);
 
+/* Whether `post` is a pure driver geometry heap-slot reset stream (no API
+ * compute, no query/timestamp/OQ work, and bound to a non-zero heap slot). */
+bool hk_render_pack_post_is_heap_reset(const struct hk_cs *post);
+
 /* Whether a later member's leading CDM stream `bs_pre` may be hoisted ahead of
  * earlier members already in `state`. Returns NULL if safe, or a refusal reason. */
 const char *hk_render_pack_pre_cs_refusal(
    const struct hk_render_pack_run_state *state, const struct hk_cs *bs_pre,
-   unsigned run_post, uint8_t run_vdm_kinds,
-   const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS]);
+   unsigned run_post, uint8_t post_heap_slots, bool post_heap_only,
+   uint8_t run_vdm_kinds, const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS],
+   const uint8_t run_post_tail_req[HK_SYNC_NUM_KINDS]);
 
 /* `b` (stream `bs`) joins `run` after `a`, its boundary accepted. */
 void hk_render_pack_run_join(struct hk_render_pack_run_state *run,
