@@ -826,7 +826,7 @@ agx_chip_command_stream_generation(enum agx_chip chip)
 static inline uint32_t
 agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
 {
-   if (chip == AGX_CHIP_G13X ||
+   if (chip == AGX_CHIP_G13G || chip == AGX_CHIP_G13X ||
        (chip == AGX_CHIP_G14X && gpu_generation == 14))
       return 0x1ffu;
    return AGX_CDM_BARRIER_FULL_WORD;

@@ -178,6 +178,14 @@ enum agx_chip_cap {
     * Measured on G13G and G13X; other generations keep the unfolded
     * addresses until they are measured. */
    AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
+
+   /* AGX2 compute streams defer the post-launch CDM cache flush until the
+    * next launch sees a declared barrier, a non-deferred/meta launch runs,
+    * or the compute stream closes, avoiding redundant 0x1ff barriers between
+    * independent dispatches. Measured on G13G (+2.16% to +3.33% LLM decode
+    * combined with 0x1ff/0x160; +1.16% to +1.25% incremental over 0x1ff/0x160,
+    * bit-identical output, 0 regressions on synchronization/memory_model CTS). */
+   AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -242,7 +250,7 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
+   X(G13G, AGX_CAPS_G13 | AGX_CAP_CDM_DEFER_FLUSH, __VA_ARGS__)                \
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \

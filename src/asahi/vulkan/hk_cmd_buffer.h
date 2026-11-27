@@ -1603,6 +1603,9 @@ struct hk_cs {
     * flush requested with nothing recorded since it can be elided. */
    void *strong_flush_end;
 
+   /* AGX2 CDM (AGX_CAP_CDM_DEFER_FLUSH): post-launch flush deferred. */
+   bool cdm_flush_pending;
+
    /* Likewise for the weak ordering barrier attached to a native launch. A
     * later cache-flush request upgrades this record in place instead of
     * emitting two adjacent barriers. */
@@ -3972,7 +3975,8 @@ bool hk_cdm_visibility_flush_needed(const struct hk_device *dev,
 void hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                                  struct agx_cdm_launch_word_0_packed launch,
                                  uint32_t usc, struct agx_grid grid,
-                                 struct agx_workgroup local_size);
+                                 struct agx_workgroup local_size,
+                                 bool allow_defer);
 
 void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_shader_info *info, uint32_t usc,
