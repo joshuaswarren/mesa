@@ -14721,6 +14721,29 @@ agx3_order_g17p_mrt_tile_ops_strict(agx_context *ctx)
  * under a single uniform pixel-class transaction covering every touched
  * partition. */
 static bool
+agx3_is_local_read_cf_op(enum agx_opcode op)
+{
+   switch (op) {
+   case AGX_OPCODE_IF_ICMP:
+   case AGX_OPCODE_WHILE_ICMP:
+   case AGX_OPCODE_ELSE_ICMP:
+   case AGX_OPCODE_IF_FCMP:
+   case AGX_OPCODE_WHILE_FCMP:
+   case AGX_OPCODE_ELSE_FCMP:
+   case AGX_OPCODE_JMP_EXEC_ANY:
+   case AGX_OPCODE_JMP_EXEC_NONE:
+   case AGX_OPCODE_JMP_EXEC_NONE_AFTER:
+   case AGX_OPCODE_POP_EXEC:
+   case AGX_OPCODE_BREAK_IF_ICMP:
+   case AGX_OPCODE_BREAK_IF_FCMP:
+   case AGX_OPCODE_BEGIN_CF:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
 {
    if (!ctx->key->agx3_local_read || ctx->key->m5_uniform_blend)
@@ -14852,6 +14875,82 @@ agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
          list_add(&I->link, &anchor->link);
          anchor = I;
       }
+   } else if (multisample && load_count > 1) {
+      /* Group entry-block multisample probe LD_TILE instructions into
+       * back-to-back batches (capped at 32 destination halves per batch, matching
+       * one 4-word chunk across 4 samples) so tilebuffer fetches pipeline on
+       * slot 6 instead of serializing behind per-sample ALU waits without
+       * inflating peak register pressure. */
+      const unsigned batch_cap = 32;
+      BITSET_WORD *avail =
+         rzalloc_array(ctx, BITSET_WORD, BITSET_WORDS(ctx->alloc));
+      agx_instr **hoistable = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+      agx_instr *anchor = NULL;
+      agx_instr *hoist_before = NULL;
+      unsigned batch_halves = 0;
+
+      agx_foreach_instr_in_block_safe(first_block, I) {
+         if (I->op == AGX_OPCODE_ST_TILE ||
+             I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 ||
+             I->op == AGX_OPCODE_STOP || agx3_is_local_read_cf_op(I->op))
+            break;
+
+         if (I->op == AGX_OPCODE_LD_TILE) {
+            const unsigned halves =
+               agx_size_align_16(I->dest[0].size) * agx_channels(I->dest[0]);
+            const unsigned mask_val = I->src[0].value;
+            const bool mask_ready =
+               anchor &&
+               (BITSET_TEST(avail, mask_val) || hoistable[mask_val] != NULL);
+            if (!anchor || !mask_ready || batch_halves + halves > batch_cap) {
+               anchor = I;
+               hoist_before = I;
+               if (hoist_before->link.prev != &first_block->instructions) {
+                  agx_instr *prev =
+                     list_entry(hoist_before->link.prev, agx_instr, link);
+                  if (prev->op == AGX_OPCODE_WAIT_PIX)
+                     hoist_before = prev;
+               }
+               batch_halves = halves;
+               memset(hoistable, 0, ctx->alloc * sizeof(*hoistable));
+               memset(avail, 0, BITSET_WORDS(ctx->alloc) * sizeof(*avail));
+               agx_foreach_instr_in_block(first_block, P) {
+                  if (P == I)
+                     break;
+                  agx_foreach_ssa_dest(P, d)
+                     BITSET_SET(avail, P->dest[d].value);
+               }
+               continue;
+            }
+            if (!BITSET_TEST(avail, mask_val)) {
+               agx_instr *def = hoistable[mask_val];
+               list_del(&def->link);
+               list_addtail(&def->link, &hoist_before->link);
+               BITSET_SET(avail, mask_val);
+               hoistable[mask_val] = NULL;
+            }
+            list_del(&I->link);
+            list_add(&I->link, &anchor->link);
+            anchor = I;
+            batch_halves += halves;
+         } else if (anchor &&
+                    (I->op == AGX_OPCODE_BITOP || I->op == AGX_OPCODE_MOV ||
+                     I->op == AGX_OPCODE_MOV_IMM) &&
+                    I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL) {
+            bool srcs_ok = true;
+            agx_foreach_src(I, s) {
+               if (I->src[s].type == AGX_INDEX_REGISTER)
+                  srcs_ok = false;
+               else if (I->src[s].type == AGX_INDEX_NORMAL &&
+                        !BITSET_TEST(avail, I->src[s].value))
+                  srcs_ok = false;
+            }
+            if (srcs_ok)
+               hoistable[I->dest[0].value] = I;
+         }
+      }
+      ralloc_free(avail);
+      ralloc_free(hoistable);
    }
 
    ctx->agx3_mrt_tile_ops_ordered = true;
