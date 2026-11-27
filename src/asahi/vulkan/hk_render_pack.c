@@ -55,16 +55,30 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
          return "view";
       if (x->samples != y->samples)
          return "sample count";
-      /* B continues what A left in the tiles: it must load it, and store it
-       * as A would have. */
+      /* B continues what A left in the tiles: it must load it, and either keep
+       * A's store op or discard a stored colour attachment (STORE ->
+       * DONT_CARE). A must not have resolved; B may terminate the merged pass
+       * with a colour resolve across a framebuffer-local dependency. */
       if (y->load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
          return "load op";
-      if (y->store_op != x->store_op)
+      const bool is_color = i < a->color_count;
+      const bool store_drop =
+         is_color &&
+         x->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+         y->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      if (y->store_op != x->store_op && !store_drop)
          return "store op";
-      if (x->resolve_mode != VK_RESOLVE_MODE_NONE ||
-          y->resolve_mode != VK_RESOLVE_MODE_NONE)
+      if (x->resolve_mode != VK_RESOLVE_MODE_NONE)
          return "resolve";
-      if (x->flags != y->flags)
+      const bool y_resolves = y->resolve_mode != VK_RESOLVE_MODE_NONE;
+      if (y_resolves && (!is_color || ordered))
+         return "resolve";
+      const uint32_t y_flags =
+         y_resolves
+            ? (y->flags &
+               ~VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR)
+            : y->flags;
+      if (x->flags != y_flags)
          return "flags";
       /* The same layout in both: a layout transition between them that
        * recorded no work left the memory as A stored it
@@ -129,10 +143,13 @@ background_object_unused(const struct hk_render_registers *r)
 }
 
 /* Which of the render registers two streams program differently, or NULL.
- * `b` follows `a` in the tile pass, which begins with `a`'s background. */
+ * `b` follows `a` in the tile pass, which begins with `a`'s background. When
+ * `eot_changes` is set, `b` supplies a different final end-of-tile program
+ * (a colour STORE -> DONT_CARE discard or a final direct resolve), so its
+ * `eot.main` resources and `process_empty_tiles` may differ from `a`'s. */
 static const char *
 registers_differ(const struct hk_render_registers *a,
-                 const struct hk_render_registers *b)
+                 const struct hk_render_registers *b, bool eot_changes)
 {
    if (a->width != b->width || a->height != b->height ||
        a->layers != b->layers || a->zls_width != b->zls_width ||
@@ -147,7 +164,7 @@ registers_differ(const struct hk_render_registers *a,
        memcmp(&a->zls_control_partial, &b->zls_control_partial,
               sizeof(a->zls_control_partial)))
       return "depth/stencil control";
-   if (a->process_empty_tiles != b->process_empty_tiles ||
+   if ((!eot_changes && a->process_empty_tiles != b->process_empty_tiles) ||
        a->whole_attachments != b->whole_attachments)
       return "tile flags";
 
@@ -168,7 +185,7 @@ registers_differ(const struct hk_render_registers *a,
       return "depth/stencil buffers";
 
    if (!bg_eot_resources_equal(&a->bg.main, &b->bg.main) ||
-       !bg_eot_resources_equal(&a->eot.main, &b->eot.main) ||
+       (!eot_changes && !bg_eot_resources_equal(&a->eot.main, &b->eot.main)) ||
        !bg_eot_resources_equal(&a->bg.partial, &b->bg.partial) ||
        !bg_eot_resources_equal(&a->eot.partial, &b->eot.partial))
       return "tile program resources";
@@ -183,12 +200,45 @@ attachment_sets_equal(const struct hk_drm_attachment_set *a,
           !memcmp(a->list, b->list, a->count * sizeof(a->list[0]));
 }
 
-const char *
-hk_render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b)
+static bool
+attachment_set_merge(struct hk_drm_attachment_set *dst,
+                     const struct hk_drm_attachment_set *src, bool apply)
+{
+   unsigned count = dst->count;
+   for (unsigned i = 0; i < src->count; ++i) {
+      const struct drm_asahi_attachment att = src->list[i];
+      bool found = false;
+      for (unsigned j = 0; j < count; ++j) {
+         if (dst->list[j].pointer == att.pointer &&
+             dst->list[j].size == att.size) {
+            found = true;
+            break;
+         }
+      }
+      if (found)
+         continue;
+      if (count >= ARRAY_SIZE(dst->list))
+         return false;
+      if (apply)
+         dst->list[count] = att;
+      count++;
+   }
+   if (apply) {
+      dst->count = count;
+      dst->complete &= src->complete;
+   }
+   return true;
+}
+
+static const char *
+render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b,
+                          bool eot_changes, bool resolving)
 {
    if (memcmp(&a->tib, &b->tib, sizeof(a->tib)))
       return "tilebuffer";
-   const char *why = registers_differ(&a->cr, &b->cr);
+   if (resolving && (!a->cr.whole_attachments || !b->cr.whole_attachments))
+      return "partial render area resolve";
+   const char *why = registers_differ(&a->cr, &b->cr, eot_changes);
    if (why)
       return why;
    /* The tile programs: the merged command runs A's background programs, B's
@@ -212,13 +262,32 @@ hk_render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b)
    if (a->has_sample_locations != b->has_sample_locations ||
        a->ppp_multisamplectl != b->ppp_multisamplectl)
       return "sample locations";
-   if (!attachment_sets_equal(&a->fragment_attachments,
-                              &b->fragment_attachments))
+   if (resolving) {
+      struct hk_drm_attachment_set merged = a->fragment_attachments;
+      if (!attachment_set_merge(&merged, &b->fragment_attachments, false))
+         return "attachment set";
+   } else if (!attachment_sets_equal(&a->fragment_attachments,
+                                     &b->fragment_attachments)) {
       return "attachment set";
-   if (memcmp(&a->tile_resources, &b->tile_resources,
-              sizeof(a->tile_resources)))
+   }
+   if (eot_changes) {
+      if (a->tile_resources.stage != b->tile_resources.stage ||
+          a->tile_resources.imageblock_bytes !=
+             b->tile_resources.imageblock_bytes ||
+          a->tile_resources.multisample_bytes !=
+             b->tile_resources.multisample_bytes)
+         return "tile resources";
+   } else if (memcmp(&a->tile_resources, &b->tile_resources,
+                     sizeof(a->tile_resources))) {
       return "tile resources";
+   }
    return NULL;
+}
+
+const char *
+hk_render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b)
+{
+   return render_pack_streams_match(a, b, false, false);
 }
 
 /* Whether `cmd` pushed one of the attachments of `pass` as a descriptor. */
@@ -304,7 +373,18 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
          return "ordered, attachment pushed as a descriptor";
    }
 
-   return hk_render_pack_streams_match(first, bs);
+   bool eot_changes = false, resolving = false;
+   for (unsigned i = 0; i < eb->head_pass.color_count; ++i) {
+      const struct hk_render_pack_att *y = &eb->head_pass.att[i];
+      if (!y->iview)
+         continue;
+      if (y->resolve_mode != VK_RESOLVE_MODE_NONE)
+         resolving = eot_changes = true;
+      if (y->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE)
+         eot_changes = true;
+   }
+
+   return render_pack_streams_match(first, bs, eot_changes, resolving);
 }
 
 void
@@ -588,11 +668,20 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
    cs->scratch.fs.preamble |= item->scratch.fs.preamble;
    if (cs->cr.dbias_is_int == U_TRISTATE_UNSET)
       cs->cr.dbias_is_int = item->cr.dbias_is_int;
+   cs->cr.process_empty_tiles |= item->cr.process_empty_tiles;
+   cs->tile_resources.primary_bytes =
+      MAX2(cs->tile_resources.primary_bytes, item->tile_resources.primary_bytes);
+   cs->tile_resources.secondary_bytes =
+      MAX2(cs->tile_resources.secondary_bytes,
+           item->tile_resources.secondary_bytes);
    if (last) {
-      /* The last instance stores the attachments, as the final instance of
-       * an in-buffer continuation does. */
+      /* The last instance stores or resolves the attachments, as the final
+       * instance of an in-buffer continuation does. */
       cs->cr.eot.main = item->cr.eot.main;
       cs->g17p_pass_ends = item->g17p_pass_ends;
+      if (!attachment_set_merge(&cs->fragment_attachments,
+                                &item->fragment_attachments, true))
+         return false;
    }
    add_anatomy(cs, item);
 

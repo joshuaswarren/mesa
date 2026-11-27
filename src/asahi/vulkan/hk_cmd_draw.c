@@ -4150,11 +4150,16 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 
 /* Whether the attachment of a beginning instance continues the one the
  * ended instance had in the same slot: the same view (or none in both),
- * loaded, stored the same way, unresolved, with the same flags. */
+ * loaded, with matching store op (or a final STORE -> DONT_CARE discard),
+ * unresolved or ending with a final colour resolve over whole attachments,
+ * and matching non-resolve flags. */
 static const char *
 hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
                            const struct hk_attachment *att,
-                           unsigned expected_samples)
+                           unsigned expected_samples, bool is_color,
+                           bool allow_store_drop, bool prev_whole,
+                           uint32_t prev_width, uint32_t prev_height,
+                           bool *eot_changed, bool *resolving)
 {
    const bool present = info != NULL && info->imageView != VK_NULL_HANDLE;
    if (present != (att->iview != NULL))
@@ -4173,12 +4178,37 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
    }
    if (info->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
       return "load op";
-   if (info->storeOp != att->store_op)
+   const bool store_drop =
+      allow_store_drop &&
+      att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+      info->storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   if (info->storeOp != att->store_op && !store_drop)
       return "store op";
-   if (info->resolveMode != VK_RESOLVE_MODE_NONE)
-      return "resolve";
-   if (vk_get_rendering_attachment_flags(info) != att->flags)
+
+   const bool has_resolve = info->resolveMode != VK_RESOLVE_MODE_NONE;
+   if (has_resolve) {
+      if (!is_color || !prev_whole ||
+          info->resolveImageView == VK_NULL_HANDLE)
+         return "resolve";
+      VK_FROM_HANDLE(hk_image_view, res_iview, info->resolveImageView);
+      const unsigned res_level = res_iview->vk.base_mip_level;
+      if (u_minify(res_iview->vk.image->extent.width, res_level) !=
+             prev_width ||
+          u_minify(res_iview->vk.image->extent.height, res_level) !=
+             prev_height)
+         return "resolve extent";
+   }
+
+   VkRenderingAttachmentFlagsKHR flags = vk_get_rendering_attachment_flags(info);
+   if (has_resolve)
+      flags &= ~VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
+   if (flags != att->flags)
       return "flags";
+
+   if (store_drop || has_resolve)
+      *eot_changed = true;
+   if (has_resolve)
+      *resolving = true;
    return NULL;
 }
 
@@ -4578,23 +4608,30 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    const char *slot = NULL;
+   bool color_eot_changed = false;
+   bool zls_changed = false;
+   bool any_resolve = false;
    if (!why) {
       slot = "depth";
-      why = hk_m5_attachment_continues(info->pDepthAttachment,
-                                       &prev->depth_att,
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         info->pDepthAttachment, &prev->depth_att, prev->tilebuffer.nr_samples,
+         false, prev->zls_precise, prev->cr.whole_attachments, prev->cr.width,
+         prev->cr.height, &zls_changed, &any_resolve);
    }
    if (!why) {
       slot = "stencil";
-      why = hk_m5_attachment_continues(info->pStencilAttachment,
-                                       &prev->stencil_att,
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         info->pStencilAttachment, &prev->stencil_att,
+         prev->tilebuffer.nr_samples, false, prev->zls_precise,
+         prev->cr.whole_attachments, prev->cr.width, prev->cr.height,
+         &zls_changed, &any_resolve);
    }
    for (uint32_t i = 0; !why && i < info->colorAttachmentCount; ++i) {
       slot = "color";
-      why = hk_m5_attachment_continues(&info->pColorAttachments[i],
-                                       &prev->color_att[i],
-                                       prev->tilebuffer.nr_samples);
+      why = hk_m5_attachment_continues(
+         &info->pColorAttachments[i], &prev->color_att[i],
+         prev->tilebuffer.nr_samples, true, true, prev->cr.whole_attachments,
+         prev->cr.width, prev->cr.height, &color_eot_changed, &any_resolve);
    }
 
    if (why) {
@@ -4604,13 +4641,45 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    /* An ordered dependency, or one recorded before an earlier continuation
-    * of this stream, needs the merged pass to be memory-equivalent. */
+    * of this stream, needs the merged pass to be memory-equivalent. Keep
+    * final-pass resolves out of ordered continuations so the first instance
+    * cannot have a WAR hazard against the newly added resolve target. */
    const bool ordered = m->ordered || cs->m5_ordered;
    if (ordered) {
-      why = hk_m5_ordered_refusal(cmd, info, prev, cs);
+      why = any_resolve ? "resolve" : hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
          hk_frame_anatomy_note(dev, "pass-merge end: ordered, %s", why);
          return false;
+      }
+   }
+
+   /* A newly added resolve target must not overlap an existing attachment, a
+    * pending transfer, or an earlier render pass's tile footprint in this
+    * command buffer (whose wait would not be on the already-created stream). */
+   if (any_resolve) {
+      if (hk_sync_xfer_pending(&cmd->sync)) {
+         hk_frame_anatomy_note(dev, "pass-merge end: resolve pending xfer");
+         return false;
+      }
+      for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+         if (att->imageView == VK_NULL_HANDLE ||
+             att->resolveMode == VK_RESOLVE_MODE_NONE)
+            continue;
+         VK_FROM_HANDLE(hk_image_view, res_iview, att->resolveImageView);
+         if (hk_m5_image_is_attachment(prev, res_iview->vk.image)) {
+            hk_frame_anatomy_note(dev, "pass-merge end: resolve aliases att");
+            return false;
+         }
+         util_dynarray_foreach(&cmd->sync_pass_records,
+                               struct hk_sync_pass_record, rec) {
+            if (rec->last && rec->last != cs &&
+                rec->fp.image == res_iview->vk.image) {
+               hk_frame_anatomy_note(
+                  dev, "pass-merge end: resolve target prior pass");
+               return false;
+            }
+         }
       }
    }
 
@@ -4644,7 +4713,130 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    *render = *prev;
    render->flags = info->flags;
 
+   if (color_eot_changed) {
+      render->g17p_direct_color_resolve = false;
+      for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+         if (att->imageView == VK_NULL_HANDLE)
+            continue;
+         render->color_att[i].store_op = att->storeOp;
+         render->color_att[i].flags = vk_get_rendering_attachment_flags(att);
+         if (att->resolveMode != VK_RESOLVE_MODE_NONE) {
+            VK_FROM_HANDLE(hk_image_view, res_iview, att->resolveImageView);
+            render->color_att[i].resolve_mode = att->resolveMode;
+            render->color_att[i].resolve_iview = res_iview;
+         }
+      }
+
+      const bool incomplete_render_area = !render->cr.whole_attachments;
+      struct hk_g17p_bg_eot_cache_entry *bg_eot_cache =
+         hk_g17p_bg_eot_cache_get(cmd, info, incomplete_render_area);
+      render->cr.eot.main =
+         hk_build_bg_eot(cmd, info, true, false, incomplete_render_area,
+                         bg_eot_cache);
+      if (vk_command_buffer_has_error(&cmd->vk)) {
+         hk_sync_merge_rendering(cmd, cs);
+         return true;
+      }
+
+      if (agx_chip_g17_m5(dev->dev.chip)) {
+         cs->tile_resources.primary_bytes =
+            MAX2(cs->tile_resources.primary_bytes,
+                 render->cr.eot.main.primary_storage_B);
+         cs->tile_resources.secondary_bytes =
+            MAX2(cs->tile_resources.secondary_bytes,
+                 render->cr.eot.main.staging_storage_B);
+      }
+
+      if (render->g17p_direct_color_resolve) {
+         cs->cr.process_empty_tiles = true;
+         render->process_empty_tiles_without_z = true;
+
+         for (uint32_t i = 0; i < render->color_att_count; ++i) {
+            struct hk_image_view *res_view = render->color_att[i].resolve_iview;
+            if (!res_view)
+               continue;
+            struct hk_image *image =
+               container_of(res_view->vk.image, struct hk_image, vk);
+            const VkImageCreateFlags aliasing =
+               image->swapchain_memory
+                  ? VK_IMAGE_CREATE_SPARSE_BINDING_BIT
+                  : VK_IMAGE_CREATE_ALIAS_BIT |
+                       VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
+            if ((image->vk.create_flags & aliasing) ||
+                image->vk.tiling == VK_IMAGE_TILING_LINEAR)
+               render->m5_attachments_reach_memory = true;
+
+            if (agx_chip_native_or_g18g(dev->dev.chip)) {
+               const uint8_t image_plane = res_view->planes[0].image_plane;
+               if (image_plane >= image->plane_count) {
+                  cs->fragment_attachments.complete = false;
+               } else {
+                  const struct hk_image_plane *plane =
+                     &image->planes[image_plane];
+                  const uint64_t size = plane->layout.size_B;
+                  if (!plane->addr || !size)
+                     cs->fragment_attachments.complete = false;
+                  else
+                     hk_drm_attachment_set_add(&cs->fragment_attachments,
+                                               plane->addr, size);
+               }
+            }
+         }
+      }
+   }
+
+   if (zls_changed) {
+      VkRenderingAttachmentInfo z_info = {0}, s_info = {0};
+      const VkRenderingAttachmentInfo *attach_z = NULL, *attach_s = NULL;
+      struct ail_layout *z_layout = NULL, *s_layout = NULL;
+      if (render->depth_att.iview && info->pDepthAttachment) {
+         render->depth_att.store_op = info->pDepthAttachment->storeOp;
+         z_info = *info->pDepthAttachment;
+         z_info.loadOp = prev->depth_att.load_op;
+         attach_z = &z_info;
+         struct hk_image *z_img =
+            container_of(render->depth_att.iview->vk.image, struct hk_image, vk);
+         z_layout = &z_img->planes[0].layout;
+      }
+      if (render->stencil_att.iview && info->pStencilAttachment) {
+         render->stencil_att.store_op = info->pStencilAttachment->storeOp;
+         s_info = *info->pStencilAttachment;
+         s_info.loadOp = prev->stencil_att.load_op;
+         attach_s = &s_info;
+         struct hk_image *s_img = container_of(
+            render->stencil_att.iview->vk.image, struct hk_image, vk);
+         const unsigned s_plane =
+            hk_image_aspects_to_plane(s_img, VK_IMAGE_ASPECT_STENCIL_BIT);
+         s_layout = &s_img->planes[s_plane].layout;
+      }
+      const bool incomplete_render_area = !render->cr.whole_attachments;
+      hk_pack_zls_control_final(&render->zls_control_only, z_layout, s_layout,
+                                attach_z, attach_s, incomplete_render_area,
+                                false);
+      hk_pack_zls_control_final(&render->zls_control_last, z_layout, s_layout,
+                                attach_z, attach_s, incomplete_render_area,
+                                true);
+      render->no_z_store_ok = false;
+   }
+
    hk_sync_merge_rendering(cmd, cs);
+   if (render->g17p_direct_color_resolve) {
+      const uint32_t pass_layers = render->cr.layers;
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         const struct hk_image_view *res_iview =
+            render->color_att[i].resolve_iview;
+         if (!res_iview)
+            continue;
+         const uint32_t level = res_iview->vk.base_mip_level;
+         hk_sync_pass_footprint(
+            cmd, res_iview->vk.image, level, res_iview->vk.base_array_layer,
+            res_iview->vk.base_array_layer + MAX2(pass_layers, 1),
+            u_minify(res_iview->vk.image->extent.width, level),
+            u_minify(res_iview->vk.image->extent.height, level), render->area,
+            false);
+      }
+   }
    hk_sync_first_render_stream(cmd, cs);
 
    /* The per-instance state hk_begin_rendering() resets. */

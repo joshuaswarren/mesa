@@ -208,11 +208,41 @@ test_continues(void)
    T("B discarding depth refuses", hk_render_pack_continues(&a, &b, false));
    RESET();
    b.att[2].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-   T("another store op refuses", hk_render_pack_continues(&a, &b, false));
+   T("colour STORE -> DONT_CARE continues",
+     !hk_render_pack_continues(&a, &b, false) &&
+        !hk_render_pack_continues(&a, &b, true));
+   RESET();
+   b.att[2].store_op = VK_ATTACHMENT_STORE_OP_NONE;
+   T("colour STORE -> NONE refuses", hk_render_pack_continues(&a, &b, false));
+   RESET();
+   a.att[2].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   b.att[2].store_op = VK_ATTACHMENT_STORE_OP_STORE;
+   T("colour DONT_CARE -> STORE refuses",
+     hk_render_pack_continues(&a, &b, false));
+   RESET();
+   b.att[HK_RENDER_PACK_DEPTH].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   T("depth STORE -> DONT_CARE refuses",
+     hk_render_pack_continues(&a, &b, false));
+   RESET();
+   b.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   b.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   T("final-member colour resolve continues locally",
+     !hk_render_pack_continues(&a, &b, false));
+   b.att[0].flags =
+      VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
+   T("final-member resolve skip-transfer flag continues",
+     !hk_render_pack_continues(&a, &b, false));
+   T("final-member colour resolve refuses across an ordered dependency",
+     hk_render_pack_continues(&a, &b, true));
+   RESET();
+   b.att[HK_RENDER_PACK_DEPTH].resolve_mode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+   T("depth resolve refuses", hk_render_pack_continues(&a, &b, false));
    RESET();
    a.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   T("continuing after a resolve refuses",
+     hk_render_pack_continues(&a, &b, false));
    b.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
-   T("a resolve refuses", hk_render_pack_continues(&a, &b, false));
+   T("two resolves refuse", hk_render_pack_continues(&a, &b, false));
    RESET();
    b.area.extent.width = 2268;
    T("another render area refuses", hk_render_pack_continues(&a, &b, false));
@@ -511,6 +541,37 @@ test_boundary(void)
    bs->render_pack_elided = 1;
    T("streams programming another tile pass refuse",
      boundary(a, b));
+   bs->render_pack_elided = 0;
+
+   /* Final-member direct colour resolve with STORE -> DONT_CARE. */
+   as->cr.whole_attachments = bs->cr.whole_attachments = true;
+   as->cr.process_empty_tiles = false;
+   bs->cr.process_empty_tiles = true;
+   bs->cr.eot.main.primary_storage_B = 64;
+   bs->tile_resources.primary_bytes = 64;
+   as->fragment_attachments.complete = bs->fragment_attachments.complete = true;
+   as->fragment_attachments.count = 1;
+   as->fragment_attachments.list[0] =
+      (struct drm_asahi_attachment){.pointer = 0x10000, .size = 0x4000};
+   bs->fragment_attachments.count = 2;
+   bs->fragment_attachments.list[0] = as->fragment_attachments.list[0];
+   bs->fragment_attachments.list[1] =
+      (struct drm_asahi_attachment){.pointer = 0x20000, .size = 0x1000};
+   b->render_pack.head_pass.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   b->render_pack.head_pass.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   b->render_pack.tail = false;
+   T("final-member colour resolve boundary packs over whole attachments",
+     !boundary(a, b));
+   as->cr.whole_attachments = bs->cr.whole_attachments = false;
+   T("final-member colour resolve refuses partial render areas",
+     boundary(a, b));
+   as->cr.whole_attachments = bs->cr.whole_attachments = true;
+   b->render_pack.head_dep = HK_M5_MERGE_DEP_ORDERED;
+   T("final-member colour resolve refuses ordered dependencies",
+     boundary(a, b));
+   b->render_pack.head_dep = HK_M5_MERGE_DEP_LOCAL;
+   struct hk_cmd_buffer *c_after = split(5);
+   T("no member continues after a resolving tail", boundary(b, c_after));
 }
 
 /* The tails a submission writes, and that every later submission writes
@@ -740,6 +801,36 @@ test_fold(bool exact)
    T(N("a later member's image reads carry an earlier tail to the vertex half"),
      cs->sync.vtx_images &&
         (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
+
+   /* Final-member resolve fold: merges process_empty_tiles, EOT program,
+    * tile resources, and fragment attachment sets. */
+   struct hk_cmd_buffer *a5 = split(4), *b5 = split(6);
+   struct hk_cs *as5 = first_cs(a5), *bs5 = first_cs(b5);
+   as5->cr.process_empty_tiles = false;
+   bs5->cr.process_empty_tiles = true;
+   bs5->cr.eot.main.usc = eot + 0x100;
+   bs5->cr.eot.main.primary_storage_B = 96;
+   bs5->tile_resources.primary_bytes = 96;
+   bs5->tile_resources.secondary_bytes = 32;
+   as5->fragment_attachments.complete = bs5->fragment_attachments.complete = true;
+   as5->fragment_attachments.count = 1;
+   as5->fragment_attachments.list[0] =
+      (struct drm_asahi_attachment){.pointer = 0x10000, .size = 0x4000};
+   bs5->fragment_attachments.count = 2;
+   bs5->fragment_attachments.list[0] = as5->fragment_attachments.list[0];
+   bs5->fragment_attachments.list[1] =
+      (struct drm_asahi_attachment){.pointer = 0x20000, .size = 0x1000};
+   struct hk_cmd_buffer *ab5[] = {a5, b5};
+   packet = pack(ab5, 2, &cs);
+   T(N("final-member resolve fold updates EOT, empty-tile flag, tile resources and attachments"),
+     cs->cr.eot.main.usc == eot + 0x100 &&
+        cs->cr.eot.main.primary_storage_B == 96 &&
+        cs->cr.process_empty_tiles &&
+        cs->tile_resources.primary_bytes == 96 &&
+        cs->tile_resources.secondary_bytes == 32 &&
+        cs->fragment_attachments.count == 2 &&
+        cs->fragment_attachments.list[1].pointer == 0x20000 &&
+        cs->fragment_attachments.complete);
 #undef N
 }
 
