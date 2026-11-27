@@ -2450,11 +2450,10 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
    load->memory_is_packed = packed_count != 0;
    /* nir_opt_access proved nothing writes this memory and it is not
-    * volatile, so the read is a function of its address alone. The AGX3
-    * spiller may then repeat it in place of filling the value from a spill
-    * slot. */
+    * volatile, so the read is a function of its address alone. On AGX3 the
+    * spiller may repeat it in place of filling a spill slot; on AGX2 wait
+    * insertion may keep it in flight across a threadgroup barrier. */
    load->memory_can_reorder =
-      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       nir_intrinsic_can_reorder(instr) && !nir_is_coherent(instr);
    agx_emit_cached_split(b, dest, instr->def.num_components);
 }

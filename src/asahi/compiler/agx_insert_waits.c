@@ -26,6 +26,14 @@ struct slot {
     * AGX_MAX_PENDING for correct results.
     */
    uint8_t nr_pending;
+
+   /* Whether a threadgroup barrier must wait for this slot. Read-only
+    * non-aliasing device loads write only private registers and cannot race
+    * with threadgroup memory, so they may stay in flight across a
+    * threadgroup_barrier until their destination registers are consumed (or a
+    * memory_barrier/block exit is reached).
+    */
+   bool drain_on_tg_barrier;
 };
 
 /*
@@ -84,9 +92,12 @@ agx_insert_waits_local(agx_context *ctx, agx_block *block)
       }
 
       /* Check for barriers */
-      if (I->op == AGX_OPCODE_THREADGROUP_BARRIER ||
-          I->op == AGX_OPCODE_MEMORY_BARRIER) {
-
+      if (I->op == AGX_OPCODE_THREADGROUP_BARRIER) {
+         for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
+            if (slots[slot].nr_pending && slots[slot].drain_on_tg_barrier)
+               wait_mask |= BITSET_BIT(slot);
+         }
+      } else if (I->op == AGX_OPCODE_MEMORY_BARRIER) {
          for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
             if (slots[slot].nr_pending)
                wait_mask |= BITSET_BIT(slot);
@@ -115,6 +126,7 @@ agx_insert_waits_local(agx_context *ctx, agx_block *block)
 
          BITSET_ZERO(slots[slot].writes);
          slots[slot].nr_pending = 0;
+         slots[slot].drain_on_tg_barrier = false;
       }
 
       /* Record access */
@@ -127,6 +139,9 @@ agx_insert_waits_local(agx_context *ctx, agx_block *block)
             BITSET_SET_COUNT(slots[I->scoreboard].writes, I->dest[d].value,
                              agx_index_size_16(I->dest[d]));
          }
+
+         if (I->op != AGX_OPCODE_DEVICE_LOAD || !I->memory_can_reorder)
+            slots[I->scoreboard].drain_on_tg_barrier = true;
 
          slots[I->scoreboard].nr_pending++;
       }
