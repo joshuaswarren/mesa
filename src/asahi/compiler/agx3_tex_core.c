@@ -1539,16 +1539,16 @@ agx3_tex_decode_fetch(enum agx_isa_encoding enc, const void *instruction,
  * operand bank 6, not architectural r3. The FLOAT source is a half, while the
  * INTEGER source is the full uint required by texture2d::read. */
 /* PACK_SMPIR publishes a read's sampler operands at half bank + 6, beside the
- * coordinates that read stages at `bank`. A read that shares a shader with an
- * image write stages at bank 16, clear of imgwci's halves 0..14: metal-nt
- * -arch applegpu_g17p publishes a texture2d_array read's layer followed by a
- * write as 1705541600000000f0c00400, a texture2d read's uint level as
- * 1705541600000004f0c00c00, and both for texture2d_array as
- * 170554160010020070c06500 (layer r8), each with SMP f19=16. */
+ * coordinates that read stages at `bank`. Eight-half aligned banks 0..248 keep
+ * consecutive staged samples disjoint (f5 carries the full destination half):
+ * metal-nt -arch applegpu_g17p publishes a texture2d_array read's layer
+ * followed by a write at bank 16 as 1705541600000000f0c00400, a texture2d
+ * read's uint level as 1705541600000004f0c00c00, and both for texture2d_array
+ * as 170554160010020070c06500 (layer r8), each with SMP f19=16. */
 static bool
 sampler_bank_valid(uint16_t bank)
 {
-   return bank == 0 || bank == 16;
+   return (bank & 7) == 0 && bank <= 248;
 }
 
 static bool
