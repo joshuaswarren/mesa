@@ -276,6 +276,20 @@ hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
                 ? 1 : cs->cr.layers;
 }
 
+static bool
+hk_render_has_color_attachments(const struct hk_cs *cs)
+{
+   if (cs->tib.sample_size_B != 0)
+      return true;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cs->tib.logical_format); ++i) {
+      if (cs->tib.logical_format[i] != PIPE_FORMAT_NONE)
+         return true;
+   }
+
+   return false;
+}
+
 static void
 asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
                        struct drm_asahi_cmd_render *c)
@@ -378,6 +392,26 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    /* Can be 0 for attachmentless rendering with no draws */
    c->samples = MAX2(cs->tib.nr_samples, 1);
+
+   /* On M5 (G17S), Metal sets ZLS_CONTROL bit 0 (0x00080045 for D32F,
+    * 0x04080045 for D16 in isolated macOS-HV render.shadow trace t4) on
+    * single-sample depth-only passes with no colour or stencil attachments
+    * (tib=0B). Setting bit 0 on colour-attached passes suppresses colour
+    * output, and trace t4 only covered depth-only passes without stencil, so
+    * restrict it to colour-free, stencil-free single-sample depth passes
+    * without shader memory writes. */
+   if (agx_chip_g17_m5(dev->dev.chip) && c->samples == 1 &&
+       cs->cr.depth.buffer != 0 && !cs->cr.stencil.buffer &&
+       !cs->m5_shader_writes_memory &&
+       !hk_render_has_color_attachments(cs)) {
+      agx_unpack(NULL, &c->zls_ctrl, ZLS_CONTROL, zls);
+      if (zls.z_load || zls.z_store) {
+         zls.unknown_0 = true;
+         agx_pack(&c->zls_ctrl, ZLS_CONTROL, cfg) {
+            cfg = zls;
+         }
+      }
+   }
    c->layers = layers;
 
    /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
