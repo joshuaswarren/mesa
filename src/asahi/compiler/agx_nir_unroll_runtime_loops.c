@@ -1497,7 +1497,7 @@ peel_straight_prefix(nir_function_impl *impl, nir_loop *loop, unsigned count,
    struct counted_loop cl;
    if (!analyze_loop(loop, &cl) || cl.bottom)
       return false;
-   if (count_unrollable(loop, cl.nif) < 0)
+   if (count_unrollable(loop, cl.nif, NULL) < 0)
       return false;
 
    nir_foreach_block_in_cf_node(block, &loop->cf_node)
