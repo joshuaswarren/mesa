@@ -157,6 +157,22 @@ test_mod3_reg_bank_ra(void)
    }
 }
 
+/* G17D partitions AGX_CAPS_M5 into measured and excluded capabilities so any
+ * new M5 capability fails this test until assigned to one set. */
+static void
+test_g17d_partitions_m5(void)
+{
+   CHECK((AGX_CAPS_G17D_MEASURED & AGX_CAPS_G17D_EXCLUDED) == 0);
+   CHECK((AGX_CAPS_G17D_MEASURED | AGX_CAPS_G17D_EXCLUDED) == AGX_CAPS_M5);
+   for (unsigned bit = 1; bit; bit <<= 1) {
+      if (!(all_caps & bit))
+         continue;
+      CHECK_CHIP(agx_chip_has_cap(AGX_CHIP_G17D, bit) ==
+                    ((AGX_CAPS_G17D_MEASURED & bit) != 0),
+                 AGX_CHIP_G17D);
+   }
+}
+
 /* AGX_CAP_GEN10_2D_COMPRESSION is enabled on the M5 parts only; G18G, the
  * other Gen10 descriptor chip, keeps it off until measured. */
 static void
@@ -165,7 +181,7 @@ test_gen10_2d_compression(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17G || c == AGX_CHIP_G17S ||
-                            c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17C || c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_GEN10_2D_COMPRESSION) == expected,
                  c);
    }
@@ -181,7 +197,7 @@ test_sparse_binding(void)
       const bool expected =
          c == AGX_CHIP_G13G || c == AGX_CHIP_G13X || c == AGX_CHIP_G14G ||
          c == AGX_CHIP_G14X || c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-         c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+         c == AGX_CHIP_G17S || c == AGX_CHIP_G17C || c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_SPARSE_BINDING) == expected, c);
    }
 }
@@ -292,6 +308,7 @@ main(void)
    test_coalesce_pure_global_workgroups();
    test_cdm_war_weak_barrier();
    test_mod3_reg_bank_ra();
+   test_g17d_partitions_m5();
    test_gen10_2d_compression();
    test_sparse_binding();
    test_zls_full_render_bounds();

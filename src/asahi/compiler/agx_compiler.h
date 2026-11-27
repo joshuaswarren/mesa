@@ -665,6 +665,11 @@ typedef struct {
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
+   /* Tile stores a multisample reload background has left before it releases
+    * the colour class (agx_background_holds_colour); -1 once it is known not
+    * to hold it. */
+   int background_stores_left;
+
    /* G17P depth/stencil writes not yet emitted. Every sample's write shares
     * one class-1 transaction, released after the last. */
    unsigned zs_writes_left;

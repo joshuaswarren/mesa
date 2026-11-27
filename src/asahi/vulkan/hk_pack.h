@@ -215,7 +215,7 @@ void hk_pack_finish_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs);
 bool hk_pack_add_bo(struct util_dynarray *bos, struct agx_bo *bo);
 
 #define HK_PACK_FOOTPRINT_MAX_READS 8u
-#define HK_PACK_FOOTPRINT_MAX_WRITES 6u
+#define HK_PACK_FOOTPRINT_MAX_WRITES 8u
 #define HK_PACK_HAZARD_MAX_INTERVALS 64u
 #define HK_PACK_LIVENESS_MAX_INTERVALS 64u
 

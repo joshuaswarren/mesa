@@ -26,6 +26,7 @@
 #include "hk_device.h"
 #include "hk_queue.h"
 #include "hk_device_memory.h"
+#include "util/u_atomic.h"
 #include "hk_entrypoints.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "hk_image_layout_core.h"
@@ -2321,6 +2322,10 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       plane->mem = mem;
       plane->bo_offset_B = bo_offset_B;
       plane->rem = mem_size_B - bo_offset_B;
+      if (!p_atomic_read(&mem->has_image_binding)) {
+         p_atomic_set(&mem->has_image_binding, true);
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      }
    }
 
    return true;

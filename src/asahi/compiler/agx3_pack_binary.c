@@ -2767,7 +2767,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * Gallium does on G17C) need it: their layer count does not shrink with
     * the selected mip level, unlike 3D depth.
     */
-   const bool layer_operand = !m5 || chip == AGX_CHIP_G17C;
+   const bool layer_operand = !m5 || agx_chip_m5_layer_operand(chip);
    const bool array = I->dim == AGX_DIM_2D_ARRAY && layer_operand;
    const bool three_d = I->dim == AGX_DIM_3D ||
                         (!layer_operand && I->dim == AGX_DIM_2D_ARRAY);
@@ -10193,8 +10193,11 @@ agx3_g17p_colour_writeout(uint32_t writeout, unsigned pair)
  * one LSTCOL per sample, release 524 once.
  *
  * Admitted shapes: a background emits one two- or four-store set to
- * partition zero with no pixel transaction (one set per target, at disjoint
- * whole-sample tile ranges, for several targets); a colour epilog emits one
+ * partition zero (one set per target, at disjoint whole-sample tile ranges,
+ * for several targets) with no pixel transaction or, when it reloads the
+ * samples, inside one class-12 transaction: pixwait 12 before the first
+ * store, pixrel 12 after the last (agx_background_holds_colour()). A colour
+ * epilog emits one
  * set to partition zero, at most one store per framebuffer sample, after its
  * class-12 wait. Stores of API-disabled samples (zero coverage) may be
  * missing. Within a target each store's mask must come from its own
@@ -10239,6 +10242,7 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
     * fragments do before their colour stores: 1 waited, 2 written,
     * 3 released. */
    unsigned depth = 0, colour_signals = 0;
+   bool bg_waited = false, bg_released = false;
 
    agx_block *store_block = tail ? tail : agx_start_block(ctx);
    agx_foreach_instr_in_block(store_block, I) {
@@ -10271,6 +10275,19 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
          waited = true;
          continue;
       }
+      /* A reloading background's class-12 transaction around all its stores. */
+      if (!colour && I->op == AGX_OPCODE_WAIT_PIX && I->writeout == 12 &&
+          !bg_waited && !target_count) {
+         bg_waited = true;
+         continue;
+      }
+      if (!colour && I->op == AGX_OPCODE_SIGNAL_PIX && I->writeout == 12 &&
+          bg_waited && !bg_released && target_count) {
+         bg_released = true;
+         continue;
+      }
+      if (bg_released && I->op == AGX_OPCODE_ST_TILE)
+         return 0;
 
       /* G18's generic tile lowering releases after each unrolled sample.
        * Native sample-ID and texture-reload fragments instead hold class12
@@ -10389,6 +10406,7 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
            samples > 0 && samples <= ctx->key->fs.nr_samples
       : samples == 2 || samples == 4;
    return stopped && waited == colour && complete &&
+                bg_waited == bg_released &&
                 (depth == 0 || depth == 3) &&
                 (target_count == 1 || ctx->key->g17p_mrt_bg)
              ? target_count : 0;

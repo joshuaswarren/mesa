@@ -80,161 +80,163 @@ static unsigned checks;
  * refactor of the chip tables must leave it passing unedited; a row changes
  * only together with the hardware evidence for the new answer.
  *
- * Each row is an expression of `c` and its value for the twenty identities in
+ * Each row is an expression of `c` and its value for the twenty-one identities in
  * enum order, one base-36 digit each, grouped by generation:
  *
  *    G13G G13X G14G G14X | G15P G15G G15S G15C G15D | G16P G16G G16S G16C |
- *    G17P G17A G17G G17S G17C | G18G | UNKNOWN
+ *    G17P G17A G17G G17S G17C G17D | G18G | UNKNOWN
  *
  * A failing row prints the string the code produces.
  */
 #define TRUTH_TABLE(ROW)                                                       \
    /* Identity and generation axes. */                                         \
-   ROW(agx_chip_isa(c), "2222 23333 3333 33333 3 0")                           \
-   ROW(agx_chip_isa_encoding(c), "0000 01111 1111 11222 3 4")                  \
-   ROW(agx_chip_command_stream_generation(c), "0000 41111 2222 22333 3 4")     \
-   ROW(agx_chip_descriptor_generation(c), "7788 09999 9999 99aaa a 0")         \
-   ROW(agx_chip_sampler_generation(c), "0000 30000 1111 11222 2 3")            \
-   ROW(agx_chip_sampler_heap_element_size(c) / 8, "1111 04444 4444 44444 4 0") \
-   ROW(agx_chip_submission_model(c), "0000 30000 3011 13222 2 3")              \
-   ROW(agx_chip_record_family(c), "0123 4ddd8 9dbc defgh i j")                 \
+   ROW(agx_chip_isa(c), "2222 23333 3333 333333 3 0")                           \
+   ROW(agx_chip_isa_encoding(c), "0000 01111 1111 112222 3 4")                  \
+   ROW(agx_chip_command_stream_generation(c), "0000 41111 2222 223333 3 4")     \
+   ROW(agx_chip_descriptor_generation(c), "7788 09999 9999 99aaaa a 0")         \
+   ROW(agx_chip_sampler_generation(c), "0000 30000 1111 112222 2 3")            \
+   ROW(agx_chip_sampler_heap_element_size(c) / 8, "1111 04444 4444 444444 4 0") \
+   ROW(agx_chip_submission_model(c), "0000 30000 3011 132222 2 3")              \
+   ROW(agx_chip_record_family(c), "0123 4ddd8 9dbc defghi j k")                 \
    ROW(agx_encoding_is_agx3(agx_chip_isa_encoding(c)),                         \
-       "0000 01111 1111 11111 1 0")                                            \
-   ROW(agx_isa_is_agx3(agx_chip_isa_encoding(c)), "0000 01111 1111 11111 0 0") \
+       "0000 01111 1111 111111 1 0")                                            \
+   ROW(agx_isa_is_agx3(agx_chip_isa_encoding(c)), "0000 01111 1111 111111 0 0") \
    ROW(agx_encoding_is_g17_class(agx_chip_isa_encoding(c)),                    \
-       "0000 00000 0000 00111 1 0")                                            \
+       "0000 00000 0000 001111 1 0")                                            \
    /* Paths. */                                                                \
-   ROW(agx_chip_info(c)->path, "1111 02220 0200 20333 3 0")                    \
-   ROW(agx_chip_native_agx3(c), "0000 01110 0100 10000 0 0")                   \
-   ROW(agx_chip_native_g15(c), "0000 01110 0000 00000 0 0")                    \
-   ROW(agx_chip_g17_m5(c), "0000 00000 0000 00111 0 0")                        \
-   ROW(agx_chip_hal300_records(c), "0000 00000 0000 00100 1 0")                \
-   ROW(agx_chip_m5_paths(c), "0000 00000 0000 00100 1 0")                      \
-   ROW(agx_chip_codegen_supported(c), "1111 11111 1111 11111 0 0")             \
-   ROW(agx_chip_driver_supported(c), "1111 01110 0100 10000 0 0")              \
+   ROW(agx_chip_info(c)->path, "1111 02220 0200 203333 3 0")                    \
+   ROW(agx_chip_native_agx3(c), "0000 01110 0100 100000 0 0")                   \
+   ROW(agx_chip_native_g15(c), "0000 01110 0000 000000 0 0")                    \
+   ROW(agx_chip_g17_m5(c), "0000 00000 0000 001111 0 0")                        \
+   ROW(agx_chip_hal300_records(c), "0000 00000 0000 001000 1 0")                \
+   ROW(agx_chip_m5_paths(c), "0000 00000 0000 001000 1 0")                      \
+   ROW(agx_chip_m5_layer_operand(c), "0000 00000 0000 000010 0 0")              \
+   ROW(agx_chip_gl_through_zink(c), "0000 00000 0000 000001 0 0")               \
+   ROW(agx_chip_codegen_supported(c), "1111 11111 1111 111111 0 0")             \
+   ROW(agx_chip_driver_supported(c), "1111 01110 0100 100000 0 0")              \
    ROW(agx_chip_uses_legacy_precompiled_programs(c),                           \
-       "1111 00000 0000 00000 0 0")                                            \
-   ROW(agx_chip_hal300_path(c), "0000 00000 0000 00111 1 0")                   \
-   ROW(agx_chip_agx3_path(c), "0000 01110 0100 10111 1 0")                     \
-   ROW(agx_chip_native_or_m5(c), "0000 01110 0100 10111 0 0")                  \
-   ROW(agx_chip_native_or_g18g(c), "0000 01110 0100 10000 1 0")                \
-   ROW(agx_chip_g17p_or_m5(c), "0000 00000 0000 10111 0 0")                    \
+       "1111 00000 0000 000000 0 0")                                            \
+   ROW(agx_chip_hal300_path(c), "0000 00000 0000 001111 1 0")                   \
+   ROW(agx_chip_agx3_path(c), "0000 01110 0100 101111 1 0")                     \
+   ROW(agx_chip_native_or_m5(c), "0000 01110 0100 101111 0 0")                  \
+   ROW(agx_chip_native_or_g18g(c), "0000 01110 0100 100000 1 0")                \
+   ROW(agx_chip_g17p_or_m5(c), "0000 00000 0000 101111 0 0")                    \
    /* Capabilities and quirks. */                                              \
-   ROW(agx_chip_has_native_render_context(c), "0000 00000 0000 10000 0 0")     \
-   ROW(agx_chip_native_indirect_compute(c), "0000 01110 0100 10000 0 0")       \
-   ROW(agx_chip_indirect_geometry_flush(c), "0000 01110 0000 00000 0 0")       \
-   ROW(agx_chip_cdm_wide_visibility(c), "0000 01110 0000 00000 0 0")           \
-   ROW(agx_chip_elide_app_dispatch_barrier(c), "0000 01110 0100 10111 0 0")    \
-   ROW(agx_chip_usc_helper_table_slots(c, 0), "aaaa aaaaa aaaa 6aaaa a a")     \
-   ROW(agx_chip_usc_helper_table_slots(c, 6), "aaaa aaaaa aaaa 6aaaa a a")     \
-   ROW(agx_chip_usc_helper_table_slots(c, 10), "aaaa aaaaa aaaa aaaaa a a")    \
-   ROW(agx_chip_usc_base_page_fill_returns(c), "0000 00010 0000 00000 0 0")    \
+   ROW(agx_chip_has_native_render_context(c), "0000 00000 0000 100000 0 0")     \
+   ROW(agx_chip_native_indirect_compute(c), "0000 01110 0100 100000 0 0")       \
+   ROW(agx_chip_indirect_geometry_flush(c), "0000 01110 0000 000000 0 0")       \
+   ROW(agx_chip_cdm_wide_visibility(c), "0000 01110 0000 000000 0 0")           \
+   ROW(agx_chip_elide_app_dispatch_barrier(c), "0000 01110 0100 101111 0 0")    \
+   ROW(agx_chip_usc_helper_table_slots(c, 0), "aaaa aaaaa aaaa 6aaaaa a a")     \
+   ROW(agx_chip_usc_helper_table_slots(c, 6), "aaaa aaaaa aaaa 6aaaaa a a")     \
+   ROW(agx_chip_usc_helper_table_slots(c, 10), "aaaa aaaaa aaaa aaaaaa a a")    \
+   ROW(agx_chip_usc_base_page_fill_returns(c), "0000 00010 0000 000000 0 0")    \
    ROW(agx_chip_usc_base_page_fill_returns_for(c, 1),                          \
-       "0000 00010 0000 00000 0 0")                                            \
+       "0000 00010 0000 000000 0 0")                                            \
    ROW(agx_chip_usc_base_page_fill_returns_for(c, 2),                          \
-       "0000 00010 0000 00000 0 0")                                            \
+       "0000 00010 0000 000000 0 0")                                            \
    ROW(agx_chip_usc_base_page_fill_returns_for(c, 4),                          \
-       "0000 01110 0100 10000 0 0")                                            \
-   ROW(agx_chip_explicit_robust_image_bounds(c), "0000 01110 0100 00000 0 0")  \
-   ROW(agx_chip_vdm_indirect_index_bounds(c), "0000 00000 0000 10111 0 0")     \
-   ROW(agx_chip_hw_texel_fetch_bounds(c), "0000 00000 0000 00111 0 0")         \
-   ROW(agx_chip_native_imageblock(c), "0000 01110 0100 10000 0 0")             \
-   ROW(agx_chip_uncovered_tile_ms_defect(c), "0000 01110 0100 10000 0 0")      \
+       "0000 01110 0100 100000 0 0")                                            \
+   ROW(agx_chip_explicit_robust_image_bounds(c), "0000 01110 0100 000000 0 0")  \
+   ROW(agx_chip_vdm_indirect_index_bounds(c), "0000 00000 0000 101110 0 0")     \
+   ROW(agx_chip_hw_texel_fetch_bounds(c), "0000 00000 0000 001110 0 0")         \
+   ROW(agx_chip_native_imageblock(c), "0000 01110 0100 100000 0 0")             \
+   ROW(agx_chip_uncovered_tile_ms_defect(c), "0000 01110 0100 100000 0 0")      \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x8140, 2),                 \
-       "0000 01110 0100 10000 0 0")                                            \
+       "0000 01110 0100 100000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x8140, 4),                 \
-       "0000 01110 0100 10000 0 0")                                            \
+       "0000 01110 0100 100000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x6040, 2),                 \
-       "0000 01110 0100 00000 0 0")                                            \
+       "0000 01110 0100 000000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x6040, 4),                 \
-       "0000 01110 0100 10000 0 0")                                            \
+       "0000 01110 0100 100000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x6041, 2),                 \
-       "0000 01110 0100 00000 0 0")                                            \
+       "0000 01110 0100 000000 0 0")                                            \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x6041, 4),                 \
-       "0000 01110 0100 10000 0 0")                                            \
-   ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10111 0 0") \
-   ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 10000 0 0")   \
-   ROW(agx_chip_exact_fma32(c), "1111 11111 1111 11111 1 1")                   \
-   ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11111 1 0")          \
-   ROW(agx_chip_native_preamble(c), "0000 00000 0100 10000 0 0")               \
-   ROW(agx_chip_query_ti_spill(c), "0000 00000 0100 10000 0 0")                \
-   ROW(agx_chip_has_hardware_ray_tracing(c), "0000 01111 1111 11111 1 0")      \
-   ROW(agx_chip_has_agx3_ray_opcodes(c), "0000 01111 1111 11111 0 0")          \
-   ROW(agx_chip_needs_scheduling_stalls(c), "0000 01000 0000 00000 0 0")       \
-   ROW(agx_chip_cooperative_matrix_supported(c), "1111 01111 1111 11111 0 0")  \
-   ROW(agx_chip_local_read_tilebuffer(c), "0000 00000 1111 11111 0 0")         \
+       "0000 01110 0100 100000 0 0")                                            \
+   ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 101110 0 0") \
+   ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 100000 0 0")   \
+   ROW(agx_chip_exact_fma32(c), "1111 11111 1111 111111 1 1")                   \
+   ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 111111 1 0")          \
+   ROW(agx_chip_native_preamble(c), "0000 00000 0100 100000 0 0")               \
+   ROW(agx_chip_query_ti_spill(c), "0000 00000 0100 100000 0 0")                \
+   ROW(agx_chip_has_hardware_ray_tracing(c), "0000 01111 1111 111111 1 0")      \
+   ROW(agx_chip_has_agx3_ray_opcodes(c), "0000 01111 1111 111111 0 0")          \
+   ROW(agx_chip_needs_scheduling_stalls(c), "0000 01000 0000 000000 0 0")       \
+   ROW(agx_chip_cooperative_matrix_supported(c), "1111 01111 1111 111111 0 0")  \
+   ROW(agx_chip_local_read_tilebuffer(c), "0000 00000 1111 111111 0 0")         \
    /* Per-record allowlists: VDM. */                                           \
    ROW(agx_vdm_state_vertex_pipeline_pair_supported(c),                        \
-       "0000 01111 0111 10111 1 0")                                            \
-   ROW(agx_vdm_state_update_supported(c), "0000 01111 0111 10111 1 0")         \
-   ROW(agx_vdm_ppp_state_core_supported(c), "0000 01111 0111 10111 1 0")       \
-   ROW(agx_vdm_barrier_core_supported(c), "0000 01111 0111 10111 1 0")         \
+       "0000 01111 0111 101111 1 0")                                            \
+   ROW(agx_vdm_state_update_supported(c), "0000 01111 0111 101111 1 0")         \
+   ROW(agx_vdm_ppp_state_core_supported(c), "0000 01111 0111 101111 1 0")       \
+   ROW(agx_vdm_barrier_core_supported(c), "0000 01111 0111 101111 1 0")         \
    ROW(agx_vdm_barrier_core_word(c, false) == AGX_VDM_BARRIER_CORE_PLAIN,      \
-       "0000 00110 0100 00000 0 0")                                            \
-   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 1 0")     \
-   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 1 0")     \
+       "0000 00110 0100 000000 0 0")                                            \
+   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 101111 1 0")     \
+   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 101111 1 0")     \
    ROW(agx_vdm_stream_terminate_core_supported(c),                             \
-       "0000 01111 0111 10111 1 0")                                            \
+       "0000 01111 0111 101111 1 0")                                            \
    ROW(agx_vdm_tessellate_direct_target_supported(c),                          \
-       "0000 01111 0111 10111 0 0")                                            \
+       "0000 01111 0111 101111 0 0")                                            \
    ROW(agx_vdm_index_list_direct_target_supported_inline(c),                   \
-       "0000 01111 0111 10111 0 0")                                            \
+       "0000 01111 0111 101111 0 0")                                            \
    ROW(agx_vdm_index_list_direct_is_hal300_inline(c),                          \
-       "0000 00000 0000 00111 0 0")                                            \
-   ROW(agx_vdm_index_list_record_chip(c), "0123 45678 9abc defgh f j")         \
+       "0000 00000 0000 001111 0 0")                                            \
+   ROW(agx_vdm_index_list_record_chip(c), "0123 45678 9abc defghi f k")         \
    ROW(agx_vdm_index_list_indexed_or_indirect_supported_inline(c),             \
-       "0000 01111 0111 10111 1 0")                                            \
-   ROW(agx_vdm_index_list_nonindexed_has_tail(c), "0000 00000 0000 00111 1 0") \
-   ROW(agx_vdm_index_list_hal300_unk2(c, 12), "7777 77777 7777 77777 5 7")     \
+       "0000 01111 0111 101111 1 0")                                            \
+   ROW(agx_vdm_index_list_nonindexed_has_tail(c), "0000 00000 0000 001111 1 0") \
+   ROW(agx_vdm_index_list_hal300_unk2(c, 12), "7777 77777 7777 777777 5 7")     \
    /* Per-record allowlists: PPP. */                                           \
-   ROW(agx_ppp_legacy_payload_supported(c), "1111 01111 0111 10000 0 0")       \
-   ROW(agx_ppp_hal200_graphics_core_supported(c), "0000 01110 0100 10000 0 0") \
+   ROW(agx_ppp_legacy_payload_supported(c), "1111 01111 0111 100000 0 0")       \
+   ROW(agx_ppp_hal200_graphics_core_supported(c), "0000 01110 0100 100000 0 0") \
    ROW(agx_ppp_hal300_depth_stencil_core_supported(c),                         \
-       "0000 00000 0000 00111 1 0")                                            \
+       "0000 00000 0000 001111 1 0")                                            \
    ROW(agx_ppp_hal300_depth_bias_scissor_core_supported(c),                    \
-       "0000 00000 0000 00111 1 0")                                            \
+       "0000 00000 0000 001111 1 0")                                            \
    ROW(agx_ppp_viewport_payload_core_supported(c),                             \
-       "0000 01111 0111 10111 1 0")                                            \
-   ROW(viewport_payload_generation(c), "0000 06666 0666 60777 7 0")            \
-   ROW(w_clamp_cull2_generation(c), "0000 06666 0666 60777 7 0")               \
+       "0000 01111 0111 101111 1 0")                                            \
+   ROW(viewport_payload_generation(c), "0000 06666 0666 607777 7 0")            \
+   ROW(w_clamp_cull2_generation(c), "0000 06666 0666 607777 7 0")               \
    /* Per-record allowlists: CDM. */                                           \
-   ROW(agx3_cdm_launch_target_grounded(c), "0000 01111 0111 10111 1 0")        \
-   ROW(agx3_cdm_direct_launch_target_grounded(c), "0000 01111 0111 10111 1 0") \
+   ROW(agx3_cdm_launch_target_grounded(c), "0000 01111 0111 101111 1 0")        \
+   ROW(agx3_cdm_direct_launch_target_grounded(c), "0000 01111 0111 101111 1 0") \
    ROW(agx3_cdm_indirect_launch_target_grounded(c),                            \
-       "0000 01111 0111 10111 1 0")                                            \
+       "0000 01111 0111 101111 1 0")                                            \
    ROW(agx3_cdm_indirect_launch_36_target_grounded(c),                         \
-       "0000 01111 0111 10111 1 0")                                            \
-   ROW(agx3_cdm_stream_link_target_grounded(c), "0000 01111 0111 10111 0 0")   \
-   ROW(agx3_cdm_link_padding_target_grounded(c), "0000 01111 0111 10111 0 0")  \
-   ROW(agx3_cdm_barrier_target_grounded(c), "0000 01111 0111 10111 1 0")       \
-   ROW(agx3_cdm_barrier_flags_grounded(c, 0), "0000 01111 0111 10111 1 0")     \
-   ROW(agx3_cdm_barrier_flags_grounded(c, 1), "0000 00000 0000 00111 0 0")     \
-   ROW(agx3_cdm_barrier_flags_grounded(c, 5), "0000 01111 0111 10111 1 0")     \
-   ROW(agx3_cdm_barrier_flags_grounded(c, 0xf), "0000 00000 0000 00111 0 0")   \
-   ROW(agx3_cdm_barrier_flags_grounded(c, 0x10), "0000 00000 0000 00000 0 0")  \
+       "0000 01111 0111 101111 1 0")                                            \
+   ROW(agx3_cdm_stream_link_target_grounded(c), "0000 01111 0111 101111 0 0")   \
+   ROW(agx3_cdm_link_padding_target_grounded(c), "0000 01111 0111 101111 0 0")  \
+   ROW(agx3_cdm_barrier_target_grounded(c), "0000 01111 0111 101111 1 0")       \
+   ROW(agx3_cdm_barrier_flags_grounded(c, 0), "0000 01111 0111 101111 1 0")     \
+   ROW(agx3_cdm_barrier_flags_grounded(c, 1), "0000 00000 0000 001111 0 0")     \
+   ROW(agx3_cdm_barrier_flags_grounded(c, 5), "0000 01111 0111 101111 1 0")     \
+   ROW(agx3_cdm_barrier_flags_grounded(c, 0xf), "0000 00000 0000 001111 0 0")   \
+   ROW(agx3_cdm_barrier_flags_grounded(c, 0x10), "0000 00000 0000 000000 0 0")  \
    ROW(agx3_cdm_barrier_wide_visibility_grounded(c),                           \
-       "0000 01110 0100 00000 0 0")                                            \
-   ROW(agx3_cdm_barrier_flush_memory_grounded(c), "0000 00000 0000 10111 0 0") \
+       "0000 01110 0100 000000 0 0")                                            \
+   ROW(agx3_cdm_barrier_flush_memory_grounded(c), "0000 00000 0000 101111 0 0") \
    ROW(agx3_cdm_substream_barrier_target_grounded(c),                          \
-       "0000 01111 0111 10111 0 0")                                            \
+       "0000 01111 0111 101111 0 0")                                            \
    ROW(agx3_cdm_secondary_barrier_target_grounded(c),                          \
-       "0000 00000 0000 00111 0 0")                                            \
+       "0000 00000 0000 001111 0 0")                                            \
    ROW(agx3_g17s_minimal_compute_dispatch_ready(c),                            \
-       "0000 00000 0000 00010 0 0")                                            \
+       "0000 00000 0000 000100 0 0")                                            \
    ROW(agx3_native_indirect_compute_dispatch_size(c) / 4,                      \
-       "iiii ijjji iiii iiiii i i")                                            \
+       "iiii ijjji iiii iiiiii i i")                                            \
    /* Per-record allowlists: Ioto. */                                          \
-   ROW(agx_chip_ioto_generation(c), "0000 01111 0111 10222 0 0")               \
-   ROW(agx_ioto_target_supported(c), "0000 01111 0111 10111 0 0")              \
-   ROW(agx_ioto_load_target_encoding(c), "0000 01111 0111 10222 0 0")          \
-   ROW(agx_ioto_profile_control_supported(c), "0000 01111 0111 10111 0 0")     \
-   ROW(agx_ioto_profile_control_size(c), "0000 04444 0444 40666 0 0")          \
-   ROW(ioto_preshader_generation(c), "0000 01111 0111 10222 0 0")              \
-   ROW(ioto_state_generation(c), "0000 01111 0111 10222 0 0")                  \
-   ROW(ioto_program_inline_lddev(c), "0000 01111 0111 10000 0 0")              \
+   ROW(agx_chip_ioto_generation(c), "0000 01111 0111 102222 0 0")               \
+   ROW(agx_ioto_target_supported(c), "0000 01111 0111 101111 0 0")              \
+   ROW(agx_ioto_load_target_encoding(c), "0000 01111 0111 102222 0 0")          \
+   ROW(agx_ioto_profile_control_supported(c), "0000 01111 0111 101111 0 0")     \
+   ROW(agx_ioto_profile_control_size(c), "0000 04444 0444 406666 0 0")          \
+   ROW(ioto_preshader_generation(c), "0000 01111 0111 102222 0 0")              \
+   ROW(ioto_state_generation(c), "0000 01111 0111 102222 0 0")                  \
+   ROW(ioto_program_inline_lddev(c), "0000 01111 0111 100000 0 0")              \
    /* Outside lib: the command-stream decoder and the Vulkan driver. */        \
-   ROW(decoder_chip(c), "0123 45678 9abc defgh i j")                           \
-   ROW(shader_binary_version_class(c), "2222 21111 1111 31333 1 1")
+   ROW(decoder_chip(c), "0123 45678 9abc defghi j k")                           \
+   ROW(shader_binary_version_class(c), "2222 21111 1111 313333 1 1")
 
 /* The Ioto encoding a codec packs for a chip: 1 for GPU0, 2 for GPU1, or 0
  * when it refuses the chip. The preshader branch starts with a different byte
@@ -330,7 +332,7 @@ w_clamp_cull2_generation(enum agx_chip chip)
 static const char *const chip_names[AGX_CHIP_UNKNOWN + 1] = {
    "G13G", "G13X", "G14G", "G14X", "G15P", "G15G",    "G15S",
    "G15C", "G15D", "G16P", "G16G", "G16S", "G16C",    "G17P",
-   "G17A", "G17G", "G17S", "G17C", "G18G", "unknown",
+   "G17A", "G17G", "G17S", "G17C", "G17D", "G18G", "unknown",
 };
 
 static void
@@ -349,9 +351,9 @@ check_row(const char *expr, const unsigned *got, const char *want)
 
    checks++;
    if (strcmp(got_s, want_s)) {
-      fprintf(stderr, "%s:\n  got      \"%.4s %.5s %.4s %.5s %.1s %.1s\"\n",
-              expr, got_s, got_s + 4, got_s + 9, got_s + 13, got_s + 18,
-              got_s + 19);
+      fprintf(stderr, "%s:\n  got      \"%.4s %.5s %.4s %.6s %.1s %.1s\"\n",
+              expr, got_s, got_s + 4, got_s + 9, got_s + 13, got_s + 19,
+              got_s + 20);
       fprintf(stderr, "  expected \"%s\"\n", want_s);
       failures++;
    }
@@ -360,7 +362,7 @@ check_row(const char *expr, const unsigned *got, const char *want)
 static void
 test_truth_table(void)
 {
-   _Static_assert(AGX_CHIP_UNKNOWN == 19, "one column per chip");
+   _Static_assert(AGX_CHIP_UNKNOWN == 20, "one column per chip");
 
 #define ROW(expr, want)                                                        \
    {                                                                           \
@@ -411,7 +413,7 @@ test_chip_sets(void)
       CHECK(agx_chip_native_or_g18g(c) == (native || c == AGX_CHIP_G18G));
       CHECK(agx_chip_g17p_or_m5(c) == (c == AGX_CHIP_G17P || m5));
       CHECK(m5 == (c == AGX_CHIP_G17G || c == AGX_CHIP_G17S ||
-                   c == AGX_CHIP_G17C));
+                   c == AGX_CHIP_G17C || c == AGX_CHIP_G17D));
    }
 }
 
@@ -433,6 +435,7 @@ static const struct {
    {16, 'C', 4, AGX_CHIP_G16C}, {17, 'P', 1, AGX_CHIP_G17P},
    {17, 'A', 1, AGX_CHIP_G17A}, {17, 'G', 1, AGX_CHIP_G17G},
    {17, 'S', 2, AGX_CHIP_G17S}, {17, 'C', 4, AGX_CHIP_G17C},
+   {17, 'D', 8, AGX_CHIP_G17D},
    {18, 'G', 1, AGX_CHIP_G18G},
 };
 
@@ -637,7 +640,7 @@ test_invalid_identity(void)
    CHECK_EQ(chip_for(19, 'G', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(15, 'A', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(16, 'D', 8), AGX_CHIP_UNKNOWN);
-   CHECK_EQ(chip_for(17, 'D', 8), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(chip_for(18, 'D', 8), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(13, 'P', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(13, 'G', 0), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(17, 'S', DRM_ASAHI_MAX_CLUSTERS + 1),
@@ -672,6 +675,37 @@ test_classification_invariants(void)
    CHECK(strcmp(agx_isa_name(AGX_ISA_UNKNOWN), "unknown") == 0);
 }
 
+/* Device tree compatibles name a chip as the kernel's generation and variant
+ * do; the loader reads them to pick zink (agx_chip_gl_through_zink()). */
+static void
+test_compatible(void)
+{
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17d"), AGX_CHIP_G17D);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17c"), AGX_CHIP_G17C);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g13g"), AGX_CHIP_G13G);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g14s"), AGX_CHIP_G14X);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g13x"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-t6050"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17dd"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g017d"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-gD"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible(""), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible(NULL), AGX_CHIP_UNKNOWN);
+
+   /* Every chip GL reaches through zink is named by its compatible. */
+   for (unsigned i = 0; i < AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      if (!agx_chip_gl_through_zink(c))
+         continue;
+      char compatible[32];
+      snprintf(compatible, sizeof(compatible), "apple,agx-g%.2s%c",
+               chip_names[i] + 1, chip_names[i][3] - 'A' + 'a');
+      CHECK_EQ(agx_chip_from_compatible(compatible), c);
+   }
+}
+
 int
 main(void)
 {
@@ -683,6 +717,7 @@ main(void)
    test_params_contracts();
    test_invalid_identity();
    test_classification_invariants();
+   test_compatible();
 
    if (failures) {
       fprintf(stderr, "agx_chip: %u of %u checks failed\n", failures, checks);

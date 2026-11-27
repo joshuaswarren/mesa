@@ -64,9 +64,11 @@ agx3_build_m5_container_lead(void *image, size_t capacity, unsigned clusters)
    bytes[1] = size >> 8;
    for (size_t i = 0x40; i < size; i += 2)
       bytes[i] = 0x06;
-   /* One helper table per cluster for each of the two stage groups. */
-   for (unsigned table = clusters; table < 3 * clusters; ++table) {
-      uint8_t *base = bytes + table * 0x100;
+   /* One helper table per cluster for each of the two stage groups, from
+    * the first group's offset (agx3_m5_container_group_offset()). */
+   const uint32_t first = agx3_m5_container_group_offset(clusters, false);
+   for (unsigned table = 0; table < 2 * clusters; ++table) {
+      uint8_t *base = bytes + first + table * 0x100;
       for (unsigned i = 0; i < sizeof(helpers) / sizeof(helpers[0]); ++i) {
          uint8_t *record = base + i * 16;
          memset(record, 0, 10);
