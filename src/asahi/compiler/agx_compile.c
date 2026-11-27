@@ -12669,6 +12669,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
+   /* int64 lowering and the perspective divide emit fdiv after preprocessing;
+    * the backend has no fdiv, so lower what is left before it is scheduled.
+    */
+   NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
+
    /* Reassociate before forming preambles because it makes preambles more
     * effective. Clean up after. On AGX3, also order the loop-invariant terms of
     * a chain in a loop first, so accumulations of per-iteration constants
@@ -16688,7 +16693,7 @@ libagx_frcp(nir_builder *b, nir_def *x)
 }
 
 static bool
-agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
+libagx_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 {
    if (alu->op != nir_op_frcp || !nir_alu_instr_is_exact(alu) ||
        alu->def.bit_size != 32)
@@ -16742,9 +16747,18 @@ agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
    };
    NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
 
-   /* Has to run after nir_lower_idiv */
-   NIR_PASS(progress, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
-            nir_metadata_control_flow, NULL);
+   /* Has to run after nir_lower_idiv. Skipped on internal shaders: the
+    * exact path refines every frcp itself, so this pass would only refine
+    * the idiv reciprocal a second time. */
+   if (!nir->info.internal)
+      NIR_PASS(progress, nir, nir_shader_alu_pass, libagx_lower_fdiv,
+               nir_metadata_control_flow, NULL);
+
+   /* fdiv has no hardware: every stage gets a * frcp(d). Internal shaders
+    * additionally get correctly rounded frcp/fdiv/log.
+    */
+   NIR_PASS(progress, nir, agx_nir_lower_fdiv);
+   NIR_PASS(progress, nir, agx_nir_lower_log);
    return progress;
 }
 
@@ -16979,8 +16993,19 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    if (!post_lower) {
       NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
-      NIR_PASS(_, nir, agx_lower_sincos,
-               g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0);
+      /* Chips with a native sinc keep it on every stage, internal
+       * shaders included; everywhere else the exact lowering runs first
+       * and the stock approximation lowers whatever it skipped (all of it
+       * on application shaders). */
+      const unsigned native =
+         g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0;
+      if (native) {
+         NIR_PASS(_, nir, agx_lower_sincos, native);
+      } else {
+         NIR_PASS(_, nir, agx_nir_lower_sincos);
+         if (!nir->info.internal)
+            NIR_PASS(_, nir, agx_lower_sincos, 0);
+      }
    }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_lower_front_face,
             nir_metadata_control_flow, NULL);
@@ -19118,6 +19143,7 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_bit_size, lower_bit_size_callback, NULL);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+   NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
@@ -19292,6 +19318,12 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
       NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
+      /* Bit-size and scalar lowering can still emit fdiv here; the
+       * a * frcp(d) rewrite must land before denorm-preserve so the
+       * emitted multiply gets the preserve expansion -- the ordering
+       * .lower_fdiv had inside nir_opt_algebraic.
+       */
+      NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
       NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
 
       /* Late VBO lowering creates constant udiv instructions */

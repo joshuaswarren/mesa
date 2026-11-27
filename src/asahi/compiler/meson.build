@@ -60,6 +60,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_g17p_combined_sampler.c',
   'agx_nir_ray_query.c',
   'agx_nir_gen1_ray_query.c',
+  'agx_nir_lower_math.c',
   'agx_nir_lower_shared_bitsize.c',
   'agx_nir_opt_shared_phase_cse.c',
   'agx_nir_lower_subgroups.c',
@@ -765,6 +766,7 @@ if with_tests
       files(
          'test/test-compact-constants.cpp',
          'test/test-agx3-pack-binary.cpp',
+         'test/test-lower-math.cpp',
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
