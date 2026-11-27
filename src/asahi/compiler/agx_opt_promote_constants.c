@@ -91,6 +91,58 @@ record_use(void *memctx, struct hash_table_u64 *constants, uint64_t imm,
    info->align_16 = MAX2(info->align_16, agx_size_align_16(size));
 }
 
+/*
+ * On AGX3B, a 16-bit float ALU operand read from the uniform file inside a
+ * loop runs slower than reading it from a register (matching
+ * agx_nir_opt_preamble's keep_half_loop_operand_in_registers). Keep 16-bit
+ * constants in GPRs for in-loop half-float ALU uses so late compiler passes
+ * such as agx_opt_agx3_normflt_byte_pairs do not re-introduce uniform-file
+ * half-float reads inside hot loops.
+ */
+static bool
+agx3b_avoids_half_float_uniform_in_loop(const agx_context *ctx,
+                                        const agx_instr *I, enum agx_size size,
+                                        bool block_in_loop)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B || !block_in_loop ||
+       size != AGX_SIZE_16)
+      return false;
+
+   switch (I->op) {
+   case AGX_OPCODE_HADD:
+   case AGX_OPCODE_HMUL:
+   case AGX_OPCODE_HFMA:
+   case AGX_OPCODE_FADD:
+   case AGX_OPCODE_FMUL:
+   case AGX_OPCODE_FFMA:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool *
+build_in_loop_map(agx_context *ctx, void *memctx, unsigned *nr_blocks_out)
+{
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+   *nr_blocks_out = nr_blocks;
+
+   bool *in_loop = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1u));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index) {
+            for (unsigned i = succ->index; i <= block->index; ++i)
+               in_loop[i] = true;
+         }
+      }
+      if (block->loop_header)
+         in_loop[block->index] = true;
+   }
+   return in_loop;
+}
+
 /* Reuse the packer's full instruction-domain proof for AGX3 integer operands.
  * Do not broaden the opcode-only predicate: modifiers, operand position and
  * the opposite source's type are part of the native instruction contract.
@@ -98,8 +150,12 @@ record_use(void *memctx, struct hash_table_u64 *constants, uint64_t imm,
  */
 static bool
 constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
-                             unsigned uniform, enum agx_size size)
+                             unsigned uniform, enum agx_size size,
+                             bool block_in_loop)
 {
+   if (agx3b_avoids_half_float_uniform_in_loop(ctx, I, size, block_in_loop))
+      return false;
+
    if (agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s, uniform, size))
       return true;
 
@@ -196,36 +252,46 @@ pass(agx_context *ctx, void *memctx, bool late_m5_float)
          : ctx->out->push_count;
    const unsigned push_before = ctx->out->push_count;
 
-   /* Gather constant definitions and use */
-   agx_foreach_instr_global(ctx, I) {
-      if (I->op == AGX_OPCODE_MOV_IMM) {
-         assert(I->dest[0].type == AGX_INDEX_NORMAL);
-         BITSET_SET(is_immediate, I->dest[0].value);
-         values[I->dest[0].value] = I->imm;
-      } else if (late_m5_float) {
-         agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(is_immediate, I->src[s].value) &&
-                late_m5_float_use(ctx, I, s, probe_uniform, I->src[s].size))
-               record_use(memctx, constants, values[I->src[s].value],
-                          I->src[s].size);
-         }
-      } else {
-         unsigned multiplier;
-         if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
-                                 &multiplier)) {
-            record_use(memctx, constants, values[I->src[multiplier].value],
-                       I->src[multiplier].size);
-            record_use(memctx, constants, values[I->src[2].value],
-                       I->src[2].size);
-            continue;
-         }
-         agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(is_immediate, I->src[s].value) &&
-                constant_use_accepts_uniform(ctx, I, s, probe_uniform,
-                                             I->src[s].size)) {
+   unsigned nr_blocks = 0;
+   bool *in_loop = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B
+                      ? build_in_loop_map(ctx, memctx, &nr_blocks)
+                      : NULL;
 
-               record_use(memctx, constants, values[I->src[s].value],
-                          I->src[s].size);
+   /* Gather constant definitions and use */
+   agx_foreach_block(ctx, block) {
+      const bool block_in_loop =
+         in_loop && block->index < nr_blocks && in_loop[block->index];
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM) {
+            assert(I->dest[0].type == AGX_INDEX_NORMAL);
+            BITSET_SET(is_immediate, I->dest[0].value);
+            values[I->dest[0].value] = I->imm;
+         } else if (late_m5_float) {
+            agx_foreach_ssa_src(I, s) {
+               if (BITSET_TEST(is_immediate, I->src[s].value) &&
+                   late_m5_float_use(ctx, I, s, probe_uniform, I->src[s].size))
+                  record_use(memctx, constants, values[I->src[s].value],
+                             I->src[s].size);
+            }
+         } else {
+            unsigned multiplier;
+            if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
+                                     &multiplier)) {
+               record_use(memctx, constants, values[I->src[multiplier].value],
+                          I->src[multiplier].size);
+               record_use(memctx, constants, values[I->src[2].value],
+                          I->src[2].size);
+               continue;
+            }
+            agx_foreach_ssa_src(I, s) {
+               if (BITSET_TEST(is_immediate, I->src[s].value) &&
+                   constant_use_accepts_uniform(ctx, I, s, probe_uniform,
+                                                I->src[s].size,
+                                                block_in_loop)) {
+
+                  record_use(memctx, constants, values[I->src[s].value],
+                             I->src[s].size);
+               }
             }
          }
       }
@@ -338,47 +404,52 @@ pass(agx_context *ctx, void *memctx, bool late_m5_float)
    }
 
    /* Promote in the IR */
-   agx_foreach_instr_global(ctx, I) {
-      if (late_m5_float) {
+   agx_foreach_block(ctx, block) {
+      const bool block_in_loop =
+         in_loop && block->index < nr_blocks && in_loop[block->index];
+      agx_foreach_instr_in_block(block, I) {
+         if (late_m5_float) {
+            agx_foreach_ssa_src(I, s) {
+               if (!BITSET_TEST(is_immediate, I->src[s].value))
+                  continue;
+               struct constant_info *info =
+                  _mesa_hash_table_u64_search(constants, values[I->src[s].value]);
+               if (info && info->promoted &&
+                   late_m5_float_use(ctx, I, s, info->uniform, I->src[s].size))
+                  agx_replace_src(I, s,
+                                  agx_uniform(info->uniform, I->src[s].size));
+            }
+            continue;
+         }
+         unsigned multiplier;
+         if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
+                                  &multiplier)) {
+            struct constant_info *m = _mesa_hash_table_u64_search(
+               constants, values[I->src[multiplier].value]);
+            struct constant_info *c = _mesa_hash_table_u64_search(
+               constants, values[I->src[2].value]);
+            if (m && c && m->promoted && c->promoted) {
+               /* Both values own aligned uniforms before either source changes. */
+               agx_replace_src(I, multiplier,
+                               agx_uniform(m->uniform, I->src[multiplier].size));
+               agx_replace_src(I, 2, agx_uniform(c->uniform, I->src[2].size));
+               continue;
+            }
+         }
          agx_foreach_ssa_src(I, s) {
             if (!BITSET_TEST(is_immediate, I->src[s].value))
                continue;
+
             struct constant_info *info =
                _mesa_hash_table_u64_search(constants, values[I->src[s].value]);
+
             if (info && info->promoted &&
-                late_m5_float_use(ctx, I, s, info->uniform, I->src[s].size))
-               agx_replace_src(I, s,
-                               agx_uniform(info->uniform, I->src[s].size));
-         }
-         continue;
-      }
-      unsigned multiplier;
-      if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
-                              &multiplier)) {
-         struct constant_info *m = _mesa_hash_table_u64_search(
-            constants, values[I->src[multiplier].value]);
-         struct constant_info *c = _mesa_hash_table_u64_search(
-            constants, values[I->src[2].value]);
-         if (m && c && m->promoted && c->promoted) {
-            /* Both values own aligned uniforms before either source changes. */
-            agx_replace_src(I, multiplier,
-                            agx_uniform(m->uniform, I->src[multiplier].size));
-            agx_replace_src(I, 2, agx_uniform(c->uniform, I->src[2].size));
-            continue;
-         }
-      }
-      agx_foreach_ssa_src(I, s) {
-         if (!BITSET_TEST(is_immediate, I->src[s].value))
-            continue;
+                constant_use_accepts_uniform(ctx, I, s,
+                                             info->uniform, I->src[s].size,
+                                             block_in_loop)) {
 
-         struct constant_info *info =
-            _mesa_hash_table_u64_search(constants, values[I->src[s].value]);
-
-         if (info && info->promoted &&
-             constant_use_accepts_uniform(ctx, I, s,
-                                       info->uniform, I->src[s].size)) {
-
-            agx_replace_src(I, s, agx_uniform(info->uniform, I->src[s].size));
+               agx_replace_src(I, s, agx_uniform(info->uniform, I->src[s].size));
+            }
          }
       }
    }

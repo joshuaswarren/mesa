@@ -676,6 +676,24 @@ reassoc_const_offsets = [
      ('iadd', ('isub', a, b), c)),
 ]
 
+# Drop aligned addends under low-bit masks ((a + b) & (2^k - 1) == b & (2^k - 1)
+# when (a & (2^k - 1)) == 0) and merge sums of disjoint masks of the same value
+# ((x & m1) + (x & m2) == x & (m1 | m2)). Collapses redundant byte-in-word
+# shared/buffer address splits before imad fusion.
+fold_aligned_masks = [
+    (('iand', ('iadd', 'a@32(agx_is_multiple_of_2)', 'b@32'), 1), ('iand', 'b', 1)),
+    (('iand', ('iadd', 'a@32(agx_is_multiple_of_4)', 'b@32'), 3), ('iand', 'b', 3)),
+    (('iand', ('iadd', 'a@32(agx_is_multiple_of_8)', 'b@32'), 7), ('iand', 'b', 7)),
+    (('iand', ('iadd', 'a@32(agx_is_multiple_of_16)', 'b@32'), 15), ('iand', 'b', 15)),
+    (('iand', ('iand', 'x@32', '#c'), '#d'), ('iand', 'x', ('iand', c, d))),
+    (('iand', 'x@32', 0xffffffff), 'x'),
+    (('iadd(agx_iadd_disjoint_masks)', ('iand', 'x@32', '#c'), ('iand', 'x@32', '#d')),
+     ('iand', 'x', ('ior', c, d))),
+    (('iadd(agx_iadd_disjoint_masks_nested)', ('iand', 'x@32', '#c'),
+      ('iadd', 'a@32', ('iand', 'x@32', '#d'))),
+     ('iadd', 'a', ('iand', 'x', ('ior', c, d)))),
+]
+
 m5_narrow_to_float = [
     (('i2f32', ('u2u32', 'a@8')), ('u2f32', a)),
     (('u2f32', ('u2u32', 'a@8')), ('u2f32', a)),
@@ -855,6 +873,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       m5_narrow_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_reassoc_const_offsets",
                                       reassoc_const_offsets).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_aligned_masks",
+                                      fold_aligned_masks).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +
