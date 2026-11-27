@@ -1070,7 +1070,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    u_rwlock_init(&dev->host_alias.patch_lock);
    dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
+   /* A device whose dependencies always take memory scope has none to
+    * decide per resource (agx_cdm_ordering_memory_scope()). */
    if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+       !agx_cdm_ordering_memory_scope(&pdev->dev) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {
@@ -1150,6 +1153,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "Failed to get DRM device: %m");
       goto fail_fd;
    }
+
+   /* The kernel's feature word, read when the device was opened: queues copy
+    * this into their submission tracking when they are created. */
+   dev->load_hazard_frag = dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS;
 
    /* Splitting a long submission lets the GPU start work from the first ioctl
     * while the kernel validates later ioctls, so a profile may cap batch size. */

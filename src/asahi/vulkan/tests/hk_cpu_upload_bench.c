@@ -1808,12 +1808,16 @@ graphics_launch_replay_correctness(struct fixture *f)
    f->dev.dev.shader_base = shader_base;
    util_dynarray_init(&cmd->large_bos, NULL);
 
-   const enum agx_chip chips[] = {
-      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
-      AGX_CHIP_G17C,
+   const struct {
+      enum agx_chip chip;
+      unsigned clusters;
+   } chips[] = {
+      {AGX_CHIP_G16G, 1}, {AGX_CHIP_G17P, 1}, {AGX_CHIP_G17G, 1},
+      {AGX_CHIP_G17S, 2}, {AGX_CHIP_G17C, 4}, {AGX_CHIP_G17D, 8},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
-      f->dev.dev.chip = chips[i];
+      f->dev.dev.chip = chips[i].chip;
+      f->dev.dev.params.num_clusters_total = chips[i].clusters;
       reset(f);
       cmd->vk.record_result = VK_SUCCESS;
       cmd->ioto = (struct hk_ioto_arena){
@@ -1911,7 +1915,7 @@ graphics_launch_replay_correctness(struct fixture *f)
          .max_bytes_per_tile = 32768,
       };
       const uint64_t msaa1 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
-      if (agx_chip_g17_m5(chips[i])) {
+      if (agx_chip_g17_m5(chips[i].chip)) {
          CHECK(msaa1 != 0 && cmd->vk.record_result == VK_SUCCESS);
          CHECK(cmd->ioto.programs == 1);
          CHECK(cmd->state.gfx.g17p_ioto[1].admit.s == hw_fs);
@@ -1948,6 +1952,7 @@ graphics_launch_replay_correctness(struct fixture *f)
    *hw_vs = saved_vs;
    *hw_fs = saved_fs;
    f->dev.dev.chip = AGX_CHIP_G17P;
+   f->dev.dev.params.num_clusters_total = 0;
    f->dev.dev.shader_base = 0;
    f->pdev.vk.instance = saved_instance;
    mtx_destroy(&inst.debug_utils.callbacks_mutex);

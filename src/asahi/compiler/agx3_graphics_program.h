@@ -88,6 +88,13 @@ struct agx3_g17p_graphics_program_desc {
    const struct agx3_cprog_inputs *cprog_inputs;
 
    const struct agx_ioto_preshader_desc *preshader;
+
+   /* M5: the cluster count the USC window's code-container lead was built
+    * for, the kernel's num_clusters_total (agx3_build_m5_container_lead()).
+    * The program's profile loader points at that lead's helper-table group
+    * (agx3_m5_container_group_offset()); an M5 program is refused without
+    * it. Other paths ignore it. */
+   unsigned usc_clusters;
 };
 
 struct agx3_g17p_graphics_program {
@@ -142,6 +149,14 @@ bool agx3_g18g_graphics_program_generate_tps(
 /* No-preamble internal tile shaders: EOT has no PIXREL, background has the
  * distinct release mask. Uniform ranges describe the compiled shader ABI. */
 bool agx3_g18g_tile_program_generate(
+   const struct agx3_g17p_graphics_program_desc *desc, bool store,
+   struct agx3_g17p_graphics_program *program);
+
+/* G18G general HAL300 tile shaders (any admitted M5 imageblock shape), emitted
+ * as single-cluster G17G canonical GPU1 so agx3_transcode_agx3d_ioto() doubles
+ * the SR14 helper base from 0x100 to the witnessed G18G 0x200 base regardless
+ * of the host device's cluster count. */
+bool agx3_g18g_general_tile_program_generate(
    const struct agx3_g17p_graphics_program_desc *desc, bool store,
    struct agx3_g17p_graphics_program *program);
 

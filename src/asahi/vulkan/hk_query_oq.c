@@ -42,6 +42,7 @@ hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
    for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
       const unsigned slot = order[i];
       if ((slot == 0 && render->timestamp.start.handle) ||
+          (slot == 1 && render->timestamp.vtx_end.handle) ||
           render->oq_stamp[slot].handle)
          continue;
       free_slots[nfree++] = slot;
@@ -158,6 +159,7 @@ hk_stamp_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *post)
    for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
       const unsigned slot = order[i];
       if ((slot == 0 && render->timestamp.start.handle) ||
+          (slot == 1 && render->timestamp.vtx_end.handle) ||
           render->oq_stamp[slot].handle)
          continue;
       free_slots[nfree++] = slot;

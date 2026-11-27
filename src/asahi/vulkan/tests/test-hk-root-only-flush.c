@@ -63,7 +63,7 @@ test_root_only_flush_selection(void)
 
    /* Every chip that packs the HAL300 graphics core takes it; AGX2 cannot. */
    const enum agx_chip hal300[] = {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
-                                   AGX_CHIP_G18G};
+                                   AGX_CHIP_G17D, AGX_CHIP_G18G};
    for (unsigned i = 0; i < ARRAY_SIZE(hal300); ++i) {
       CHECK(hk_root_only_flush_supported(hal300[i], &latched),
             "%s: HAL300 chip misses the root-only flush",

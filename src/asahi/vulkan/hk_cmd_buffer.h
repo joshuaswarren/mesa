@@ -935,12 +935,16 @@ struct hk_rendering_state {
     */
    VkImageAspectFlags g17p_zls_written;
 
-   /* M5: an attachment of the pass can alias another resource (aliased,
-    * sparse or linear image), so its stores count as memory writes for
-    * dependency tracking (HK_SYNC_GFX_MEM). */
+   /* M5: an attachment of the pass can alias a buffer or external/linear
+    * resource, so its stores count as memory writes for dependency tracking
+    * (HK_SYNC_GFX_MEM). */
    bool m5_attachments_reach_memory;
    /* Bloom filter of plane GPU VAs of all pass/resolve attachments. */
    uint64_t att_bloom;
+   /* M5: an optimal VK_IMAGE_CREATE_ALIAS_BIT attachment was exempted from
+    * m5_attachments_reach_memory because its memory had no buffer binding at
+    * record time; checked against hk_device::buffer_alias_mem_gen at submit. */
+   bool m5_attachments_alias_image;
 
    /* AGX3 dead depth/stencil store: aspects stored in this single-stream pass
     * that may become dead if overwritten before read (hk_take_pending_z_store),
@@ -1928,10 +1932,16 @@ struct hk_cs {
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
     * kernel writes both from the firmware's native pass record.
+    *
+    * vtx_end, render only: the vertex end, for a command buffer's leading
+    * top-of-pipe timestamp (hk_sync_write_timestamp()). Like every end stamp
+    * it is latched after the command's barriers resolve, here those of the
+    * vertex half.
     */
    struct {
       struct agx_timestamp_req start;
       struct agx_timestamp_req end;
+      struct agx_timestamp_req vtx_end;
    } timestamp;
 
    /* G17P and M5: timestamp.start came from a leading TOP_OF_PIPE write on a
@@ -1941,7 +1951,8 @@ struct hk_cs {
 
    /* Render only: occlusion availability slots written by the kernel at
     * retirement, indexed vertex start, vertex end, fragment start, fragment
-    * end. Slots 0 and 3 are only used when timestamp.start/end are not. */
+    * end. Slots 0, 1 and 3 are only used when timestamp.start, vtx_end and
+    * end are not. */
    struct agx_timestamp_req oq_stamp[4];
 
    /* G17P query commands observe timestamp writes from earlier streams.
@@ -4055,18 +4066,23 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_dispatch_g17g_native(cmd, cs, s, grid, local_size);
       return;
    }
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
-      return;
-   }
-   if (agx_chip_native_agx3(dev->dev.chip)) {
-      hk_reserve_scratch(cmd, cs, s);
-      hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   if (m5 || agx_chip_native_agx3(dev->dev.chip)) {
+      if (m5) {
+         hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
+      } else {
+         hk_reserve_scratch(cmd, cs, s);
+         hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+      }
       /* Software graphics stages communicate through memory: VS outputs,
        * geometry counts and XFB bases are consumed by the next dispatch.
        * The application cannot supply barriers between these internal
        * stages. Preserve the AGX2 flush-after-launch contract, including
-       * indirect launches, by strengthening the native ordering barrier. */
+       * indirect launches, by strengthening the native ordering barrier.
+       * Every M5 part needs this as G17P does. On M5 the flush has memory
+       * scope (hk_cdm_cache_flush(): 0x6000157c, where G17P writes the plain
+       * 0x60001560); without it, tessellated draws of the render CTS fail
+       * on the M5 Ultra (G17D). */
       if (s->info.stage != MESA_SHADER_COMPUTE) {
          hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_cache_flush(dev, cs);

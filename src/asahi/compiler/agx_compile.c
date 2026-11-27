@@ -20495,23 +20495,33 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
                                           preamble_newly_enabled, 4, NULL);
 }
 
-/* The M5 helpers serve G17G, G17S and G17C, which share one row of the
- * capability table. */
-#define AGX_M5_SIGNED_ZERO_SELECT                                              \
-   ((AGX_CAPS_M5 & AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) != 0)
+void
+agx_preprocess_nir_m5_chip(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(
+      nir, false, true, false, true,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT), true, false,
+      false, false);
+}
 
+void
+agx_preprocess_nir_m5_defer_idiv_chip(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(
+      nir, false, true, false, true,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT), true, false,
+      true, false);
+}
+
+/* Single-die M5 convenience entry points (for callers without a device). */
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true,
-                               AGX_M5_SIGNED_ZERO_SELECT, true, false, false,
-                               false);
+   agx_preprocess_nir_m5_chip(nir, AGX_CHIP_G17G);
 }
 
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true,
-                               AGX_M5_SIGNED_ZERO_SELECT, true, false, true,
-                               false);
+   agx_preprocess_nir_m5_defer_idiv_chip(nir, AGX_CHIP_G17G);
 }

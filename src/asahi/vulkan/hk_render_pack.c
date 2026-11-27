@@ -360,10 +360,13 @@ hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
    if (!cs->g17p_pass_begins || !cs->g17p_pass_ends)
       return "pass edges";
 
-   /* No query or timestamp rides on the render, nothing calls another
-    * stream, and nothing patches the stream at submission. */
-   if (cs->timestamp.start.handle || cs->timestamp.end.handle ||
-       cs->unordered_start_ts || cs->g17p_timestamp_query)
+   /* No query or start timestamp rides on the render, nothing calls another
+    * stream, and nothing patches the stream at submission. A vertex-end or
+    * fragment-end timestamp may ride on it: the packet carries it on the
+    * same stamp of the merged render, which latches no earlier
+    * (hk_render_pack_add()). */
+   if (cs->timestamp.start.handle || cs->unordered_start_ts ||
+       cs->g17p_timestamp_query)
       return "timestamp";
    if (cs->oq_pending_count || cs->oq_stamps.size)
       return "occlusion query";
@@ -402,6 +405,15 @@ hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
          return "pass record";
    }
    return NULL;
+}
+
+/* The packet stamps the members' timestamps take: bit 0 the vertex end,
+ * bit 1 the fragment end. */
+unsigned
+hk_render_pack_stamp_slots(const struct hk_cs *cs)
+{
+   return (cs->timestamp.vtx_end.handle ? 1 : 0) |
+          (cs->timestamp.end.handle ? 2 : 0);
 }
 
 const struct hk_cs *
@@ -603,6 +615,16 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
       cs->cr.eot.main = item->cr.eot.main;
       cs->g17p_pass_ends = item->g17p_pass_ends;
    }
+
+   /* A member's vertex-end or fragment-end timestamp becomes the merged
+    * render's: its vertex half ends after the member's vertex work, its
+    * fragment half after the member's fragment work, and the packet waits
+    * for everything the member waited for. A run holds at most one of each
+    * (hk_render_pack_stamp_slots()). */
+   if (item->timestamp.vtx_end.handle)
+      cs->timestamp.vtx_end = item->timestamp.vtx_end;
+   if (item->timestamp.end.handle)
+      cs->timestamp.end = item->timestamp.end;
    add_anatomy(cs, item);
 
    /* The kernel folds the list into one demand with a per-field maximum, so

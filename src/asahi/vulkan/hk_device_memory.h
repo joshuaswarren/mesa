@@ -59,6 +59,12 @@ struct hk_device_memory {
    /* An fd or dma-buf import, counted in hk_device::alias_live for its
     * lifetime (hk_device_alias_get()). */
    bool alias_fd;
+
+   /* Atomic flags tracking whether an image or buffer has ever been bound to
+    * this memory object. Used by exact-alias dependency tracking so optimal
+    * placed images in image-only heaps do not force HK_SYNC_GFX_MEM. */
+   bool has_image_binding;
+   bool has_buffer_binding;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,
