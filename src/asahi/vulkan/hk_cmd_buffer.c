@@ -636,6 +636,8 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       cmd->state.conditional;
 
    hk_flush_deferred_clears(cmd);
+   cmd->state.cs.cdm_barrier_full_needed = true;
+   cmd->state.cs.cdm_stream_has_images = true;
 
    /* Secondary command buffers are materialized by replaying their common
     * command queues into the primary.  Their last bound state is therefore
@@ -1248,6 +1250,10 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_sync_flush_stamp_copies(cmd);
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
+   cmd->state.cs.cdm_barrier_pending = false;
+   cmd->state.cs.cdm_barrier_full_needed = false;
+   cmd->state.cs.cdm_stream_has_images = false;
+
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_pending_oq_available(cmd);
    hk_resolve_deferred_oq_available(cmd);
@@ -1591,7 +1597,14 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          return;
       }
 
-      hk_cmd_buffer_end_compute(cmd);
+      /* On AGX2 outside a render pass, keep an open compute stream alive
+       * across the barrier so the next pure compute SSBO launch can narrow
+       * the previous launch's trailing barrier word in place (hk_cmd_dispatch.c).
+       * Non-AGX2 command streams (such as G18G/HAL300), fullcdmbarrier, and
+       * open graphics batches still end the compute stream as on the base. */
+      if (hk_cdm_record_pipeline_barrier(cmd, pDependencyInfo))
+         hk_cmd_buffer_end_compute(cmd);
+
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
@@ -5412,6 +5425,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
    agx_usc_words_precomp(t.cpu, &prog->b, uploaded_data, data_size);
 
+   cmd->state.cs.cdm_barrier_full_needed = true;
+   cmd->state.cs.cdm_stream_has_images = true;
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);

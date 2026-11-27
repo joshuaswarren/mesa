@@ -1723,6 +1723,15 @@ if with_tests
       '-Wl,--wrap=os_get_available_system_memory',
       '-Wl,--wrap=os_get_total_physical_memory']),
     timeout : 30, suite : ['asahi'])
+
+  test('hk_cdm_barrier_stream', executable('hk_cdm_barrier_stream_test',
+    files('tests/test-hk-cdm-barrier-stream.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_lib],
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
+      '-Wl,--wrap=hk_ensure_cs_has_space']),
+    timeout : 30, suite : ['asahi'])
 endif
 
 if with_tests
