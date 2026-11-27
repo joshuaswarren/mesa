@@ -3524,15 +3524,14 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    bg_info.pColorAttachments = bg_atts;
    const struct hk_bg_eot bg_main = hk_build_bg_eot(
       cmd, &bg_info, false, false, incomplete_render_area, NULL);
-   if (direct_resolve) {
-      /* Covered attachments only: the end-of-tile programs, which carry the
-       * resolve, and the partial-render reload stay as they are. */
+   if (direct_resolve || !elide) {
+      /* Covered attachments only: the end-of-tile programs and partial-render
+       * reload stay as they are. */
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
       cs->cr.bg.main = bg_main;
       cs->anatomy_covered = covered;
-      perf_debug(cmd, "Dropped loads of covered attachments 0x%x of a pass "
-                 "with a direct resolve", covered);
+      perf_debug(cmd, "Dropped loads of covered attachments 0x%x", covered);
       return;
    }
    const struct hk_bg_eot eot_main =

@@ -1890,6 +1890,7 @@ struct hk_cs {
 
    struct util_dynarray scissor, depth_bias;
    uint64_t uploaded_scissor, uploaded_zbias;
+   uint32_t uploaded_scissor_size, uploaded_zbias_size;
 
    /* G17P: the last uploaded draw-state selector record and the scissor /
     * depth-bias array sizes and viewport count it selects for. */
@@ -3576,17 +3577,25 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
        * addresses, matching native's USC-window allocations; a main-heap
        * address has bit 39 set and incorrectly selects the upper root.
        */
-      cs->uploaded_scissor =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
-            : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+      if (!cs->uploaded_scissor ||
+          cs->uploaded_scissor_size != cs->scissor.size) {
+         cs->uploaded_scissor =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
+               : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+         cs->uploaded_scissor_size = cs->scissor.size;
+      }
 
-      cs->uploaded_zbias =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
-                                 cs->depth_bias.size, 64)
-            : hk_pool_upload(cmd, cs->depth_bias.data,
-                             cs->depth_bias.size, 64);
+      if (!cs->uploaded_zbias ||
+          cs->uploaded_zbias_size != cs->depth_bias.size) {
+         cs->uploaded_zbias =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
+                                    cs->depth_bias.size, 64)
+               : hk_pool_upload(cmd, cs->depth_bias.data,
+                                cs->depth_bias.size, 64);
+         cs->uploaded_zbias_size = cs->depth_bias.size;
+      }
 
       /* TODO: maybe free scissor/depth_bias now? */
       cs->current = hk_cmd_buffer_emit_vdm_terminate(cmd, cs->current);
