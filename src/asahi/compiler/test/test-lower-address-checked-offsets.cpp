@@ -367,4 +367,126 @@ TEST(LowerAddressCheckedOffsets, ProvenIndicesStayFolded)
    }
 }
 
+/* Where the loop guard proves `i + c <= UINT32_MAX`, zero-extended AGX3B
+ * loads fold `c` into the signed 16-bit byte offset without sign-extending
+ * `i`; offsets that could wrap (or negative signed IV starts) stay unfolded. */
+TEST(LowerAddressCheckedOffsets, ZeroExtendedByteOffsetGuardProof)
+{
+   auto run_u32_loop = [](uint32_t c, bool checked) -> int16_t {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "zext-u32-guard");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *limit = nir_bcsel(&b, nir_uge(&b, n, nir_imm_int(&b, 224)),
+                                 nir_iadd_imm(&b, n, -224), nir_imm_int(&b, 0));
+
+      nir_variable *iv_var =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "iv");
+      nir_variable *sum_var =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "sum");
+      nir_store_var(&b, iv_var, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, sum_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *iv = nir_load_var(&b, iv_var);
+      nir_break_if(&b, nir_uge(&b, iv, limit));
+      nir_def *idx = nir_iadd_imm(&b, iv, c);
+      nir_def *addr =
+         nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 3));
+      nir_def *v = nir_load_global(&b, 2, 32, addr, .align_mul = 8);
+      nir_store_var(&b, sum_var,
+                    nir_iadd(&b, nir_load_var(&b, sum_var), nir_channel(&b, v, 0)),
+                    1);
+      nir_store_var(&b, iv_var, nir_iadd_imm(&b, iv, 256), 1);
+      nir_pop_loop(&b, loop);
+
+      nir_store_global(&b, nir_load_var(&b, sum_var), out, .align_mul = 4);
+      nir_lower_vars_to_ssa(b.shader);
+      agx_nir_lower_address(b.shader, true, true, checked);
+
+      int16_t folded = 0;
+      bool found = false;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_agx)
+               continue;
+            nir_intrinsic_instr *ld = nir_instr_as_intrinsic(instr);
+            EXPECT_FALSE(nir_intrinsic_sign_extend(ld));
+            folded = (int16_t)(nir_intrinsic_base(ld) >>
+                               AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
+            found = true;
+         }
+      }
+      EXPECT_TRUE(found);
+      ralloc_free(b.shader);
+      return folded;
+   };
+
+   /* max(iv) <= UINT32_MAX - 225, so +224 (+1792B) cannot wrap 32-bit unsigned. */
+   EXPECT_EQ(run_u32_loop(224u, false), 1792);
+   /* Exact boundary: +226 can wrap when n == UINT32_MAX and iv == UINT32_MAX - 225. */
+   EXPECT_EQ(run_u32_loop(226u, false), 0);
+   /* Checked offsets keep constant byte-offset folding disabled. */
+   EXPECT_EQ(run_u32_loop(224u, true), 0);
+
+   auto run_s32_loop = [](int32_t init_val, int32_t step_val, uint32_t c) -> int16_t {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "zext-s32-guard");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *limit =
+         nir_bcsel(&b, nir_ige(&b, n, nir_imm_int(&b, INT32_MIN + 16)),
+                   nir_iadd_imm(&b, n, -16), nir_imm_int(&b, INT32_MIN));
+
+      nir_variable *iv_var =
+         nir_local_variable_create(b.impl, glsl_int_type(), "iv");
+      nir_variable *sum_var =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "sum");
+      nir_store_var(&b, iv_var, nir_imm_int(&b, init_val), 1);
+      nir_store_var(&b, sum_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *iv = nir_load_var(&b, iv_var);
+      nir_break_if(&b, nir_ige(&b, iv, limit));
+      nir_def *idx = nir_iadd_imm(&b, iv, c);
+      nir_def *addr =
+         nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+      nir_def *v = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_store_var(&b, sum_var, nir_iadd(&b, nir_load_var(&b, sum_var), v), 1);
+      nir_store_var(&b, iv_var, nir_iadd_imm(&b, iv, step_val), 1);
+      nir_pop_loop(&b, loop);
+
+      nir_store_global(&b, nir_load_var(&b, sum_var), out, .align_mul = 4);
+      nir_lower_vars_to_ssa(b.shader);
+      agx_nir_lower_address(b.shader, true, true, false);
+
+      int16_t folded = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_agx)
+               continue;
+            nir_intrinsic_instr *ld = nir_instr_as_intrinsic(instr);
+            EXPECT_FALSE(nir_intrinsic_sign_extend(ld));
+            folded = (int16_t)(nir_intrinsic_base(ld) >>
+                               AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
+         }
+      }
+      ralloc_free(b.shader);
+      return folded;
+   };
+
+   /* Positive: 0 <= iv <= INT32_MAX - 17, step 4 cannot wrap negative, +16 folds. */
+   EXPECT_EQ(run_s32_loop(0, 4, 16u), 64);
+   /* Negative control: negative init can wrap u32 on +16. */
+   EXPECT_EQ(run_s32_loop(-4, 4, 16u), 0);
+   /* Negative control: step 32 can wrap INT32_MAX to negative on next iteration. */
+   EXPECT_EQ(run_s32_loop(0, 32, 16u), 0);
+}
+
 } // namespace

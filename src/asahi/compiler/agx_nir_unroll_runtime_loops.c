@@ -206,12 +206,16 @@ lane_dependent(const nir_intrinsic_instr *intr)
 }
 
 /* Everything in the loop that is safe to execute F times in a row per
- * main-loop iteration. Returns the number of instructions, or -1. */
+ * main-loop iteration. Returns the number of instructions, or -1. When
+ * `top_level_out` is non-NULL, stores the number of instructions directly in
+ * the loop's unconditional top-level blocks (excluding nested `if` bodies). */
 static int
-count_unrollable(nir_loop *loop, nir_if *terminator)
+count_unrollable(nir_loop *loop, nir_if *terminator, int *top_level_out)
 {
    int count = 0;
+   int top_level = 0;
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      const bool is_top = block->cf_node.parent == &loop->cf_node;
       nir_foreach_instr(instr, block) {
          switch (instr->type) {
          case nir_instr_type_jump:
@@ -250,10 +254,15 @@ count_unrollable(nir_loop *loop, nir_if *terminator)
          default:
             break;
          }
-         if (instr->type != nir_instr_type_phi)
+         if (instr->type != nir_instr_type_phi) {
             count++;
+            if (is_top)
+               top_level++;
+         }
       }
    }
+   if (top_level_out)
+      *top_level_out = top_level;
    return count;
 }
 
@@ -270,18 +279,17 @@ src_varies(nir_src *src, void *data)
    return true;
 }
 
-/* 32-bit registers one iteration's memory and texture reads fill, counting
- * the reads whose address depends on a value the loop carries (reads of
- * addresses that are the same every iteration, such as descriptors and the
- * bound's parameters, are shared by the unrolled copies). */
 static unsigned
-loaded_dwords(nir_function_impl *impl, nir_loop *loop)
+loaded_dwords_in_loop(nir_function_impl *impl, nir_loop *loop,
+                      bool top_level_only)
 {
    BITSET_WORD *varying =
       calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
    nir_block *header = nir_loop_first_block(loop);
    unsigned dwords = 0;
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      const bool count_block =
+         !top_level_only || block->cf_node.parent == &loop->cf_node;
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
          if (!def)
@@ -295,6 +303,8 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
             continue;
          BITSET_SET(varying, def->index);
 
+         if (!count_block)
+            continue;
          bool load = instr->type == nir_instr_type_tex;
          if (instr->type == nir_instr_type_intrinsic) {
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
@@ -308,6 +318,16 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
    }
    free(varying);
    return dwords;
+}
+
+/* 32-bit registers one iteration's memory and texture reads fill, counting
+ * the reads whose address depends on a value the loop carries (reads of
+ * addresses that are the same every iteration, such as descriptors and the
+ * bound's parameters, are shared by the unrolled copies). */
+static unsigned
+loaded_dwords(nir_function_impl *impl, nir_loop *loop)
+{
+   return loaded_dwords_in_loop(impl, loop, false);
 }
 
 static bool
@@ -886,23 +906,38 @@ choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
    if (nested_workgroup_stripe(impl->function->shader, cl))
       return 0;
 
-   int size = count_unrollable(loop, cl->nif);
+   int top_size = 0;
+   int size = count_unrollable(loop, cl->nif, &top_size);
    if (size < 0)
       return 0;
+   /* A guarded loop with a compact unconditional prefix and a larger nested
+    * conditional body executes only the prefix unconditionally per iteration.
+    * When 4x already fits the standard budget, allow 8x up to 2x total code
+    * size as long as the unconditional hot path stays within half the budget
+    * and unconditional in-flight loads stay within 16 dwords; backend
+    * occupancy / register-file checks fall back to 4x if pressure grows. */
+   const bool compact_guarded_prefix =
+      top_size < size && (unsigned)size * 4 <= max_instrs &&
+      (unsigned)top_size * factor <= max_instrs / 2 &&
+      (unsigned)size * factor <= max_instrs * 2;
+   const unsigned budget = compact_guarded_prefix ? max_instrs * 2 : max_instrs;
+
    /* A body too large for the full factor still gains from two
     * iterations per test when it fits the budget at half the factor. */
    unsigned f = factor;
-   while (f > 2 && (unsigned)size * f > max_instrs)
+   while (f > 2 && (unsigned)size * f > budget)
       f /= 2;
-   /* Beyond four iterations, keep the reads the unrolled body has in
-    * flight within 16 registers: more only raises register pressure
-    * (the scheduler issues them together) and can cost occupancy. */
+   /* Beyond four iterations, keep the unconditional reads the unrolled body
+    * has in flight within 16 registers: more only raises register pressure
+    * (the scheduler issues them together) and can cost occupancy. Loads inside
+    * nested `if` bodies are guarded and do not issue together across
+    * iterations. */
    if (f > 4) {
-      const unsigned dwords = loaded_dwords(impl, loop);
+      const unsigned dwords = loaded_dwords_in_loop(impl, loop, true);
       while (f > 4 && dwords * f > 16)
          f /= 2;
    }
-   return (unsigned)size * f > max_instrs ? 0 : f;
+   return (unsigned)size * f > budget ? 0 : f;
 }
 
 /* Computable before `outer` from values defined before it, without memory
