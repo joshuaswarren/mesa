@@ -3750,9 +3750,31 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
          formats, count, samples, layered, max_sample_size_B,
          (!m5 && layered) ? 32768 : 65536, 2048, resident_mask);
    }
+   const unsigned max_samples_per_tile =
+      agx_chip_native_agx3(dev->dev.chip) ? 2048 : 0;
+
+   /* A kernel that admits 48 KiB tile buffers lets a 4x layout of 24-byte
+    * samples take 32x16 tiles instead of 16x16, with every target resident.
+    * Take the larger budget for that shape only. Elsewhere it would mostly
+    * keep more targets of a spilling layout resident, in shapes the native
+    * background and end-of-tile programs refuse: eight 2x RGBA32 targets
+    * would keep six, and they take four.
+    */
+   if (imageblock &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_TILE_BUFFER_48K)) {
+      const struct agx_tilebuffer_layout wide =
+         agx_build_tilebuffer_layout_with_limits_resident(
+            formats, count, samples, layered, max_sample_size_B,
+            AGX_NATIVE_TILE_BUFFER_48K_BYTES, max_samples_per_tile,
+            resident_mask);
+      if (wide.nr_samples == 4 && wide.tile_size == 32 * 16 &&
+          !agx_tilebuffer_spills(&wide))
+         return wide;
+   }
+
    return agx_build_tilebuffer_layout_with_limits_resident(
       formats, count, samples, layered, max_sample_size_B,
-      imageblock ? 32768 : 0, agx_chip_native_agx3(dev->dev.chip) ? 2048 : 0,
+      imageblock ? AGX_NATIVE_TILE_BUFFER_BYTES : 0, max_samples_per_tile,
       resident_mask);
 }
 
