@@ -675,6 +675,37 @@ test_classification_invariants(void)
    CHECK(strcmp(agx_isa_name(AGX_ISA_UNKNOWN), "unknown") == 0);
 }
 
+/* Device tree compatibles name a chip as the kernel's generation and variant
+ * do; the loader reads them to pick zink (agx_chip_gl_through_zink()). */
+static void
+test_compatible(void)
+{
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17d"), AGX_CHIP_G17D);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17c"), AGX_CHIP_G17C);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g13g"), AGX_CHIP_G13G);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g14s"), AGX_CHIP_G14X);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g13x"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-t6050"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g17dd"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g017d"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-g"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible("apple,agx-gD"), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible(""), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(agx_chip_from_compatible(NULL), AGX_CHIP_UNKNOWN);
+
+   /* Every chip GL reaches through zink is named by its compatible. */
+   for (unsigned i = 0; i < AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      if (!agx_chip_gl_through_zink(c))
+         continue;
+      char compatible[32];
+      snprintf(compatible, sizeof(compatible), "apple,agx-g%.2s%c",
+               chip_names[i] + 1, chip_names[i][3] - 'A' + 'a');
+      CHECK_EQ(agx_chip_from_compatible(compatible), c);
+   }
+}
+
 int
 main(void)
 {
@@ -686,6 +717,7 @@ main(void)
    test_params_contracts();
    test_invalid_identity();
    test_classification_invariants();
+   test_compatible();
 
    if (failures) {
       fprintf(stderr, "agx_chip: %u of %u checks failed\n", failures, checks);
