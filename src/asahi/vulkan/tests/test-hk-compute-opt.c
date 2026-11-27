@@ -841,6 +841,7 @@ test_bilinear_resize_border(void)
    struct hk_compute_opt_plan plan = {0};
    assert(hk_nir_match_compute_opt(s, 1, layouts, &plan));
    assert(plan.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+   assert(plan.flags == HK_RESIZE_LERP_DIFF_FFMA);
    assert(plan.tile_w == 128 && plan.tile_h == 8);
    assert(plan.pc_off[0] == 12 && plan.pc_off[1] == 16 &&
           plan.pc_off[2] == 20 && plan.pc_off[3] == 24 &&
@@ -883,8 +884,13 @@ test_bilinear_resize_border(void)
    ralloc_free(bad);
 
    /* Verify pre-lowered GB6 form: in-arm primary stores, dst reload at primary
-    * index, (1 - t) * a + t * b lerp, and 4 direct sibling mirror border ifs. */
-   for (unsigned bad_reload = 0; bad_reload < 2; bad_reload++) {
+    * index, (1 - t) * a + t * b lerp, and 4 direct sibling mirror border ifs.
+    * variant 0 = valid GB6 form; 1 = bad reload; 2 = mismatched scale grouping
+    * `(x * sw) * frcp(dw)`; 3 = unlowered flrp (must reject). */
+   for (unsigned variant = 0; variant < 4; variant++) {
+      const bool bad_reload = (variant == 1);
+      const bool bad_scale = (variant == 2);
+      const bool use_flrp = (variant == 3);
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_COMPUTE, &test_nir_options, "resize_prelower");
       b.shader->info.internal = false;
@@ -938,7 +944,12 @@ test_bilinear_resize_border(void)
             nir_def *prim_idx = nir_iadd(&b, y_row, px);
             nir_push_if(&b, do_res);
             {
-               nir_def *sx = nir_fmul(&b, nir_u2f32(&b, x), sx_scale);
+               nir_def *sx =
+                  bad_scale
+                     ? nir_fmul(&b,
+                                nir_fmul(&b, nir_u2f32(&b, x), nir_i2f32(&b, sw)),
+                                nir_frcp(&b, nir_i2f32(&b, dw)))
+                     : nir_fmul(&b, nir_u2f32(&b, x), sx_scale);
                nir_def *sy = nir_fmul(&b, nir_u2f32(&b, y), sy_scale);
                nir_def *fx = nir_fsub(&b, sx, nir_ftrunc(&b, sx));
                nir_def *fy = nir_fsub(&b, sy, nir_ftrunc(&b, sy));
@@ -952,11 +963,18 @@ test_bilinear_resize_border(void)
                nir_def *p01 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y0, ss), x1)))));
                nir_def *p10 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x0)))));
                nir_def *p11 = nir_i2f32(&b, nir_u2u32(&b, nir_load_deref(&b, nir_build_deref_ptr_as_array(&b, src, nir_iadd(&b, nir_imul(&b, y1, ss), x1)))));
-               nir_def *omfx = nir_fsub(&b, nir_imm_float(&b, 1.0f), fx);
-               nir_def *omfy = nir_fsub(&b, nir_imm_float(&b, 1.0f), fy);
-               nir_def *t = nir_fadd(&b, nir_fmul(&b, omfx, p00), nir_fmul(&b, fx, p01));
-               nir_def *bt = nir_fadd(&b, nir_fmul(&b, omfx, p10), nir_fmul(&b, fx, p11));
-               nir_def *v = nir_fadd(&b, nir_fmul(&b, omfy, t), nir_fmul(&b, fy, bt));
+               nir_def *v;
+               if (use_flrp) {
+                  nir_def *t = nir_flrp(&b, p00, p01, fx);
+                  nir_def *bt = nir_flrp(&b, p10, p11, fx);
+                  v = nir_flrp(&b, t, bt, fy);
+               } else {
+                  nir_def *omfx = nir_fsub(&b, nir_imm_float(&b, 1.0f), fx);
+                  nir_def *omfy = nir_fsub(&b, nir_imm_float(&b, 1.0f), fy);
+                  nir_def *t = nir_fadd(&b, nir_fmul(&b, omfx, p00), nir_fmul(&b, fx, p01));
+                  nir_def *bt = nir_fadd(&b, nir_fmul(&b, omfx, p10), nir_fmul(&b, fx, p11));
+                  v = nir_fadd(&b, nir_fmul(&b, omfy, t), nir_fmul(&b, fy, bt));
+               }
                nir_def *v8 = nir_u2u8(&b, nir_f2i32(&b, nir_fmin(&b, nir_fmax(&b, v, nir_imm_float(&b, 0.0f)), nir_imm_float(&b, 255.0f))));
                nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, dst, prim_idx), v8, 0x1);
             }
@@ -1022,9 +1040,30 @@ test_bilinear_resize_border(void)
       nir_validate_shader(b.shader, "resize_prelower");
       struct hk_compute_opt_plan p3 = {0};
       bool matched = hk_nir_match_compute_opt(b.shader, 1, layouts, &p3);
-      assert(matched == !bad_reload);
-      if (matched)
+      assert(matched == (variant == 0));
+      if (matched) {
          assert(p3.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+         assert(p3.flags == HK_RESIZE_LERP_ONE_MINUS_ADD);
+         nir_shader *opt3 = hk_nir_build_compute_opt(
+            NULL, b.shader, &p3, nir_address_format_64bit_bounded_global);
+         assert(opt3 != NULL);
+         bool saw_fadd = false, saw_ffma = false, saw_fmin = false, saw_fmax = false;
+         nir_foreach_block(blk, nir_shader_get_entrypoint(opt3)) {
+            nir_foreach_instr(ins, blk) {
+               if (ins->type != nir_instr_type_alu)
+                  continue;
+               switch (nir_instr_as_alu(ins)->op) {
+               case nir_op_fadd: saw_fadd = true; break;
+               case nir_op_ffma: saw_ffma = true; break;
+               case nir_op_fmin: saw_fmin = true; break;
+               case nir_op_fmax: saw_fmax = true; break;
+               default: break;
+               }
+            }
+         }
+         assert(saw_fadd && !saw_ffma && saw_fmin && saw_fmax);
+         ralloc_free(opt3);
+      }
       ralloc_free(b.shader);
    }
 
@@ -1121,173 +1160,207 @@ test_bilinear_resize_border(void)
       ralloc_free(b.shader);
    }
 
-   /* Exact pixel-compare between scalar reference and vectorized 128x8
-    * quad_int + fast_u8x2 + mirrored border semantics across copy, downscale,
-    * upscale, non-multiple-of-4 widths, and borders (0, 1, 3, 19). */
+   /* Exact pixel-compare between scalar reference (modelling the exact matched
+    * lerp algebra + [0, 255] clamp) and vectorized 128x8 quad_int + fast_u8x2 +
+    * mirrored border semantics across copy, downscale (including 640->480),
+    * upscale, non-multiple-of-4 widths, borders (0, 1, 3, 8, 19), and both
+    * ONE_MINUS_ADD (GB6) and DIFF_FFMA lerp modes. */
    {
+      /* Verify the host model distinguishes ONE_MINUS_ADD vs DIFF_FFMA on the
+       * 640->480 x=1 taps (5, 2) counterexample (3 vs 4). */
+      volatile float c_rcp = 1.0f / (float)480;
+      volatile float c_sc = (float)640 * c_rcp;
+      volatile float c_sx = 1.0f * c_sc;
+      volatile float c_fx = c_sx - truncf(c_sx);
+      volatile float c_om = 1.0f - c_fx;
+      volatile float c_m0 = c_om * 5.0f;
+      volatile float c_m1 = c_fx * 2.0f;
+      volatile float c_add = c_m0 + c_m1;
+      volatile float c_fma = fmaf(c_fx, 2.0f - 5.0f, 5.0f);
+      assert((uint8_t)(int32_t)fminf(fmaxf(c_add, 0.0f), 255.0f) == 3u);
+      assert((uint8_t)(int32_t)fminf(fmaxf(c_fma, 0.0f), 255.0f) == 4u);
+
       struct {
          uint32_t sw, sh, ss, dw, dh, ds, border;
       } cases[] = {
          {64, 48, 64, 64, 48, 70, 3},
          {137, 93, 144, 137, 93, 180, 19},
          {137, 93, 144, 114, 77, 156, 19},
+         {640, 480, 640, 480, 360, 496, 8},
          {79, 53, 80, 66, 44, 66, 0},
          {31, 29, 32, 47, 41, 51, 1},
          {100, 60, 100, 29, 17, 37, 3},
       };
-      for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ci++) {
-         const uint32_t sw = cases[ci].sw, sh = cases[ci].sh, ss = cases[ci].ss;
-         const uint32_t dw = cases[ci].dw, dh = cases[ci].dh, ds = cases[ci].ds;
-         const uint32_t bd = cases[ci].border;
-         const uint32_t dh_pad = dh + 2u * bd;
-         uint8_t *src = calloc(sh * ss, 1);
-         uint8_t *ref = calloc(dh_pad * ds, 1);
-         uint8_t *vec = calloc(dh_pad * ds, 1);
-         assert(src && ref && vec);
-         memset(ref, 0xA5, dh_pad * ds);
-         memset(vec, 0xA5, dh_pad * ds);
-         for (uint32_t y = 0; y < sh; y++)
-            for (uint32_t x = 0; x < sw; x++)
-               src[y * ss + x] = (uint8_t)((x * 37u + y * 131u + ci * 17u) & 0xffu);
+      for (unsigned lm = 0; lm < 2; lm++) {
+         const bool one_minus_add = (lm == 0);
+         for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ci++) {
+            const uint32_t sw = cases[ci].sw, sh = cases[ci].sh, ss = cases[ci].ss;
+            const uint32_t dw = cases[ci].dw, dh = cases[ci].dh, ds = cases[ci].ds;
+            const uint32_t bd = cases[ci].border;
+            const uint32_t dh_pad = dh + 2u * bd;
+            uint8_t *src = calloc(sh * ss, 1);
+            uint8_t *ref = calloc(dh_pad * ds, 1);
+            uint8_t *vec = calloc(dh_pad * ds, 1);
+            assert(src && ref && vec);
+            memset(ref, 0xA5, dh_pad * ds);
+            memset(vec, 0xA5, dh_pad * ds);
+            for (uint32_t y = 0; y < sh; y++)
+               for (uint32_t x = 0; x < sw; x++)
+                  src[y * ss + x] = (uint8_t)((x * 37u + y * 131u + ci * 17u) & 0xffu);
 
-         const bool do_res = (sw != dw) || (sh != dh);
-         const float sx_sc = (float)(int32_t)sw * (1.0f / (float)(int32_t)dw);
-         const float sy_sc = (float)(int32_t)sh * (1.0f / (float)(int32_t)dh);
+            const bool do_res = (sw != dw) || (sh != dh);
+            const float sx_sc = (float)(int32_t)sw * (1.0f / (float)(int32_t)dw);
+            const float sy_sc = (float)(int32_t)sh * (1.0f / (float)(int32_t)dh);
 
-         /* Scalar reference with full mirrored border writes. */
-         for (uint32_t y = 0; y < dh; y++) {
-            float sy = (float)y * sy_sc;
-            float fy = sy - truncf(sy);
-            int32_t iy = (int32_t)sy;
-            int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
-            int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
-            for (uint32_t x = 0; x < dw; x++) {
-               uint8_t v8;
-               if (do_res) {
-                  float sx = (float)x * sx_sc;
-                  float fx = sx - truncf(sx);
-                  int32_t ix = (int32_t)sx;
-                  int32_t x0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
-                  int32_t x1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
-                  float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)x0];
-                  float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)x1];
-                  float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)x0];
-                  float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)x1];
-                  float t = fmaf(fx, p01 - p00, p00);
-                  float bt = fmaf(fx, p11 - p10, p10);
-                  float v = fmaf(fy, bt - t, t);
-                  v = fminf(fmaxf(v, 0.0f), 255.0f);
-                  v8 = (uint8_t)(int32_t)v;
-               } else {
-                  v8 = src[y * ss + x];
-               }
-               uint32_t yrow = (y + bd) * ds, px = x + bd;
-               ref[yrow + px] = v8;
-               bool xl = (x != 0 && x <= bd);
-               bool xr = (x + bd + 2u > dw && x + 1u < dw);
-               bool yt = (y != 0 && y <= bd);
-               bool yb = (y + bd + 2u > dh && y + 1u < dh);
-               uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
-               uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
-               if (xl) {
-                  ref[yrow + ryl] = v8;
-                  if (yt) ref[ryt + ryl] = v8;
-                  if (yb) ref[ryb + ryl] = v8;
-               }
-               if (yt) ref[ryt + px] = v8;
-               if (xr) {
-                  ref[yrow + ryr] = v8;
-                  if (yt) ref[ryt + ryr] = v8;
-                  if (yb) ref[ryb + ryr] = v8;
-               }
-               if (yb) ref[ryb + px] = v8;
-            }
-         }
+#define EVAL_MATCHED_BILERP(out_var, P00, P01, P10, P11, FX, FY)               \
+   do {                                                                        \
+      float _v;                                                                \
+      if (one_minus_add) {                                                     \
+         volatile float _omx = 1.0f - (FX);                                    \
+         volatile float _omy = 1.0f - (FY);                                    \
+         volatile float _t0 = _omx * (P00), _t1 = (FX) * (P01);                \
+         volatile float _t = _t0 + _t1;                                        \
+         volatile float _b0 = _omx * (P10), _b1 = (FX) * (P11);                \
+         volatile float _bt = _b0 + _b1;                                       \
+         volatile float _v0 = _omy * _t, _v1 = (FY) * _bt;                     \
+         _v = _v0 + _v1;                                                       \
+      } else {                                                                 \
+         float _t = fmaf((FX), (P01) - (P00), (P00));                          \
+         float _bt = fmaf((FX), (P11) - (P10), (P10));                         \
+         _v = fmaf((FY), _bt - _t, _t);                                        \
+      }                                                                        \
+      _v = fminf(fmaxf(_v, 0.0f), 255.0f);                                     \
+      (out_var) = (uint8_t)(int32_t)_v;                                        \
+   } while (0)
 
-         /* Vectorized 4-pixel-per-lane simulation matching emitted NIR. */
-         uint32_t x_lim_lo = dw - 2u - bd;
-         uint32_t y_lim_lo = dh - 2u - bd;
-         for (uint32_t y = 0; y < dh; y++) {
-            float sy = (float)y * sy_sc;
-            float fy = sy - truncf(sy);
-            int32_t iy = (int32_t)sy;
-            int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
-            int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
-            for (uint32_t x0 = 0; x0 < dw; x0 += 4u) {
-               bool qint = (bd < y && y <= y_lim_lo && bd < x0 && x0 + 3u <= x_lim_lo);
-               if (qint) {
-                  uint8_t out[4];
+            /* Scalar reference with full mirrored border writes. */
+            for (uint32_t y = 0; y < dh; y++) {
+               float sy = (float)y * sy_sc;
+               float fy = sy - truncf(sy);
+               int32_t iy = (int32_t)sy;
+               int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
+               int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
+               for (uint32_t x = 0; x < dw; x++) {
+                  uint8_t v8;
                   if (do_res) {
-                     uint32_t ix3 = (uint32_t)(int32_t)((float)(x0 + 3u) * sx_sc);
-                     bool fast = ix3 < sw - 1u;
-                     for (uint32_t k = 0; k < 4u; k++) {
-                        float sx = (float)(x0 + k) * sx_sc;
-                        float fx = sx - truncf(sx);
-                        int32_t ix = (int32_t)sx;
-                        uint32_t c0 = fast ? (uint32_t)ix : (uint32_t)(ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix));
-                        uint32_t c1 = fast ? (uint32_t)(ix + 1) : (uint32_t)(ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1));
-                        float p00 = (float)src[(uint32_t)y0 * ss + c0];
-                        float p01 = (float)src[(uint32_t)y0 * ss + c1];
-                        float p10 = (float)src[(uint32_t)y1 * ss + c0];
-                        float p11 = (float)src[(uint32_t)y1 * ss + c1];
-                        float t = fmaf(fx, p01 - p00, p00);
-                        float bt = fmaf(fx, p11 - p10, p10);
-                        out[k] = (uint8_t)(int32_t)fmaf(fy, bt - t, t);
-                     }
+                     float sx = (float)x * sx_sc;
+                     float fx = sx - truncf(sx);
+                     int32_t ix = (int32_t)sx;
+                     int32_t x0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
+                     int32_t x1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
+                     float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)x0];
+                     float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)x1];
+                     float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)x0];
+                     float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)x1];
+                     EVAL_MATCHED_BILERP(v8, p00, p01, p10, p11, fx, fy);
                   } else {
-                     memcpy(out, &src[y * ss + x0], 4);
+                     v8 = src[y * ss + x];
                   }
-                  memcpy(&vec[(y + bd) * ds + (x0 + bd)], out, 4);
-               } else {
-                  for (uint32_t k = 0; k < 4u; k++) {
-                     uint32_t x = x0 + k;
-                     if (x >= dw)
-                        continue;
-                     uint8_t v8;
+                  uint32_t yrow = (y + bd) * ds, px = x + bd;
+                  ref[yrow + px] = v8;
+                  bool xl = (x != 0 && x <= bd);
+                  bool xr = (x + bd + 2u > dw && x + 1u < dw);
+                  bool yt = (y != 0 && y <= bd);
+                  bool yb = (y + bd + 2u > dh && y + 1u < dh);
+                  uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
+                  uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
+                  if (xl) {
+                     ref[yrow + ryl] = v8;
+                     if (yt) ref[ryt + ryl] = v8;
+                     if (yb) ref[ryb + ryl] = v8;
+                  }
+                  if (yt) ref[ryt + px] = v8;
+                  if (xr) {
+                     ref[yrow + ryr] = v8;
+                     if (yt) ref[ryt + ryr] = v8;
+                     if (yb) ref[ryb + ryr] = v8;
+                  }
+                  if (yb) ref[ryb + px] = v8;
+               }
+            }
+
+            /* Vectorized 4-pixel-per-lane simulation matching emitted NIR. */
+            uint32_t x_lim_lo = dw - 2u - bd;
+            uint32_t y_lim_lo = dh - 2u - bd;
+            for (uint32_t y = 0; y < dh; y++) {
+               float sy = (float)y * sy_sc;
+               float fy = sy - truncf(sy);
+               int32_t iy = (int32_t)sy;
+               int32_t y0 = iy < 0 ? 0 : (iy > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy);
+               int32_t y1 = iy + 1 < 0 ? 0 : (iy + 1 > (int32_t)sh - 1 ? (int32_t)sh - 1 : iy + 1);
+               for (uint32_t x0 = 0; x0 < dw; x0 += 4u) {
+                  bool qint = (bd < y && y <= y_lim_lo && bd < x0 && x0 + 3u <= x_lim_lo);
+                  if (qint) {
+                     uint8_t out[4];
                      if (do_res) {
-                        float sx = (float)x * sx_sc;
-                        float fx = sx - truncf(sx);
-                        int32_t ix = (int32_t)sx;
-                        int32_t c0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
-                        int32_t c1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
-                        float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)c0];
-                        float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)c1];
-                        float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)c0];
-                        float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)c1];
-                        float t = fmaf(fx, p01 - p00, p00);
-                        float bt = fmaf(fx, p11 - p10, p10);
-                        v8 = (uint8_t)(int32_t)fmaf(fy, bt - t, t);
+                        uint32_t ix3 = (uint32_t)(int32_t)((float)(x0 + 3u) * sx_sc);
+                        bool fast = ix3 < sw - 1u;
+                        for (uint32_t k = 0; k < 4u; k++) {
+                           float sx = (float)(x0 + k) * sx_sc;
+                           float fx = sx - truncf(sx);
+                           int32_t ix = (int32_t)sx;
+                           uint32_t c0 = fast ? (uint32_t)ix : (uint32_t)(ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix));
+                           uint32_t c1 = fast ? (uint32_t)(ix + 1) : (uint32_t)(ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1));
+                           float p00 = (float)src[(uint32_t)y0 * ss + c0];
+                           float p01 = (float)src[(uint32_t)y0 * ss + c1];
+                           float p10 = (float)src[(uint32_t)y1 * ss + c0];
+                           float p11 = (float)src[(uint32_t)y1 * ss + c1];
+                           EVAL_MATCHED_BILERP(out[k], p00, p01, p10, p11, fx, fy);
+                        }
                      } else {
-                        v8 = src[y * ss + x];
+                        memcpy(out, &src[y * ss + x0], 4);
                      }
-                     uint32_t yrow = (y + bd) * ds, px = x + bd;
-                     vec[yrow + px] = v8;
-                     bool xl = (x != 0 && x <= bd);
-                     bool xr = (x + bd + 2u > dw && x + 1u < dw);
-                     bool yt = (y != 0 && y <= bd);
-                     bool yb = (y + bd + 2u > dh && y + 1u < dh);
-                     uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
-                     uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
-                     if (xl) {
-                        vec[yrow + ryl] = v8;
-                        if (yt) vec[ryt + ryl] = v8;
-                        if (yb) vec[ryb + ryl] = v8;
+                     memcpy(&vec[(y + bd) * ds + (x0 + bd)], out, 4);
+                  } else {
+                     for (uint32_t k = 0; k < 4u; k++) {
+                        uint32_t x = x0 + k;
+                        if (x >= dw)
+                           continue;
+                        uint8_t v8;
+                        if (do_res) {
+                           float sx = (float)x * sx_sc;
+                           float fx = sx - truncf(sx);
+                           int32_t ix = (int32_t)sx;
+                           int32_t c0 = ix < 0 ? 0 : (ix > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix);
+                           int32_t c1 = ix + 1 < 0 ? 0 : (ix + 1 > (int32_t)sw - 1 ? (int32_t)sw - 1 : ix + 1);
+                           float p00 = (float)src[(uint32_t)y0 * ss + (uint32_t)c0];
+                           float p01 = (float)src[(uint32_t)y0 * ss + (uint32_t)c1];
+                           float p10 = (float)src[(uint32_t)y1 * ss + (uint32_t)c0];
+                           float p11 = (float)src[(uint32_t)y1 * ss + (uint32_t)c1];
+                           EVAL_MATCHED_BILERP(v8, p00, p01, p10, p11, fx, fy);
+                        } else {
+                           v8 = src[y * ss + x];
+                        }
+                        uint32_t yrow = (y + bd) * ds, px = x + bd;
+                        vec[yrow + px] = v8;
+                        bool xl = (x != 0 && x <= bd);
+                        bool xr = (x + bd + 2u > dw && x + 1u < dw);
+                        bool yt = (y != 0 && y <= bd);
+                        bool yb = (y + bd + 2u > dh && y + 1u < dh);
+                        uint32_t ryl = (bd - x), ryr = (2u * dw + bd - 2u - x);
+                        uint32_t ryt = (bd - y) * ds, ryb = (2u * dh + bd - 2u - y) * ds;
+                        if (xl) {
+                           vec[yrow + ryl] = v8;
+                           if (yt) vec[ryt + ryl] = v8;
+                           if (yb) vec[ryb + ryl] = v8;
+                        }
+                        if (yt) vec[ryt + px] = v8;
+                        if (xr) {
+                           vec[yrow + ryr] = v8;
+                           if (yt) vec[ryt + ryr] = v8;
+                           if (yb) vec[ryb + ryr] = v8;
+                        }
+                        if (yb) vec[ryb + px] = v8;
                      }
-                     if (yt) vec[ryt + px] = v8;
-                     if (xr) {
-                        vec[yrow + ryr] = v8;
-                        if (yt) vec[ryt + ryr] = v8;
-                        if (yb) vec[ryb + ryr] = v8;
-                     }
-                     if (yb) vec[ryb + px] = v8;
                   }
                }
             }
+#undef EVAL_MATCHED_BILERP
+            assert(memcmp(ref, vec, dh_pad * ds) == 0);
+            free(src);
+            free(ref);
+            free(vec);
          }
-         assert(memcmp(ref, vec, dh_pad * ds) == 0);
-         free(src);
-         free(ref);
-         free(vec);
       }
    }
    free(layout);

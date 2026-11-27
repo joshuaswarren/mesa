@@ -24,6 +24,17 @@ enum hk_compute_opt_kind {
    HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 = 4,
 };
 
+/* Exact float32 lerp algebra recorded in plan->flags for
+ * HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 so the emitted kernel reproduces
+ * the matched shader's rounding bit-for-bit. */
+enum hk_resize_lerp_mode {
+   HK_RESIZE_LERP_ONE_MINUS_ADD = 0,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_A = 1,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_B = 2,
+   HK_RESIZE_LERP_DIFF_FFMA = 3,
+   HK_RESIZE_LERP_DIFF_ADD = 4,
+};
+
 struct hk_compute_opt_binding {
    uint32_t set;
    uint32_t binding;

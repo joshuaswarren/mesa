@@ -3317,6 +3317,8 @@ walk_mirror_border_list(struct exec_list *list, unsigned active_guards,
    return true;
 }
 
+/* Match `float(src_dim) * frcp(float(dst_dim))` strictly (exact grouping
+ * emitted by build_bilinear_resize_border_u8_kernel). */
 static bool
 match_pc_f32_ratio(nir_def *def, uint16_t *num_pc_out, uint16_t *den_pc_out)
 {
@@ -3324,17 +3326,16 @@ match_pc_f32_ratio(nir_def *def, uint16_t *num_pc_out, uint16_t *den_pc_out)
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (alu->op != nir_op_fmul || alu->fp_math_ctrl != 0)
+      return false;
 
    nir_def *num = NULL, *den = NULL;
-   if (alu->op == nir_op_fdiv) {
-      num = strip_mov(alu->src[0].src.ssa);
-      den = strip_mov(alu->src[1].src.ssa);
-   } else if (alu->op == nir_op_fmul) {
-      for (unsigned side = 0; side < 2; side++) {
-         nir_def *r = strip_mov(alu->src[side].src.ssa);
-         if (r && nir_def_instr(r)->type == nir_instr_type_alu &&
-             nir_instr_as_alu(nir_def_instr(r))->op == nir_op_frcp) {
-            den = strip_mov(nir_instr_as_alu(nir_def_instr(r))->src[0].src.ssa);
+   for (unsigned side = 0; side < 2; side++) {
+      nir_def *r = strip_mov(alu->src[side].src.ssa);
+      if (r && nir_def_instr(r)->type == nir_instr_type_alu) {
+         nir_alu_instr *ra = nir_instr_as_alu(nir_def_instr(r));
+         if (ra->op == nir_op_frcp && ra->fp_math_ctrl == 0) {
+            den = strip_mov(ra->src[0].src.ssa);
             num = strip_mov(alu->src[1 - side].src.ssa);
             break;
          }
@@ -3352,8 +3353,8 @@ match_pc_f32_ratio(nir_def *def, uint16_t *num_pc_out, uint16_t *den_pc_out)
           match_push_const_u32(da->src[0].src.ssa, den_pc_out);
 }
 
-/* Match `s = float(coord) * (float(src_dim) / float(dst_dim))` or
- * `(float(coord) * float(src_dim)) / float(dst_dim)`. */
+/* Match `s = float(coord) * (float(src_dim) * frcp(float(dst_dim)))` strictly
+ * so the emitted scale expression reproduces the matched float32 rounding. */
 static bool
 match_scaled_coord_f32(nir_def *def, nir_def *coord, uint16_t want_dst_pc,
                        uint16_t *src_dim_pc_out)
@@ -3362,86 +3363,21 @@ match_scaled_coord_f32(nir_def *def, nir_def *coord, uint16_t want_dst_pc,
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (alu->op != nir_op_fmul || alu->fp_math_ctrl != 0)
+      return false;
 
-   if (alu->op == nir_op_fmul) {
-      for (unsigned side = 0; side < 2; side++) {
-         nir_def *cf = strip_mov(alu->src[side].src.ssa);
-         if (!cf || nir_def_instr(cf)->type != nir_instr_type_alu)
-            continue;
-         nir_alu_instr *ca = nir_instr_as_alu(nir_def_instr(cf));
-         if ((ca->op == nir_op_u2f32 || ca->op == nir_op_i2f32) &&
-             strip_mov(ca->src[0].src.ssa) == coord) {
-            uint16_t s_pc = 0, d_pc = 0;
-            if (match_pc_f32_ratio(alu->src[1 - side].src.ssa, &s_pc, &d_pc) &&
-                d_pc == want_dst_pc) {
-               *src_dim_pc_out = s_pc;
-               return true;
-            }
-         }
-         /* `(float(coord) * float(src_dim)) * frcp(float(dst_dim))` */
-         if (ca->op == nir_op_frcp) {
-            nir_def *den = strip_mov(ca->src[0].src.ssa);
-            nir_def *num = strip_mov(alu->src[1 - side].src.ssa);
-            if (den && num && nir_def_instr(den)->type == nir_instr_type_alu &&
-                nir_def_instr(num)->type == nir_instr_type_alu) {
-               nir_alu_instr *da = nir_instr_as_alu(nir_def_instr(den));
-               nir_alu_instr *na = nir_instr_as_alu(nir_def_instr(num));
-               uint16_t d_pc = 0;
-               if ((da->op == nir_op_i2f32 || da->op == nir_op_u2f32) &&
-                   match_push_const_u32(da->src[0].src.ssa, &d_pc) &&
-                   d_pc == want_dst_pc && na->op == nir_op_fmul) {
-                  for (unsigned ms = 0; ms < 2; ms++) {
-                     nir_def *c0 = strip_mov(na->src[ms].src.ssa);
-                     nir_def *s0 = strip_mov(na->src[1 - ms].src.ssa);
-                     if (!c0 || !s0 ||
-                         nir_def_instr(c0)->type != nir_instr_type_alu ||
-                         nir_def_instr(s0)->type != nir_instr_type_alu)
-                        continue;
-                     nir_alu_instr *c0a = nir_instr_as_alu(nir_def_instr(c0));
-                     nir_alu_instr *s0a = nir_instr_as_alu(nir_def_instr(s0));
-                     uint16_t s_pc = 0;
-                     if ((c0a->op == nir_op_u2f32 || c0a->op == nir_op_i2f32) &&
-                         strip_mov(c0a->src[0].src.ssa) == coord &&
-                         (s0a->op == nir_op_i2f32 || s0a->op == nir_op_u2f32) &&
-                         match_push_const_u32(s0a->src[0].src.ssa, &s_pc)) {
-                        *src_dim_pc_out = s_pc;
-                        return true;
-                     }
-                  }
-               }
-            }
-         }
-      }
-   } else if (alu->op == nir_op_fdiv) {
-      /* `(float(coord) * float(src_dim)) / float(dst_dim)` */
-      nir_def *num = strip_mov(alu->src[0].src.ssa);
-      nir_def *den = strip_mov(alu->src[1].src.ssa);
-      if (num && den && nir_def_instr(num)->type == nir_instr_type_alu &&
-          nir_def_instr(den)->type == nir_instr_type_alu) {
-         nir_alu_instr *na = nir_instr_as_alu(nir_def_instr(num));
-         nir_alu_instr *da = nir_instr_as_alu(nir_def_instr(den));
-         uint16_t d_pc = 0;
-         if ((da->op == nir_op_i2f32 || da->op == nir_op_u2f32) &&
-             match_push_const_u32(da->src[0].src.ssa, &d_pc) &&
-             d_pc == want_dst_pc && na->op == nir_op_fmul) {
-            for (unsigned ms = 0; ms < 2; ms++) {
-               nir_def *c0 = strip_mov(na->src[ms].src.ssa);
-               nir_def *s0 = strip_mov(na->src[1 - ms].src.ssa);
-               if (!c0 || !s0 ||
-                   nir_def_instr(c0)->type != nir_instr_type_alu ||
-                   nir_def_instr(s0)->type != nir_instr_type_alu)
-                  continue;
-               nir_alu_instr *c0a = nir_instr_as_alu(nir_def_instr(c0));
-               nir_alu_instr *s0a = nir_instr_as_alu(nir_def_instr(s0));
-               uint16_t s_pc = 0;
-               if ((c0a->op == nir_op_u2f32 || c0a->op == nir_op_i2f32) &&
-                   strip_mov(c0a->src[0].src.ssa) == coord &&
-                   (s0a->op == nir_op_i2f32 || s0a->op == nir_op_u2f32) &&
-                   match_push_const_u32(s0a->src[0].src.ssa, &s_pc)) {
-                  *src_dim_pc_out = s_pc;
-                  return true;
-               }
-            }
+   for (unsigned side = 0; side < 2; side++) {
+      nir_def *cf = strip_mov(alu->src[side].src.ssa);
+      if (!cf || nir_def_instr(cf)->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *ca = nir_instr_as_alu(nir_def_instr(cf));
+      if ((ca->op == nir_op_u2f32 || ca->op == nir_op_i2f32) &&
+          strip_mov(ca->src[0].src.ssa) == coord) {
+         uint16_t s_pc = 0, d_pc = 0;
+         if (match_pc_f32_ratio(alu->src[1 - side].src.ssa, &s_pc, &d_pc) &&
+             d_pc == want_dst_pc) {
+            *src_dim_pc_out = s_pc;
+            return true;
          }
       }
    }
@@ -3607,46 +3543,45 @@ match_one_minus_f32(nir_def *def, nir_def **t_out)
 }
 
 static bool
-match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out)
+match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out,
+               enum hk_resize_lerp_mode *mode_out)
 {
    def = strip_mov(def);
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (alu->fp_math_ctrl != 0)
+      return false;
 
-   if (alu->op == nir_op_flrp) {
-      *a_out = strip_mov(alu->src[0].src.ssa);
-      *b_out = strip_mov(alu->src[1].src.ssa);
-      *t_out = strip_mov(alu->src[2].src.ssa);
-      return true;
-   }
-
-   /* Also match `a * (1.0 - t) + b * t` (as `fadd(fmul, fmul)` or `ffma`). */
+   /* Match `a * (1.0 - t) + b * t` (as `fadd(fmul, fmul)` or `ffma`),
+    * recording the exact fusion form so the emitter reproduces rounding. */
    if (alu->op == nir_op_fadd || alu->op == nir_op_ffma) {
       nir_def *p0a = NULL, *p0b = NULL, *p1a = NULL, *p1b = NULL;
       if (alu->op == nir_op_ffma) {
          p0a = strip_mov(alu->src[0].src.ssa);
          p0b = strip_mov(alu->src[1].src.ssa);
          nir_def *c = strip_mov(alu->src[2].src.ssa);
-         if (c && nir_def_instr(c)->type == nir_instr_type_alu &&
-             nir_instr_as_alu(nir_def_instr(c))->op == nir_op_fmul) {
+         if (c && nir_def_instr(c)->type == nir_instr_type_alu) {
             nir_alu_instr *ca = nir_instr_as_alu(nir_def_instr(c));
-            p1a = strip_mov(ca->src[0].src.ssa);
-            p1b = strip_mov(ca->src[1].src.ssa);
+            if (ca->op == nir_op_fmul && ca->fp_math_ctrl == 0) {
+               p1a = strip_mov(ca->src[0].src.ssa);
+               p1b = strip_mov(ca->src[1].src.ssa);
+            }
          }
       } else {
          nir_def *s0 = strip_mov(alu->src[0].src.ssa);
          nir_def *s1 = strip_mov(alu->src[1].src.ssa);
          if (s0 && s1 && nir_def_instr(s0)->type == nir_instr_type_alu &&
-             nir_def_instr(s1)->type == nir_instr_type_alu &&
-             nir_instr_as_alu(nir_def_instr(s0))->op == nir_op_fmul &&
-             nir_instr_as_alu(nir_def_instr(s1))->op == nir_op_fmul) {
+             nir_def_instr(s1)->type == nir_instr_type_alu) {
             nir_alu_instr *m0 = nir_instr_as_alu(nir_def_instr(s0));
             nir_alu_instr *m1 = nir_instr_as_alu(nir_def_instr(s1));
-            p0a = strip_mov(m0->src[0].src.ssa);
-            p0b = strip_mov(m0->src[1].src.ssa);
-            p1a = strip_mov(m1->src[0].src.ssa);
-            p1b = strip_mov(m1->src[1].src.ssa);
+            if (m0->op == nir_op_fmul && m1->op == nir_op_fmul &&
+                m0->fp_math_ctrl == 0 && m1->fp_math_ctrl == 0) {
+               p0a = strip_mov(m0->src[0].src.ssa);
+               p0b = strip_mov(m0->src[1].src.ssa);
+               p1a = strip_mov(m1->src[0].src.ssa);
+               p1b = strip_mov(m1->src[1].src.ssa);
+            }
          }
       }
       if (p0a && p0b && p1a && p1b) {
@@ -3656,16 +3591,23 @@ match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out)
                nir_def *t = NULL;
                if (match_one_minus_f32(pairs[which][side], &t)) {
                   nir_def *a_cand = pairs[which][1 - side];
+                  enum hk_resize_lerp_mode m =
+                     alu->op == nir_op_fadd
+                        ? HK_RESIZE_LERP_ONE_MINUS_ADD
+                        : (which == 0 ? HK_RESIZE_LERP_ONE_MINUS_FFMA_A
+                                      : HK_RESIZE_LERP_ONE_MINUS_FFMA_B);
                   if (pairs[1 - which][0] == t) {
                      *a_out = a_cand;
                      *b_out = pairs[1 - which][1];
                      *t_out = t;
+                     *mode_out = m;
                      return true;
                   }
                   if (pairs[1 - which][1] == t) {
                      *a_out = a_cand;
                      *b_out = pairs[1 - which][0];
                      *t_out = t;
+                     *mode_out = m;
                      return true;
                   }
                }
@@ -3682,13 +3624,14 @@ match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out)
    } else if (alu->op == nir_op_fadd) {
       for (unsigned side = 0; side < 2; side++) {
          nir_def *m = strip_mov(alu->src[side].src.ssa);
-         if (m && nir_def_instr(m)->type == nir_instr_type_alu &&
-             nir_instr_as_alu(nir_def_instr(m))->op == nir_op_fmul) {
+         if (m && nir_def_instr(m)->type == nir_instr_type_alu) {
             nir_alu_instr *ma = nir_instr_as_alu(nir_def_instr(m));
-            mul_a = strip_mov(ma->src[0].src.ssa);
-            mul_b = strip_mov(ma->src[1].src.ssa);
-            base = strip_mov(alu->src[1 - side].src.ssa);
-            break;
+            if (ma->op == nir_op_fmul && ma->fp_math_ctrl == 0) {
+               mul_a = strip_mov(ma->src[0].src.ssa);
+               mul_b = strip_mov(ma->src[1].src.ssa);
+               base = strip_mov(alu->src[1 - side].src.ssa);
+               break;
+            }
          }
       }
    }
@@ -3696,16 +3639,21 @@ match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out)
       return false;
 
    /* One of mul_a/mul_b must be `b - base` (`fsub(b, base)` or `fadd(b, fneg(base))`). */
+   const enum hk_resize_lerp_mode diff_mode =
+      alu->op == nir_op_ffma ? HK_RESIZE_LERP_DIFF_FFMA : HK_RESIZE_LERP_DIFF_ADD;
    nir_def *mands[2] = {mul_a, mul_b};
    for (unsigned side = 0; side < 2; side++) {
       nir_def *d = mands[side];
       if (!d || nir_def_instr(d)->type != nir_instr_type_alu)
          continue;
       nir_alu_instr *da = nir_instr_as_alu(nir_def_instr(d));
+      if (da->fp_math_ctrl != 0)
+         continue;
       if (da->op == nir_op_fsub && strip_mov(da->src[1].src.ssa) == base) {
          *a_out = base;
          *b_out = strip_mov(da->src[0].src.ssa);
          *t_out = mands[1 - side];
+         *mode_out = diff_mode;
          return true;
       }
       if (da->op == nir_op_fadd) {
@@ -3718,6 +3666,7 @@ match_lerp_f32(nir_def *def, nir_def **a_out, nir_def **b_out, nir_def **t_out)
                *a_out = base;
                *b_out = strip_mov(da->src[1 - ds].src.ssa);
                *t_out = mands[1 - side];
+               *mode_out = diff_mode;
                return true;
             }
          }
@@ -4126,9 +4075,11 @@ match_bilinear_resize_border_inloop_u8(
    nir_def *top_f = NULL, *bot_f = NULL, *fy_d = NULL;
    nir_def *p00_f = NULL, *p01_f = NULL, *fx0_d = NULL;
    nir_def *p10_f = NULL, *p11_f = NULL, *fx1_d = NULL;
-   if (!match_lerp_f32(bilerp_val, &top_f, &bot_f, &fy_d) ||
-       !match_lerp_f32(top_f, &p00_f, &p01_f, &fx0_d) ||
-       !match_lerp_f32(bot_f, &p10_f, &p11_f, &fx1_d) || fx0_d != fx1_d)
+   enum hk_resize_lerp_mode lerp_val, lerp_top, lerp_bot;
+   if (!match_lerp_f32(bilerp_val, &top_f, &bot_f, &fy_d, &lerp_val) ||
+       !match_lerp_f32(top_f, &p00_f, &p01_f, &fx0_d, &lerp_top) ||
+       !match_lerp_f32(bot_f, &p10_f, &p11_f, &fx1_d, &lerp_bot) ||
+       fx0_d != fx1_d || lerp_val != lerp_top || lerp_val != lerp_bot)
       return false;
 
    nir_intrinsic_instr *p[4] = {NULL};
@@ -4256,6 +4207,7 @@ match_bilinear_resize_border_inloop_u8(
       return false;
 
    plan->kind = HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8;
+   plan->flags = (uint8_t)lerp_val;
    plan->tile_w = 128;
    plan->tile_h = 8;
    plan->pc_off[0] = dw_pc;
@@ -4385,7 +4337,6 @@ match_bilinear_resize_border_u8(
    nir_if *res_bdr_if = NULL, *cpy_bdr_if = NULL;
    nir_intrinsic_instr *res_prim_st = NULL, *cpy_prim_st = NULL;
    nir_intrinsic_instr *cpy_load = NULL;
-   nir_intrinsic_instr *res_loads[4] = {NULL};
    unsigned res_load_cnt = 0;
 
    foreach_list_typed(nir_cf_node, n, node, &rx_loop->body) {
@@ -4405,7 +4356,7 @@ match_bilinear_resize_border_u8(
             if (intr->intrinsic == nir_intrinsic_load_deref) {
                if (res_load_cnt >= 4)
                   return false;
-               res_loads[res_load_cnt++] = intr;
+               res_load_cnt++;
             } else if (intr->intrinsic == nir_intrinsic_store_deref) {
                if (res_prim_st)
                   return false;
@@ -4590,9 +4541,11 @@ match_bilinear_resize_border_u8(
    nir_def *top_f = NULL, *bot_f = NULL, *fy_d = NULL;
    nir_def *p00_f = NULL, *p01_f = NULL, *fx0_d = NULL;
    nir_def *p10_f = NULL, *p11_f = NULL, *fx1_d = NULL;
-   if (!match_lerp_f32(bilerp_val, &top_f, &bot_f, &fy_d) ||
-       !match_lerp_f32(top_f, &p00_f, &p01_f, &fx0_d) ||
-       !match_lerp_f32(bot_f, &p10_f, &p11_f, &fx1_d) || fx0_d != fx1_d)
+   enum hk_resize_lerp_mode lerp_val, lerp_top, lerp_bot;
+   if (!match_lerp_f32(bilerp_val, &top_f, &bot_f, &fy_d, &lerp_val) ||
+       !match_lerp_f32(top_f, &p00_f, &p01_f, &fx0_d, &lerp_top) ||
+       !match_lerp_f32(bot_f, &p10_f, &p11_f, &fx1_d, &lerp_bot) ||
+       fx0_d != fx1_d || lerp_val != lerp_top || lerp_val != lerp_bot)
       return false;
 
    nir_intrinsic_instr *p[4] = {NULL};
@@ -4725,6 +4678,7 @@ match_bilinear_resize_border_u8(
       return false;
 
    plan->kind = HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8;
+   plan->flags = (uint8_t)lerp_val;
    plan->tile_w = 128;
    plan->tile_h = 8;
    plan->pc_off[0] = dw_pc;
@@ -5670,19 +5624,45 @@ emit_mirror_border_writes(nir_builder *b, nir_deref_instr *dst_u8,
 }
 
 static nir_def *
+eval_lerp_f32(nir_builder *b, nir_def *a, nir_def *bv, nir_def *t,
+              enum hk_resize_lerp_mode mode)
+{
+   switch (mode) {
+   case HK_RESIZE_LERP_ONE_MINUS_ADD: {
+      nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);
+      return nir_fadd(b, nir_fmul(b, omt, a), nir_fmul(b, t, bv));
+   }
+   case HK_RESIZE_LERP_ONE_MINUS_FFMA_A: {
+      nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);
+      return nir_ffma(b, omt, a, nir_fmul(b, t, bv));
+   }
+   case HK_RESIZE_LERP_ONE_MINUS_FFMA_B: {
+      nir_def *omt = nir_fsub(b, nir_imm_float(b, 1.0f), t);
+      return nir_ffma(b, t, bv, nir_fmul(b, omt, a));
+   }
+   case HK_RESIZE_LERP_DIFF_FFMA:
+      return nir_ffma(b, t, nir_fsub(b, bv, a), a);
+   case HK_RESIZE_LERP_DIFF_ADD:
+      return nir_fadd(b, nir_fmul(b, t, nir_fsub(b, bv, a)), a);
+   }
+   UNREACHABLE("invalid hk_resize_lerp_mode");
+}
+
+static nir_def *
 eval_bilerp_u8_pixel(nir_builder *b, nir_def *p00, nir_def *p01, nir_def *p10,
-                     nir_def *p11, nir_def *fx, nir_def *fy)
+                     nir_def *p11, nir_def *fx, nir_def *fy,
+                     enum hk_resize_lerp_mode lerp_mode)
 {
    nir_def *f00 = nir_u2f32(b, p00);
    nir_def *f01 = nir_u2f32(b, p01);
    nir_def *f10 = nir_u2f32(b, p10);
    nir_def *f11 = nir_u2f32(b, p11);
-   nir_def *top = nir_ffma(b, fx, nir_fsub(b, f01, f00), f00);
-   nir_def *bot = nir_ffma(b, fx, nir_fsub(b, f11, f10), f10);
-   nir_def *val = nir_ffma(b, fy, nir_fsub(b, bot, top), top);
-   /* Inputs p00..p11 are u8 in [0, 255] and fx, fy are in [0, 1), so val is
-    * bounded to [0, 255] and f2i32(val) is bit-exact with clamping. */
-   return nir_u2u8(b, nir_f2i32(b, val));
+   nir_def *top = eval_lerp_f32(b, f00, f01, fx, lerp_mode);
+   nir_def *bot = eval_lerp_f32(b, f10, f11, fx, lerp_mode);
+   nir_def *val = eval_lerp_f32(b, top, bot, fy, lerp_mode);
+   nir_def *cl = nir_fmin(b, nir_fmax(b, val, nir_imm_float(b, 0.0f)),
+                          nir_imm_float(b, 255.0f));
+   return nir_u2u8(b, nir_f2i32(b, cl));
 }
 
 static void
@@ -5690,7 +5670,8 @@ emit_resize_border_loop(nir_builder *b, nir_deref_instr *src_u8,
                         nir_deref_instr *dst_u8, nir_def *x0, nir_def *py,
                         nir_def *dst_w, nir_def *dst_h, nir_def *dst_stride,
                         nir_def *border, nir_def *swm1, nir_def *sx_scale,
-                        nir_def *fy, nir_def *row0, nir_def *row1)
+                        nir_def *fy, nir_def *row0, nir_def *row1,
+                        enum hk_resize_lerp_mode lerp_mode)
 {
    nir_variable *kv = nir_local_variable_create(b->impl, glsl_uint_type(), "k");
    nir_store_var(b, kv, nir_imm_int(b, 0), 0x1);
@@ -5716,7 +5697,8 @@ emit_resize_border_loop(nir_builder *b, nir_deref_instr *src_u8,
          nir_def *p01 = load_ssbo_ro(b, src_u8, nir_iadd(b, row0, ix1));
          nir_def *p10 = load_ssbo_ro(b, src_u8, nir_iadd(b, row1, ix0));
          nir_def *p11 = load_ssbo_ro(b, src_u8, nir_iadd(b, row1, ix1));
-         nir_def *val = eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy);
+         nir_def *val =
+            eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy, lerp_mode);
          emit_mirror_border_writes(b, dst_u8, xk, py, val, dst_w, dst_h,
                                    dst_stride, border);
       }
@@ -5795,6 +5777,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
    nir_def *py = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wgid, 1), 3),
                           nir_channel(b, lid, 1));
 
+   const enum hk_resize_lerp_mode lerp_mode =
+      (enum hk_resize_lerp_mode)plan->flags;
    nir_def *do_resize =
       nir_ior(b, nir_ine(b, src_w, dst_w), nir_ine(b, src_h, dst_h));
 
@@ -5854,7 +5838,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
                      eval_bilerp_u8_pixel(b, nir_channel(b, r0, 0),
                                           nir_channel(b, r0, 1),
                                           nir_channel(b, r1, 0),
-                                          nir_channel(b, r1, 1), fx, fy),
+                                          nir_channel(b, r1, 1), fx, fy,
+                                          lerp_mode),
                      0x1);
                }
             }
@@ -5880,7 +5865,9 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
                      load_ssbo_ro(b, src_u8, nir_iadd(b, row1, ix1));
                   nir_store_var(
                      b, out_v[k],
-                     eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy), 0x1);
+                     eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy,
+                                          lerp_mode),
+                     0x1);
                }
             }
             nir_pop_if(b, NULL);
@@ -5899,7 +5886,7 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
          {
             emit_resize_border_loop(b, src_u8, dst_u8, x0, py, dst_w, dst_h,
                                     dst_stride, border, swm1, sx_scale, fy,
-                                    row0, row1);
+                                    row0, row1, lerp_mode);
          }
          nir_pop_if(b, NULL);
       }
