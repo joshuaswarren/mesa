@@ -498,7 +498,7 @@ test_boundary(void)
       enum agx_chip chip;
       const char *name;
    } m5[] = {{AGX_CHIP_G17G, "G17G"}, {AGX_CHIP_G17S, "G17S"},
-             {AGX_CHIP_G17C, "G17C"}};
+             {AGX_CHIP_G17C, "G17C"}, {AGX_CHIP_G17D, "G17D"}};
    char name[128];
    for (unsigned i = 0; i < ARRAY_SIZE(m5); ++i) {
       dev->dev.chip = m5[i].chip;

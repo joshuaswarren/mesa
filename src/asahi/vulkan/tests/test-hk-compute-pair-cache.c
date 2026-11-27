@@ -11,14 +11,17 @@
  * shader cache keys them with.
  */
 #undef NDEBUG
+#include "hk_cmd_buffer.h"
 #include "hk_compute_pair.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
+#include "hk_shader.h"
 
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/lib/agx_bo.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_serialize.h"
 #include "util/blob.h"
@@ -318,17 +321,99 @@ check_chip(enum agx_chip chip)
    free(pdev);
 }
 
+static void
+check_fused_m5_dispatch(enum agx_chip chip, uint32_t clusters, uint32_t dies,
+                        bool expect_ok, uint32_t expected_tail)
+{
+   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_shader *s = calloc(1, sizeof(*s));
+   struct hk_linked_shader *linked = calloc(1, sizeof(*linked));
+   assert(pdev && dev && s && linked);
+
+   pdev->dev.chip = chip;
+   pdev->vk.properties.maxComputeWorkGroupInvocations = 1024;
+   dev->vk.physical = &pdev->vk;
+   dev->dev.chip = chip;
+   dev->dev.shader_base = UINT64_C(0x10000000000);
+   dev->dev.params.num_clusters_total = clusters;
+   dev->dev.params.num_dies = dies;
+
+   struct agx_va shader_va = {
+      .addr = dev->dev.shader_base + 0x400,
+      .size_B = 0x100,
+   };
+   struct agx_bo shader_bo = {
+      .va = &shader_va,
+   };
+   linked->b.bo = &shader_bo;
+   linked->b.size = 64;
+   linked->b.nr_gprs = 8;
+
+   s->only_linked = linked;
+   s->info.stage = MESA_SHADER_COMPUTE;
+   s->b.info.stage = MESA_SHADER_COMPUTE;
+   s->b.info.workgroup_size[0] = 64;
+   s->b.info.workgroup_size[1] = 1;
+   s->b.info.workgroup_size[2] = 1;
+   s->b.info.agx3_staging_known = true;
+   s->b.info.agx3_staging_halfs = 2;
+
+   struct hk_compute_pair_dispatch p = {
+      .exec_local = {64, 1, 1},
+      .exec_threads = {64, 1, 1},
+      .root_va = UINT64_C(0x200000000),
+   };
+
+   uint8_t cs_bytes[HK_CS_SPACE_PADDING + 256];
+   memset(cs_bytes, 0, sizeof(cs_bytes));
+   struct hk_cs cs = {
+      .type = HK_CS_CDM,
+      .start = cs_bytes,
+      .current = cs_bytes,
+      .end = cs_bytes + sizeof(cs_bytes),
+   };
+
+   uint8_t ioto_buf[512];
+   size_t ioto_used = 0;
+   const bool ok = hk_emit_fused_compute_dispatch(
+      dev, &cs, s, &p, ioto_buf, dev->dev.shader_base + 0x8000,
+      sizeof(ioto_buf), &ioto_used);
+   assert(ok == expect_ok);
+   if (expect_ok) {
+      assert(ioto_used > 0);
+      assert((const uint8_t *)cs.current >=
+             (const uint8_t *)cs.start + sizeof(uint32_t));
+      uint32_t tail = 0;
+      memcpy(&tail, (const uint8_t *)cs.current - sizeof(tail), sizeof(tail));
+      assert(tail == expected_tail);
+   }
+
+   free(linked);
+   free(s);
+   free(dev);
+   free(pdev);
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
-   const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S};
+   const enum agx_chip chips[] = {
+      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17D,
+   };
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i)
       check_chip(chips[i]);
    glsl_type_singleton_decref();
 
+   check_fused_m5_dispatch(AGX_CHIP_G17G, 2, 1, true, 0x60000160);
+   check_fused_m5_dispatch(AGX_CHIP_G17G, 2, 2, true, 0x60000160);
+   check_fused_m5_dispatch(AGX_CHIP_G17D, 8, 2, true, 0x6000017c);
+   check_fused_m5_dispatch(AGX_CHIP_G17G, 0, 1, false, 0);
+   check_fused_m5_dispatch(AGX_CHIP_G17D, 0, 2, false, 0);
+
    printf("PASS: compute-pair producers and their set layouts round-trip on "
-          "%zu chips\n",
+          "%zu chips; fused M5 dispatch verified\n",
           ARRAY_SIZE(chips));
    return 0;
 }

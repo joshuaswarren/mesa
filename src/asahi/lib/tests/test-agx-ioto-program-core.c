@@ -6,6 +6,7 @@
 #include "../agx_ioto_program_core.h"
 
 #include "../agx_ioto_core.h"
+#include "../agx_ioto_load_core.h"
 #include "../../compiler/test/probes/g17p-sparse-mrt.h"
 
 #include <stdio.h>
@@ -27,14 +28,14 @@ static uint64_t checks;
 static const enum agx_chip targets[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static bool
 is_gpu1(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 static struct agx_ioto_state_tail
@@ -1060,6 +1061,77 @@ test_g17g_graphics_no_resource_programs(void)
    return 0;
 }
 
+/* The profile loader's LDIMM loads the byte offset of the helper-table group
+ * its stage calls, where the USC window's lead puts it for the device's
+ * cluster count: 0x100 a cluster, twice that for vertex. Eight clusters (the
+ * M5 Ultra) need 0x800 and 0x1000, past what the template's raw byte can
+ * carry; a count of 0 is refused. */
+static int
+test_m5_profile_loader_table_base(void)
+{
+   static const uint8_t body[] = {
+      0x2c,0x80,0x02,0x00,0x00,0x00,0x80,0x00,
+      0x3c,0x80,0x02,0x00,0x04,0x00,0x00,0x00,
+      0x0b,0x24,0x09,0x04,
+   };
+   static const uint8_t tail_bytes[2][AGX_IOTO_STATE_TAIL_TYPE0_SIZE] = {
+      {0x07,0x00,0x00,0x0c,0x00,0x00,0x00,0x00,
+       0x87,0x04,0x48,0x0e,0x00,0x00,0x00,0x00,0x00,0x01,
+       0x87,0x00,0x00,0x0d,0x00,0x00,0x00,0x00,0x00,0x00},
+      {0x17,0x00,0x00,0x2c,0x00,0x00,0x18,0x08,
+       0xc7,0x03,0x40,0x0e,0x00,0x00,0x00,0x00,0x00,0x01,
+       0x07,0x00,0x00,0x0d,0x00,0x00,0x00,0x00,0x00,0x00},
+   };
+   static const struct {
+      enum agx_chip chip;
+      unsigned clusters;
+      uint32_t fragment, vertex;
+   } cases[] = {
+      {AGX_CHIP_G17G, 1, 0x100, 0x200},
+      {AGX_CHIP_G17S, 2, 0x200, 0x400},
+      {AGX_CHIP_G17C, 4, 0x400, 0x800},
+      {AGX_CHIP_G17D, 8, 0x800, 0x1000},
+   };
+   const uint64_t field = agx_ioto_load_ldimm_long_immediate(UINT32_MAX);
+   /* The template's LDIMM destination, with the immediate cleared. */
+   const uint64_t dest = UINT64_C(0x0002800c);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      size_t copy_offset;
+      CHECK(agx_ioto_program_first_copy_offset(cases[i].chip, body,
+                                               sizeof(body), &copy_offset));
+      for (unsigned fragment = 0; fragment < 2; ++fragment) {
+         struct agx_ioto_state_tail_output tail = {
+            .length = AGX_IOTO_STATE_TAIL_TYPE0_SIZE,
+         };
+         memcpy(tail.bytes, tail_bytes[fragment], tail.length);
+         uint8_t output[160];
+         size_t written = 0;
+         const enum agx_ioto_g17g_program_stage stage =
+            fragment ? AGX_IOTO_G17G_PROGRAM_FRAGMENT
+                     : AGX_IOTO_G17G_PROGRAM_VERTEX;
+         CHECK(!agx_ioto_m5_resource_program_compose_classes(
+            cases[i].chip, 0, UINT64_C(0x10000160000), body, sizeof(body),
+            &tail, stage, 1, output, sizeof(output), &written));
+         CHECK(agx_ioto_m5_resource_program_compose_classes(
+            cases[i].chip, cases[i].clusters, UINT64_C(0x10000160000), body,
+            sizeof(body), &tail, stage, 1, output, sizeof(output),
+            &written));
+         const uint8_t *ldimm =
+            output + copy_offset + AGX_IOTO_STATE_TAIL_TYPE0_SIZE + 16;
+         uint64_t word = 0;
+         for (unsigned b = 0; b < 8; ++b)
+            word |= (uint64_t)ldimm[b] << (8 * b);
+         CHECK((word & ~field) == dest);
+         CHECK((word & field) ==
+               agx_ioto_load_ldimm_long_immediate(
+                  fragment ? cases[i].fragment : cases[i].vertex));
+      }
+   }
+   return 0;
+}
+
+
 int
 main(void)
 {
@@ -1074,6 +1146,7 @@ main(void)
    CHECK(test_g17p_fragment_resource_program() == 0);
    CHECK(test_g17s_minimal_compute_program() == 0);
    CHECK(test_g17g_graphics_no_resource_programs() == 0);
+   CHECK(test_m5_profile_loader_table_base() == 0);
    printf("agx_ioto_program_core: %llu checks passed\n",
           (unsigned long long)checks);
    return 0;

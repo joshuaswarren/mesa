@@ -10,6 +10,7 @@
 #include "hk_device.h"
 #include "hk_drm_prior_core.h"
 #include "hk_queue.h"
+#include "agx_chip_caps.h"
 _Static_assert(sizeof(struct drm_asahi_cmd_render) == 320, "legacy render");
 _Static_assert(sizeof(struct drm_asahi_cmd_compute) == 128,
                "legacy Mesa compute");
@@ -145,7 +146,7 @@ end_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
 /* Chips whose start stamps latch before a command's waits (hk_sync.c,
  * start_stamps_ordered()): G17P and M5. */
 static const enum agx_chip end_stamp_chips[] = {
-   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D};
 
 /* G17P and M5: ResetQueryPool leaves a reusable compute stream. A TOP_OF_PIPE
  * stamp after it ends that stream's command: start stamps latch before the
@@ -2601,8 +2602,12 @@ test_draw_indirect_scope(void)
 static void
 test_cdm_overlap_splits(void)
 {
+   unsigned tested = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(end_stamp_chips); ++i) {
       const enum agx_chip chip = end_stamp_chips[i];
+      if (!agx_chip_has_cap(chip, AGX_CAP_CDM_OVERLAP_SPLIT))
+         continue;
+      tested++;
 
       /* U1 same-CB: R1 -> C1(indep) -> barrier(GFX->COMPUTE) -> C2 */
       {
@@ -2749,8 +2754,10 @@ test_cdm_overlap_splits(void)
       }
    }
 
-   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
-   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
+   T("at least one chip tests CDM overlap splits", tested > 0);
+
+   /* Unmeasured chips (G15, G16G, G17D) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17D};
    for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
       struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
       struct hk_cs *c1 = add(cmd, true);
