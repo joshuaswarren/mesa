@@ -107,10 +107,17 @@ struct hk_descriptor_pool {
    struct vk_object_base base;
 
    struct list_head sets;
+   /* Recycled zero-dynamic-descriptor set objects, returned on pool reset. */
+   struct list_head free_sets;
 
    struct agx_bo *bo;
    uint8_t *mapped_ptr;
    struct util_vma_heap heap;
+
+   /* Pools without VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT allocate
+    * monotonically from linear_offset and reset to 0 on vkResetDescriptorPool. */
+   bool linear;
+   uint64_t linear_offset;
 
    /* The pool BO is CPU-cached: every CPU write is cleaned to the point of
     * coherency as it is made, and queue submission fences those cleans. */
