@@ -1166,14 +1166,23 @@ agx_chip_hw_texel_fetch_bounds(enum agx_chip chip)
 
 /*
  * Whether the Apple9 imageblock applies: up to 128 bytes a sample in a full
- * 32 KiB (32768-byte) tile. Apple's Metal feature set tables give G15 (M3)
- * and G17P (A18 Pro) the same Apple9 limits.
+ * 32 KiB (32768-byte) tile, or 48 KiB where the kernel admits it
+ * (AGX_NATIVE_TILE_BUFFER_48K_BYTES). Apple's Metal feature set tables give
+ * G15 (M3) and G17P (A18 Pro) the same Apple9 limits.
  */
 static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_IMAGEBLOCK;
 }
+
+/* Tile buffer budget of a render on chips with the native imageblock. A
+ * kernel that reports DRM_ASAHI_FEATURE_TILE_BUFFER_48K admits 48 KiB. With
+ * 24-byte samples at 4x that fits 32x16 tiles instead of 16x16, so a render
+ * bins half as many tiles.
+ */
+#define AGX_NATIVE_TILE_BUFFER_BYTES     (32768)
+#define AGX_NATIVE_TILE_BUFFER_48K_BYTES (49152)
 
 /*
  * Whether single-sample 2D colour images are losslessly compressed in the
