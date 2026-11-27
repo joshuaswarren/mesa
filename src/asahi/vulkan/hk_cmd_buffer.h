@@ -616,6 +616,7 @@ struct hk_descriptor_state {
       uint8_t dirty_mask;
       bool bypass_launched;
       uint64_t dynbuf_dirty_mask;
+      uint64_t push_dirty_dwords;
    } root_change;
    uint64_t generation;
    /* Advances on every descriptor state change except hk_push_constants()
@@ -708,12 +709,35 @@ hk_root_mark_dirty(struct hk_descriptor_state *desc)
    desc->root_change.bypass_launched = false;
 }
 
-/* Root changed in its push constants. An earlier change of any other kind
- * since the last upload stays recorded in dirty_mask. */
+/* Root changed in its push constants at [offset, offset + size). An earlier
+ * change of any other kind since the last upload stays recorded in dirty_mask. */
+static inline void
+hk_root_mark_push_dirty_range(struct hk_descriptor_state *desc, uint32_t offset,
+                              uint32_t size)
+{
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   if (size > 0) {
+      const uint32_t first_dw = offset >> 2;
+      const uint32_t last_dw = (offset + size - 1) >> 2;
+      if (first_dw < 64) {
+         const uint32_t clamped_last = MIN2(last_dw, 63u);
+         const uint32_t count = clamped_last - first_dw + 1;
+         const uint64_t mask =
+            count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << first_dw;
+         desc->root_change.push_dirty_dwords |= mask;
+      }
+   } else {
+      desc->root_change.push_dirty_dwords = UINT64_MAX;
+   }
+   desc->root_change.bypass_launched = false;
+}
+
+/* Root changed in its push constants (unknown range). */
 static inline void
 hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
 {
    desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   desc->root_change.push_dirty_dwords = UINT64_MAX;
    desc->root_change.bypass_launched = false;
 }
 
@@ -762,12 +786,43 @@ hk_root_mark_clean(struct hk_descriptor_state *desc)
    desc->root_change.dirty_mask = 0;
    desc->root_change.bypass_launched = false;
    desc->root_change.dynbuf_dirty_mask = 0;
+   desc->root_change.push_dirty_dwords = 0;
 }
 
-/* Whether a shader reading root_reads / dynbuf_reads cannot observe any of the
- * root bytes currently dirty in desc. */
+/* Whether a root byte span [start, end) overlaps any of the four regions that
+ * may be dirty while hk_root_bypass_dirty() holds (push constants, dynamic
+ * buffers, or vertex attribute bases/clamps). Any other root field (such as
+ * draw.attrib_strides[]) marks HK_ROOT_DIRTY_OTHER when mutated, so a disjoint
+ * span stays current in gfx->root across root-bypass launches. */
+static inline bool
+hk_root_span_overlaps_bypassable(uint64_t start, uint64_t end)
+{
+   if (end <= start)
+      return false;
+   const uint64_t push_lo = hk_root_descriptor_offset(push);
+   const uint64_t push_hi = push_lo + HK_MAX_PUSH_SIZE;
+   const uint64_t dyn_lo = hk_root_descriptor_offset(dynamic_buffers);
+   const uint64_t dyn_hi =
+      dyn_lo + sizeof(((struct hk_root_descriptor_table *)0)->dynamic_buffers);
+   const uint64_t vb_base_lo = hk_root_descriptor_offset(draw.attrib_base);
+   const uint64_t vb_base_hi =
+      vb_base_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_base);
+   const uint64_t vb_clamp_lo = hk_root_descriptor_offset(draw.attrib_clamps);
+   const uint64_t vb_clamp_hi =
+      vb_clamp_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_clamps);
+   return (start < push_hi && end > push_lo) ||
+          (start < dyn_hi && end > dyn_lo) ||
+          (start < vb_base_hi && end > vb_base_lo) ||
+          (start < vb_clamp_hi && end > vb_clamp_lo);
+}
+
+/* Whether a shader reading root_reads / dynbuf_reads / push_reads cannot
+ * observe any of the root bytes currently dirty in desc. */
 static inline bool
 hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
+                           uint64_t push_reads,
                            const struct hk_descriptor_state *desc)
 {
    const uint8_t dm = desc->root_change.dirty_mask;
@@ -777,7 +832,8 @@ hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
       return false;
    if (root_reads & HK_ROOT_READS_ADDRESS)
       return false;
-   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH))
+   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH) &&
+       (!push_reads || (push_reads & desc->root_change.push_dirty_dwords)))
       return false;
    if ((dm & (HK_ROOT_DIRTY_VB_BASE | HK_ROOT_DIRTY_VB_CLAMP)) &&
        (root_reads & HK_ROOT_READS_VERTEX_INPUT))

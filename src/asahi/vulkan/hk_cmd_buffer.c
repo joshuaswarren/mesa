@@ -2043,12 +2043,40 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
    /* D3D translation layers re-push unchanged constants before most draws.
     * While the root is clean the uploaded root holds exactly these bytes, so
     * an identical push changes nothing; keep the root and every preparation
-    * keyed to the current descriptor generation. */
-   if (memcmp(desc->root.push + info->offset, info->pValues, info->size) == 0)
-      return;
-
-   memcpy(desc->root.push + info->offset, info->pValues, info->size);
-   hk_root_mark_push_dirty(desc);
+    * keyed to the current descriptor generation. Fast-path common 4/8/16-byte
+    * push updates (root constants and root CBV VAs) to avoid PLT memcmp/memcpy
+    * overhead on hot draw loops. */
+   uint8_t *dst = desc->root.push + info->offset;
+   if (info->size == 8) {
+      uint64_t cur, val;
+      memcpy(&cur, dst, 8);
+      memcpy(&val, info->pValues, 8);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 8);
+   } else if (info->size == 4) {
+      uint32_t cur, val;
+      memcpy(&cur, dst, 4);
+      memcpy(&val, info->pValues, 4);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 4);
+   } else if (info->size == 16) {
+      uint64_t c0, c1, v0, v1;
+      memcpy(&c0, dst, 8);
+      memcpy(&c1, dst + 8, 8);
+      memcpy(&v0, info->pValues, 8);
+      memcpy(&v1, (const uint8_t *)info->pValues + 8, 8);
+      if (c0 == v0 && c1 == v1)
+         return;
+      memcpy(dst, &v0, 8);
+      memcpy(dst + 8, &v1, 8);
+   } else {
+      if (memcmp(dst, info->pValues, info->size) == 0)
+         return;
+      memcpy(dst, info->pValues, info->size);
+   }
+   hk_root_mark_push_dirty_range(desc, info->offset, info->size);
    /* non_push_generation intentionally does not advance on push constants
     * (push constants carry no tracked resource addresses; BDA transfers
     * already set sync.xfer_any). */
@@ -2117,6 +2145,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
                                  const VkSetDescriptorBufferOffsetsInfoEXT *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+   bool changed = false;
 
    for (uint32_t i = 0; i < info->setCount; ++i) {
       const uint32_t s = info->firstSet + i;
@@ -2128,10 +2157,22 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
       const uint64_t addr =
          cmd->state.descriptor_buffers[info->pBufferIndices[i]] +
          info->pOffsets[i];
+      const uint32_t size = set_layout ? set_layout->max_buffer_size : 0;
+      const uint32_t bit = BITFIELD_BIT(s);
 
-      hk_bind_buffer_set(desc, pipeline_layout, s, addr,
-                         set_layout ? set_layout->max_buffer_size : 0);
+      if ((desc->buffer_active & bit) && !(desc->push_active & bit) &&
+          desc->sets[s] == NULL && desc->root.sets[s] == addr &&
+          desc->set_sizes[s] == size &&
+          desc->root.set_dynamic_buffer_start[s] ==
+             pipeline_layout->dynamic_descriptor_offset[s])
+         continue;
+
+      hk_bind_buffer_set(desc, pipeline_layout, s, addr, size);
+      changed = true;
    }
+
+   if (!changed)
+      return;
 
    hk_root_mark_dirty(desc);
    desc->generation++;
@@ -3828,17 +3869,28 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
       case HK_G17P_RANGE_SOURCE_CONSTANT:
          offset = ranges[i].address;
          break;
-      case HK_G17P_RANGE_SOURCE_ROOT:
+      case HK_G17P_RANGE_SOURCE_ROOT: {
          offset = ranges[i].address - root;
-         /* The root/set table header range at offset 0 only exposes the
-          * root_desc_addr pointer when the main body, preamble, or prolog
-          * reads it; otherwise it only supplies root.sets[], which never
-          * change on push, dynamic-buffer, or VB base/clamp updates. */
-         if (offset != 0 || !s->b.info.agx3_root_uniform_usage_valid ||
-             s->b.info.agx3_main_uses_root_uniform ||
-             s->b.info.has_preamble || linked->g17p_prolog_uses_root)
+         const uint64_t end = offset + 2u * ranges[i].size_halfs;
+         /* Offset 0 is the root/set header: it exposes root_desc_addr only
+          * when the main body, preamble, or prolog reads it; otherwise it only
+          * supplies root.sets[], which never change on bypassable updates.
+          * Non-zero root uniform-DMA spans (e.g. draw.attrib_strides[]) read
+          * only [offset, end), so they remain up to date in gfx->root whenever
+          * disjoint from the four bypass-dirtyable regions. */
+         if (offset == 0) {
+            if (!s->b.info.agx3_root_uniform_usage_valid ||
+                s->b.info.agx3_main_uses_root_uniform ||
+                (s->b.info.has_preamble &&
+                 s->b.info.agx3_preamble_uses_root_uniform) ||
+                linked->g17p_prolog_uses_root ||
+                hk_root_span_overlaps_bypassable(offset, end))
+               has_general_root = true;
+         } else if (hk_root_span_overlaps_bypassable(offset, end)) {
             has_general_root = true;
+         }
          break;
+      }
       case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
          offset = ranges[i].address - root;
          if (offset != hk_root_descriptor_offset(draw.attrib_base) ||
@@ -5001,7 +5053,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    if (launch->has_general_root &&
        !hk_root_reads_ignore_dirty(s->info.agx3_root_reads,
-                                   s->info.agx3_dynbuf_reads, desc))
+                                   s->info.agx3_dynbuf_reads,
+                                   s->info.agx3_push_read_dwords, desc))
       return 0;
 
    const uint8_t dirty_mask = desc->root_change.dirty_mask;
