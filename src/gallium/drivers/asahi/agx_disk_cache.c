@@ -154,6 +154,7 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
    binary->push_range_count = blob_read_uint32(blob);
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);
+   agx_compute_shader_upload_sizes(binary);
 
    const uint32_t inline_blend_nir_size = blob_read_uint32(blob);
    if (inline_blend_nir_size) {

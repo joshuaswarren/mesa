@@ -675,6 +675,127 @@ test_local_read(void)
          0);
 }
 
+
+static void
+test_pure_compute_ssbo(void)
+{
+   const VkPipelineStageFlags2 cs = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+   const VkAccessFlags2 sw = VK_ACCESS_2_SHADER_WRITE_BIT;
+   const VkAccessFlags2 srw =
+      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+
+   VkMemoryBarrier2 mb = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = cs,
+      .srcAccessMask = sw,
+      .dstStageMask = cs,
+      .dstAccessMask = srw,
+   };
+   VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &mb,
+   };
+   check("pure_ssbo: compute memory barrier admitted",
+         hk_dependency_is_pure_compute_ssbo(&dep), 1);
+
+   mb.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+   check("pure_ssbo: memory barrier with NONE srcStage rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+   mb.srcStageMask = cs;
+   mb.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+   check("pure_ssbo: memory barrier with NONE dstStage rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+   mb.dstStageMask = cs;
+   mb.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
+   check("pure_ssbo: uniform read access rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+   mb.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+   check("pure_ssbo: sampled read access rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+   mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+   check("pure_ssbo: broad MEMORY_READ rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   VkBufferMemoryBarrier2 bb = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+      .srcStageMask = cs,
+      .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+      .dstStageMask = cs,
+      .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+   };
+   dep = (VkDependencyInfo){
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .bufferMemoryBarrierCount = 1,
+      .pBufferMemoryBarriers = &bb,
+   };
+   check("pure_ssbo: local buffer barrier (IGNORED) admitted",
+         hk_dependency_is_pure_compute_ssbo(&dep), 1);
+
+   bb.srcQueueFamilyIndex = 0;
+   bb.dstQueueFamilyIndex = 0;
+   check("pure_ssbo: local buffer barrier (same queue) admitted",
+         hk_dependency_is_pure_compute_ssbo(&dep), 1);
+
+   /* Ownership release to VK_QUEUE_FAMILY_EXTERNAL (dstScope NONE). */
+   bb.srcQueueFamilyIndex = 0;
+   bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+   bb.srcStageMask = cs;
+   bb.srcAccessMask = sw;
+   bb.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+   bb.dstAccessMask = VK_ACCESS_2_NONE;
+   check("pure_ssbo: ownership release to EXTERNAL rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   /* Ownership acquire from VK_QUEUE_FAMILY_EXTERNAL (srcScope NONE). */
+   bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+   bb.dstQueueFamilyIndex = 0;
+   bb.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+   bb.srcAccessMask = VK_ACCESS_2_NONE;
+   bb.dstStageMask = cs;
+   bb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+   check("pure_ssbo: ownership acquire from EXTERNAL rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   /* Cross-queue transfer even with COMPUTE on both scopes. */
+   bb.srcQueueFamilyIndex = 0;
+   bb.dstQueueFamilyIndex = 1;
+   bb.srcStageMask = cs;
+   bb.srcAccessMask = sw;
+   bb.dstStageMask = cs;
+   bb.dstAccessMask = srw;
+   check("pure_ssbo: cross-queue buffer transfer rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   /* EXTERNAL == EXTERNAL or FOREIGN == FOREIGN rejected. */
+   bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+   bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+   check("pure_ssbo: EXTERNAL queue family rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+   bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+   check("pure_ssbo: FOREIGN queue family rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+
+   /* Image barrier alongside pure buffer barrier rejected. */
+   bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   VkImageMemoryBarrier2 ib = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = cs,
+      .srcAccessMask = sw,
+      .dstStageMask = cs,
+      .dstAccessMask = srw,
+   };
+   dep.imageMemoryBarrierCount = 1;
+   dep.pImageMemoryBarriers = &ib;
+   check("pure_ssbo: image barrier present rejected",
+         hk_dependency_is_pure_compute_ssbo(&dep), 0);
+}
+
 int
 main(void)
 {
@@ -683,6 +804,7 @@ main(void)
    test_read_only_attachments();
    test_resources_and_fallbacks();
    test_local_read();
+   test_pure_compute_ssbo();
    printf("hk_barrier: %u checks, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

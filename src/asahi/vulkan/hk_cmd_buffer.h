@@ -861,13 +861,13 @@ struct hk_rendering_state {
     * dependency tracking (HK_SYNC_GFX_MEM). */
    bool m5_attachments_reach_memory;
 
-   /* AGX3 dead depth store: the "only" ZLS word with the depth store
-    * dropped, and whether the pass processes empty tiles without that store,
-    * for a later pass that makes the store dead (hk_take_pending_z_store()).
-    * Valid when no_z_store_ok. */
-   bool no_z_store_ok;
-   bool process_empty_tiles_without_z;
-   struct agx_zls_control_packed zls_control_only_no_z_store;
+   /* AGX3 dead depth/stencil store: aspects stored in this single-stream pass
+    * that may become dead if overwritten before read (hk_take_pending_z_store),
+    * plus empty-tile attribution split across color/resolve vs Z vs S clears. */
+   VkImageAspectFlags pending_zs_store_mask;
+   bool empty_tiles_other;
+   bool empty_tiles_z;
+   bool empty_tiles_s;
 
    /* G17P: colour attachments a draw or clear of the pass may write, and
     * whether a fragment shader reads the tilebuffer. See
@@ -1408,6 +1408,18 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
+    * Lives on the command buffer so it survives CS splits and
+    * merge_control_streams. */
+   bool cdm_barrier_pending;
+   /* True when the pending barrier requires the full default CDM barrier word
+    * (0x1ff, with USC/PBE/texture maintenance) rather than the pure compute
+    * SSBO word (0x160). */
+   bool cdm_barrier_full_needed;
+   /* True if any launch in the open CDM stream used images, textures, or
+    * samplers (including bindless), so Vulkan 1.0 SHADER_READ/WRITE barriers
+    * keep the default word. */
+   bool cdm_stream_has_images;
 };
 
 /*
@@ -2361,6 +2373,8 @@ struct hk_cmd_buffer {
          struct hk_image *image;
          VkImageAspectFlags aspects;
          VkClearValue value;
+         bool from_gfx;
+         struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
       bool deferred_clear_flushing;
@@ -2386,16 +2400,18 @@ struct hk_cmd_buffer {
        * hk_resolve_pending_oq_available(). */
       struct hk_cs *oq_pending_render;
 
-      /* AGX3: the last render pass instance stored a whole depth-only image
-       * that nothing recorded since may have read. A later instance that
-       * clears the whole image, or does not care about its contents, makes
-       * that store dead (hk_take_pending_z_store()). Kept across exactly the
-       * commands deferred clears survive (deferred_clear_hold). */
+      /* AGX3: the last render pass instance stored a whole depth/stencil image
+       * that nothing recorded since may have read. A later instance or clear
+       * that overwrites depth and/or stencil over the whole image makes those
+       * aspect stores dead (hk_take_pending_z_store()). Kept across exactly
+       * the commands deferred clears survive (deferred_clear_hold). */
       struct hk_pending_z_store {
          struct hk_cs *cs;
          const struct hk_image *image;
-         struct agx_zls_control_packed zls_control;
-         bool process_empty_tiles;
+         VkImageAspectFlags aspects;
+         bool empty_tiles_other;
+         bool empty_tiles_z;
+         bool empty_tiles_s;
       } pending_z_store;
 
       /* M5: the open render stream is an ordered continuation (hk_cs::
@@ -2978,15 +2994,36 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
 
-/* The depth image of the pending store is overwritten as a whole before
- * anything read it: the store is dead (see hk_take_pending_z_store()). */
+/* Aspects of the depth/stencil image of the pending store are overwritten as a
+ * whole before anything read them: drop those aspect stores (see
+ * hk_take_pending_z_store()). */
 static inline void
-hk_kill_pending_z_store(struct hk_cmd_buffer *cmd)
+hk_kill_pending_z_store_aspects(struct hk_cmd_buffer *cmd,
+                                VkImageAspectFlags kill_aspects)
 {
    struct hk_pending_z_store *p = &cmd->state.pending_z_store;
-   p->cs->cr.zls_control = p->zls_control;
-   p->cs->cr.process_empty_tiles = p->process_empty_tiles;
-   p->cs = NULL;
+   const VkImageAspectFlags kill = p->aspects & kill_aspects;
+   if (!p->cs || !kill)
+      return;
+
+   agx_unpack(NULL, &p->cs->cr.zls_control, ZLS_CONTROL, control);
+   if (kill & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      control.z_store = false;
+      p->empty_tiles_z = false;
+   }
+   if (kill & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      control.s_store = false;
+      p->empty_tiles_s = false;
+   }
+   agx_pack(&p->cs->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg = control;
+   }
+
+   p->aspects &= ~kill;
+   p->cs->cr.process_empty_tiles =
+      p->empty_tiles_other || p->empty_tiles_z || p->empty_tiles_s;
+   if (!p->aspects)
+      p->cs = NULL;
 }
 void hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
                                     uint64_t size);
@@ -3393,6 +3430,13 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
  * while hk_cmd_alias_scope() asks for it; otherwise its last record is a
  * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+/* Record a non-native pipeline barrier against the open compute stream.
+ * Returns true when the caller must end the open compute stream (non-AGX2
+ * command streams such as G18G/HAL300, fullcdmbarrier, or an open graphics
+ * batch). */
+bool hk_cdm_record_pipeline_barrier(struct hk_cmd_buffer *cmd,
+                                    const VkDependencyInfo *dep);
 
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
@@ -3954,6 +3998,14 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
    }
    uint32_t usc = uploaded;
+
+   if (s->info.reads_images || s->b.info.texture_state_count != 0 ||
+       s->b.info.sampler_state_count != 0 || s->b.info.uses_sampler_heap ||
+       s->b.info.uses_txf || s->info.stage != MESA_SHADER_COMPUTE ||
+       cmd->in_meta) {
+      cmd->state.cs.cdm_barrier_full_needed = true;
+      cmd->state.cs.cdm_stream_has_images = true;
+   }
 
    hk_reserve_scratch(cmd, cs, s);
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);

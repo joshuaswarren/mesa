@@ -4308,6 +4308,37 @@ agx3_emit_texture_sample_g17g(struct util_dynarray *emission,
    return true;
 }
 
+/*
+ * A fragment sample with uniform or immediate descriptors stages its operands
+ * and returns its result on one scoreboard slot. AGX3B has six slots, so a run
+ * of more than six samples reuses a slot whose result is still pending and
+ * waits for that result before it can stage: in a 3x3 comparison filter the
+ * seventh to ninth samples each waited for one of the first three to return.
+ *
+ * When a fragment part has more such samples than slots 1..5, each of them
+ * instead stages on slot 6, which its own SMP waits at once, and returns on
+ * slots 1..5, where two results may share a slot. A consumer of either result
+ * then waits for both, which costs nothing when the results are combined after
+ * the run, and the whole run stays in flight. A part with fewer samples keeps
+ * the single-slot form: it never runs out of slots.
+ */
+static bool
+agx3_sample_stages_on_own_slot(enum agx_isa_encoding enc, bool fragment,
+                               const agx_instr *I)
+{
+   return enc == AGX_ISA_ENCODING_AGX3B && fragment &&
+          I->op == AGX_OPCODE_TEXTURE_SAMPLE && !I->query_lod &&
+          I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY &&
+          !I->agx3_tex_coords_staged && I->nr_srcs >= 5 &&
+          I->src[3].type != AGX_INDEX_REGISTER &&
+          I->src[4].type != AGX_INDEX_REGISTER;
+}
+
+#define AGX3_SAMPLE_STAGING_SLOT 6
+#define AGX3_SAMPLE_RESULTS_PER_SLOT 2
+/* Allocator join class shared only by these samples. */
+#define AGX3_SAMPLE_JOIN_CLASS 2
+
 /* Filtered 2D samples use scoreboard-signalling native staging producers.
  * Plain implicit 2D keeps its coordinate layout. Explicit per-lane LOD and
  * 2D-array samples stage coordinates into bank 0; their auxiliary scalar is
@@ -4324,7 +4355,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
                          const uint16_t cem_scratch[3], bool vertex_stage,
                          bool compute_stage, uint16_t array_scratch,
                          uint16_t bank_base, uint16_t g17g_lod_relay, bool g18g,
-                         bool publication_last, uint16_t heap_uniform_base)
+                         bool publication_last, uint16_t heap_uniform_base,
+                         bool own_staging_slot)
 {
    /* G18G (agx3d) keeps j873's G17G-family sampler, whose forms its agx3d
     * re-encode is grounded on. */
@@ -4675,10 +4707,15 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * loads and face publication on that transaction. Uniform/immediate
     * operands use the ordinary result slot. */
    const bool native_staged_coords = native_coord_slot != 0;
-   const uint8_t stage_slot = native_staged_coords
-                                 ? native_coord_slot
-                                 : (array || cube) && register_operands ? 6
-                                                                        : slot;
+   /* The slot allocator kept this sample's result off the staging slot
+    * (agx3_sample_stages_on_own_slot()). */
+   if (own_staging_slot && slot >= AGX3_SAMPLE_STAGING_SLOT)
+      return agx3_tex_decline(I, __LINE__);
+   const uint8_t stage_slot =
+      native_staged_coords ? native_coord_slot
+      : (array || cube) && register_operands ? 6
+      : own_staging_slot ? AGX3_SAMPLE_STAGING_SLOT
+                         : slot;
    /* Coordinates occupy a sampler-private range, independently of the
     * source GPRs. Apple's linked pipelines use four-half groups at 4/8/12/16
     * and at 84/128/132/140/152. The native witnesses are reproduced by
@@ -13590,7 +13627,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     */
    bool g17p_blend_protocol =
       (enc == AGX_ISA_ENCODING_AGX3B ||
-       (enc == AGX_ISA_ENCODING_AGX3C && ctx->key->m5_uniform_blend &&
+       (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+        (ctx->key->m5_uniform_blend ||
+         (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND)) &&
         !ctx->key->secondary && !ctx->key->no_stop &&
         ctx->key->fs.nr_samples == 1)) &&
       ctx->stage == MESA_SHADER_FRAGMENT &&
@@ -13627,8 +13666,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             } else if (P->op == AGX_OPCODE_LD_TILE ||
                        P->op == AGX_OPCODE_ST_TILE) {
                const bool load = P->op == AGX_OPCODE_LD_TILE;
+               const bool m5_inline_format =
+                  enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+                  !ctx->key->m5_uniform_blend &&
+                  agx3_tile_format_width(P->format) >= 0 &&
+                  P->mask >= 1 && P->mask <= 15;
                if (phase != (load ? 1 : 3) ||
-                   !((agx3_g17p_8norm_format(P->format) &&
+                   !(m5_inline_format ||
+                     (agx3_g17p_8norm_format(P->format) &&
                       (P->mask == 3 || P->mask == 15)) ||
                      ((P->format == AGX_FORMAT_RGB10A2 ||
                        P->format == AGX_FORMAT_RGB9E5) && P->mask == 1)) ||
@@ -13876,13 +13921,24 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       break;
    }
 
+   /* agx3_sample_stages_on_own_slot(): split staging only when the part has
+    * more such samples than result slots. */
+   unsigned own_slot_samples = 0;
+   agx_foreach_instr_global(ctx, sample_scan) {
+      own_slot_samples += agx3_sample_stages_on_own_slot(
+         enc, ctx->stage == MESA_SHADER_FRAGMENT, sample_scan);
+   }
+   const bool split_sample_staging =
+      own_slot_samples > AGX3_SAMPLE_STAGING_SLOT - 1;
+
    unsigned k = 0;
    unsigned vertex_loads_scheduled = 0;
    const bool batch_device_loads =
       enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
+      ctx->nir && !ctx->nir->info.internal &&
       (ctx->stage == MESA_SHADER_COMPUTE ||
-       ctx->stage == MESA_SHADER_FRAGMENT) &&
-      ctx->nir && !ctx->nir->info.internal;
+       ctx->stage == MESA_SHADER_FRAGMENT ||
+       (!ctx->key->dev.emit_agx3d && ctx->stage == MESA_SHADER_VERTEX));
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
          if (I->op == AGX_OPCODE_STOP)
@@ -13908,13 +13964,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
          e->is_async = agx3_is_async(I) || I->agx3_tex_coord_start;
-         /* Native G17G loads16/loads32 issue several independent 32-bit
-          * device loads on each queue before the first consumer wait.
-          * Keep coherent operations and other asynchronous engines separate. */
+         /* Native G17G loads16/loads32 issue several independent device loads
+          * on each queue before the first consumer wait (W32/F16/W16/W8 all
+          * share the non-coherent LDDEV engine). Keep coherent operations and
+          * other asynchronous engines separate. */
          if (batch_device_loads &&
              I->op == AGX_OPCODE_DEVICE_LOAD &&
-             I->format == AGX_FORMAT_I32 && !I->coherent &&
-             !I->agx3_tex_coord_start) {
+             (I->format == AGX_FORMAT_I32 ||
+              (!ctx->key->dev.emit_agx3d &&
+               (I->format == AGX_FORMAT_F16 || I->format == AGX_FORMAT_I16 ||
+                I->format == AGX_FORMAT_I8))) &&
+             !I->coherent && !I->agx3_tex_coord_start) {
             e->join_class = 1;
             e->join_limit = 8;
          }
@@ -14007,6 +14067,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             e->preferred_slot = 1;
          if (I->agx3_tex_coords_staged)
             e->preferred_slot = 1;
+         if (split_sample_staging &&
+             agx3_sample_stages_on_own_slot(
+                enc, ctx->stage == MESA_SHADER_FRAGMENT, I)) {
+            e->transient_slots = 1u << (AGX3_SAMPLE_STAGING_SLOT - 1);
+            e->max_slot = AGX3_SAMPLE_STAGING_SLOT - 1;
+            e->join_class = AGX3_SAMPLE_JOIN_CLASS;
+            e->join_limit = AGX3_SAMPLE_RESULTS_PER_SLOT;
+         }
          /* A cube sample whose descriptors are uniforms or immediates groups
           * CEM's face finalizers with its own result slot (f12), and that
           * field only carries slots 1..7: on AGX3C a round-robin slot 8 made
@@ -16358,7 +16426,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                           ctx->key->dev.emit_agx3d,
                                           published && resource_last_use[
                                              published_resource] == instr_index,
-                                          ctx->key->g17p_texture_uniform_base))
+                                          ctx->key->g17p_texture_uniform_base,
+                                          split_sample_staging &&
+                                             agx3_sample_stages_on_own_slot(
+                                                enc,
+                                                ctx->stage ==
+                                                   MESA_SHADER_FRAGMENT,
+                                                I)))
                AGX3_REFUSE(I);
             /* Keep this fixed sampler block owned until its consumer has
              * retired, so later samples, fetches or image writes cannot

@@ -324,3 +324,45 @@ hk_barrier_split_reason_name(enum hk_barrier_split_reason reason)
    };
    return names[reason];
 }
+
+bool
+hk_dependency_is_pure_compute_ssbo(const VkDependencyInfo *dep)
+{
+   if (!dep || dep->pNext != NULL || dep->imageMemoryBarrierCount != 0)
+      return false;
+
+   if (dep->memoryBarrierCount == 0 && dep->bufferMemoryBarrierCount == 0)
+      return false;
+
+   const VkPipelineStageFlags2 required_stage =
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+   const VkAccessFlags2 allowed_access =
+      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+      VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+   for (uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &dep->pMemoryBarriers[i];
+      if (b->pNext != NULL ||
+          b->srcStageMask != required_stage ||
+          b->dstStageMask != required_stage ||
+          (b->srcAccessMask & ~allowed_access) != 0 ||
+          (b->dstAccessMask & ~allowed_access) != 0)
+         return false;
+   }
+
+   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &dep->pBufferMemoryBarriers[i];
+      if (b->pNext != NULL ||
+          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ||
+          b->srcQueueFamilyIndex == VK_QUEUE_FAMILY_EXTERNAL ||
+          b->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          b->srcStageMask != required_stage ||
+          b->dstStageMask != required_stage ||
+          (b->srcAccessMask & ~allowed_access) != 0 ||
+          (b->dstAccessMask & ~allowed_access) != 0)
+         return false;
+   }
+
+   return true;
+}
