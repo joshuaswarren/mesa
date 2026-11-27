@@ -1769,6 +1769,8 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct hk_g17p_compute_program_ref program;
    if (!hk_g17p_get_precomp_program(cmd, prog, idx, data, data_size,
@@ -1912,6 +1914,8 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct agx_ptr uploaded = hk_pool_alloc(cmd, uploaded_size, 4);
    if (!uploaded.cpu) {
@@ -5224,6 +5228,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                                  agx_is_indirect(grid));
    }
    cs->stats.calls++;
+   if (cmd->in_meta)
+      cs->render_pack_compute_internal = true;
 }
 
 static void

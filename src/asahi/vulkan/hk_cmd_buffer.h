@@ -1761,6 +1761,10 @@ struct hk_cs {
     * cr.zls_control, so render packing can union z_store/s_store across members. */
    uint8_t render_pack_zls_elided_store;
 
+   /* CDM stream: set if a meta or non-pre/post-graphics internal helper
+    * dispatch ran in this stream. */
+   bool render_pack_compute_internal;
+
    /* Scratch requirements */
    struct {
       union {
@@ -2341,6 +2345,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->anatomy_precomp[i].dispatches += b->anatomy_precomp[j].dispatches;
    }
    a->anatomy_precomp_other += b->anatomy_precomp_other;
+   a->render_pack_compute_internal |= b->render_pack_compute_internal;
 }
 
 static inline void
@@ -3296,7 +3301,16 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 
       *ptr = cs;
 
+      const bool rpack_head_cs_ok =
+         compute && ptr == &cmd->current_cs.cs && !cmd->in_meta &&
+         !cmd->current_cs.gfx && !cmd->current_cs.pre_gfx &&
+         !cmd->current_cs.post_gfx && cmd->render_pack.head_open &&
+         cmd->render_pack.head_epoch == cmd->sync.epoch &&
+         !cmd->sync.xfer_depth && !cmd->sync.brl_transition_active &&
+         !cmd->sync.kind_override;
       hk_sync_stream_created(cmd, cs, ptr, compute);
+      if (rpack_head_cs_ok)
+         cmd->render_pack.head_epoch = cmd->sync.epoch;
    }
 
    assert(*ptr != NULL);

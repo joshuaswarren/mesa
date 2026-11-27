@@ -23,7 +23,7 @@ static_assert(AGX_VDM_STREAM_TERMINATE_CORE_LENGTH <=
 const char *
 hk_render_pack_continues(const struct hk_render_pack_pass *a,
                          const struct hk_render_pack_pass *b, bool ordered,
-                         bool non_local_src)
+                         bool non_local_src, bool att_visible)
 {
    const VkRenderingFlags open = VK_RENDERING_SUSPENDING_BIT |
                                  VK_RENDERING_RESUMING_BIT |
@@ -102,17 +102,18 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
          return "input attachment feedback";
       if (x->feedback_loop || y->feedback_loop)
          return "feedback loop";
-      if (ordered && (x->aliasable || y->aliasable))
+      if (ordered && att_visible && (x->aliasable || y->aliasable))
          return "ordered with an aliasable image";
    }
    if (!attachments)
       return "no attachments";
 
-   /* An ordered dependency makes A's attachment writes visible to B's
-    * shaders; the merged pass has not stored them yet. Within one command
-    * buffer the continuation may instead show that no descriptor set is
-    * bound, which another command buffer's recording cannot. */
-   if (ordered && !b->layout_proof)
+   /* An ordered dependency that makes A's attachment writes visible to B's
+    * shaders requires attachment-only layouts so no descriptor can read A's
+    * unstored attachments. Within one command buffer the continuation may
+    * instead show that no descriptor set is bound, which another command
+    * buffer's recording cannot. */
+   if (ordered && att_visible && !b->layout_proof)
       return "ordered without attachment-only layouts";
    return NULL;
 }
@@ -357,6 +358,7 @@ hk_render_pack_run_start(struct hk_render_pack_run_state *run,
    *run = (struct hk_render_pack_run_state){
       .ordered = cs->m5_ordered,
       .non_local_src = cs->m5_non_local_src,
+      .att_visible = cs->m5_ordered,
       .writes_memory = cs->m5_shader_writes_memory,
       .unsafe = cs->render_pack_unsafe,
       .pushed_attachment =
@@ -389,6 +391,19 @@ run_non_local_src(const struct hk_render_pack_run_state *run,
           b->render_pack.head_non_local_src || bs->m5_non_local_src;
 }
 
+static bool
+run_att_visible(const struct hk_render_pack_run_state *run,
+                const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b,
+                const struct hk_cs *bs)
+{
+   const bool tail_vis =
+      a->render_pack.tail_dep == HK_M5_MERGE_DEP_ORDERED &&
+      !a->render_pack.tail_att_not_visible;
+   const bool head_vis =
+      b->render_pack.head_dep == HK_M5_MERGE_DEP_ORDERED &&
+      !b->render_pack.head_att_not_visible;
+   return run->att_visible || tail_vis || head_vis || bs->m5_ordered;
+}
 const char *
 hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
                         const struct hk_cmd_buffer *a,
@@ -410,8 +425,10 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
 
    const bool ordered = run_ordered(run, a, b, bs);
    const bool non_local_src = run_non_local_src(run, a, b, bs);
+   const bool att_visible = run_att_visible(run, a, b, bs);
    const char *why = hk_render_pack_continues(&ea->tail_pass, &eb->head_pass,
-                                              ordered, non_local_src);
+                                              ordered, non_local_src,
+                                              att_visible);
    if (why)
       return why;
 
@@ -425,7 +442,8 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
          return "ordered, writes memory";
       if (run->unsafe || bs->render_pack_unsafe)
          return "ordered, draw hazard";
-      if (run->pushed_attachment || pushes_attachment(b, &eb->head_pass))
+      if (att_visible &&
+          (run->pushed_attachment || pushes_attachment(b, &eb->head_pass)))
          return "ordered, attachment pushed as a descriptor";
    }
 
@@ -450,6 +468,7 @@ hk_render_pack_run_join(struct hk_render_pack_run_state *run,
 {
    run->ordered = run_ordered(run, a, b, bs);
    run->non_local_src = run_non_local_src(run, a, b, bs);
+   run->att_visible = run_att_visible(run, a, b, bs);
    run->writes_memory |= bs->m5_shader_writes_memory;
    run->unsafe |= bs->render_pack_unsafe;
    run->pushed_attachment |= pushes_attachment(b, &b->render_pack.head_pass);
@@ -520,16 +539,34 @@ hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
 }
 
 static const char *
-hk_render_pack_aux_cdm_refusal(const struct hk_cs *cs, bool is_post)
+hk_render_pack_aux_cdm_refusal(const struct hk_cs *cs, bool is_post,
+                               bool is_first)
 {
    if (cs->type != HK_CS_CDM)
       return "aux not compute";
-   if (cs->stats.calls != 0)
-      return "api compute";
-   if (is_post && !cs->stats.cmds)
-      return "empty post-graphics";
-   if (cs->sync.kind != (HK_SYNC_GFX | HK_SYNC_GFX_MEM))
+   if (is_post) {
+      if (cs->stats.calls != 0)
+         return "api compute";
+      if (!cs->stats.cmds)
+         return "empty post-graphics";
+      if (cs->sync.kind != (HK_SYNC_GFX | HK_SYNC_GFX_MEM))
+         return "aux sync kind";
+   } else if (cs->stats.calls != 0) {
+      if (!is_first && cs->render_pack_compute_internal)
+         return "api compute internal";
+      const uint8_t allowed =
+         HK_SYNC_COMPUTE | HK_SYNC_GFX | HK_SYNC_GFX_MEM |
+         (is_first ? HK_SYNC_XFER : 0);
+      if (!cs->sync.kind || (cs->sync.kind & ~allowed))
+         return "aux sync kind";
+   } else if (is_first && cs->stats.cmds) {
+      const uint8_t allowed =
+         HK_SYNC_XFER | HK_SYNC_COMPUTE | HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+      if (!cs->sync.kind || (cs->sync.kind & ~allowed))
+         return "aux sync kind";
+   } else if (cs->sync.kind != (HK_SYNC_GFX | HK_SYNC_GFX_MEM)) {
       return "aux sync kind";
+   }
    if (cs->timestamp.start.handle || cs->timestamp.end.handle ||
        cs->unordered_start_ts || cs->g17p_timestamp_query)
       return "aux timestamp";
@@ -559,7 +596,7 @@ hk_render_pack_aux_cdm_refusal(const struct hk_cs *cs, bool is_post)
 
 static const char *
 hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
-                                      const struct hk_cs **vdm_out,
+                                      bool first, const struct hk_cs **vdm_out,
                                       const struct hk_cs **pre_out,
                                       const struct hk_cs **post_out)
 {
@@ -632,10 +669,10 @@ hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
       return "layout transition";
 
    if (pre) {
-      const char *why = hk_render_pack_aux_cdm_refusal(pre, false);
+      const char *why = hk_render_pack_aux_cdm_refusal(pre, false, first);
       if (why)
          return why;
-      if (pre->sync.heap_slot != cs->sync.heap_slot)
+      if (pre->sync.heap_slot && pre->sync.heap_slot != cs->sync.heap_slot)
          return "pre heap slot";
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
          if (pre->sync.dep[sq].cut || pre->sync.dep_ta[sq].cut)
@@ -643,7 +680,7 @@ hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
       }
    }
    if (post) {
-      const char *why = hk_render_pack_aux_cdm_refusal(post, true);
+      const char *why = hk_render_pack_aux_cdm_refusal(post, true, false);
       if (why)
          return why;
       if (!post->sync.heap_slot || post->sync.heap_slot != cs->sync.heap_slot)
@@ -690,18 +727,25 @@ hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
 }
 
 const char *
+hk_render_pack_member_refusal_for(const struct hk_cmd_buffer *cmd, bool first)
+{
+   return hk_render_pack_member_refusal_streams(cmd, first, NULL, NULL, NULL);
+}
+
+const char *
 hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
 {
-   return hk_render_pack_member_refusal_streams(cmd, NULL, NULL, NULL);
+   return hk_render_pack_member_refusal_for(cmd, false);
 }
 
 const struct hk_cs *
-hk_render_pack_member_streams(const struct hk_cmd_buffer *cmd,
+hk_render_pack_member_streams(const struct hk_cmd_buffer *cmd, bool first,
                               const struct hk_cs **pre_out,
                               const struct hk_cs **post_out)
 {
    const struct hk_cs *vdm = NULL;
-   if (hk_render_pack_member_refusal_streams(cmd, &vdm, pre_out, post_out))
+   if (hk_render_pack_member_refusal_streams(cmd, first, &vdm, pre_out,
+                                             post_out))
       return NULL;
    return vdm;
 }
@@ -717,7 +761,7 @@ hk_render_pack_stamp_slots(const struct hk_cs *cs)
 const struct hk_cs *
 hk_render_pack_member(const struct hk_cmd_buffer *cmd)
 {
-   return hk_render_pack_member_streams(cmd, NULL, NULL);
+   return hk_render_pack_member_streams(cmd, false, NULL, NULL);
 }
 
 bool

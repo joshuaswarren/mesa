@@ -115,6 +115,7 @@ struct hk_render_pack_edges {
    bool head_open;
    bool head_msaa_end;
    bool head_non_local_src;
+   bool head_att_not_visible;
    bool transitions_overflow;
    bool head_undef_alias_overflow;
    uint8_t head_dep;
@@ -142,6 +143,7 @@ struct hk_render_pack_edges {
    bool tail_open;
    bool tail_msaa;
    bool tail_non_local_src;
+   bool tail_att_not_visible;
    uint8_t tail_dep;
    uint32_t tail_epoch, tail_next_seq, tail_seq;
    const struct hk_cs *tail_stream;
@@ -175,7 +177,8 @@ struct hk_render_pack_edges {
  * Returns NULL or why not. */
 const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
                                      const struct hk_render_pack_pass *b,
-                                     bool ordered, bool non_local_src);
+                                     bool ordered, bool non_local_src,
+                                     bool att_visible);
 
 /* What the members a packed run holds so far bring to its next boundary. In
  * one tile pass every member's vertex work may run ahead of every earlier
@@ -188,6 +191,9 @@ struct hk_render_pack_run_state {
    /* A barrier inside the run (between members or inside one) has a graphics
     * first scope outside the attachment stages, forbidding a final resolve. */
    bool non_local_src;
+   /* An ordered dependency in the run makes attachment writes visible to
+    * later shaders (requires attachment-only layouts and non-aliasable images). */
+   bool att_visible;
    /* A member's shaders write memory other than its attachments. */
    bool writes_memory;
    /* A member draws with a stage that runs ahead of the tile pass
@@ -238,10 +244,13 @@ const struct hk_cs *hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
                                             const struct hk_cs **pre_out,
                                             const struct hk_cs **post_out);
 
-/* Like hk_render_pack_member(), also returning optional driver-only pre/post
- * CDM streams belonging to the same pass. */
+/* Like hk_render_pack_member(), also returning optional pre/post CDM streams
+ * belonging to the same pass. When `first` is true, `cmd` starts a packed run
+ * so its leading pre-render CDM stream stays in submission order and may carry
+ * meta/transfer work; later members (`first == false`) must hoist their
+ * pre-render compute ahead of earlier render passes. */
 const struct hk_cs *hk_render_pack_member_streams(
-   const struct hk_cmd_buffer *cmd, const struct hk_cs **pre_out,
+   const struct hk_cmd_buffer *cmd, bool first, const struct hk_cs **pre_out,
    const struct hk_cs **post_out);
 
 /* The only stream of `cmd` if it may be a member of a packed run (a render
@@ -255,6 +264,8 @@ unsigned hk_render_pack_stamp_slots(const struct hk_cs *cs);
 
 /* Why `cmd` is no member (hk_render_pack_member()), or NULL. */
 const char *hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd);
+const char *hk_render_pack_member_refusal_for(const struct hk_cmd_buffer *cmd,
+                                              bool first);
 
 /* Whether `cmd`'s tail may be written: recorded without SIMULTANEOUS_USE,
  * with room for a stream link at its terminate record. */

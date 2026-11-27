@@ -1891,6 +1891,11 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       into->sync.brl_transition = true;
    }
    into->sync.kind |= from->sync.kind;
+   if (from->sync.heap_slot) {
+      assert(!into->sync.heap_slot ||
+             into->sync.heap_slot == from->sync.heap_slot);
+      into->sync.heap_slot = from->sync.heap_slot;
+   }
    into->sync.att_bloom |= from->sync.att_bloom;
    into->sync.vtx_images |= from->sync.vtx_images;
    into->sync.vtx_img_bloom |= from->sync.vtx_img_bloom;
@@ -1912,6 +1917,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->brl_transition_last[sq], from, into);
    replace_pointer(&st->brl_event_poll, from, into);
    replace_pointer(&st->stamp_copy_after[sq], from, into);
+   replace_pointer(&st->pass_heap_last[sq], from, into);
+   for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs)
+      replace_pointer(&st->last_heap_slot[hs][sq], from, into);
    records_replace_stream(cmd, from, into);
    xfer_replace_stream(st, from, into);
 
