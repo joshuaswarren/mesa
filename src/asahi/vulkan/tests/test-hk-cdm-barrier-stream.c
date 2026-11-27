@@ -211,7 +211,7 @@ static void
 test_pure_ssbo_narrows_before_chunk_switch(void)
 {
    struct fixture f;
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
 
    struct agx_shader_info pure = make_compute_shader_info(false);
    uint32_t *b1 = emit_launch(&f, &pure);
@@ -243,14 +243,14 @@ test_conservative_cases_keep_default_word(void)
    VkDependencyInfo dep_broad = make_broad_dep(&mb_broad);
 
    /* 1. No barrier between two launches. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    uint32_t *b1 = emit_launch(&f, &pure);
    emit_launch(&f, &pure);
    assert(*b1 == barrier_record(0x1ffu));
    fixture_fini(&f);
 
    /* 2. Broad ALL_COMMANDS barrier between two launches. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &pure);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_broad));
    assert(f.cmd.state.cs.cdm_barrier_full_needed);
@@ -259,7 +259,7 @@ test_conservative_cases_keep_default_word(void)
    fixture_fini(&f);
 
    /* 3. Pure SSBO barrier merged with a broader barrier before launch 2. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &pure);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_broad));
@@ -268,7 +268,7 @@ test_conservative_cases_keep_default_word(void)
    fixture_fini(&f);
 
    /* 4. Image producer -> pure SSBO barrier -> pure consumer. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &img);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
    emit_launch(&f, &pure);
@@ -276,7 +276,7 @@ test_conservative_cases_keep_default_word(void)
    fixture_fini(&f);
 
    /* 5. Pure producer -> pure SSBO barrier -> image consumer. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &pure);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
    emit_launch(&f, &img);
@@ -284,7 +284,7 @@ test_conservative_cases_keep_default_word(void)
    fixture_fini(&f);
 
    /* 6. Pure producer -> pure SSBO barrier -> stream close (no launch 2). */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &pure);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
    hk_cdm_end_stream_flush(&f.cmd, &f.cs);
@@ -313,7 +313,7 @@ test_full_word_and_overrides(void)
    fixture_fini(&f);
 
    /* Sparse resource created before launch 2 inhibits narrowing. */
-   fixture_init(&f, AGX_CHIP_G13X, 13, 0);
+   fixture_init(&f, AGX_CHIP_G14X, 14, 0);
    b1 = emit_launch(&f, &pure);
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep));
    p_atomic_set(&f.dev.sparse_used, 1);
@@ -358,7 +358,7 @@ test_stream_open_limits(void)
 }
 
 static void
-test_defer_flush_g13g(void)
+test_defer_flush_g13(enum agx_chip chip)
 {
    struct fixture f;
    struct agx_shader_info pure = make_compute_shader_info(false);
@@ -367,7 +367,7 @@ test_defer_flush_g13g(void)
    VkDependencyInfo dep_broad = make_broad_dep(&mb_broad);
 
    /* 1. Two independent launches: zero barriers between them, 0x1ff at close. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    assert(f.cs.cdm_flush_pending);
    assert(f.cs.stats.flushes == 0);
@@ -386,7 +386,7 @@ test_defer_flush_g13g(void)
 
    /* 2. Pure SSBO barrier between two launches emits 0x160; stream close emits
     * 0x1ff; late sparse patching upgrades both to 0xfffff. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    void *after_l1 = f.cs.current;
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
@@ -408,7 +408,7 @@ test_defer_flush_g13g(void)
    fixture_fini(&f);
 
    /* 3. Broad barrier between two launches emits 0x1ff. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    after_l1 = f.cs.current;
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_broad));
@@ -420,7 +420,7 @@ test_defer_flush_g13g(void)
 
    /* 4. Deferred launch followed by in_meta launch flushes 0x1ff before meta
     * and meta emits trailing 0x1ff. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    after_l1 = f.cs.current;
    f.cmd.in_meta = true;
@@ -434,7 +434,7 @@ test_defer_flush_g13g(void)
 
    /* 5. Internal precomp launches (e.g. query reset -> query copy on the same
     * stream) never defer: each emits its own trailing 0x1ff flush. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    uint32_t *p1_tail = emit_precomp_launch(&f);
    assert(*p1_tail == barrier_record(0x1ffu));
    assert(!f.cs.cdm_flush_pending);
@@ -447,7 +447,7 @@ test_defer_flush_g13g(void)
 
    /* 6. Deferred app dispatch followed by precomp drains 0x1ff before precomp
     * and emits trailing 0x1ff after precomp. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    assert(f.cs.cdm_flush_pending);
    assert(f.cs.stats.flushes == 0);
@@ -462,7 +462,7 @@ test_defer_flush_g13g(void)
 
    /* 7. Deferred app dispatch -> pure SSBO barrier -> precomp must upgrade the
     * pending barrier to full 0x1ff (not 0x160) and flush after precomp. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   fixture_init(&f, chip, 13, 0);
    emit_launch(&f, &pure);
    after_l1 = f.cs.current;
    assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
@@ -475,7 +475,7 @@ test_defer_flush_g13g(void)
    fixture_fini(&f);
 
    /* 8. fullcdmbarrier disables deferral and emits 0xfffff per launch. */
-   fixture_init(&f, AGX_CHIP_G13G, 13, HK_PERF_FULLCDMBARRIER);
+   fixture_init(&f, chip, 13, HK_PERF_FULLCDMBARRIER);
    uint32_t *b1 = emit_launch(&f, &pure);
    assert(*b1 == barrier_record(AGX_CDM_BARRIER_FULL_WORD));
    assert(!f.cs.cdm_flush_pending);
@@ -485,13 +485,13 @@ test_defer_flush_g13g(void)
 int
 main(void)
 {
-   test_pure_ssbo_narrows_between_launches(AGX_CHIP_G13X, 13);
    test_pure_ssbo_narrows_between_launches(AGX_CHIP_G14X, 14);
    test_pure_ssbo_narrows_before_chunk_switch();
    test_conservative_cases_keep_default_word();
    test_full_word_and_overrides();
    test_stream_open_limits();
-   test_defer_flush_g13g();
+   test_defer_flush_g13(AGX_CHIP_G13G);
+   test_defer_flush_g13(AGX_CHIP_G13X);
    printf("hk_cdm_barrier_stream: all checks passed\n");
    return 0;
 }

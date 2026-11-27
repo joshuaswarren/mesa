@@ -299,13 +299,13 @@ test_g13_compute_codegen_caps(void)
    }
 }
 
-/* AGX_CAP_CDM_DEFER_FLUSH is enabled on the measured G13G row only. */
+/* AGX_CAP_CDM_DEFER_FLUSH is enabled on the measured G13 rows (G13G, G13X). */
 static void
 test_cdm_defer_flush(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G13G;
+      const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_DEFER_FLUSH) == expected, c);
    }
 }

@@ -2899,6 +2899,51 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
    return false;
 }
 
+bool
+hk_sync_submit_has_unretired_priors(const struct hk_queue *queue)
+{
+   const struct hk_sync_queue *q = &queue->sync;
+   return q->exact_prior && q->retired_count > 0 &&
+          (q->submitted[HK_SYNC_VDM] > q->retired_ord[HK_SYNC_VDM] ||
+           q->submitted[HK_SYNC_CDM] > q->retired_ord[HK_SYNC_CDM]);
+}
+
+static void
+sync_advance_retired(struct hk_sync_queue *q, uint64_t completed)
+{
+   const uint32_t n = MIN2(q->retired_count, HK_SYNC_RETIRED_RING);
+   for (uint32_t i = 0; i < n; ++i) {
+      if (q->retired[i].point && q->retired[i].point <= completed) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+            q->retired_ord[sq] = MAX2(q->retired_ord[sq], q->retired[i].ord[sq]);
+      }
+   }
+
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      const uint64_t ret = q->retired_ord[sq];
+      if (!ret)
+         continue;
+      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+         if (q->last_absolute[k][sq] <= ret)
+            q->last_absolute[k][sq] = 0;
+         if (q->tail[k][sq] <= ret)
+            q->tail[k][sq] = 0;
+      }
+   }
+}
+
+static void
+sync_record_retired(struct hk_sync_queue *q, uint64_t point)
+{
+   if (!point)
+      return;
+   q->retired[q->retired_next].point = point;
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+      q->retired[q->retired_next].ord[sq] = q->submitted[sq];
+   q->retired_next = (q->retired_next + 1) % HK_SYNC_RETIRED_RING;
+   q->retired_count = MIN2(q->retired_count + 1, HK_SYNC_RETIRED_RING);
+}
+
 /* Whether a footprint of an earlier render on the render subqueue that
  * shares a tile with fp needs only fp's fragment half ordered after it
  * (hk_sync_queue::load_hazard_frag). */
@@ -3120,6 +3165,8 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
          if (queue->sync.submitted[sq] > UINT64_MAX - added[sq])
             return false;
       }
+      if (completed)
+         sync_advance_retired(&queue->sync, completed);
    }
 
    bool indexed = !queue->sync.precise_tile_evictions ||
@@ -3486,6 +3533,21 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
                covered[sq] = cs->sync.index;
          }
 
+         /* Prune exact historical priors already retired on the queue timeline
+          * before computing ta_split so stale ordinals (e.g. an old GFX_MEM
+          * render) do not block fragment-only barriers or direct submission. */
+         if (queue->sync.exact_prior) {
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               const uint64_t ret = queue->sync.retired_ord[sq];
+               if (ret) {
+                  if (cs->sync.prior[sq] <= ret)
+                     cs->sync.prior[sq] = 0;
+                  if (cs->sync.prior_ta[sq] <= ret)
+                     cs->sync.prior_ta[sq] = 0;
+               }
+            }
+         }
+
          /* A render's vertex half may wait for less than its fragment half
           * only when the kernel orders the halves separately and nothing
           * above raised the whole render's fields afterwards (the
@@ -3569,6 +3631,8 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
          *tail_raised_out = tail_raised;
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
          queue->sync.submitted[sq] += ss.count[sq];
+      if (ss.count[HK_SYNC_VDM] || ss.count[HK_SYNC_CDM])
+         sync_record_retired(&queue->sync, queue->drm.timeline_value);
    }
    for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs) {
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {

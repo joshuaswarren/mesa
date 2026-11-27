@@ -182,9 +182,8 @@ enum agx_chip_cap {
    /* AGX2 compute streams defer the post-launch CDM cache flush until the
     * next launch sees a declared barrier, a non-deferred/meta launch runs,
     * or the compute stream closes, avoiding redundant 0x1ff barriers between
-    * independent dispatches. Measured on G13G (+2.16% to +3.33% LLM decode
-    * combined with 0x1ff/0x160; +1.16% to +1.25% incremental over 0x1ff/0x160,
-    * bit-identical output, 0 regressions on synchronization/memory_model CTS). */
+    * independent dispatches. Measured on G13G and G13X (0 regressions on
+    * synchronization/memory_model/compute CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
 };
 
@@ -196,7 +195,7 @@ enum agx_chip_cap {
 /* What the measured G13 chips (G13G, G13X) add over the AGX2 set. */
 #define AGX_CAPS_G13                                                           \
    (AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |                      \
-    AGX_CAP_FOLD_SHARED_OFFSETS)
+    AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -250,7 +249,7 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_G13 | AGX_CAP_CDM_DEFER_FLUSH, __VA_ARGS__)                \
+   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
