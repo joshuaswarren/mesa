@@ -75,3 +75,66 @@ one form does not transfer to another.  Map each form separately by varying
 one field at a time from a known-good baseline.  Common to both memory forms:
 wait mask = bits 12..17 (wait slots 1..6), lddev signal slot = bits 70..72,
 lddev uniform base = byte 4 = base / 4.
+## g14g (AGX2) fixtures and the encoded-output comparison
+
+The same procedure applies to AGX2 chips (`applegpu_g14g`, M2 Max class)
+with one decoder difference: the instruction stream is AGX2, so
+`agx2_disassemble_instr` (generated tables in `src/asahi/isa/`) is the
+authority on instruction boundaries and forms, not `agx3_compose` round
+trips.  Only exact round trips are still the facts; decoded text names what
+the decoder establishes and nothing more.
+
+Fixture layout follows the existing native corpus under
+`src/asahi/compiler/test/native/`:
+
+    native/g14g/
+      scoreprobe-reference.metal             MSL source (smallest shape that
+                                             keeps the operation and its live
+                                             operands)
+      scoreprobe-reference.mtlp-json         metal-nt pipeline script
+      probe.scoreprobe-reference.scoreprobe.g14g.bin
+                                             the _agc.main bytes exactly as
+                                             Apple emitted them; the full
+                                             __TEXT,__text section may be
+                                             dropped in instead, the tests
+                                             read from the entry offset
+      manifest.json                          provenance (archive/inner-object
+                                             SHA-256), symbol offsets, the
+                                             section layout and the expected
+                                             decode, in the g18g schema
+      README.md                              file guide and regeneration steps
+
+Two gtests in `agx_tests` consume the fixture:
+
+  * `test-agx2-g14g-witness.cpp` (AGX2G14GWitness) decodes `_agc.main` with
+    `agx2_disassemble_instr` and asserts instruction length and decoded text
+    against the manifest's expected listing.
+  * `test-agx2-witness-compare.cpp` (Agx2WitnessCompare) builds the
+    equivalent NIR with `nir_builder`, compiles it through
+    `agx_compile_shader_nir` with `key.dev.chip = AGX_CHIP_G14G`,
+    `key.dev.encoding = AGX_ISA_ENCODING_AGX2` and `key.no_preamble = true`,
+    then compares the encoded bytes against the witness instruction by
+    instruction through `agx2_disassemble_instr`.
+
+Per instruction pair the comparison reports one of:
+
+  * byte-identical
+  * same decoded text, different encoding
+  * same form, operands differ
+  * form differs
+
+and per program it reports the ABI fields it can check (binary/main/preamble
+sizes and offsets, constant-program presence per the manifest, instruction
+count, termination form).  Anything the decoder cannot settle -- for example
+staging order once the streams' instruction counts diverge, or the meaning of
+bytes the decoder leaves unnamed -- is printed as unestablished, never
+inferred.  Buffer bases read through `load_preamble` encode as `du` slots in
+the driver uniform area; established on our side: our `du` index is half the
+preamble base (preamble base 0 loads as `du0`, base 4 as `du2`).  On Apple's
+side the witness shows the `load` on `du0` and the `store` on `du2`; whether
+Apple derives the index the same way is unestablished -- its base values
+live in the constant program, which the checked-in fixture does not carry.
+
+To run just this comparison:
+
+    meson test -C build agx_tests --test-args='--gtest_filter=Agx2WitnessCompare.*'
