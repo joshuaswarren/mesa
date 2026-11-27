@@ -342,3 +342,32 @@ TEST(OptLicm, KeepsM5UnpackedScalarLodInLoop)
    EXPECT_EQ(count(l.body, AGX_OPCODE_MOV), 1u);
    EXPECT_EQ(count(l.entry, AGX_OPCODE_MOV), 1u);
 }
+
+/* Uniform copies consumed by scalar branch compares (IF_FCMP) hoist and merge
+ * with identical ALU copies in the loop; written uniforms stay pinned. */
+TEST(OptLicm, HoistsUniformUsedByBranchCompare)
+{
+   for (bool uniforms_written : {false, true}) {
+      Loop l;
+      agx_builder *b = l.b;
+      b->shader->uniforms_written = uniforms_written;
+      b->cursor = agx_after_block(l.entry);
+      agx_index w = busy_preheader(b);
+
+      b->cursor = agx_after_block(l.body);
+      agx_index u1 = agx_mov(b, agx_uniform(22, AGX_SIZE_32));
+      agx_index u2 = agx_mov(b, agx_uniform(22, AGX_SIZE_32));
+      agx_instr *alu = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32), w, u2);
+      agx_instr *br = agx_if_fcmp(b, w, u1, 1, AGX_FCOND_GE, true, l.exit);
+
+      b->cursor = agx_after_block(l.exit);
+      agx_unit_test(b, alu->dest[0]);
+
+      EXPECT_EQ(licm(b->shader, 64), !uniforms_written);
+      EXPECT_EQ(count(l.body, AGX_OPCODE_MOV), uniforms_written ? 2u : 0u);
+      EXPECT_EQ(count(l.entry, AGX_OPCODE_MOV), uniforms_written ? 0u : 1u);
+      if (!uniforms_written) {
+         EXPECT_EQ(br->src[1].value, alu->src[1].value);
+      }
+   }
+}

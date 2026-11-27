@@ -1004,7 +1004,16 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
       *len = 0;
       return false;
    }
-   if (!agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len)) {
+   /* AGX3b's 14-byte immediate-descriptor form names coordinate banks 0..60
+    * only. The 20-byte ep4 form carries the full bank field: Apple's linked
+    * pipelines stage at banks 84..152 with it (test_linked_staging_witnesses)
+    * and sparse samples already use it with immediate descriptors. A run of
+    * eight-half samples (a 3x3 PCF kernel on a shadow array) relocates past
+    * bank 60, so take the longer form when the short one cannot name the
+    * bank, as AGX3c's compact forms escalate above. */
+   if (!agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len) &&
+       !(enc == AGX_ISA_ENCODING_AGX3B && ep == 3 &&
+         agx3_bind_compose(enc, AGX3_MN_smp, 4, base, nb, ov, n, out, len))) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
       return false;

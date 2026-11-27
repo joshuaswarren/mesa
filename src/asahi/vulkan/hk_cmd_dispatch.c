@@ -644,6 +644,7 @@ hk_cdm_flush_impl(struct hk_device *dev, struct hk_cs *cs, bool memory,
 
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
+      cs->cdm_flush_pending = false;
       if (cs->current == cs->strong_flush_end)
          return;
 
@@ -836,14 +837,19 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * funnels here, so no caller can end the compute stream with a declared
     * dependency left unemitted. This also keeps the drain out of
     * hk_cmd_buffer.h: standalone test binaries stub this function. */
+   const bool flush_pending = cs->cdm_flush_pending;
+   bool barrier_pending = false;
    if (cs == cmd->current_cs.cs) {
       cmd->state.cs.cdm_stream_has_images = false;
       if (cmd->state.cs.cdm_barrier_pending) {
          cmd->state.cs.cdm_barrier_pending = false;
          cmd->state.cs.cdm_barrier_full_needed = false;
-         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-         hk_cdm_cache_flush(dev, cs);
+         barrier_pending = true;
       }
+   }
+   if (barrier_pending || flush_pending) {
+      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
    }
 
 
@@ -930,7 +936,7 @@ void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             struct agx_cdm_launch_word_0_packed launch,
                             uint32_t usc, struct agx_grid grid,
-                            struct agx_workgroup wg)
+                            struct agx_workgroup wg, bool allow_defer)
 {
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
@@ -958,13 +964,13 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
       return;
    }
 
+   const bool defer =
+      allow_defer && cs == cs->cmd->current_cs.cs && !cs->cmd->in_meta &&
+      !HK_PERF(dev, FULLCDMBARRIER) &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_DEFER_FLUSH);
+
    if (cs == cs->cmd->current_cs.cs && !HK_PERF(dev, FULLCDMBARRIER) &&
        cs->cmd->state.cs.cdm_barrier_pending) {
-      /* The app declared a memory dependency since the last launch. Because
-       * every launch ends with the conservative default barrier word, a pure
-       * compute-to-compute SSBO boundary narrows that preceding trailing
-       * barrier in place to 0x160 before any chunk switch; every other
-       * boundary keeps the default word. */
       const bool pure_ssbo =
          !cs->cmd->state.cs.cdm_barrier_full_needed && cs->stats.cmds > 0;
       cs->cmd->state.cs.cdm_barrier_pending = false;
@@ -975,6 +981,9 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
          hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
          hk_cdm_cache_flush(dev, cs);
       }
+   } else if (!defer && cs->cdm_flush_pending) {
+      hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
    }
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
@@ -983,7 +992,11 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   if (defer) {
+      cs->cdm_flush_pending = true;
+   } else {
+      hk_cdm_cache_flush(dev, cs);
+   }
 }
 
 void
@@ -1006,7 +1019,8 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cs->cmd->state.cs.cdm_barrier_full_needed = true;
       cs->cmd->state.cs.cdm_stream_has_images = true;
    }
-   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size,
+                               info->stage == MESA_SHADER_COMPUTE);
 }
 
 static bool

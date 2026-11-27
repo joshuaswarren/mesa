@@ -185,15 +185,16 @@ hk_upload_rodata(struct hk_device *dev)
     * own buffer object so the sampler table next to the texel-fetch sampler
     * never changes after device creation.
     */
-   dev->rodata.heap_bo = agx_bo_create(&dev->dev, sizeof(struct poly_heap), 0,
-                                       0, "Geometry heap descriptor");
+   dev->rodata.heap_bo = agx_bo_create(&dev->dev,
+                                       HK_HEAP_SLOTS * sizeof(struct poly_heap),
+                                       0, 0, "Geometry heap descriptor");
    if (!dev->rodata.heap_bo)
       goto fail;
 
    void *heap_map = agx_bo_map(dev->rodata.heap_bo);
    if (!heap_map)
       goto fail;
-   memset(heap_map, 0, sizeof(struct poly_heap));
+   memset(heap_map, 0, HK_HEAP_SLOTS * sizeof(struct poly_heap));
    dev->rodata.heap = dev->rodata.heap_bo->va->addr;
 
    return VK_SUCCESS;
@@ -1342,6 +1343,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       list_inithead(&dev->vdm.full[class]);
    }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
    simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
    list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
@@ -1496,7 +1498,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bo_unreference(&dev->dev, dev->rodata.heap_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.indexed_heap_pointers_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
-   agx_bo_unreference(&dev->dev, dev->heap);
+   for (unsigned s = 0; s < HK_HEAP_SLOTS; ++s)
+      agx_bo_unreference(&dev->dev, dev->heap_slots[s]);
+   simple_mtx_destroy(&dev->heap_lock);
    hk_g17p_bg_eot_dev_cache_finish(dev);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);

@@ -615,6 +615,165 @@ TEST(AGX3VisionOpts, UnrollAndJamRejectsOuterReductionUsedInInnerLoop)
    ralloc_free(b.shader);
 }
 
+TEST(AGX3VisionOpts, UnrollAndJamSlidingWindowInnerLoop)
+{
+   for (int non_sliding = 0; non_sliding <= 1; ++non_sliding) {
+      nir_builder b = make_compute_shader(non_sliding ? "jam-non-sliding"
+                                                      : "jam-sliding");
+      nir_def *left_base = make_desc_base(&b, 4);
+      nir_def *right_base = make_desc_base(&b, 8);
+      nir_def *out_base = make_desc_base(&b, 12);
+      nir_def *pc_base = make_desc_base(&b, 16);
+      nir_def *x = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *w_m1 = load_push_word(&b, 0, 32);
+
+      nir_variable *dv = nir_local_variable_create(b.impl, glsl_int_type(), "d");
+      nir_variable *best_sad =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "best_sad");
+      nir_variable *best_d =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "best_d");
+      nir_store_var(&b, dv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, best_sad, nir_imm_int(&b, 0x7fffffff), 1);
+      nir_store_var(&b, best_d, nir_imm_int(&b, 0), 1);
+
+      nir_loop *outer = nir_push_loop(&b);
+      {
+         nir_def *d = nir_load_var(&b, dv);
+         nir_def *disp = nir_load_global_constant(
+            &b, 1, 32, make_buffer_addr(&b, pc_base, nir_imm_int(&b, 4)),
+            .access = ACCESS_CAN_SPECULATE);
+         nir_break_if(&b, nir_ige(&b, d, disp));
+
+         nir_variable *dyv =
+            nir_local_variable_create(b.impl, glsl_int_type(), "dy");
+         nir_variable *sad =
+            nir_local_variable_create(b.impl, glsl_uint_type(), "sad");
+         nir_store_var(&b, dyv, nir_imm_int(&b, -1), 1);
+         nir_store_var(&b, sad, nir_imm_int(&b, 0), 1);
+
+         nir_loop *inner = nir_push_loop(&b);
+         {
+            nir_def *dy = nir_load_var(&b, dyv);
+            nir_def *row = nir_imul_imm(&b, nir_iadd_imm(&b, dy, 1), 64);
+            nir_def *acc = nir_load_var(&b, sad);
+            const int stride = non_sliding ? 10 : 1;
+            for (int k = 0; k < 6; ++k) {
+               nir_def *lx = nir_imin(
+                  &b, nir_imax(&b, nir_iadd_imm(&b, x, k * stride), nir_imm_int(&b, 0)),
+                  w_m1);
+               nir_def *rx = nir_imin(
+                  &b,
+                  nir_imax(&b,
+                           nir_iadd(&b, nir_iadd_imm(&b, x, k * stride),
+                                    nir_ineg(&b, d)),
+                           nir_imm_int(&b, 0)),
+                  w_m1);
+               nir_def *l = load_readonly_byte(
+                  &b, make_buffer_addr(&b, left_base, nir_iadd(&b, row, lx)));
+               nir_def *r = load_readonly_byte(
+                  &b, make_buffer_addr(&b, right_base, nir_iadd(&b, row, rx)));
+               acc = nir_iadd(&b, acc,
+                              nir_iabs(&b, nir_isub(&b, nir_u2u32(&b, l),
+                                                    nir_u2u32(&b, r))));
+            }
+            nir_store_var(&b, sad, acc, 1);
+            nir_def *next_dy = nir_iadd_imm(&b, dy, 1);
+            nir_store_var(&b, dyv, next_dy, 1);
+            nir_break_if(&b, nir_ilt(&b, nir_imm_int(&b, 1), next_dy));
+         }
+         nir_pop_loop(&b, inner);
+
+         nir_def *cur_sad = nir_load_var(&b, sad);
+         nir_def *cur_best = nir_load_var(&b, best_sad);
+         nir_def *better = nir_ult(&b, cur_sad, cur_best);
+         nir_store_var(&b, best_d,
+                       nir_bcsel(&b, better, d, nir_load_var(&b, best_d)), 1);
+         nir_store_var(&b, best_sad, nir_umin(&b, cur_best, cur_sad), 1);
+         nir_store_var(&b, dv, nir_iadd_imm(&b, d, 1), 1);
+      }
+      nir_pop_loop(&b, outer);
+
+      nir_store_global(&b, nir_iadd(&b, nir_load_var(&b, best_d),
+                                    nir_load_var(&b, best_sad)),
+                       out_base);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_cse);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      unsigned widest = 0;
+      bool jammed = agx_nir_unroll_and_jam(b.shader, 8, &widest);
+      nir_validate_shader(b.shader, "unroll and jam sliding");
+      EXPECT_EQ(jammed, !non_sliding);
+      if (!non_sliding) {
+         EXPECT_EQ(count_loops(b.shader), 4u);
+         NIR_PASS(_, b.shader, agx_nir_reassoc_const_offsets);
+         NIR_PASS(_, b.shader, nir_opt_constant_folding);
+         NIR_PASS(_, b.shader, nir_opt_algebraic);
+         NIR_PASS(_, b.shader, nir_opt_cse);
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         /* Jammed loop has 6 invariant + (6 + 4 - 1) = 9 variant loads = 15,
+          * plus 12 in the scalar tail loop = 27 total (vs 6 + 24 + 12 = 42
+          * without diagonal CSE). */
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_global), 27u);
+      } else {
+         EXPECT_EQ(count_loops(b.shader), 2u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, U8AbsdiffFpMatchesNarrowedR8LoadAgx)
+{
+   for (int mode = 0; mode < 3; ++mode) {
+      /* mode 0: 16-bit load_agx R8_UINT unsigned -> matches
+       * mode 1: 16-bit load_agx R16_UINT unsigned -> rejected
+       * mode 2: 16-bit load_agx R8_UINT signed -> rejected */
+      nir_builder b = make_compute_shader("absdiff-r8-load-agx");
+      nir_def *base = make_desc_base(&b, 4);
+      nir_def *out = make_desc_base(&b, 8);
+      const enum pipe_format fmt =
+         mode == 1 ? PIPE_FORMAT_R16_UINT : PIPE_FORMAT_R8_UINT;
+      const bool sext = (mode == 2);
+
+      nir_def *a[4], *c[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         a[i] = nir_load_agx(&b, 1, 16, base, nir_imm_int(&b, i),
+                             .access = ACCESS_NON_WRITEABLE, .base = 0,
+                             .format = fmt, .sign_extend = sext);
+         c[i] = nir_load_agx(&b, 1, 16, base, nir_imm_int(&b, 16 + i),
+                             .access = ACCESS_NON_WRITEABLE, .base = 0,
+                             .format = fmt, .sign_extend = sext);
+      }
+      nir_def *acc1 = nir_imm_int(&b, 0);
+      nir_def *acc2 = nir_imm_int(&b, 0);
+      for (unsigned i = 0; i < 4; ++i) {
+         acc1 = nir_iadd(
+            &b, acc1,
+            nir_iabs(&b, nir_isub(&b, nir_u2u32(&b, a[i]),
+                                  nir_u2u32(&b, c[i]))));
+         acc2 = nir_iadd(
+            &b, acc2,
+            nir_iabs(&b, nir_isub(&b, nir_u2u32(&b, a[i]),
+                                  nir_u2u32(&b, c[(i + 1) & 3]))));
+      }
+      nir_store_global(&b, acc1, out);
+      nir_store_global(&b, acc2,
+                       make_buffer_addr(&b, out, nir_imm_int(&b, 4)));
+
+      bool changed = agx_nir_opt_u8_absdiff_fp(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "u8 absdiff fp r8 load_agx");
+      EXPECT_EQ(changed, mode == 0);
+      if (mode == 0) {
+         EXPECT_EQ(count_alu_op(b.shader, nir_op_u2f32), 8u);
+         EXPECT_EQ(count_alu_op(b.shader, nir_op_f2u32), 2u);
+         EXPECT_EQ(count_alu_op(b.shader, nir_op_iabs), 0u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(AGX3VisionOpts, ForwardMergeLoadsChecksSignExtend)
 {
    nir_builder b = make_compute_shader("forward-merge-sext");

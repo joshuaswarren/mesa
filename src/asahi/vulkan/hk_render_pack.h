@@ -229,6 +229,20 @@ bool hk_render_pack_array_prefix(const struct util_dynarray *a,
                                  const struct util_dynarray *b,
                                  const struct util_dynarray **longer);
 
+/* Locates the unique VDM stream of `cmd`, optionally bracketed by a single
+ * pre-graphics CDM stream before it and/or a single post-graphics CDM stream
+ * after it. Does not inspect sync/query validity; used by packet init and
+ * end-of-recording edge setup. */
+const struct hk_cs *hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
+                                            const struct hk_cs **pre_out,
+                                            const struct hk_cs **post_out);
+
+/* Like hk_render_pack_member(), also returning optional driver-only pre/post
+ * CDM streams belonging to the same pass. */
+const struct hk_cs *hk_render_pack_member_streams(
+   const struct hk_cmd_buffer *cmd, const struct hk_cs **pre_out,
+   const struct hk_cs **post_out);
+
 /* The only stream of `cmd` if it may be a member of a packed run (a render
  * stream with draws and no query, start timestamp, event or in-buffer
  * cut), or NULL. */
