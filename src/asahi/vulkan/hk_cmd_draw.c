@@ -11498,6 +11498,7 @@ hk_g17p_prepared_bind_tail_matches_impl(
             hk_root_reads_ignore_dirty(
                prepared->fragment_shader->info.agx3_root_reads,
                prepared->fragment_shader->info.agx3_dynbuf_reads,
+               prepared->fragment_shader->info.agx3_push_read_dwords,
                &gfx->descriptors));
    const bool vb_gen_match =
       prepared->vertex_buffer_generation == gfx->vertex_buffer_generation ||
@@ -11748,6 +11749,7 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                hk_root_bypass_dirty(&gfx->descriptors) &&
                hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
                                           fs->info.agx3_dynbuf_reads,
+                                          fs->info.agx3_push_read_dwords,
                                           &gfx->descriptors);
             const bool desc_gen_ok =
                prepared->descriptor_generation ==
@@ -14042,10 +14044,10 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           dev->dev.chip, pipeline_program,
           program->template_info.raw_state_load_count_18 << 3, &pair)) {
       static_assert(sizeof(pair.bytes) == 8, "pipeline pair is two words");
-      encoded = gfx->g17p_vdm_update_memo.encoded;
-      memcpy(&encoded.bytes[8], pair.bytes, sizeof(pair.bytes));
-      memcpy(out, encoded.bytes, encoded.length);
-      out += encoded.length;
+      const uint16_t vdm_len = gfx->g17p_vdm_update_memo.encoded.length;
+      memcpy(out, gfx->g17p_vdm_update_memo.encoded.bytes, vdm_len);
+      memcpy(out + 8, pair.bytes, sizeof(pair.bytes));
+      out += vdm_len;
       goto tail;
    }
 
@@ -15199,18 +15201,24 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * intact (hk_agx3_try_push_only_vs_program()). Once it has been, a draw
     * that changes nothing keeps that launch as a clean root would keep its
     * own. */
+   const bool vs_preamble_bypass_ok =
+      !hw_vs->b.info.has_preamble ||
+      (hw_vs->b.info.agx3_root_uniform_usage_valid &&
+       !hw_vs->b.info.agx3_preamble_uses_root_uniform &&
+       !gfx->g17p_hoisted_preamble_va);
    const bool bypass_draw_ok = !agx_is_indirect(draw.b) &&
-                               !hw_vs->b.info.has_preamble &&
+                               vs_preamble_bypass_ok &&
                                !root_needs_growth;
-   const bool bypass_launch_fits =
+   const bool fs_ignores_dirty =
       bypass_draw_ok && hk_root_bypass_dirty(desc) &&
       hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
-                                 fs->info.agx3_dynbuf_reads, desc);
+                                 fs->info.agx3_dynbuf_reads,
+                                 fs->info.agx3_push_read_dwords, desc);
 
    const bool republishes_base_param =
       sw_vs->b.info.uses_base_param || linked_vs->b.uses_base_param;
    const bool uses_draw_id = sw_vs->b.info.uses_draw_id;
-   if (!gfx->dirty && hk_root_launch_current(desc, bypass_launch_fits) &&
+   if (!gfx->dirty && hk_root_launch_current(desc, fs_ignores_dirty) &&
        !republishes_base_param && !uses_draw_id) {
       if (unlikely(cull_changed)) {
          assert(cs->current + 0x1000 < cs->end && "already ensured space");
@@ -15238,7 +15246,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (unlikely(dev->frame_anatomy))
       cs->anatomy_republish++;
 
-   if (gfx->dirty & HK_DIRTY_VB)
+   const bool vb_dirty = (gfx->dirty & HK_DIRTY_VB) != 0;
+   if (unlikely(vb_dirty))
       hk_flush_vertex_attribs_root(cmd, sw_vs);
 
    gfx->render.color_written |= gfx->fast_link_fs.color_written;
@@ -15247,13 +15256,16 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_flush_draw_params_and_id(cmd, sw_vs, linked_vs, draw_id, draw);
 
    /* hk_flush_vertex_attribs_root() may have marked VB base/clamp dirty (or
-    * HK_ROOT_DIRTY_OTHER if strides changed) since bypass_launch_fits was
+    * HK_ROOT_DIRTY_OTHER if strides changed) since fs_ignores_dirty was
     * decided. The root stays dirty after a bypassed launch, so the next draw
     * that needs all of it, through any path, uploads it. */
    const bool try_bypass =
-      bypass_draw_ok && hk_root_bypass_dirty(desc) &&
-      hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
-                                 fs->info.agx3_dynbuf_reads, desc);
+      unlikely(vb_dirty)
+         ? (bypass_draw_ok && hk_root_bypass_dirty(desc) &&
+            hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
+                                       fs->info.agx3_dynbuf_reads,
+                                       fs->info.agx3_push_read_dwords, desc))
+         : fs_ignores_dirty;
    uint64_t pipeline_program = 0;
    if (try_bypass)
       pipeline_program =
@@ -15432,11 +15444,18 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) ==
              gfx->fast_link_fs.key.prolog.statistics) {
          struct hk_descriptor_state *desc = &gfx->descriptors;
+         const bool vs_preamble_bypass_ok =
+            !hw_vs->b.info.has_preamble ||
+            (hw_vs->b.info.agx3_root_uniform_usage_valid &&
+             !hw_vs->b.info.agx3_preamble_uses_root_uniform &&
+             !gfx->g17p_hoisted_preamble_va);
          const bool bypass_launch_fits =
             hk_root_bypass_dirty(desc) && !agx_is_indirect(draw.b) &&
-            !hw_vs->b.info.has_preamble &&
+            vs_preamble_bypass_ok &&
             hk_root_reads_ignore_dirty(fs_src->info.agx3_root_reads,
-                                       fs_src->info.agx3_dynbuf_reads, desc) &&
+                                       fs_src->info.agx3_dynbuf_reads,
+                                       fs_src->info.agx3_push_read_dwords,
+                                       desc) &&
             !hk_root_upload_needs_growth(
                desc->uploaded_root_size,
                hk_gfx_root_size_from_stages(
@@ -18909,6 +18928,13 @@ hk_agx3_draw_indirect_gpu(struct hk_cmd_buffer *cmd, uint64_t in,
    libagx_build_indirect_vdm(
       cmd, agx_1d((max_draw_count + 1u) * LIBAGX_INDIRECT_VDM_LANES_PER_DRAW),
       AGX_BARRIER_ALL | AGX_PREGFX, desc_gpu);
+   if (republishes) {
+      /* The GPU-built sub-stream ends on the last draw's vertex program rather
+       * than draw 0's; clear host draw-ID/loader caches so a subsequent draw
+       * in the same render pass cannot reuse draw 0's state. */
+      gfx->g17p_draw_id_host_valid = false;
+      gfx->g17p_ioto[0].loader_program = 0;
+   }
    return true;
 
 fallback:
