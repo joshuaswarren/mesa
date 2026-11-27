@@ -6834,16 +6834,16 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
 }
 
 static bool
-hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
-                                  const struct hk_buffer *buffer,
-                                  uint64_t address, uint64_t offset,
-                                  uint64_t size,
-                                  struct hk_native_pbe_descriptor *pbe)
+hk_g17p_buffer_pbe_supported(const struct hk_device *dev,
+                             const struct hk_buffer *buffer,
+                             uint64_t address, uint64_t offset,
+                             uint64_t size, uint64_t min_size,
+                             struct hk_native_pbe_descriptor *pbe)
 {
    const struct hk_physical_device *pdev =
       (const struct hk_physical_device *)dev->vk.physical;
    if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
-       size < (64u << 20) || ((address | offset | size) & 15) ||
+       size < min_size || ((address | offset | size) & 15) ||
        !address || size > UINT64_MAX - address ||
        size / 16 > pdev->vk.properties.maxTexelBufferElements)
       return false;
@@ -6892,8 +6892,8 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_native_pbe_descriptor pbe;
-      if (hk_g17p_fill_buffer_pbe_supported(dev, buffer, address, dstOffset,
-                                           size, &pbe))
+      if (hk_g17p_buffer_pbe_supported(dev, buffer, address, dstOffset,
+                                       size, 32u << 20, &pbe))
          hk_g17p_fill_buffer_pbe(cmd, dstBuffer, dstOffset, size, data, &pbe);
       else
          vk_meta_fill_buffer_addr(&cmd->vk, &dev->meta, address, size, data);
