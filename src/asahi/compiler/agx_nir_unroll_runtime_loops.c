@@ -1531,7 +1531,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       nir_def *cond4 = NULL, *cond3 = NULL;
       unsigned inner_ord = 0;
       if (split_small) {
-         nir_def *g4 = guard_bound(&b, &cl, bound, 4);
+         nir_def *g4 = guard_bound(&b, &cl, bound, NULL, 4);
          if (cl.rel == REL_LT || cl.rel == REL_LE)
             cond4 = cl.is_unsigned ? nir_ult(&b, iv0, g4) : nir_ilt(&b, iv0, g4);
          else
