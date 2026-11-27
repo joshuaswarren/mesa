@@ -751,6 +751,7 @@ if with_tests
     ),
     suite : ['asahi'],
     protocol : 'gtest',
+    env : {'MESON_SOURCE_ROOT' : meson.project_source_root()},
   )
 
   test(
