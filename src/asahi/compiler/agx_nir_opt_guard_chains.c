@@ -72,8 +72,8 @@
 
 #define MAX_PREFIX_INSTRS        24u
 #define MAX_PREFIX_LOADS         4u
-#define MAX_GROUP_IFS            4u
-#define MAX_LIVE_HOISTED_DWORDS  24u
+#define MAX_GROUP_IFS            8u
+#define MAX_LIVE_HOISTED_DWORDS  48u
 #define MIN_COALESCE_BODY_INSTRS 12u
 
 static unsigned
@@ -1358,7 +1358,20 @@ try_unwrap_zero_fadd_bias(nir_builder *b, nir_block *prev_block,
 
    for (unsigned m = 0; m < k; ++m)
       vals[m] = unwrapped[m];
-   *thresh_inout = nir_fneg(b, bias);
+
+   /* Unwrap fneg(fneg(x)) -> x (IEEE-754 bit-exact including signed zeros,
+    * infinities, and NaN payloads) so downstream passes see the original
+    * uniform/SSA value instead of a redundant double negation. */
+   nir_alu_instr *bias_alu = nir_def_as_alu_or_null(bias);
+   if (bias_alu && bias_alu->op == nir_op_fneg &&
+       bias_alu->def.num_components == 1 && bias_alu->def.bit_size == 32 &&
+       bias_alu->src[0].swizzle[0] == 0 &&
+       bias_alu->src[0].src.ssa->num_components == 1 &&
+       nir_block_dominates(nir_def_block(bias_alu->src[0].src.ssa), prev_block)) {
+      *thresh_inout = bias_alu->src[0].src.ssa;
+   } else {
+      *thresh_inout = nir_fneg(b, bias);
+   }
    return true;
 }
 

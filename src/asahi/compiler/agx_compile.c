@@ -20408,19 +20408,30 @@ agx_compile_shader_nir_unrolled(nir_shader *nir, struct agx_shader_key *key,
    const unsigned full = agx_occupancy_for_register_count(0).max_threads;
    const unsigned first =
       ok ? agx_occupancy_for_register_count(out->info.nr_gprs).max_threads : 0;
-   /* Also when the wider unroll did not compile at all. */
-   if (widest > 4 && first < full) {
+   const bool agx3b_over_half =
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      (!ok || out->info.nr_gprs > AGX3B_NUM_REGS / 2);
+   /* Also when the wider unroll did not compile at all, or exceeded half the
+    * AGX3B register file (try factor 4 before falling back to factor 1). */
+   if (widest > 4 && (first < full || agx3b_over_half)) {
       nir_shader *narrow_nir = nir_shader_clone(NULL, clone);
       struct agx_shader_part narrow = {0};
       struct blob narrow_blob;
       blob_init(&narrow_blob);
       *key = saved_key;
-      if (agx_compile_shader_nir_internal(narrow_nir, key, &narrow,
-                                          pre_preamble_blob ? &narrow_blob
-                                                            : NULL,
-                                          false, false, false, 4, NULL) &&
-          agx_occupancy_for_register_count(narrow.info.nr_gprs).max_threads >
-             first) {
+      const bool narrow_ok =
+         agx_compile_shader_nir_internal(narrow_nir, key, &narrow,
+                                         pre_preamble_blob ? &narrow_blob
+                                                           : NULL,
+                                         false, false, false, 4, NULL);
+      const unsigned narrow_occ =
+         narrow_ok
+            ? agx_occupancy_for_register_count(narrow.info.nr_gprs).max_threads
+            : 0;
+      if (narrow_ok &&
+          (narrow_occ > first ||
+           (agx3b_over_half && narrow_occ >= first &&
+            (!ok || narrow.info.nr_gprs < out->info.nr_gprs)))) {
          if (ok)
             free(out->binary);
          *out = narrow;
