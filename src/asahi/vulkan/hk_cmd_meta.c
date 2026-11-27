@@ -4162,10 +4162,22 @@ hk_g17p_buffer_pbe_supported(const struct hk_device *dev,
    return hk_pack_native_pbe(generation, &last, &semantic);
 }
 
-/* Large buffer-to-buffer copies whose source and destination exceed L2
- * benefit from writing the destination through a linear RGBA32_UINT PBE
- * storage texel buffer: PBE stores bypass L2 write-allocate/RFO traffic,
- * leaving more cache capacity for source reads and overlapping copies. */
+/* Separate minimum transfer sizes for AGX3/M5 PBE buffer policies.
+ *
+ * Fill is write-only and wins once the destination fills most of SLC
+ * (>= 32 MiB). Copy touches both source and destination (2 * size): an 8 MiB
+ * cutoff crosses the 48 MiB SLC boundary at 24-28 MiB on G17C where
+ * back-to-back copies can regress, whereas >= 32 MiB (64 MiB combined)
+ * strictly exceeds SLC on all AGX3/M5 chips with zero regressions across
+ * queue depths d=1..8. */
+#define HK_G17P_FILL_PBE_MIN_SIZE (32u << 20)
+#define HK_G17P_COPY_PBE_MIN_SIZE (32u << 20)
+
+/* Large buffer-to-buffer copies whose combined source+destination working set
+ * exceeds SLC benefit from writing the destination through a linear
+ * RGBA32_UINT PBE storage texel buffer: PBE stores bypass L2 write-allocate
+ * / RFO traffic, leaving more cache capacity for source reads and overlapping
+ * copies. */
 static void
 hk_g17p_copy_buffer_pbe(struct hk_cmd_buffer *cmd, uint64_t src_addr,
                         VkBuffer dst_buffer, uint64_t dst_addr,
@@ -4316,7 +4328,7 @@ hk_xfer_copybuffer2_range(struct hk_cmd_buffer *cmd,
    struct hk_native_pbe_descriptor pbe;
    if (src && (src & 15) == 0 && size <= UINT64_MAX - src &&
        hk_g17p_buffer_pbe_supported(dev, dst_buffer, dst, dst_offset,
-                                    size, 8u << 20, &pbe) &&
+                                    size, HK_G17P_COPY_PBE_MIN_SIZE, &pbe) &&
        (dst + size <= src || src + size <= dst)) {
       hk_copy_batch_flush(cmd, batch);
       hk_g17p_copy_buffer_pbe(cmd, src, dst_handle, dst, dst_offset, size,
@@ -7058,7 +7070,7 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_native_pbe_descriptor pbe;
       if (hk_g17p_buffer_pbe_supported(dev, buffer, address, dstOffset,
-                                       size, 32u << 20, &pbe))
+                                       size, HK_G17P_FILL_PBE_MIN_SIZE, &pbe))
          hk_g17p_fill_buffer_pbe(cmd, dstBuffer, dstOffset, size, data, &pbe);
       else
          vk_meta_fill_buffer_addr(&cmd->vk, &dev->meta, address, size, data);
