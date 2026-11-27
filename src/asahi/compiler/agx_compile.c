@@ -12725,6 +12725,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (progress) {
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
+      if (agx3_compute_opts) {
+         bool fp_absdiff = false;
+         NIR_PASS(fp_absdiff, nir, agx_nir_opt_u8_absdiff_fp);
+         if (fp_absdiff) {
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
    }
 
    /* Only lower int64 after optimizing address arithmetic, so that u2u64/i2i64
