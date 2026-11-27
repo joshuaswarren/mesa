@@ -1358,6 +1358,7 @@ void agx_opt_promote_constants(agx_context *ctx);
 void agx_opt_promote_m5_float_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
+void agx_hoist_loads(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
 int agx_ilp_m5_device_load_cap(int program_peak);
 unsigned agx3_register_budget(agx_context *ctx);

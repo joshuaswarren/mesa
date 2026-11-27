@@ -2423,3 +2423,139 @@ agx_ilp_schedule(agx_context *ctx)
    free(dag_state.last_write);
    ralloc_free(memctx);
 }
+
+#define AGX_HOIST_WINDOW 64
+
+static bool
+hoist_uniform_store_conflict(const agx_instr *store, const agx_instr *instr)
+{
+   if (store->src[1].type != AGX_INDEX_IMMEDIATE)
+      return true;
+
+   unsigned lo = store->src[1].value, hi = lo + 16;
+
+   agx_foreach_src(instr, s) {
+      agx_index src = instr->src[s];
+      if (src.type != AGX_INDEX_UNIFORM)
+         continue;
+
+      unsigned src_lo = src.value, src_hi = src_lo + agx_index_size_16(src);
+      if (src_lo < hi && lo < src_hi)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+hoist_can_cross(const agx_instr *P, const agx_instr *instr)
+{
+   if (P->op == AGX_OPCODE_THREADGROUP_BARRIER ||
+       P->op == AGX_OPCODE_LOCAL_LOAD || P->op == AGX_OPCODE_LOCAL_STORE)
+      return true;
+
+   if (P->op == AGX_OPCODE_DEVICE_LOAD)
+      return !P->coherent;
+
+   if (P->op == AGX_OPCODE_UNIFORM_STORE)
+      return !hoist_uniform_store_conflict(P, instr);
+
+   const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+   return info->schedule_class == AGX_SCHEDULE_CLASS_NONE &&
+          info->can_reorder && info->can_eliminate;
+}
+
+static bool
+hoist_is_pure_addr_producer(const agx_instr *P)
+{
+   if (P->op == AGX_OPCODE_PHI || P->op == AGX_OPCODE_PRELOAD ||
+       P->nr_dests == 0)
+      return false;
+
+   const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+   if (info->schedule_class != AGX_SCHEDULE_CLASS_NONE ||
+       !info->can_reorder || !info->can_eliminate)
+      return false;
+
+   agx_foreach_dest(P, d) {
+      if (!agx_is_null(P->dest[d]) && P->dest[d].type != AGX_INDEX_NORMAL)
+         return false;
+   }
+
+   agx_foreach_src(P, s) {
+      if (agx_is_null(P->src[s]))
+         continue;
+      enum agx_index_type t = P->src[s].type;
+      if (t != AGX_INDEX_NORMAL && t != AGX_INDEX_UNIFORM &&
+          t != AGX_INDEX_IMMEDIATE)
+         return false;
+   }
+
+   return true;
+}
+
+void
+agx_hoist_loads(agx_context *ctx)
+{
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (instr_after_logical_end(I))
+            break;
+
+         if (I->op != AGX_OPCODE_DEVICE_LOAD || I->coherent)
+            continue;
+
+         agx_instr *chain[4];
+         unsigned chain_len = 1;
+         chain[0] = I;
+
+         agx_instr *best_target = NULL;
+         unsigned best_chain_len = 0;
+         unsigned n = 0;
+
+         for (agx_instr *P = list_entry(I->link.prev, agx_instr, link);
+              &P->link != &block->instructions && n < AGX_HOIST_WINDOW;
+              P = list_entry(P->link.prev, agx_instr, link), ++n) {
+
+            bool dep = false;
+            for (unsigned ci = 0; ci < chain_len && !dep; ++ci) {
+               agx_foreach_ssa_dest(P, d) {
+                  agx_foreach_ssa_src(chain[ci], s) {
+                     if (chain[ci]->src[s].value == P->dest[d].value)
+                        dep = true;
+                  }
+               }
+            }
+
+            if (dep) {
+               if (chain_len < ARRAY_SIZE(chain) &&
+                   hoist_is_pure_addr_producer(P)) {
+                  chain[chain_len++] = P;
+                  continue;
+               }
+               break;
+            }
+
+            bool can_cross_all = true;
+            for (unsigned ci = 0; ci < chain_len; ++ci) {
+               if (!hoist_can_cross(P, chain[ci])) {
+                  can_cross_all = false;
+                  break;
+               }
+            }
+            if (!can_cross_all)
+               break;
+
+            best_target = P;
+            best_chain_len = chain_len;
+         }
+
+         if (best_target) {
+            for (int ci = (int)best_chain_len - 1; ci >= 0; --ci) {
+               agx_remove_instruction(chain[ci]);
+               list_addtail(&chain[ci]->link, &best_target->link);
+            }
+         }
+      }
+   }
+}

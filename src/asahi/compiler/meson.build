@@ -877,7 +877,8 @@ if with_tests
          'test/test-shared-phase-cse.cpp',
          'test/test-u8x4-hsum.cpp',
          'test/test-guard-chains.cpp',
-         'test/test-insert-waits.cpp',
+         'test/test-hoist-loads.cpp',
+      'test/test-insert-waits.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
