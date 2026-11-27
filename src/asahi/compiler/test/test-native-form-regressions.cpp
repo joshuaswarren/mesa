@@ -8752,3 +8752,114 @@ TEST(NativeForms, AGX3CFfsHalfSourceZeroExtends)
    EXPECT_EQ(def->src[0].value, src16.value);
    ralloc_free(mem);
 }
+
+/* M5 (AGX3C) mesh and task shaders are VDM-launched TA stages; a per-lane
+ * explicit level in a register must lower and pack through the native vertex
+ * explicit-LOD path on all M5 chips. */
+TEST(NativeForms, M5MeshAndTaskRegisterLodSampleCompiles)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_MESH, MESA_SHADER_TASK}) {
+      SCOPED_TRACE(stage);
+      EXPECT_TRUE(
+         agx3_vertex_explicit_lod_stage(stage, AGX_ISA_ENCODING_AGX3C));
+
+      nir_builder b = nir_builder_init_simple_shader(
+         stage, &agx_nir_options, "m5 mesh/task reg lod sample");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      nir_def *tex_h = nir_bindless_image_agx(&b, nir_imm_int(&b, 0));
+      nir_def *smp_h = nir_bindless_sampler_agx(
+         &b, nir_imm_int(&b, 32), nir_imm_intN_t(&b, 5, 16));
+      nir_def *coord = nir_imm_vec2(&b, 0.5f, 0.5f);
+      nir_def *lod =
+         nir_u2f16(&b, nir_load_local_invocation_index(&b));
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 4);
+      tex->op = nir_texop_txl;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->dest_type = nir_type_uint32;
+      tex->coord_components = 2;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1, coord);
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+      tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, tex_h);
+      tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, smp_h);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x2000000),
+                       .write_mask = 15, .align_mul = 4);
+
+      ASSERT_TRUE(agx_nir_lower_g17g_indexed_reads(b.shader));
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_descriptor_set_agx)
+               continue;
+            nir_builder lb = nir_builder_at(nir_before_instr(instr));
+            nir_def *set = nir_load_preamble(&lb, 1, 64, .base = 12);
+            nir_def_replace(&intr->def, set);
+         }
+      }
+      agx_preprocess_nir_m5(b.shader);
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17C;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.reserved_preamble = 16;
+      key.no_preamble = true;
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      EXPECT_GT(part.info.binary_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+/* M5 mesh shaders with depthClipControl remap exported z/w from shared memory
+ * after the body runs, so component-wise gl_Position.{x,y,z,w} stores work. */
+TEST(NativeForms, M5MeshClipM1_1SplitPositionStores)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "m5 mesh clip m1_1 split pos");
+   nir_shader *s = b.shader;
+   s->info.workgroup_size[0] = 32;
+   s->info.workgroup_size[1] = 1;
+   s->info.workgroup_size[2] = 1;
+   s->info.mesh.max_vertices_out = 3;
+   s->info.mesh.max_primitives_out = 1;
+   s->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                      nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_store_per_vertex_output(
+         &b, nir_imm_float(&b, (float)c), lane, nir_imm_int(&b, 0),
+         .write_mask = 1, .component = c, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   }
+   nir_store_per_primitive_output(
+      &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .write_mask = 0x7, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+
+   struct agx_m5_mesh_varyings v = {};
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+   v.clip_m1_1 = true;
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v));
+   nir_validate_shader(s, "m5 mesh clip m1_1");
+
+   bool found_clip_z_coeff = false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(in)->intrinsic ==
+                nir_intrinsic_load_clip_z_coeff)
+            found_clip_z_coeff = true;
+      }
+   }
+   EXPECT_TRUE(found_clip_z_coeff);
+   ralloc_free(s);
+}

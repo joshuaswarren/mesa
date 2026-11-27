@@ -95,13 +95,14 @@ enum hk_sync_kind {
    HK_SYNC_GFX_MEM = 1 << 5,
 
    /* Stream kinds and first scopes only, never named by an application
-    * dependency: a command the driver records to carry a timestamp alone, or
-    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
-    * query memory, which only query commands and later timestamps read, so
-    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
-    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
-    * does not order later work after it. It waits like work of every class
-    * (hk_sync_full_kinds()). */
+    * dependency: a command the driver records to carry a timestamp alone, to
+    * copy timestamps (hk_sync_write_timestamp()), or to publish post-graphics
+    * query availability (hk_flush_oq_pending(),
+    * hk_queue_query_available_write()). It writes nothing but query memory,
+    * which only query commands, events, and later timestamps observe, so only
+    * their first scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope());
+    * a pipeline barrier, even an ALL_COMMANDS one, does not order later work
+    * after it. It waits like work of every class (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
 
    /* Stream kinds and first scopes only, never named by an application
@@ -474,13 +475,15 @@ struct hk_sync_state {
 
    /* On chips whose start stamps latch before barriers resolve: a
     * timestamp recorded before any stream of the command buffer, waiting for
-    * the first one to carry it on an end stamp, which is latched after that
-    * stream's barriers (a render's vertex end, a compute stream's end). That
-    * stream waits for lead_scope, the kinds of the stamp's first scope as
-    * hk_sync_src_dep() takes them: the resets of timestamp queries alone for
-    * a top-of-pipe stamp, whose first scope is empty; the earlier work of
-    * its stages and the earlier timestamps for any other. Then the end stamp
-    * is latched no earlier than a command of its own could latch it. */
+    * a first render stream to carry it on its vertex end stamp (vtx_end),
+    * which is latched after the render's barriers and remains distinct from
+    * fragment end (end). That render waits for lead_scope, the kinds of the
+    * stamp's first scope as hk_sync_src_dep() takes them: the resets of
+    * timestamp queries alone for a top-of-pipe stamp, whose first scope is
+    * empty; the earlier work of its stages and the earlier timestamps for
+    * any other. A compute stream has no separate start-side end stamp, so
+    * opening one first flushes lead_ts into a preceding timestamp-only
+    * carrier (hk_sync_flush_lead_timestamp()). */
    struct agx_timestamp_req lead_ts;
    uint8_t lead_scope;
    bool has_unordered_start_ts;
@@ -766,6 +769,7 @@ void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
+void hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 
 /* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a

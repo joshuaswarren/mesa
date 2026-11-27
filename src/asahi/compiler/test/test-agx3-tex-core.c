@@ -2269,6 +2269,59 @@ test_fetch_lod(void)
    CHECK(!agx3_tex_stage_typed_lod(AGX_ISA_ENCODING_AGX3B, 4, 2, 0, false,
                                    true, (enum agx3_tex_level_kind)4, b,
                                    &len));
+
+   /* Relocatable 8-half banks 0..248 on AGX3B carry bank + 6 in f5 for both
+    * scalar typed LOD and combined array layer + LOD staging. */
+   uint64_t f0[AGX3_MAX_FIELDS], fb[AGX3_MAX_FIELDS];
+   CHECK(agx3_decode(&agx3b_table, float_level, sizeof(float_level),
+                     AGX3_MN_pack_smpir, f0) >= 0);
+   CHECK(f0[5] == 6);
+   static const uint16_t banks[] = {0, 8, 16, 64, 248};
+   for (unsigned i = 0; i < sizeof(banks) / sizeof(banks[0]); ++i) {
+      CHECK(agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, banks[i], 6, 1,
+                                        0, false, true, AGX3_TEX_LEVEL_FLOAT,
+                                        b, &len));
+      CHECK(len == 12 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_pack_smpir, fb) >= 0);
+      CHECK(fb[5] == banks[i] + 6);
+      fb[5] = f0[5];
+      CHECK(memcmp(fb, f0, sizeof(f0)) == 0);
+
+      CHECK(agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, banks[i], 8, 9,
+                                        1, 0, false, true, false, true, b,
+                                        &len));
+      CHECK(len == 12 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_pack_smpir, fb) >= 0);
+      CHECK(fb[5] == banks[i] + 6);
+   }
+   CHECK(!agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, 4, 6, 1, 0, false,
+                                      true, AGX3_TEX_LEVEL_FLOAT, b, &len));
+   CHECK(!agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, 256, 6, 1, 0,
+                                      false, true, AGX3_TEX_LEVEL_FLOAT, b,
+                                      &len));
+   CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, 4, 8, 9, 1, 0,
+                                      false, true, false, true, b, &len));
+   CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, 256, 8, 9, 1, 0,
+                                      false, true, false, true, b, &len));
+
+   /* Long ep4 escalation for register-LOD / register-bias samples past bank 60. */
+   for (unsigned m = 0; m < 2; ++m) {
+      struct agx3_tex_sample_desc sd = {
+         .dest = 8,
+         .coord = 64,
+         .width = AGX3_TEX_W32,
+         .mask = 15,
+         .lod = m ? AGX3_TEX_LOD_BIAS_REGISTER : AGX3_TEX_LOD_REGISTER,
+         .slot = 1,
+         .wait_mask = 1,
+         .final = true,
+         .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
+      };
+      CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &sd, b, &len));
+      CHECK(len == 20 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_smp, fb) >= 0);
+      CHECK(fb[19] == 64);
+   }
    return 0;
 }
 

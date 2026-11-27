@@ -94,7 +94,6 @@ hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
 
    return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
 }
-
 /* Whether a barrier's first scope covers graphics work outside the
  * framebuffer-local attachment stages while its second scope reaches graphics
  * work. Such a barrier still classifies as HK_M5_MERGE_DEP_LOCAL when its
@@ -117,7 +116,6 @@ hk_m5_pass_merge_non_local_src(VkPipelineStageFlags2 src_stages,
       hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
    return from_non_local_gfx && to_gfx;
 }
-
 /* Whether a vkCmdPipelineBarrier2 dependency's first synchronization scope
  * covers fragment-shader image reads (either directly or through a logically
  * later graphics or global stage). Folding a trailing vkCmdResolveImage2 into
@@ -181,4 +179,26 @@ hk_render_forbids_direct_resolve(VkRenderingFlags flags, bool resumed_in_cb)
    return resumed_in_cb ||
           (flags & (VK_RENDERING_SUSPENDING_BIT |
                     VK_RENDERING_RESUMING_BIT)) != 0;
+}
+
+/* Whether a pipeline barrier can make render pass attachment writes from an
+ * earlier instance available to later shaders. A barrier whose source scope
+ * excludes attachment-output stages or attachment/memory writes cannot make
+ * attachment writes visible, so a later instance still cannot read the first
+ * instance's attachments through descriptors or aliases without racing. */
+static inline bool
+hk_m5_barrier_makes_att_visible(VkPipelineStageFlags2 src_stages,
+                                VkAccessFlags2 src_access)
+{
+   const VkPipelineStageFlags2 att_stages =
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   const VkAccessFlags2 att_access =
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_2_MEMORY_WRITE_BIT;
+   return (src_stages & att_stages) != 0 && (src_access & att_access) != 0;
 }

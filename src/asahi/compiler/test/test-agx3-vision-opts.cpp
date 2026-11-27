@@ -1992,3 +1992,63 @@ TEST(AGX3VisionOpts, SharedIndexSortNegativeNonSort)
    nir_validate_shader(b.shader, "shared_index_sort_neg");
    ralloc_free(b.shader);
 }
+
+TEST(AGX3VisionOpts, FoldAlignedLowMaskAndDisjointMaskSum)
+{
+   /* Collapse ((row * 100 + cx) & ~3) + ((row * 100 + cx) & 3) and the
+    * reassociated (cx & 124) + (row * 100 + ((row * 100 + (cx & 127)) & 3))
+    * into single imadshl_agx address computations with zero remaining iands. */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options,
+                                                  "aligned_mask_fold");
+   b.shader->info.workgroup_size[0] = 64;
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .range = 16);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *row = nir_channel(&b, lid, 1);
+   nir_def *raw = nir_channel(&b, lid, 0);
+   nir_def *cx = nir_iand_imm(&b, raw, 127);
+
+   /* Form 1: (cx & ~3) + ((row * 100 + cx) & 3) + row * 100 */
+   nir_def *row100 = nir_imul_imm(&b, row, 100);
+   nir_def *sum1 = nir_iadd(&b, row100, cx);
+   nir_def *addr1 = nir_iadd(&b, nir_iadd(&b, nir_iand_imm(&b, cx, ~3u),
+                                          nir_iand_imm(&b, sum1, 3)),
+                             row100);
+
+   /* Form 2: (raw & 124) + (row * 132 + ((row * 132 + (raw & 127)) & 3)) */
+   nir_def *row132 = nir_imul_imm(&b, row, 132);
+   nir_def *sum2 = nir_iadd(&b, row132, cx);
+   nir_def *addr2 = nir_iadd(&b, nir_iand_imm(&b, raw, 124),
+                             nir_iadd(&b, row132, nir_iand_imm(&b, sum2, 3)));
+
+   /* Negative control: stride 101 is not a multiple of 4, so the mask must stay. */
+   nir_def *row101 = nir_imul_imm(&b, row, 101);
+   nir_def *odd_mod = nir_iand_imm(&b, nir_iadd(&b, row101, raw), 3);
+
+   nir_store_global(&b, nir_vec3(&b, addr1, addr2, odd_mod), addr, .write_mask = 7);
+   nir_lower_vars_to_ssa(b.shader);
+
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, b.shader, agx_nir_fold_aligned_masks);
+      if (progress) {
+         NIR_PASS(_, b.shader, nir_opt_constant_folding);
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         NIR_PASS(_, b.shader, nir_opt_cse);
+      }
+   } while (progress);
+   do {
+      progress = false;
+      NIR_PASS(progress, b.shader, agx_nir_fuse_algebraic_late);
+      if (progress) {
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         NIR_PASS(_, b.shader, nir_opt_cse);
+      }
+   } while (progress);
+
+   nir_validate_shader(b.shader, "aligned_mask_fold");
+   /* Only the original `raw & 127` and the odd-stride `odd_mod` iands remain. */
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_iand), 2u);
+   EXPECT_GE(count_alu_op(b.shader, nir_op_imadshl_agx), 2u);
+   ralloc_free(b.shader);
+}

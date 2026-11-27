@@ -115,6 +115,8 @@ struct hk_render_pack_edges {
    bool head_open;
    bool head_msaa_end;
    bool head_non_local_src;
+   bool head_att_available;
+   bool head_att_not_visible;
    bool transitions_overflow;
    bool head_undef_alias_overflow;
    uint8_t head_dep;
@@ -142,6 +144,8 @@ struct hk_render_pack_edges {
    bool tail_open;
    bool tail_msaa;
    bool tail_non_local_src;
+   bool tail_att_available;
+   bool tail_att_not_visible;
    uint8_t tail_dep;
    uint32_t tail_epoch, tail_next_seq, tail_seq;
    const struct hk_cs *tail_stream;
@@ -182,7 +186,8 @@ struct hk_render_pack_edges {
  * Returns NULL or why not. */
 const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
                                      const struct hk_render_pack_pass *b,
-                                     bool ordered, bool non_local_src);
+                                     bool ordered, bool non_local_src,
+                                     bool att_visible);
 
 /* What the members a packed run holds so far bring to its next boundary. In
  * one tile pass every member's vertex work may run ahead of every earlier
@@ -195,6 +200,12 @@ struct hk_render_pack_run_state {
    /* A barrier inside the run (between members or inside one) has a graphics
     * first scope outside the attachment stages, forbidding a final resolve. */
    bool non_local_src;
+   /* A barrier in the run made attachment writes available; any ordered
+    * barrier after it (even with srcAccessMask == 0) chains visibility. */
+   bool att_available;
+   /* An ordered dependency in the run makes attachment writes visible to
+    * later shaders (requires attachment-only layouts and non-aliasable images). */
+   bool att_visible;
    /* A member's shaders write memory other than its attachments. */
    bool writes_memory;
    /* A member draws with a stage that runs ahead of the tile pass
@@ -219,6 +230,13 @@ const char *hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
                                     const struct hk_cmd_buffer *b,
                                     const struct hk_cs *bs,
                                     const struct hk_cs *first);
+
+/* Whether a later member's leading CDM stream `bs_pre` may be hoisted ahead of
+ * earlier members already in `state`. Returns NULL if safe, or a refusal reason. */
+const char *hk_render_pack_pre_cs_refusal(
+   const struct hk_render_pack_run_state *state, const struct hk_cs *bs_pre,
+   unsigned run_post, uint8_t run_vdm_kinds,
+   const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS]);
 
 /* `b` (stream `bs`) joins `run` after `a`, its boundary accepted. */
 void hk_render_pack_run_join(struct hk_render_pack_run_state *run,
@@ -245,10 +263,13 @@ const struct hk_cs *hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
                                             const struct hk_cs **pre_out,
                                             const struct hk_cs **post_out);
 
-/* Like hk_render_pack_member(), also returning optional driver-only pre/post
- * CDM streams belonging to the same pass. */
+/* Like hk_render_pack_member(), also returning optional pre/post CDM streams
+ * belonging to the same pass. When `first` is true, `cmd` starts a packed run
+ * so its leading pre-render CDM stream stays in submission order and may carry
+ * meta/transfer work; later members (`first == false`) must hoist their
+ * pre-render compute ahead of earlier render passes. */
 const struct hk_cs *hk_render_pack_member_streams(
-   const struct hk_cmd_buffer *cmd, const struct hk_cs **pre_out,
+   const struct hk_cmd_buffer *cmd, bool first, const struct hk_cs **pre_out,
    const struct hk_cs **post_out);
 
 /* The only stream of `cmd` if it may be a member of a packed run (a render
@@ -262,6 +283,8 @@ unsigned hk_render_pack_stamp_slots(const struct hk_cs *cs);
 
 /* Why `cmd` is no member (hk_render_pack_member()), or NULL. */
 const char *hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd);
+const char *hk_render_pack_member_refusal_for(const struct hk_cmd_buffer *cmd,
+                                              bool first);
 
 /* Whether `cmd` is an empty suspend/resume fixup command buffer with no
  * streams or side effects. */

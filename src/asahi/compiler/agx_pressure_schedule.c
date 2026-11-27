@@ -722,7 +722,7 @@ agx_pressure_schedule(agx_context *ctx)
 /* Whether an AGX3B sample or texel fetch can allocate disjoint
  * staging banks in agx3_pack_binary.c and genuinely overlap in flight.
  * Non-relocatable forms (register-descriptor 2D_ARRAY samples, 3D or cube
- * samples, gradient/register-LOD/dynamic-offset samples, and multisample or
+ * samples, gradient/min-lod/dynamic-offset samples, and multisample or
  * register-LOD fetches) stay pinned to staging bank 0, where hoisting only
  * inflates GPR pressure and forces serializing result-wait barriers between
  * consecutive samples. */
@@ -736,9 +736,8 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
 
       const bool lod_ok =
          I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-         ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-           I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-          I->src[1].type == AGX_INDEX_IMMEDIATE);
+         I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+         I->lod_mode == AGX_LOD_MODE_LOD_MIN;
       if (!lod_ok)
          return false;
 

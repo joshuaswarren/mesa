@@ -4282,9 +4282,10 @@ static bool hk_m5_image_aliases_attachment(const struct hk_rendering_state *rend
 
 static void
 hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
-                          VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
-                          VkAccessFlags2 dst_access, bool buffer,
-                          bool transition, const struct vk_image *image)
+                          VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
+                          VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
+                          bool buffer, bool transition,
+                          const struct vk_image *image)
 {
    struct hk_pass_merge_candidate *m = &cmd->pass_merge;
    if (!m->valid)
@@ -4310,6 +4311,8 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
 
    if (hk_m5_pass_merge_non_local_src(src, dst))
       m->non_local_src = true;
+   if (hk_m5_barrier_makes_att_visible(src, src_access))
+      m->att_available = true;
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -4343,21 +4346,22 @@ hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       hk_m5_pass_merge_classify(cmd, "memory", b->srcStageMask,
-                                b->dstStageMask, b->dstAccessMask, false,
-                                false, NULL);
+                                b->srcAccessMask, b->dstStageMask,
+                                b->dstAccessMask, false, false, NULL);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       hk_m5_pass_merge_classify(
-         cmd, "buffer", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
+         cmd, "buffer", b->srcStageMask, b->srcAccessMask, b->dstStageMask,
+         b->dstAccessMask, true,
+         b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
    }
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
       VK_FROM_HANDLE(vk_image, image, b->image);
       hk_m5_pass_merge_classify(
-         cmd, "image", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         false,
+         cmd, "image", b->srcStageMask, b->srcAccessMask, b->dstStageMask,
+         b->dstAccessMask, false,
          b->oldLayout != b->newLayout ||
             b->srcQueueFamilyIndex != b->dstQueueFamilyIndex,
          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ? NULL : image);
@@ -4825,6 +4829,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * resolve target. */
    const bool ordered = m->ordered || cs->m5_ordered;
    const bool non_local_src = m->non_local_src || cs->m5_non_local_src;
+   const bool att_available = m->att_available || cs->m5_att_available;
    if (ordered) {
       why = any_resolve ? "resolve" : hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
@@ -4894,6 +4899,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
    cs->m5_non_local_src = non_local_src;
+   cs->m5_att_available = att_available;
    cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
@@ -5306,7 +5312,8 @@ static uint8_t
 hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
                         const struct hk_render_pack_pass *pass,
                         struct hk_render_pack_edges *e, bool *msaa_end,
-                        bool *non_local_src, const char **why)
+                        bool *non_local_src, bool *att_available,
+                        const char **why)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    const bool msaa = pass && hk_render_pack_samples(pass) > 1;
@@ -5316,16 +5323,21 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
-      dep = MAX2(dep, hk_m5_pass_merge_dependency(b->srcStageMask,
-                                                  b->dstStageMask,
-                                                  b->dstAccessMask, false,
-                                                  false));
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
+      const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
+                                                    b->dstStageMask,
+                                                    b->dstAccessMask, false,
+                                                    false);
+      dep = MAX2(dep, d);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, true,
@@ -5348,6 +5360,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
          (!undef_alias || !pass || !hk_render_pack_aliases_va(pass, image));
       *non_local_src |=
          hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
+      if (hk_m5_barrier_makes_att_visible(b->srcStageMask, b->srcAccessMask))
+         *att_available = true;
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
@@ -5381,6 +5395,29 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
    return dep;
 }
 
+/* Whether the command buffer so far contains only clean API compute CDM
+ * streams before its first render pass (which merge_control_streams may later
+ * coalesce into one pre-render CDM stream). */
+static bool
+hk_render_pack_leading_buf_compute(const struct hk_cmd_buffer *cmd)
+{
+   if (cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
+       cmd->current_cs.post_gfx)
+      return false;
+   if (list_is_empty(&cmd->control_streams))
+      return false;
+   list_for_each_entry(const struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs->type != HK_CS_CDM || cs->render_pack_compute_internal ||
+          cs->stats.calls == 0)
+         return false;
+   }
+   if (cmd->current_cs.cs &&
+       cmd->current_cs.cs !=
+          list_last_entry(&cmd->control_streams, struct hk_cs, node))
+      return false;
+   return true;
+}
+
 /* A pipeline barrier beside the command buffer's first (head) or last (tail)
  * render pass instance. */
 void
@@ -5389,22 +5426,48 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
 {
    struct hk_render_pack_edges *e = &cmd->render_pack;
    if (e->head_open) {
-      if (!list_is_empty(&cmd->control_streams))
+      if (!list_is_empty(&cmd->control_streams) &&
+          !hk_render_pack_leading_buf_compute(cmd)) {
          e->head_open = false;
-      else
-         e->head_dep = MAX2(e->head_dep,
-                            hk_render_pack_classify(cmd, info, NULL, e,
-                                                    &e->head_msaa_end,
-                                                    &e->head_non_local_src,
-                                                    &e->head_why));
+         e->head_why = "stream";
+      } else {
+         bool att_avail = false;
+         const uint8_t d = hk_render_pack_classify(cmd, info, NULL, e,
+                                                   &e->head_msaa_end,
+                                                   &e->head_non_local_src,
+                                                   &att_avail, &e->head_why);
+         e->head_att_available |= att_avail;
+         if (d == HK_M5_MERGE_DEP_ORDERED) {
+            if (e->head_dep < HK_M5_MERGE_DEP_ORDERED)
+               e->head_att_not_visible = !e->head_att_available;
+            else if (e->head_att_available)
+               e->head_att_not_visible = false;
+         } else if (e->head_att_available &&
+                    e->head_dep == HK_M5_MERGE_DEP_ORDERED) {
+            e->head_att_not_visible = false;
+         }
+         e->head_dep = MAX2(e->head_dep, d);
+      }
    }
    if (e->tail_open) {
       bool msaa_end = false;
+      bool att_avail = false;
       const char *why = "barrier";
-      e->tail_dep = MAX2(e->tail_dep,
-                         hk_render_pack_classify(cmd, info, &e->tail_pass, e,
-                                                 &msaa_end,
-                                                 &e->tail_non_local_src, &why));
+      const uint8_t d = hk_render_pack_classify(cmd, info, &e->tail_pass, e,
+                                                &msaa_end,
+                                                &e->tail_non_local_src,
+                                                &att_avail, &why);
+      e->tail_att_available |= att_avail;
+      if (d == HK_M5_MERGE_DEP_ORDERED) {
+         if (e->tail_dep < HK_M5_MERGE_DEP_ORDERED)
+            e->tail_att_not_visible = !e->tail_att_available;
+         else if (e->tail_att_available)
+            e->tail_att_not_visible = false;
+      } else if (e->tail_att_available &&
+                 e->tail_dep == HK_M5_MERGE_DEP_ORDERED) {
+         e->tail_att_not_visible = false;
+      }
+      e->tail_dep = MAX2(e->tail_dep, d);
       if (msaa_end && e->tail_msaa)
          why = "multisampled transition";
       if ((msaa_end && e->tail_msaa) || e->tail_dep == HK_M5_MERGE_DEP_END) {
@@ -5425,18 +5488,21 @@ hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd)
       e->tail_epoch = cmd->sync.epoch;
 }
 
-/* Nothing but pipeline barriers since vkBeginCommandBuffer. Returns NULL or
- * what was. */
+/* Nothing but pipeline barriers (and optionally a single clean buffer-only API
+ * compute stream) since vkBeginCommandBuffer. Returns NULL or what was. */
 static const char *
 hk_render_pack_head_refusal(const struct hk_cmd_buffer *cmd)
 {
    const struct hk_render_pack_edges *e = &cmd->render_pack;
    if (cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
       return "meta or secondary";
-   if (!list_is_empty(&cmd->control_streams) || cmd->sync.next_seq ||
-       cmd->current_cs.cs || cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
-       cmd->current_cs.post_gfx)
-      return "stream";
+   const bool has_buf_cs = hk_render_pack_leading_buf_compute(cmd);
+   if (!has_buf_cs) {
+      if (!list_is_empty(&cmd->control_streams) || cmd->sync.next_seq ||
+          cmd->current_cs.cs || cmd->current_cs.gfx ||
+          cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx)
+         return "stream";
+   }
    if (cmd->sync.epoch != e->head_epoch)
       return "dependency";
    if (cmd->state.deferred_clear_count || cmd->sync.pending_start_ts.handle ||
@@ -5561,6 +5627,8 @@ hk_render_pack_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    e->tail_dep = cs->m5_ordered ? HK_M5_MERGE_DEP_ORDERED
                                 : HK_M5_MERGE_DEP_LOCAL;
    e->tail_non_local_src = cs->m5_non_local_src;
+   e->tail_att_available = cs->m5_ordered || cs->m5_att_available;
+   e->tail_att_not_visible = false;
    e->tail_stream = cs;
    e->tail_seq = cs->sync.seq;
    e->tail_current = cs->current;
@@ -7099,6 +7167,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
       merge->ordered = false;
       merge->non_local_src = false;
+      merge->att_available = false;
       merge->valid = true;
    }
    /* The render state is cleared by now; the candidate kept a copy. */
@@ -15379,8 +15448,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           * ordinary mesh output extent uses the same encoding as G17S.
           * Threadgroup memory is allocated separately by the shader program.
           */
-         if (dev->dev.chip == AGX_CHIP_G17P ||
-             dev->dev.chip == AGX_CHIP_G17S) {
+         if (agx_chip_g17p_or_m5(dev->dev.chip)) {
             if (!agx_vdm_m5_mesh_set_output_limits(
                    &state, hw_vs->info.mesh.max_vertices,
                    hw_vs->info.mesh.max_primitives, hw_vs->info.uvs.size)) {
@@ -15388,7 +15456,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                return;
             }
          }
-         if (dev->dev.chip == AGX_CHIP_G17S) {
+         if (agx_chip_g17_m5(dev->dev.chip)) {
             /* Native object->mesh kicks with task mesh storage bound size
              * tail[0] in 1 KiB payload slot units to cover the optional 16 B
              * child-grid record plus the task payload. Payload-free task kicks
@@ -17840,9 +17908,9 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
    const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && !sw_task && dev->dev.chip != AGX_CHIP_G17S) ||
+       (task_api && !sw_task && !agx_chip_g17_m5(dev->dev.chip)) ||
        (dev->dev.chip != AGX_CHIP_G17P &&
-        (dev->dev.chip != AGX_CHIP_G17S ||
+        (!agx_chip_g17_m5(dev->dev.chip) ||
          !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;

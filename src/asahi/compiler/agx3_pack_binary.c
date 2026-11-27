@@ -4735,7 +4735,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       !query_lod && !I->sparse && (bank_base & 7) == 0;
    const bool relocatable_array = array && !cube && !register_operands &&
       !query_lod && !staged_offset && !register_offset &&
-      !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
+      !gradient_lod && !bias_min && !gradient_min &&
       !(bank_base & 7);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
@@ -4746,15 +4746,15 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
         (three_d && !m5_banked_3d &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
         cube || (gradient_lod && !m5_banked_3d) || bias_min || gradient_min || query_lod ||
-        (enc == AGX_ISA_ENCODING_AGX3B &&
-         ((explicit_lod && !immediate_lod) || register_bias)) ||
-        (enc == AGX_ISA_ENCODING_AGX3C &&
-         (((explicit_lod && !immediate_lod) || register_bias) &&
-          (bank_base & 7))) ||
+        (((explicit_lod && !immediate_lod) || register_bias) &&
+         (bank_base & 7)) ||
         register_offset || (bank_base & 3) ||
         bank_base > AGX3_STAGING_HALFS -
            (m5_banked_3d && gradient_lod
-               ? (vertex_stage ? 40 : 32) : (array || three_d) ? 8 : 4)))
+               ? (vertex_stage ? 40 : 32)
+               : (vertex_stage && explicit_lod && !immediate_lod) ? 16
+               : (array || three_d ||
+                  (explicit_lod && !immediate_lod) || register_bias) ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            enc == AGX_ISA_ENCODING_AGX3C ||
@@ -16231,9 +16231,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                I->src[3].type != AGX_INDEX_REGISTER &&
                I->src[4].type != AGX_INDEX_REGISTER &&
                (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 I->src[1].type == AGX_INDEX_IMMEDIATE));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool banked_shadow_array =
                enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
                ctx->stage == MESA_SHADER_COMPUTE && I->dim == AGX_DIM_2D_ARRAY &&
@@ -16256,10 +16255,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
                (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
                 I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 (I->src[1].type == AGX_INDEX_IMMEDIATE ||
-                  enc == AGX_ISA_ENCODING_AGX3C)));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool staged_scalar =
                (I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE) ||

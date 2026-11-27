@@ -529,6 +529,13 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
    abort();
 }
 
+void
+hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
 bool
 hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
