@@ -179,10 +179,9 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
    static_assert(sizeof(struct hk_sampled_image_descriptor) ==
                     HK_TEXTURE_DESCRIPTOR_AGX3_SIZE +
                        sizeof(struct hk_sampled_image_descriptor_sw),
-                 "AGX3 sampled descriptor is texture then software words");
+                 "G17P sampled descriptor is texture then software words");
 
-   const unsigned generation = set->layout->descriptor_generation;
-   if ((generation != 9 && generation != 10) || !info)
+   if (set->layout->descriptor_generation != 9 || !info)
       return false;
 
    if (descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLER) {
@@ -199,6 +198,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
       struct hk_sampled_image_descriptor desc = {
          .sw =
             {
+               .sampler = sampler->planes[0].hw->key,
                .sampler_index = hk_sampler_descriptor_index(
                   set->layout, sampler->planes[0].hw->index),
                .clamp_0_sampler_index_or_negative = -1,
@@ -206,7 +206,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
             },
       };
       write_g17p_sampler_bias(&desc.sw, sampler, 0);
-      if (!hk_set_null_native_texture(generation, &desc.tex))
+      if (!hk_set_null_native_texture(9, &desc.tex))
          return false;
       write_desc(set, binding, elem, &desc, sizeof(desc));
       return true;
@@ -216,8 +216,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
       return false;
 
    VK_FROM_HANDLE(hk_image_view, view, info->imageView);
-   if (view->plane_count != 1 ||
-       (generation == 9 && view->g17p_uscaled_normalized))
+   if (view->plane_count != 1 || view->g17p_uscaled_normalized)
       return false;
 
    const struct hk_sampler *sampler = NULL;
@@ -237,28 +236,23 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
       .tex = ia ? view->planes[0].ia : view->planes[0].sampled,
       .sw =
          {
-            .sampler_index =
-               sampler
-                  ? hk_sampler_descriptor_index(set->layout,
-                                                sampler->planes[0].hw->index)
-                  : (generation == 9 ? hk_sampler_descriptor_index(set->layout, 0)
-                                     : 0),
-            .clamp_0_sampler_index_or_negative =
-               (sampler || generation == 9) ? -1 : 0,
+            .sampler_index = sampler
+                                ? hk_sampler_descriptor_index(
+                                     set->layout, sampler->planes[0].hw->index)
+                                : hk_sampler_descriptor_index(set->layout, 0),
+            .clamp_0_sampler_index_or_negative = -1,
             .lod_bias_fp16 = sampler ? sampler->lod_bias_fp16 : 0,
             .min_lod_fp16 = view->sampled_min_lod_fp16,
             .min_lod_uint16 = view->sampled_min_lod_uint16,
-            .scaled_conversion =
-               generation == 9 ? view->g17p_scaled_conversion : 0,
+            .scaled_conversion = view->g17p_scaled_conversion,
             .sampled_heap_index = ia ? view->planes[0].input_heap_index
                                      : view->planes[0].sampled_heap_index,
          },
    };
-   if (sampler) {
+   if (sampler)
       write_g17p_sampler_bias(&desc.sw, sampler, 0);
-   } else if (generation == 9 && !ia) {
+   else
       desc.sw.border[0] = hk_border_swizzle_word(view);
-   }
 
    write_desc(set, binding, elem, &desc, sizeof(desc));
    return true;
@@ -1080,22 +1074,15 @@ static void hk_descriptor_pool_free(struct hk_descriptor_pool *pool,
 static void
 hk_descriptor_set_destroy(struct hk_device *dev,
                           struct hk_descriptor_pool *pool,
-                          struct hk_descriptor_set *set, bool recycle)
+                          struct hk_descriptor_set *set)
 {
    list_del(&set->link);
-   if (set->size > 0 && !pool->linear)
+   if (set->size > 0)
       hk_descriptor_pool_free(pool, set->addr, set->size);
-   const bool can_recycle =
-      recycle && set->layout->vk.dynamic_descriptor_count == 0;
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
    free(set->storage_backings);
 
-   if (can_recycle) {
-      vk_object_base_finish(&set->base);
-      list_add(&set->link, &pool->free_sets);
-   } else {
-      vk_object_free(&dev->vk, NULL, set);
-   }
+   vk_object_free(&dev->vk, NULL, set);
 }
 
 static void
@@ -1104,13 +1091,7 @@ hk_destroy_descriptor_pool(struct hk_device *dev,
                            struct hk_descriptor_pool *pool)
 {
    list_for_each_entry_safe(struct hk_descriptor_set, set, &pool->sets, link)
-      hk_descriptor_set_destroy(dev, pool, set, false);
-
-   list_for_each_entry_safe(struct hk_descriptor_set, set, &pool->free_sets,
-                            link) {
-      list_del(&set->link);
-      vk_free(&dev->vk.alloc, set);
-   }
+      hk_descriptor_set_destroy(dev, pool, set);
 
    util_vma_heap_finish(&pool->heap);
    agx_bo_unreference(&dev->dev, pool->bo);
@@ -1134,9 +1115,6 @@ hk_CreateDescriptorPool(VkDevice _device,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    list_inithead(&pool->sets);
-   list_inithead(&pool->free_sets);
-   pool->linear =
-      !(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT);
 
    /* The heap must be a valid empty heap before anything can fail: the error
     * paths below run hk_destroy_descriptor_pool(), which calls
@@ -1228,11 +1206,9 @@ hk_CreateDescriptorPool(VkDevice _device,
        * make that extra space available to the client.
        */
       assert(pool->bo->size >= bo_size);
-      if (!pool->linear) {
-         /* Re-initialising is safe: the heap above was created empty, so there
-          * are no holes to leak here. */
-         util_vma_heap_init(&pool->heap, pool->bo->va->addr, pool->bo->size);
-      }
+      /* Re-initialising is safe: the heap above was created empty, so there
+       * are no holes to leak here. */
+      util_vma_heap_init(&pool->heap, pool->bo->va->addr, pool->bo->size);
    }
 
    *pDescriptorPool = hk_descriptor_pool_to_handle(pool);
@@ -1244,18 +1220,6 @@ hk_descriptor_pool_alloc(struct hk_descriptor_pool *pool, uint64_t size,
                          uint64_t alignment, uint64_t *addr_out, void **map_out)
 {
    assert(size > 0);
-   if (pool->linear) {
-      if (!pool->bo)
-         return VK_ERROR_OUT_OF_POOL_MEMORY;
-      uint64_t offset = align64(pool->linear_offset, alignment);
-      if (offset > pool->bo->size || size > pool->bo->size - offset)
-         return VK_ERROR_OUT_OF_POOL_MEMORY;
-      pool->linear_offset = offset + size;
-      *addr_out = pool->bo->va->addr + offset;
-      *map_out = pool->mapped_ptr + offset;
-      return VK_SUCCESS;
-   }
-
    uint64_t addr = util_vma_heap_alloc(&pool->heap, size, alignment);
    if (addr == 0)
       return VK_ERROR_OUT_OF_POOL_MEMORY;
@@ -1289,22 +1253,14 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
    struct hk_descriptor_set *set;
    VkResult result;
 
-   if (layout->vk.dynamic_descriptor_count == 0 &&
-       !list_is_empty(&pool->free_sets)) {
-      set = list_first_entry(&pool->free_sets, struct hk_descriptor_set, link);
-      list_del(&set->link);
-      memset(set, 0, sizeof(*set));
-      vk_object_base_init(&dev->vk, &set->base, VK_OBJECT_TYPE_DESCRIPTOR_SET);
-   } else {
-      uint32_t mem_size =
-         sizeof(struct hk_descriptor_set) +
-         layout->vk.dynamic_descriptor_count * sizeof(struct hk_buffer_address);
+   uint32_t mem_size =
+      sizeof(struct hk_descriptor_set) +
+      layout->vk.dynamic_descriptor_count * sizeof(struct hk_buffer_address);
 
-      set = vk_object_zalloc(&dev->vk, NULL, mem_size,
-                             VK_OBJECT_TYPE_DESCRIPTOR_SET);
-      if (!set)
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-   }
+   set =
+      vk_object_zalloc(&dev->vk, NULL, mem_size, VK_OBJECT_TYPE_DESCRIPTOR_SET);
+   if (!set)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    set->size = layout->non_variable_descriptor_buffer_size;
 
@@ -1347,30 +1303,34 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
    vk_descriptor_set_layout_ref(&layout->vk);
    set->layout = layout;
 
-   if (layout->has_compute_storage_backing &&
+   if (layout->binding_count && !layout->vk.flags &&
        agx_chip_native_or_m5(dev->dev.chip)) {
-      set->storage_backings =
-         calloc(layout->binding_count, sizeof(*set->storage_backings));
+      for (uint32_t b = 0; b < layout->binding_count; ++b) {
+         const struct hk_descriptor_set_binding_layout *binding = &layout->binding[b];
+         if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !binding->flags &&
+             binding->array_size == 1) {
+            set->storage_backings = calloc(layout->binding_count, sizeof(*set->storage_backings));
+            break;
+         }
+      }
    }
 
-   if (layout->has_immutable_samplers) {
-      for (uint32_t b = 0; b < layout->binding_count; b++) {
-         if (layout->binding[b].type != VK_DESCRIPTOR_TYPE_SAMPLER &&
-             layout->binding[b].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-            continue;
+   for (uint32_t b = 0; b < layout->binding_count; b++) {
+      if (layout->binding[b].type != VK_DESCRIPTOR_TYPE_SAMPLER &&
+          layout->binding[b].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+         continue;
 
-         if (layout->binding[b].immutable_samplers == NULL)
-            continue;
+      if (layout->binding[b].immutable_samplers == NULL)
+         continue;
 
-         uint32_t array_size = layout->binding[b].array_size;
-         if (layout->binding[b].flags &
-             VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
-            array_size = variable_count;
+      uint32_t array_size = layout->binding[b].array_size;
+      if (layout->binding[b].flags &
+          VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
+         array_size = variable_count;
 
-         for (uint32_t j = 0; j < array_size; j++) {
-            write_sampled_image_view_desc(set, NULL, b, j,
-                                          layout->binding[b].type);
-         }
+      for (uint32_t j = 0; j < array_size; j++) {
+         write_sampled_image_view_desc(set, NULL, b, j,
+                                       layout->binding[b].type);
       }
    }
 
@@ -1390,7 +1350,6 @@ hk_AllocateDescriptorSets(VkDevice device,
 
    VkResult result = VK_SUCCESS;
    uint32_t i;
-   const uint64_t saved_linear_offset = pool->linear_offset;
 
    struct hk_descriptor_set *set = NULL;
 
@@ -1422,8 +1381,6 @@ hk_AllocateDescriptorSets(VkDevice device,
    if (result != VK_SUCCESS) {
       hk_FreeDescriptorSets(device, pAllocateInfo->descriptorPool, i,
                             pDescriptorSets);
-      if (pool->linear)
-         pool->linear_offset = saved_linear_offset;
       for (i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
          pDescriptorSets[i] = VK_NULL_HANDLE;
       }
@@ -1443,7 +1400,7 @@ hk_FreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
       VK_FROM_HANDLE(hk_descriptor_set, set, pDescriptorSets[i]);
 
       if (set)
-         hk_descriptor_set_destroy(dev, pool, set, true);
+         hk_descriptor_set_destroy(dev, pool, set);
    }
    return VK_SUCCESS;
 }
@@ -1469,8 +1426,7 @@ hk_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
    VK_FROM_HANDLE(hk_descriptor_pool, pool, descriptorPool);
 
    list_for_each_entry_safe(struct hk_descriptor_set, set, &pool->sets, link)
-      hk_descriptor_set_destroy(dev, pool, set, true);
-   pool->linear_offset = 0;
+      hk_descriptor_set_destroy(dev, pool, set);
 
    return VK_SUCCESS;
 }
