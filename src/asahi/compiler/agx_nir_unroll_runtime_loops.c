@@ -57,10 +57,13 @@ struct counted_loop {
    /* The exit test ends the body (a rotated loop) instead of starting it. */
    bool bottom;
    nir_phi_instr *iv;
-   /* The test reads iv + offset. */
+   /* The test reads iv + offset (or iv + step_def when offset_is_step). */
    int64_t offset;
+   bool offset_is_step;
    nir_scalar bound;
    int64_t step;
+   /* When step == 0, the loop steps by a loop-invariant 32-bit runtime scalar. */
+   nir_scalar step_def;
    enum cont_rel rel;
    bool is_unsigned;
 };
@@ -312,8 +315,29 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
    return dwords;
 }
 
+static bool loop_is_readonly(nir_loop *loop);
+
 static bool
-analyze_loop(nir_loop *loop, struct counted_loop *out)
+loop_is_readonly_with_loads(nir_function_impl *impl, nir_loop *loop)
+{
+   if (loaded_dwords(impl, loop) == 0 || !loop_is_readonly(loop))
+      return false;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (nir_intrinsic_has_access(intr) &&
+             (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
+analyze_loop_opts(nir_loop *loop, struct counted_loop *out,
+                  bool allow_runtime_step)
 {
    if (nir_loop_has_continue_construct(loop) || loop->partially_unrolled ||
        loop->control == nir_loop_control_dont_unroll)
@@ -398,23 +422,35 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
        b.def->num_components != 1)
       return false;
 
-   /* One side is a phi of the header, or that phi plus a constant, the
-    * other is invariant. */
+   /* One side is a phi of the header, or that phi plus a constant (or plus
+    * a header-invariant runtime step in a bottom-tested loop), the other is
+    * invariant. */
    bool iv_left = false;
-   nir_scalar ivs = {0}, bound = {0};
+   bool offset_is_step = false;
+   nir_scalar ivs = {0}, bound = {0}, cond_step = {0};
    int64_t offset = 0;
    for (unsigned side = 0; side < 2 && !ivs.def; ++side) {
       nir_scalar x = side == 0 ? a : b, y = side == 0 ? b : a;
       if (!nir_scalar_is_const(y) && !header_invariant(y.def, loop, 8))
          continue;
       int64_t c = 0;
+      bool dyn_off = false;
+      nir_scalar dyn_step = {0};
       if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_iadd) {
          for (unsigned k = 0; k < 2; ++k) {
             nir_scalar kk = nir_scalar_chase_alu_src(x, k);
             nir_scalar other = nir_scalar_chase_alu_src(x, 1 - k);
-            if (nir_scalar_is_const(kk) &&
-                nir_def_instr(other.def)->type == nir_instr_type_phi) {
+            if (nir_def_instr(other.def)->type != nir_instr_type_phi)
+               continue;
+            if (nir_scalar_is_const(kk)) {
                c = nir_scalar_as_int(kk);
+               x = other;
+               break;
+            }
+            if (allow_runtime_step && bottom && kk.def->bit_size == 32 &&
+                header_invariant(kk.def, loop, 8)) {
+               dyn_off = true;
+               dyn_step = kk;
                x = other;
                break;
             }
@@ -426,6 +462,8 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
          ivs = x;
          bound = y;
          offset = c;
+         offset_is_step = dyn_off;
+         cond_step = dyn_step;
          iv_left = side == 0;
       }
    }
@@ -443,16 +481,32 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
       return false;
 
    int64_t step = 0;
+   nir_scalar step_def = {0};
    bool found = false;
    for (unsigned s = 0; s < 2; ++s) {
       nir_scalar src = nir_scalar_chase_alu_src(update, s);
       nir_scalar other = nir_scalar_chase_alu_src(update, 1 - s);
-      if (other.def == &phi->def && nir_scalar_is_const(src)) {
+      if (other.def != &phi->def)
+         continue;
+      if (!offset_is_step && nir_scalar_is_const(src)) {
          step = nir_scalar_as_int(src);
          found = true;
+         break;
+      }
+      if (allow_runtime_step && !nir_scalar_is_const(src) &&
+          src.def->bit_size == 32 && header_invariant(src.def, loop, 8)) {
+         if ((!offset_is_step && offset == 0) ||
+             (offset_is_step && nir_scalar_equal(src, cond_step))) {
+            step = 0;
+            step_def = src;
+            found = true;
+            break;
+         }
       }
    }
-   if (!found || step == 0 || step > 0x10000 || step < -0x10000)
+   if (!found)
+      return false;
+   if (!step_def.def && (step == 0 || step > 0x10000 || step < -0x10000))
       return false;
 
    /* Normalize to the condition that keeps the loop running, written as
@@ -470,8 +524,12 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
    else
       rel = cont_less ? REL_GT : REL_LE; /* bound < iv / bound >= iv */
 
-   if ((rel == REL_LT || rel == REL_LE) != (step > 0))
+   if (step_def.def) {
+      if (rel != REL_LT && rel != REL_LE)
+         return false;
+   } else if ((rel == REL_LT || rel == REL_LE) != (step > 0)) {
       return false;
+   }
 
    *out = (struct counted_loop){
       .loop = loop,
@@ -480,12 +538,20 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
       .bottom = bottom,
       .iv = phi,
       .offset = offset,
+      .offset_is_step = offset_is_step,
       .bound = bound,
       .step = step,
+      .step_def = step_def,
       .rel = rel,
       .is_unsigned = op == nir_op_ult || op == nir_op_uge,
    };
    return true;
+}
+
+static bool
+analyze_loop(nir_loop *loop, struct counted_loop *out)
+{
+   return analyze_loop_opts(loop, out, false);
 }
 
 /* The loop-invariant value G such that "iv < G" (REL_LT, REL_LE) or
@@ -493,12 +559,41 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
  * the induction variable wrapping. */
 static nir_def *
 guard_bound(nir_builder *b, const struct counted_loop *cl, nir_def *bound,
-            unsigned factor)
+            nir_def *step_val, unsigned factor)
 {
-   const int64_t span = (int64_t)(factor - 1) * (cl->step > 0 ? cl->step : -cl->step);
    const bool u = cl->is_unsigned;
    const int64_t min = u ? 0 : INT32_MIN;
    const int64_t max = u ? UINT32_MAX : INT32_MAX;
+
+   if (cl->step == 0) {
+      assert(step_val && (cl->rel == REL_LT || cl->rel == REL_LE));
+      /* Require step >= 1, factor * step <= max (no mul overflow), and
+       * bound - factor * step >= min (no sub underflow). Using span = factor *
+       * step guarantees that for any iv < bound - span, all `factor`
+       * iterations and iv + factor * step stay strictly below `bound <= max`
+       * without wrapping. */
+      nir_def *span = nir_imul_imm(b, step_val, factor);
+      nir_def *valid;
+      if (u) {
+         nir_def *pos = nir_ine_imm(b, step_val, 0);
+         nir_def *no_mul_ovf =
+            nir_uge(b, nir_imm_int(b, UINT32_MAX / factor), step_val);
+         nir_def *no_sub_udf = nir_uge(b, bound, span);
+         valid = nir_iand(b, nir_iand(b, pos, no_mul_ovf), no_sub_udf);
+      } else {
+         nir_def *pos = nir_ilt(b, nir_imm_int(b, 0), step_val);
+         nir_def *no_mul_ovf =
+            nir_ige(b, nir_imm_int(b, INT32_MAX / factor), step_val);
+         nir_def *min_plus_span = nir_iadd_imm(b, span, (uint32_t)INT32_MIN);
+         nir_def *no_sub_udf = nir_ige(b, bound, min_plus_span);
+         valid = nir_iand(b, nir_iand(b, pos, no_mul_ovf), no_sub_udf);
+      }
+      nir_def *adj = nir_isub(b, bound, span);
+      nir_def *never = nir_imm_int(b, (uint32_t)min);
+      return nir_bcsel(b, valid, adj, never);
+   }
+
+   const int64_t span = (int64_t)(factor - 1) * (cl->step > 0 ? cl->step : -cl->step);
 
    nir_def *valid, *adj, *never;
    switch (cl->rel) {
@@ -647,7 +742,7 @@ latch_register(nir_loop *loop, nir_def *value)
 
 static void
 unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
-            unsigned factor)
+            nir_def *step_val, unsigned factor)
 {
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
@@ -655,7 +750,7 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    /* The guard bound, in the preheader. */
    nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
    b.cursor = nir_after_block_before_jump(pre);
-   nir_def *g = guard_bound(&b, cl, bound, factor);
+   nir_def *g = guard_bound(&b, cl, bound, step_val, factor);
 
    /* A rotated loop runs its body before its test, so the original loop,
     * reached after the main loop, runs at least one more iteration. When
@@ -668,7 +763,7 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    unsigned nouts = 0;
    nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
    nir_phi_src *iv_back = nir_phi_get_src_from_block(cl->iv, nir_loop_last_block(loop));
-   const bool exact_tail = cl->bottom && cl->offset == cl->step && init &&
+   const bool exact_tail = cl->step != 0 && cl->bottom && cl->offset == cl->step && init &&
                            iv_back && back_edge_live_outs(loop, outs, &nouts);
    nir_def *iv0 = exact_tail ? init->src.ssa : NULL;
    nir_def *iv_next = exact_tail ? iv_back->src.ssa : NULL;
@@ -880,12 +975,114 @@ nested_workgroup_stripe(const nir_shader *shader, const struct counted_loop *cl)
    return false;
 }
 
+/* Return the linear byte scale of `iv` in `addr` (e.g. 4 for (iv + k) << 2),
+ * or 0 if `addr` is not an affine expression of `iv` with a positive scale. */
+static uint64_t
+shared_offset_iv_scale(nir_scalar s, nir_def *iv, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def == iv)
+      return 1;
+   if (!depth || !nir_scalar_is_alu(s))
+      return 0;
+   const nir_op op = nir_scalar_alu_op(s);
+   switch (op) {
+   case nir_op_u2u16:
+   case nir_op_u2u32:
+   case nir_op_u2u64:
+   case nir_op_i2i32:
+   case nir_op_i2i64:
+      return shared_offset_iv_scale(nir_scalar_chase_alu_src(s, 0), iv, depth - 1);
+   case nir_op_ishl: {
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      if (!nir_scalar_is_const(sh))
+         return 0;
+      const uint64_t k = nir_scalar_as_uint(sh);
+      if (k >= 16)
+         return 0;
+      const uint64_t base =
+         shared_offset_iv_scale(nir_scalar_chase_alu_src(s, 0), iv, depth - 1);
+      if (base > (UINT64_MAX >> k))
+         return 0;
+      return base << k;
+   }
+   case nir_op_imul:
+   case nir_op_amul: {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar c = nir_scalar_chase_alu_src(s, i);
+         if (!nir_scalar_is_const(c))
+            continue;
+         const int64_t v = nir_scalar_as_int(c);
+         if (v > 0 && v <= 0x10000) {
+            const uint64_t base =
+               shared_offset_iv_scale(nir_scalar_chase_alu_src(s, 1 - i), iv,
+                                      depth - 1);
+            uint64_t prod = 0;
+            if (__builtin_mul_overflow(base, (uint64_t)v, &prod))
+               return 0;
+            return prod;
+         }
+      }
+      return 0;
+   }
+   case nir_op_iadd: {
+      uint64_t a = shared_offset_iv_scale(nir_scalar_chase_alu_src(s, 0), iv, depth - 1);
+      uint64_t b = shared_offset_iv_scale(nir_scalar_chase_alu_src(s, 1), iv, depth - 1);
+      if (a && !b)
+         return a;
+      if (b && !a)
+         return b;
+      return 0;
+   }
+   default:
+      return 0;
+   }
+}
+
+/* A loop whose shared-memory index advances by at least the entire workgroup
+ * shared allocation in a single iteration cannot execute two in-bounds
+ * iterations, so unrolling it only adds dead code and cold guard overhead. */
+static bool
+loop_step_exceeds_shared_size(const nir_shader *shader, nir_loop *loop,
+                              const struct counted_loop *cl)
+{
+   if (cl->step == 0 || shader->info.shared_size == 0)
+      return false;
+   const uint64_t step_abs = cl->step > 0 ? (uint64_t)cl->step : (uint64_t)-cl->step;
+   if (step_abs < 8)
+      return false;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         unsigned addr_src;
+         if (intr->intrinsic == nir_intrinsic_load_shared)
+            addr_src = 0;
+         else if (intr->intrinsic == nir_intrinsic_store_shared)
+            addr_src = 1;
+         else
+            continue;
+         const uint64_t scale =
+            shared_offset_iv_scale(nir_get_scalar(intr->src[addr_src].ssa, 0),
+                                   &cl->iv->def, 8);
+         uint64_t stride = 0;
+         if (scale && (__builtin_mul_overflow(step_abs, scale, &stride) ||
+                       stride >= shader->info.shared_size))
+            return true;
+      }
+   }
+   return false;
+}
+
 /* The iterations per test for a counted loop, or 0 when it is not unrolled. */
 static unsigned
 choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
               unsigned factor, unsigned max_instrs)
 {
    if (nested_workgroup_stripe(impl->function->shader, cl))
+      return 0;
+   if (loop_step_exceeds_shared_size(impl->function->shader, loop, cl))
       return 0;
 
    int size = count_unrollable(loop, cl->nif);
@@ -1315,7 +1512,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       _mesa_hash_table_destroy(remap, NULL);
       if (cl.offset && !cl.bottom)
          iv0 = nir_iadd_imm(&b, iv0, cl.offset);
-      nir_def *g = guard_bound(&b, &cl, bound, f);
+      nir_def *g = guard_bound(&b, &cl, bound, NULL, f);
       nir_def *cond;
       if (cl.rel == REL_LT || cl.rel == REL_LE)
          cond = cl.is_unsigned ? nir_ult(&b, iv0, g) : nir_ilt(&b, iv0, g);
@@ -2340,16 +2537,19 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          struct counted_loop cl;
          unsigned f = 0;
          util_dynarray_foreach(&loops, nir_loop *, lp) {
-            if (!_mesa_set_search(skip_runtime_unroll, *lp) &&
-                analyze_loop(*lp, &cl) &&
-                (f = choose_factor(impl, *lp, &cl, factor, max_instrs)))
+            if (_mesa_set_search(skip_runtime_unroll, *lp) ||
+                !analyze_loop_opts(*lp, &cl, true))
+               continue;
+            if (cl.step == 0 && !loop_is_readonly_with_loads(impl, *lp))
+               continue;
+            if ((f = choose_factor(impl, *lp, &cl, factor, max_instrs)))
                break;
          }
          util_dynarray_fini(&loops);
          if (!f)
             break;
 
-         /* The bound as seen from the preheader. */
+         /* The bound (and runtime step, if any) as seen from the preheader. */
          nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl.loop->cf_node));
          nir_builder b = nir_builder_at(nir_after_block_before_jump(pre));
          nir_def *bound;
@@ -2364,9 +2564,16 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
             _mesa_hash_table_destroy(remap, NULL);
             bound = nir_channel(&b, def, cl.bound.comp);
          }
+         nir_def *step_val = NULL;
+         if (cl.step == 0) {
+            struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+            nir_def *def = rematerialize(&b, cl.step_def.def, cl.loop, remap);
+            _mesa_hash_table_destroy(remap, NULL);
+            step_val = nir_channel(&b, def, cl.step_def.comp);
+         }
          if (widest)
             *widest = MAX2(*widest, f);
-         unroll_loop(impl, &cl, bound, f);
+         unroll_loop(impl, &cl, bound, step_val, f);
 
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
