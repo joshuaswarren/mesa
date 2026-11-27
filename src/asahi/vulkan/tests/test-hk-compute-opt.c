@@ -954,6 +954,50 @@ test_bilinear_resize_border(void)
    }
    s->info.float_controls_execution_mode = 0;
 
+   /* SPIR-V FClamp lowers fmax/fmin with nir_fp_preserve_inf; matcher must accept
+    * and propagate it onto the emitted clamp ops. */
+   {
+      nir_shader *fp_inf = build_test_bilinear_resize_border(false);
+      unsigned marked_inf = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(fp_inf)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(ins);
+               if (alu->op == nir_op_fmax || alu->op == nir_op_fmin) {
+                  alu->fp_math_ctrl = nir_fp_preserve_inf;
+                  marked_inf++;
+               }
+            }
+         }
+      }
+      assert(marked_inf == 2);
+      struct hk_compute_opt_plan inf_plan = {0};
+      assert(hk_nir_match_compute_opt(fp_inf, 1, layouts, &inf_plan));
+      assert(inf_plan.params[0] == nir_fp_preserve_inf &&
+             inf_plan.params[1] == nir_fp_preserve_inf);
+      nir_shader *inf_opt = hk_nir_build_compute_opt(
+         NULL, fp_inf, &inf_plan, nir_address_format_64bit_bounded_global);
+      assert(inf_opt != NULL);
+      unsigned saw_fmax_inf = 0, saw_fmin_inf = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(inf_opt)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(ins);
+               if (alu->op == nir_op_fmax) {
+                  assert(alu->fp_math_ctrl == nir_fp_preserve_inf);
+                  saw_fmax_inf++;
+               } else if (alu->op == nir_op_fmin) {
+                  assert(alu->fp_math_ctrl == nir_fp_preserve_inf);
+                  saw_fmin_inf++;
+               }
+            }
+         }
+      }
+      assert(saw_fmax_inf > 0 && saw_fmin_inf > 0);
+      ralloc_free(inf_opt);
+      ralloc_free(fp_inf);
+   }
+
    /* Per-ALU float math control flags that the builder does not emit must be refused. */
    {
       nir_shader *fp_mod = build_test_bilinear_resize_border(false);

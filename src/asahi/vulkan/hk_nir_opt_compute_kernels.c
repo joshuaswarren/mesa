@@ -4054,7 +4054,7 @@ match_bilinear_resize_border_inloop_u8(
       return false;
    nir_alu_instr *mina = nir_instr_as_alu(nir_def_instr(cl_hi));
    if ((mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx) ||
-       mina->fp_math_ctrl != 0)
+       (mina->fp_math_ctrl & ~nir_fp_preserve_inf) != 0)
       return false;
    uint32_t bits_hi = 0, bits_lo = 0;
    nir_def *cl_lo = NULL;
@@ -4070,7 +4070,7 @@ match_bilinear_resize_border_inloop_u8(
       return false;
    nir_alu_instr *maxa = nir_instr_as_alu(nir_def_instr(cl_lo));
    if ((maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx) ||
-       maxa->fp_math_ctrl != 0)
+       (maxa->fp_math_ctrl & ~nir_fp_preserve_inf) != 0)
       return false;
    nir_def *bilerp_val = NULL;
    if (match_const_f32_bits(maxa->src[1].src.ssa, &bits_lo) && bits_lo == 0)
@@ -4219,6 +4219,8 @@ match_bilinear_resize_border_inloop_u8(
    plan->flags = (uint8_t)lerp_val;
    plan->tile_w = 128;
    plan->tile_h = 8;
+   plan->params[0] = maxa->fp_math_ctrl;
+   plan->params[1] = mina->fp_math_ctrl;
    plan->pc_off[0] = dw_pc;
    plan->pc_off[1] = dh_pc;
    plan->pc_off[2] = ds_pc;
@@ -4522,7 +4524,7 @@ match_bilinear_resize_border_u8(
       return false;
    nir_alu_instr *mina = nir_instr_as_alu(nir_def_instr(cl_hi));
    if ((mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx) ||
-       mina->fp_math_ctrl != 0)
+       (mina->fp_math_ctrl & ~nir_fp_preserve_inf) != 0)
       return false;
    uint32_t bits_hi = 0, bits_lo = 0;
    nir_def *cl_lo = NULL;
@@ -4538,7 +4540,7 @@ match_bilinear_resize_border_u8(
       return false;
    nir_alu_instr *maxa = nir_instr_as_alu(nir_def_instr(cl_lo));
    if ((maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx) ||
-       maxa->fp_math_ctrl != 0)
+       (maxa->fp_math_ctrl & ~nir_fp_preserve_inf) != 0)
       return false;
    nir_def *bilerp_val = NULL;
    if (match_const_f32_bits(maxa->src[1].src.ssa, &bits_lo) && bits_lo == 0)
@@ -4693,6 +4695,8 @@ match_bilinear_resize_border_u8(
    plan->flags = (uint8_t)lerp_val;
    plan->tile_w = 128;
    plan->tile_h = 8;
+   plan->params[0] = maxa->fp_math_ctrl;
+   plan->params[1] = mina->fp_math_ctrl;
    plan->pc_off[0] = dw_pc;
    plan->pc_off[1] = dh_pc;
    plan->pc_off[2] = ds_pc;
@@ -5667,7 +5671,8 @@ eval_lerp_f32(nir_builder *b, nir_def *a, nir_def *bv, nir_def *t,
 static nir_def *
 eval_bilerp_u8_pixel(nir_builder *b, nir_def *p00, nir_def *p01, nir_def *p10,
                      nir_def *p11, nir_def *fx, nir_def *fy,
-                     enum hk_resize_lerp_mode lerp_mode)
+                     enum hk_resize_lerp_mode lerp_mode, uint32_t fmax_fp_ctrl,
+                     uint32_t fmin_fp_ctrl)
 {
    nir_def *f00 = nir_u2f32(b, p00);
    nir_def *f01 = nir_u2f32(b, p01);
@@ -5676,8 +5681,12 @@ eval_bilerp_u8_pixel(nir_builder *b, nir_def *p00, nir_def *p01, nir_def *p10,
    nir_def *top = eval_lerp_f32(b, f00, f01, fx, lerp_mode);
    nir_def *bot = eval_lerp_f32(b, f10, f11, fx, lerp_mode);
    nir_def *val = eval_lerp_f32(b, top, bot, fy, lerp_mode);
-   nir_def *cl = nir_fmin(b, nir_fmax(b, val, nir_imm_float(b, 0.0f)),
-                          nir_imm_float(b, 255.0f));
+   nir_def *lo = nir_fmax(b, val, nir_imm_float(b, 0.0f));
+   if (nir_def_instr(lo)->type == nir_instr_type_alu)
+      nir_instr_as_alu(nir_def_instr(lo))->fp_math_ctrl = fmax_fp_ctrl;
+   nir_def *cl = nir_fmin(b, lo, nir_imm_float(b, 255.0f));
+   if (nir_def_instr(cl)->type == nir_instr_type_alu)
+      nir_instr_as_alu(nir_def_instr(cl))->fp_math_ctrl = fmin_fp_ctrl;
    return nir_u2u8(b, nir_f2i32(b, cl));
 }
 
@@ -5687,7 +5696,8 @@ emit_resize_border_loop(nir_builder *b, nir_deref_instr *src_u8,
                         nir_def *dst_w, nir_def *dst_h, nir_def *dst_stride,
                         nir_def *border, nir_def *swm1, nir_def *sx_scale,
                         nir_def *fy, nir_def *row0, nir_def *row1,
-                        enum hk_resize_lerp_mode lerp_mode)
+                        enum hk_resize_lerp_mode lerp_mode,
+                        uint32_t fmax_fp_ctrl, uint32_t fmin_fp_ctrl)
 {
    nir_variable *kv = nir_local_variable_create(b->impl, glsl_uint_type(), "k");
    nir_store_var(b, kv, nir_imm_int(b, 0), 0x1);
@@ -5713,8 +5723,9 @@ emit_resize_border_loop(nir_builder *b, nir_deref_instr *src_u8,
          nir_def *p01 = load_ssbo_ro(b, src_u8, nir_iadd(b, row0, ix1));
          nir_def *p10 = load_ssbo_ro(b, src_u8, nir_iadd(b, row1, ix0));
          nir_def *p11 = load_ssbo_ro(b, src_u8, nir_iadd(b, row1, ix1));
-         nir_def *val =
-            eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy, lerp_mode);
+         nir_def *val = eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy,
+                                             lerp_mode, fmax_fp_ctrl,
+                                             fmin_fp_ctrl);
          emit_mirror_border_writes(b, dst_u8, xk, py, val, dst_w, dst_h,
                                    dst_stride, border);
       }
@@ -5795,6 +5806,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
 
    const enum hk_resize_lerp_mode lerp_mode =
       (enum hk_resize_lerp_mode)plan->flags;
+   const uint32_t fmax_fp_ctrl = plan->params[0];
+   const uint32_t fmin_fp_ctrl = plan->params[1];
    nir_def *do_resize =
       nir_ior(b, nir_ine(b, src_w, dst_w), nir_ine(b, src_h, dst_h));
 
@@ -5855,7 +5868,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
                                           nir_channel(b, r0, 1),
                                           nir_channel(b, r1, 0),
                                           nir_channel(b, r1, 1), fx, fy,
-                                          lerp_mode),
+                                          lerp_mode, fmax_fp_ctrl,
+                                          fmin_fp_ctrl),
                      0x1);
                }
             }
@@ -5882,7 +5896,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
                   nir_store_var(
                      b, out_v[k],
                      eval_bilerp_u8_pixel(b, p00, p01, p10, p11, fx, fy,
-                                          lerp_mode),
+                                          lerp_mode, fmax_fp_ctrl,
+                                          fmin_fp_ctrl),
                      0x1);
                }
             }
@@ -5902,7 +5917,8 @@ build_bilinear_resize_border_u8_kernel(nir_builder *b,
          {
             emit_resize_border_loop(b, src_u8, dst_u8, x0, py, dst_w, dst_h,
                                     dst_stride, border, swm1, sx_scale, fy,
-                                    row0, row1, lerp_mode);
+                                    row0, row1, lerp_mode, fmax_fp_ctrl,
+                                    fmin_fp_ctrl);
          }
          nir_pop_if(b, NULL);
       }
