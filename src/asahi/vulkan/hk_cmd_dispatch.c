@@ -908,7 +908,7 @@ void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             struct agx_cdm_launch_word_0_packed launch,
                             uint32_t usc, struct agx_grid grid,
-                            struct agx_workgroup wg)
+                            struct agx_workgroup wg, bool allow_defer)
 {
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
@@ -937,7 +937,7 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    }
 
    const bool defer =
-      cs == cs->cmd->current_cs.cs && !cs->cmd->in_meta &&
+      allow_defer && cs == cs->cmd->current_cs.cs && !cs->cmd->in_meta &&
       !HK_PERF(dev, FULLCDMBARRIER) &&
       agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_DEFER_FLUSH);
 
@@ -991,7 +991,8 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cs->cmd->state.cs.cdm_barrier_full_needed = true;
       cs->cmd->state.cs.cdm_stream_has_images = true;
    }
-   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size,
+                               info->stage == MESA_SHADER_COMPUTE);
 }
 
 static bool

@@ -150,6 +150,17 @@ emit_launch(struct fixture *f, struct agx_shader_info *info)
    return (uint32_t *)f->cs.current - 1;
 }
 
+static uint32_t *
+emit_precomp_launch(struct fixture *f)
+{
+   struct agx_cdm_launch_word_0_packed launch = {0};
+   f->cmd.state.cs.cdm_barrier_full_needed = true;
+   f->cmd.state.cs.cdm_stream_has_images = true;
+   hk_dispatch_with_usc_launch(&f->dev, &f->cs, launch, 0x1000, agx_1d(64),
+                               agx_workgroup(64, 1, 1), false);
+   return (uint32_t *)f->cs.current - 1;
+}
+
 /* Pure SSBO barrier between two AGX2 launches narrows the barrier word between
  * them in place to 0x160 while leaving the second launch's tail at 0x1ff, and
  * late submit-time sparse patching still upgrades both records to 0xfffff. */
@@ -421,7 +432,49 @@ test_defer_flush_g13g(void)
    assert(!f.cs.cdm_flush_pending);
    fixture_fini(&f);
 
-   /* 5. fullcdmbarrier disables deferral and emits 0xfffff per launch. */
+   /* 5. Internal precomp launches (e.g. query reset -> query copy on the same
+    * stream) never defer: each emits its own trailing 0x1ff flush. */
+   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   uint32_t *p1_tail = emit_precomp_launch(&f);
+   assert(*p1_tail == barrier_record(0x1ffu));
+   assert(!f.cs.cdm_flush_pending);
+   assert(f.cs.stats.flushes == 1);
+   uint32_t *p2_tail = emit_precomp_launch(&f);
+   assert(*p2_tail == barrier_record(0x1ffu));
+   assert(!f.cs.cdm_flush_pending);
+   assert(f.cs.stats.flushes == 2);
+   fixture_fini(&f);
+
+   /* 6. Deferred app dispatch followed by precomp drains 0x1ff before precomp
+    * and emits trailing 0x1ff after precomp. */
+   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   emit_launch(&f, &pure);
+   assert(f.cs.cdm_flush_pending);
+   assert(f.cs.stats.flushes == 0);
+   after_l1 = f.cs.current;
+   p1_tail = emit_precomp_launch(&f);
+   mid_w = (uint32_t *)after_l1;
+   assert(*mid_w == barrier_record(0x1ffu));
+   assert(*p1_tail == barrier_record(0x1ffu));
+   assert(!f.cs.cdm_flush_pending);
+   assert(f.cs.stats.flushes == 2);
+   fixture_fini(&f);
+
+   /* 7. Deferred app dispatch -> pure SSBO barrier -> precomp must upgrade the
+    * pending barrier to full 0x1ff (not 0x160) and flush after precomp. */
+   fixture_init(&f, AGX_CHIP_G13G, 13, 0);
+   emit_launch(&f, &pure);
+   after_l1 = f.cs.current;
+   assert(!hk_cdm_record_pipeline_barrier(&f.cmd, &dep_ssbo));
+   p1_tail = emit_precomp_launch(&f);
+   mid_w = (uint32_t *)after_l1;
+   assert(*mid_w == barrier_record(0x1ffu));
+   assert(*p1_tail == barrier_record(0x1ffu));
+   assert(!f.cs.cdm_flush_pending);
+   assert(f.cs.stats.flushes == 2);
+   fixture_fini(&f);
+
+   /* 8. fullcdmbarrier disables deferral and emits 0xfffff per launch. */
    fixture_init(&f, AGX_CHIP_G13G, 13, HK_PERF_FULLCDMBARRIER);
    uint32_t *b1 = emit_launch(&f, &pure);
    assert(*b1 == barrier_record(AGX_CDM_BARRIER_FULL_WORD));
