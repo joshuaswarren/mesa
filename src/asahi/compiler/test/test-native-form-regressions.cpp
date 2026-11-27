@@ -8816,3 +8816,50 @@ TEST(NativeForms, M5MeshAndTaskRegisterLodSampleCompiles)
    }
 }
 
+/* M5 mesh shaders with depthClipControl remap exported z/w from shared memory
+ * after the body runs, so component-wise gl_Position.{x,y,z,w} stores work. */
+TEST(NativeForms, M5MeshClipM1_1SplitPositionStores)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "m5 mesh clip m1_1 split pos");
+   nir_shader *s = b.shader;
+   s->info.workgroup_size[0] = 32;
+   s->info.workgroup_size[1] = 1;
+   s->info.workgroup_size[2] = 1;
+   s->info.mesh.max_vertices_out = 3;
+   s->info.mesh.max_primitives_out = 1;
+   s->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                      nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_store_per_vertex_output(
+         &b, nir_imm_float(&b, (float)c), lane, nir_imm_int(&b, 0),
+         .write_mask = 1, .component = c, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   }
+   nir_store_per_primitive_output(
+      &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .write_mask = 0x7, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+
+   struct agx_m5_mesh_varyings v = {};
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+   v.clip_m1_1 = true;
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v));
+   nir_validate_shader(s, "m5 mesh clip m1_1");
+
+   bool found_clip_z_coeff = false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(in)->intrinsic ==
+                nir_intrinsic_load_clip_z_coeff)
+            found_clip_z_coeff = true;
+      }
+   }
+   EXPECT_TRUE(found_clip_z_coeff);
+   ralloc_free(s);
+}

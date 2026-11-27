@@ -9272,8 +9272,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          NIR_PASS(_, nir, hk_lower_mesh_queries, !sw_task);
       const bool clip_m1_1 =
          hk_mesh_clip_m1_1(dev->vk.enabled_features.depthClipControl, state);
-      /* G17P remaps the exported z instead (agx_nir_lower_gen1_mesh). */
-      if (clip_m1_1 && dev->dev.chip != AGX_CHIP_G17P) {
+      /* G17P and M5 remap the exported z instead (agx_nir_lower_gen1_mesh /
+       * agx_nir_lower_m5_mesh). */
+      if (clip_m1_1 && !agx_chip_g17p_or_m5(dev->dev.chip)) {
          /* Mesh outputs cannot go through output temporaries. Refuse what
           * the lowering cannot convert rather than render the wrong depth. */
          if (!agx_nir_clip_m1_1_complete(nir)) {
@@ -9304,7 +9305,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    m5_mesh_layout:;
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
-      varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
+      varyings.clip_m1_1 = clip_m1_1 && agx_chip_g17p_or_m5(dev->dev.chip);
       if ((dev->dev.chip == AGX_CHIP_G17P || m5_mesh) &&
           nir->info.mesh.primitive_type == MESA_PRIM_LINES)
          varyings.line_bias_root_B = hk_root_descriptor_offset(line_y_bias);
