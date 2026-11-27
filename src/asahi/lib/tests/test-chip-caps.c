@@ -367,11 +367,17 @@ main(void)
    test_cdm_defer_flush();
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G14X;
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COMPUTE_SMART_WAITS) == expected,
-                 c);
+      const bool expected_smart_waits =
+         c == AGX_CHIP_G13G || c == AGX_CHIP_G14X;
+      const bool expected_hoist = c == AGX_CHIP_G14X;
       CHECK_CHIP(
-         agx_chip_has_cap(c, AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS) == expected, c);
+         agx_chip_has_cap(c, AGX_CAP_COMPUTE_SMART_WAITS) ==
+            expected_smart_waits,
+         c);
+      CHECK_CHIP(
+         agx_chip_has_cap(c, AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS) ==
+            expected_hoist,
+         c);
    }
    test_compute_coherent_store();
    test_pbe_queued_buffer_copy();

@@ -157,11 +157,15 @@ TEST_F(InsertWaits, SmartWaitsAvoidsMidBurstOverflowOnG14X)
    agx_context *g14x = build_case(AGX_CHIP_G14X, MESA_SHADER_COMPUTE);
    agx_context *frag = build_case(AGX_CHIP_G14X, MESA_SHADER_FRAGMENT);
 
-   EXPECT_GE(count_waits_before_first_alu(agx_start_block(g13g)), 2u);
+   agx_context *g13g_frag = build_case(AGX_CHIP_G13G, MESA_SHADER_FRAGMENT);
+
+   EXPECT_EQ(count_waits_before_first_alu(agx_start_block(g13g)), 1u);
    EXPECT_GE(count_waits_before_first_alu(agx_start_block(g13x)), 2u);
    EXPECT_GE(count_waits_before_first_alu(agx_start_block(g14g)), 2u);
    EXPECT_EQ(count_waits_before_first_alu(agx_start_block(g14x)), 1u);
-   EXPECT_TRUE(agx_shader_equal(g13g, frag));
+   EXPECT_TRUE(agx_shader_equal(g13g, g14x));
+   EXPECT_TRUE(agx_shader_equal(g13x, frag));
+   EXPECT_TRUE(agx_shader_equal(g13x, g13g_frag));
 }
 
 TEST_F(InsertWaits, SmartWaitsLinearOnLongIndependentLoadBlock)
