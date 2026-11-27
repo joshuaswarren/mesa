@@ -5739,18 +5739,18 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                                 incomplete_render_area, true);
    }
 
-   /* A depth-only pass that stores depth may learn later that the store is
-    * dead (hk_take_pending_z_store()); keep the word without it. */
-   render->no_z_store_ok =
-      render->zls_precise && attach_z && attach_z->imageView &&
-      attach_z->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
-      attach_z->resolveMode == VK_RESOLVE_MODE_NONE && s_layout == NULL;
-   if (render->no_z_store_ok) {
-      VkRenderingAttachmentInfo z_no_store = *attach_z;
-      z_no_store.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-      hk_pack_zls_control_final(&render->zls_control_only_no_z_store,
-                                z_layout, NULL, &z_no_store, NULL,
-                                incomplete_render_area, false);
+   /* A single-stream pass that stores depth and/or stencil may learn later
+    * that one or both stores are dead (hk_take_pending_z_store()). */
+   render->pending_zs_store_mask = 0;
+   if (render->zls_precise) {
+      if (z_layout && attach_z && attach_z->imageView &&
+          attach_z->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+          attach_z->resolveMode == VK_RESOLVE_MODE_NONE)
+         render->pending_zs_store_mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (s_layout && attach_s && attach_s->imageView &&
+          attach_s->storeOp == VK_ATTACHMENT_STORE_OP_STORE &&
+          attach_s->resolveMode == VK_RESOLVE_MODE_NONE)
+         render->pending_zs_store_mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
    }
 
    /* If multiview is disabled, always read 0. If multiview is enabled,
@@ -6117,8 +6117,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       loaded_resolve |= render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_LOAD;
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
-   render->process_empty_tiles_without_z =
-      resolved_clear || resolved_clear_s || loaded_resolve;
+   render->empty_tiles_other = resolved_clear || loaded_resolve;
+   render->empty_tiles_z = resolved_clear_z;
+   render->empty_tiles_s = resolved_clear_s;
    cs->cr.process_empty_tiles = process_empty_tiles;
    if (unlikely(dev->frame_anatomy) && incomplete_render_area)
       cs->anatomy_area = render->area;
@@ -6139,11 +6140,12 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
        * a resolve of loaded samples (or Z/S clears left to ZLS when the clear
        * draw is colour-only) still writes its destination from empty tiles. */
       if (agx_chip_agx3_path(dev->dev.chip)) {
-         render->process_empty_tiles_without_z =
-            loaded_resolve || (clear_draw_skips_zs && resolved_clear_s);
+         render->empty_tiles_other = loaded_resolve;
+         render->empty_tiles_z = clear_draw_skips_zs && resolved_clear_z;
+         render->empty_tiles_s = clear_draw_skips_zs && resolved_clear_s;
          cs->cr.process_empty_tiles =
-            loaded_resolve ||
-            (clear_draw_skips_zs && (resolved_clear_z || resolved_clear_s));
+            render->empty_tiles_other || render->empty_tiles_z ||
+            render->empty_tiles_s;
       }
 
       cmd->in_begin_rendering_clear = true;
@@ -6242,35 +6244,54 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                                  ? render->zls_control_only
                                  : render->zls_control_last;
       }
-
-      /* The depth store of a single-stream pass on a whole depth-only image
-       * may turn out dead; see hk_take_pending_z_store(). */
-      const struct hk_image_view *z_view = render->depth_att.iview;
-      const struct hk_image *z_image =
-         z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
-      if (render->no_z_store_ok &&
-          !(zls_elided & VK_IMAGE_ASPECT_DEPTH_BIT) && !cmd->in_meta &&
-          cs == render->zls_first_cs && cs->stats.cmds > 0 &&
-          !render->view_mask &&
-          !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                             VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
-          z_image && z_image->vk.aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
-          z_image->vk.image_type == VK_IMAGE_TYPE_2D &&
-          z_image->vk.mip_levels == 1 && z_image->vk.array_layers == 1) {
-         z_pending = (struct hk_pending_z_store){
-            .cs = cs,
-            .image = z_image,
-            .zls_control = render->zls_control_only_no_z_store,
-            .process_empty_tiles = render->process_empty_tiles_without_z,
-         };
-      }
    }
 
    /* Apply after the final control word, including already closed streams. */
+   const VkImageAspectFlags zls_elided_store =
+      render->g17p_zls_elide_mask & render->g17p_zls_touched &
+      ~render->g17p_zls_written;
    hk_g17p_zls_elide(cmd, zls_elided);
-   hk_g17p_zls_elide_store(cmd, render->g17p_zls_elide_mask &
-                                   render->g17p_zls_touched &
-                                   ~render->g17p_zls_written);
+   hk_g17p_zls_elide_store(cmd, zls_elided_store);
+
+   /* Depth/stencil stores of a single-stream pass on a whole 2D single-mip
+    * single-layer image (depth-only, stencil-only, or combined D32S8/D24S8)
+    * may turn out dead; see hk_take_pending_z_store(). */
+   if (cs && !cmd->in_meta && cs == render->zls_first_cs &&
+       cs->stats.cmds > 0 && !render->view_mask &&
+       !(render->flags &
+         (VK_RENDERING_SUSPENDING_BIT |
+          VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))) {
+      const VkImageAspectFlags pending_aspects =
+         render->pending_zs_store_mask & ~(zls_elided | zls_elided_store);
+      const struct hk_image_view *z_view =
+         (pending_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? render->depth_att.iview
+                                                       : NULL;
+      const struct hk_image_view *s_view =
+         (pending_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+            ? render->stencil_att.iview
+            : NULL;
+      const struct hk_image *z_image =
+         z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
+      const struct hk_image *s_image =
+         s_view ? container_of(s_view->vk.image, struct hk_image, vk) : NULL;
+      const struct hk_image *zs_image = z_image ? z_image : s_image;
+      if (pending_aspects && zs_image && (!z_image || !s_image || z_image == s_image) &&
+          zs_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+          zs_image->vk.mip_levels == 1 && zs_image->vk.array_layers == 1) {
+         z_pending = (struct hk_pending_z_store){
+            .cs = cs,
+            .image = zs_image,
+            .aspects = pending_aspects,
+            .empty_tiles_other = render->empty_tiles_other,
+            .empty_tiles_z =
+               render->empty_tiles_z &&
+               (pending_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0,
+            .empty_tiles_s =
+               render->empty_tiles_s &&
+               (pending_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0,
+         };
+      }
+   }
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
@@ -6405,26 +6426,43 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       hk_sync_resolve_begin(cmd);
       hk_meta_resolve_rendering(cmd, &vk_render);
       hk_sync_resolve_end(cmd);
+      z_pending.cs = NULL;
    }
 
    cmd->state.pending_z_store = z_pending;
 }
 
+static bool
+hk_pending_zs_att_overwrites(const VkRenderingAttachmentInfo *att,
+                             const struct hk_image *image)
+{
+   if (!att || att->imageView == VK_NULL_HANDLE)
+      return false;
+   if (att->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+       att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+      return false;
+   const VkRenderingAttachmentFlagsInfoKHR *flags =
+      vk_find_struct_const(att->pNext, RENDERING_ATTACHMENT_FLAGS_INFO_KHR);
+   if (flags && flags->flags)
+      return false;
+
+   VK_FROM_HANDLE(hk_image_view, iview, att->imageView);
+   return iview->vk.image == &image->vk;
+}
+
 /*
- * Dead depth stores (AGX3).
+ * Dead depth/stencil stores (AGX3).
  *
- * Applications often store a depth attachment that is cleared again before
- * anything reads it; Minecraft stores its depth image at the end of every
- * pass and clears the whole image with vkCmdClearDepthStencilImage before
- * the next one (hk_defer_clear() kills the pending store there). A cleared and
- * stored attachment makes the pass process every tile, including tiles no
- * draw covered, only to write the clear value. When the next pass begins
- * with that whole image as its depth attachment, cleared or with undefined
- * contents, over its whole area, and nothing recorded between the two
- * passes could read the image (only buffer commands whose ranges miss it,
- * barriers, or state binding; the same commands a deferred clear survives,
- * see hk_flush_deferred_clears()), the first pass's store is unobservable:
- * drop it, and with it the empty tiles the store alone required.
+ * Applications often store depth and/or stencil attachments that are cleared
+ * again before anything reads them; Minecraft stores its depth image at the
+ * end of every pass and clears the whole image with vkCmdClearDepthStencilImage
+ * before the next one (hk_defer_clear() kills the pending store there), and
+ * modern D3D11/D3D12/Vulkan engines use combined D32S8 attachments the same
+ * way. When the next pass begins with that whole image as its depth and/or
+ * stencil attachment, cleared or with undefined contents, over its whole area,
+ * and nothing recorded between the two passes could read the image, those
+ * overwritten aspect stores are unobservable: drop them, and with them any
+ * empty tiles they alone required.
  */
 static void
 hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
@@ -6434,20 +6472,18 @@ hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
    if (likely(!p->cs))
       return;
 
-   const VkRenderingAttachmentInfo *z = info->pDepthAttachment;
    const struct hk_image *image = p->image;
-   if (z && z->imageView != VK_NULL_HANDLE &&
-       (z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
-        z->loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE) &&
-       !(info->flags & VK_RENDERING_RESUMING_BIT) && !info->viewMask &&
+   if (!(info->flags & VK_RENDERING_RESUMING_BIT) && !info->viewMask &&
        info->renderArea.offset.x == 0 && info->renderArea.offset.y == 0 &&
        info->renderArea.extent.width >= image->vk.extent.width &&
        info->renderArea.extent.height >= image->vk.extent.height) {
-      VK_FROM_HANDLE(hk_image_view, iview, z->imageView);
-      if (iview->vk.image == &image->vk) {
-         hk_kill_pending_z_store(cmd);
-         return;
-      }
+      VkImageAspectFlags kill = 0;
+      if (hk_pending_zs_att_overwrites(info->pDepthAttachment, image))
+         kill |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (hk_pending_zs_att_overwrites(info->pStencilAttachment, image))
+         kill |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      if (kill)
+         hk_kill_pending_z_store_aspects(cmd, kill);
    }
 
    p->cs = NULL;
