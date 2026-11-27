@@ -14891,15 +14891,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+            const bool zero_accum = (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM) != 0;
             if (enc != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
                 ctx->stage != MESA_SHADER_COMPUTE || I->nr_dests != 1 ||
                 I->nr_srcs != 3 || I->saturate || wait > 0xff ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
                 I->dest[0].size != AGX_SIZE_32 ||
                 agx_channels(I->dest[0]) != 8 ||
-                I->dest[0].value != I->src[2].value)
+                (!zero_accum && I->dest[0].value != I->src[2].value) ||
+                (zero_accum && !agx_is_null(I->src[2])))
                AGX3_REFUSE(I);
-            for (unsigned s = 0; s < 3; ++s) {
+            for (unsigned s = 0; s < (zero_accum ? 2u : 3u); ++s) {
                const agx_index src = I->src[s];
                if (!agx3_src_is_register(src) || src.memory || src.abs ||
                    src.neg || agx_channels(src) != 8 ||
@@ -14913,6 +14915,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                .input_type = I->matrix_type & 15,
                .b_input_type = (I->matrix_type >> 4) & 15,
                .wait_mask = wait,
+               .zero_accumulator = zero_accum,
                .preserve_a = !I->src[0].discard,
                .preserve_b = !I->src[1].discard,
             };
@@ -14925,6 +14928,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_MATMAD8_AGX3) {
             const bool f16_acc = I->matrix_type & AGX3_MATRIX_ACCUM_F16;
+            const bool zero_accum = (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM) != 0;
             const enum agx_size acc_size = f16_acc ? AGX_SIZE_16 : AGX_SIZE_32;
             if ((I->matrix_type & 15) != ((I->matrix_type >> 4) & 15))
                AGX3_REFUSE(I);
@@ -14939,20 +14943,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 I->nr_srcs != 3 || I->saturate || wait > wait_max ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
                 I->dest[0].size != acc_size ||
-                agx_channels(I->dest[0]) != 2)
+                agx_channels(I->dest[0]) != 2 ||
+                (zero_accum && !agx_is_null(I->src[2])))
                AGX3_REFUSE(I);
 
             struct agx3_matrix_mma8_desc d = {
                .dest = I->dest[0].value,
                .a = I->src[0].value,
                .b = I->src[1].value,
-               .c = I->src[2].value,
+               .c = zero_accum ? 0 : I->src[2].value,
+               .c_zero = zero_accum,
                .dest_cache = I->dest[0].cache,
                .wait_mask = wait,
                .input_type = I->matrix_type & 15,
                .f16_accumulate = f16_acc,
             };
-            for (unsigned s = 0; s < 3; ++s) {
+            for (unsigned s = 0; s < (zero_accum ? 2u : 3u); ++s) {
                const agx_index src = I->src[s];
                if (!agx3_src_is_register(src) || src.memory || src.abs ||
                    src.neg || agx_channels(src) != 2 ||

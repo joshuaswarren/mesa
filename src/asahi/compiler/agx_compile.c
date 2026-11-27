@@ -2932,7 +2932,8 @@ agx_lower_agx3_matrix_sources(agx_context *ctx)
             }
          }
 
-         if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+         if (I->op == AGX_OPCODE_MATMAD16_AGX3 &&
+             !(I->matrix_type & AGX3_MATRIX_ZERO_ACCUM)) {
             agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
             agx_index tied = agx_vec_temp(ctx, AGX_SIZE_32, 8);
             agx_mov_to(&b, tied, I->src[2]);
@@ -3679,15 +3680,46 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
               (mm_enc == AGX_ISA_ENCODING_AGX3B &&
                instr->def.num_components == 2)) &&
              (instr->def.bit_size == 32 || mm_enc == AGX_ISA_ENCODING_AGX3B));
+
+      /* Detect a constant +0.0 accumulator tile on M5 (AGX3C) so hardware
+       * zero_accumulator / c_zero eliminates 8x MOV_IMM 0 + tied-acc copy. */
+      bool zero_accum = false;
+      if (mm_enc == AGX_ISA_ENCODING_AGX3C && !b->shader->key->dev.emit_agx3d &&
+          instr->def.bit_size == 32) {
+         const unsigned nc = instr->def.num_components;
+         if (nir_src_is_const(instr->src[2])) {
+            zero_accum = true;
+            for (unsigned c = 0; c < nc; ++c)
+               zero_accum &= nir_src_comp_as_uint(instr->src[2], c) == 0u;
+         } else if (nir_def_is_alu(instr->src[2].ssa)) {
+            nir_alu_instr *vec = nir_def_as_alu(instr->src[2].ssa);
+            if (nir_op_is_vec(vec->op) &&
+                nir_op_infos[vec->op].num_inputs == nc) {
+               zero_accum = true;
+               for (unsigned c = 0; c < nc; ++c) {
+                  if (!nir_src_is_const(vec->src[c].src) ||
+                      nir_src_comp_as_uint(vec->src[c].src,
+                                           vec->src[c].swizzle[0]) != 0u) {
+                     zero_accum = false;
+                     break;
+                  }
+               }
+            }
+         }
+      }
+      if (zero_accum)
+         type |= AGX3_MATRIX_ZERO_ACCUM;
+      agx_index acc_src =
+         zero_accum ? agx_null() : agx_src_index(&instr->src[2]);
       if (instr->def.num_components == 8) {
          agx_matmad16_agx3_to(b, dst, agx_src_index(&instr->src[0]),
                             agx_src_index(&instr->src[1]),
-                            agx_src_index(&instr->src[2]), type);
+                            acc_src, type);
       } else {
          assert(instr->def.num_components == 2);
          agx_matmad8_agx3_to(b, dst, agx_src_index(&instr->src[0]),
                             agx_src_index(&instr->src[1]),
-                            agx_src_index(&instr->src[2]), type);
+                            acc_src, type);
       }
       agx_emit_cached_split(b, dst, instr->def.num_components);
       return NULL;
