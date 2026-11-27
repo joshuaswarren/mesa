@@ -6623,6 +6623,11 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
          ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
    }
 
+   if (bl->g17p_block_mip_cs)
+      ctx->delete_compute_state(ctx, bl->g17p_block_mip_cs);
+   if (bl->g17p_block_mip_sampler)
+      ctx->delete_sampler_state(ctx, bl->g17p_block_mip_sampler);
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 
@@ -9543,6 +9548,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
          .compiler_d = compiler_d,
          .threadgroup_memory_size_B =
             shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+         .imageblock_stride_B = info->imageblock_stride,
          .launch_sources = launch_sources,
          /* The program announces how it will be launched.  An indirectly
           * launched one takes its dimensions from the geometry block; a record
@@ -9872,6 +9878,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -10126,6 +10133,7 @@ agx_g18_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -10940,6 +10948,7 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
             cs->info.local_size
                ? MAX2(256u, ALIGN_POT(cs->info.local_size, 64u))
                : 0,
+         .imageblock_stride_B = cs->info.imageblock_stride,
          /* The program announces how it is launched, as the API compute
           * path's does (agx_g17p_append_compute()). */
          .ldshdr_f1 = indirect_local
