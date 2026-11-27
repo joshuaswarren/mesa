@@ -3140,6 +3140,12 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       hk_tess_batch_flush(cmd);
 
    if ((*ptr) == NULL) {
+      if (compute && unlikely(cmd->sync.lead_ts.handle)) {
+         hk_sync_flush_lead_timestamp(cmd);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return NULL;
+      }
+
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       struct hk_cs *cs = hk_cs_create(cmd, compute);
       if (!cs)
