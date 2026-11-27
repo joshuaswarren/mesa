@@ -419,12 +419,24 @@ block_is_direct_loop_body(const nir_block *block, const nir_loop *loop)
 static bool
 agx2_integer_invariant(nir_instr *instr)
 {
-   if (instr->type == nir_instr_type_intrinsic)
-      return nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_preamble;
+   if (instr->type == nir_instr_type_intrinsic) {
+      switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+      case nir_intrinsic_load_preamble:
+      case nir_intrinsic_load_subgroup_invocation:
+      case nir_intrinsic_load_subgroup_id:
+      case nir_intrinsic_load_local_invocation_index:
+      case nir_intrinsic_load_local_invocation_id:
+      case nir_intrinsic_load_workgroup_id:
+         return true;
+      default:
+         return false;
+      }
+   }
    if (instr->type != nir_instr_type_alu)
       return false;
 
    switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_mov:
    case nir_op_iadd:
    case nir_op_isub:
    case nir_op_imul:
@@ -432,6 +444,21 @@ agx2_integer_invariant(nir_instr *instr)
    case nir_op_imax:
    case nir_op_umin:
    case nir_op_umax:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_ishl:
+   case nir_op_ushr:
+   case nir_op_ishr:
+   case nir_op_ubitfield_extract:
+   case nir_op_ibitfield_extract:
+   case nir_op_bitfield_insert:
+   case nir_op_u2u16:
+   case nir_op_u2u32:
+   case nir_op_i2i16:
+   case nir_op_i2i32:
+   case nir_op_imadshl_agx:
+   case nir_op_extr_agx:
       return true;
    default:
       return false;
