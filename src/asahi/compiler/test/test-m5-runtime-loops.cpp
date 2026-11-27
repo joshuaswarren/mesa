@@ -540,6 +540,44 @@ striped_factor(uint32_t n, bool pc_start = false)
    return progress ? widest : 0;
 }
 
+/* for (i = 0; i < n; i += step) acc += buf[i], the step a push constant: a
+ * loop that steps by a runtime value. Returns the iterations per test the
+ * pass gives it at factor 8, or 0 when it leaves the loop as it is. */
+static unsigned
+runtime_step_factor(uint32_t n)
+{
+   nir_builder b = compute_shader("runtime-step-loop");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *step = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, nir_imm_int(&b, n)));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd(&b, i, step), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+   unsigned widest = 0;
+   const bool progress = agx_nir_unroll_runtime_loops(s, 8, 320, &widest);
+   nir_validate_shader(s, "runtime-step loop");
+   ralloc_free(s);
+   return progress ? widest : 0;
+}
+
 TEST(M5RuntimeLoops, TripBoundLimitsFactor)
 {
    /* At most two iterations, like a halo fill: any main loop could run at
@@ -552,6 +590,9 @@ TEST(M5RuntimeLoops, TripBoundLimitsFactor)
    EXPECT_EQ(striped_factor(32 * 16), 8u);
    /* A start that may be negative gives no bound. */
    EXPECT_EQ(striped_factor(64, true), 8u);
+   /* Neither does a step only known at run time, whatever the bound. */
+   EXPECT_EQ(runtime_step_factor(4096), 8u);
+   EXPECT_EQ(runtime_step_factor(64), 8u);
 }
 
 static nir_intrinsic_instr *
