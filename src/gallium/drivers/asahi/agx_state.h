@@ -1004,6 +1004,11 @@ struct asahi_blitter {
    /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
    void *g17p_mip_cs[32];
 
+   /* HAL200/AGX3B compressed block-mip compute shader and unnormalized linear
+    * sampler for exact 2x2 compressed mip levels. */
+   void *g17p_block_mip_cs;
+   void *g17p_block_mip_sampler;
+
    /* [filter] */
    void *sampler[2];
 

@@ -225,6 +225,10 @@ lower(nir_builder *b, nir_instr *instr, void *data)
       case nir_intrinsic_image_texel_address:
       case nir_intrinsic_load_image_block_size_agx:
          break;
+      case nir_intrinsic_image_store_block_agx:
+         if (!options->g17p_bindless_storage)
+            return false;
+         break;
       default:
          return false;
       }
@@ -1172,7 +1176,9 @@ agx_nir_lower_g17p_storage_records(nir_shader *shader, unsigned record_size_B)
             const bool load =
                intr->intrinsic == nir_intrinsic_bindless_image_load ||
                intr->intrinsic == nir_intrinsic_bindless_image_sparse_load;
-            if (intr->intrinsic != nir_intrinsic_bindless_image_store && !load)
+            if (intr->intrinsic != nir_intrinsic_bindless_image_store &&
+                intr->intrinsic != nir_intrinsic_bindless_image_store_block_agx &&
+                !load)
                continue;
 
             nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
