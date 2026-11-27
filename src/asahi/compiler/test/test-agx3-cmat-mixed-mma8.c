@@ -441,7 +441,7 @@ compile_zero_accum_case(enum agx_isa_encoding encoding, bool is_gemm16,
          .align_mul = 8);
    }
 
-   nir_const_value cv[8];
+   nir_const_value cv[8] = {0};
    for (unsigned i = 0; i < ncomp; ++i)
       cv[i].u32 = zero_bits;
    nir_def *c_mat = nir_build_imm(&b, ncomp, 32, cv);
