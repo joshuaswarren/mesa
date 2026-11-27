@@ -3097,6 +3097,55 @@ main(void)
         p_atomic_read(&mq->drm.signalled_value) == 12);
    }
    test_vertex_image_bloom();
+   /* Retired exact prior pruning drops completed VDM/CDM ordinals while
+    * preserving unretired dependencies and FRAGMENT_BARRIERS ta_split. */
+   {
+      struct hk_queue *rq = new_queue(true);
+      /* Submit 1 (point 10): HK_SYNC_GFX_MEM render (ord 1) + barrier. */
+      rq->drm.timeline_value = 10;
+      struct hk_cmd_buffer *s1 = new_cmd();
+      struct hk_cs *r_mem = add(s1, false);
+      hk_sync_note_memory_write(s1, r_mem);
+      hk_sync_barrier(s1, HK_SYNC_ALL, HK_SYNC_ALL);
+      T("retired-prior setup s1",
+        hk_sync_resolve_submit(rq, &s1, 1, false, false, 0, NULL));
+      T("retired-prior reports unretired priors after s1",
+        hk_sync_submit_has_unretired_priors(rq));
+
+      /* Submit 2 (point 11): plain render (ord 2) + fragment-only barrier,
+       * while point 10 is still in flight (completed = 0). */
+      rq->drm.timeline_value = 11;
+      struct hk_cmd_buffer *s2 = new_cmd();
+      struct hk_cs *r2 = add(s2, false);
+      hk_sync_barrier(s2, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+      T("retired-prior s2 unretired",
+        hk_sync_resolve_submit(rq, &s2, 1, false, false, 0, NULL));
+      T("retired-prior keeps unretired GFX_MEM prior_ta",
+        r2->sync.prior[HK_SYNC_VDM] == 1 && r2->sync.prior_ta[HK_SYNC_VDM] == 1);
+
+      /* Submit 3 (point 12): point 10 has retired (completed = 10), point 11
+       * is still live -> prior_ta[VDM] (1) prunes to 0 while prior[VDM] (2)
+       * stays live with ta_split=true! */
+      rq->drm.timeline_value = 12;
+      struct hk_cmd_buffer *s3 = new_cmd();
+      struct hk_cs *r3 = add(s3, false);
+      T("retired-prior s3 partial retirement",
+        hk_sync_resolve_submit(rq, &s3, 1, false, false, 10, NULL));
+      T("retired-prior prunes retired prior_ta while keeping live fragment prior",
+        r3->sync.prior[HK_SYNC_VDM] == 2 && r3->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+           r3->sync.ta_split);
+
+      /* Submit 4 (point 13): everything through point 12 has retired -> both
+       * prior and prior_ta prune to 0 and ta_split clears. */
+      rq->drm.timeline_value = 13;
+      struct hk_cmd_buffer *s4 = new_cmd();
+      struct hk_cs *r4 = add(s4, false);
+      T("retired-prior s4 full retirement",
+        hk_sync_resolve_submit(rq, &s4, 1, false, false, 12, NULL));
+      T("retired-prior clears both priors and ta_split when all retired",
+        r4->sync.prior[HK_SYNC_VDM] == 0 && r4->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+           !r4->sync.ta_split);
+   }
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
