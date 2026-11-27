@@ -18023,6 +18023,62 @@ TEST_F(AGX3PackBinary, TextureSample2DArrayShadowUsesDisjointBanks)
    }
 }
 
+/* A 3x3 PCF kernel on a sampler2DArrayShadow (gpubench-gl render.shadow):
+ * nine taps, each on its own eight-half bank, so the ninth relocates to bank
+ * 64. AGX3B's 14-byte immediate-descriptor SMP cannot name that bank; the
+ * sample must take the long form instead of failing the whole shader. */
+TEST_F(AGX3PackBinary, TextureSample2DArrayShadowPcfReachesBank64)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   agx_builder *b = builder(enc);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->max_reg = 127;
+
+   constexpr unsigned taps = 9;
+   for (unsigned i = 0; i < taps; ++i) {
+      agx_index dest = agx_register(24 + 8 * i, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(4 + 8 * (i & 1), AGX_SIZE_32);
+      coord.channels_m1 = 2;
+      agx_index ref = agx_register(2, AGX_SIZE_32);
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, agx_immediate(0), agx_immediate(0), agx_immediate(0),
+         agx_immediate(1), ref, AGX_DIM_2D_ARRAY, AGX_LOD_MODE_AUTO_LOD, 0,
+         false, true, false, AGX_GATHER_NONE, false);
+      I->mask = 1;
+   }
+   agx_stop(b);
+
+   const auto code = pack(b);
+   ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+   EXPECT_TRUE(b->shader->agx3_staging_known);
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 8u * taps);
+
+   /* The last tap's comparison reference is staged at bank 64 + 4, and its
+    * SMP is the long form naming bank 64. */
+   const uint16_t bank = 8 * (taps - 1);
+   uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+   bool found_ref = false;
+   for (unsigned hints = 0; hints < 32 && !found_ref; ++hints) {
+      const uint8_t slot = 1 + (hints >> 2);
+      if (slot <= 8 &&
+          agx3_tex_stage_copy_hints(enc, bank + 4, 2, slot, 0, hints & 1,
+                                    hints & 2, bytes, &len))
+         found_ref = std::search(code.begin(), code.end(), bytes,
+                                 bytes + len) != code.end();
+   }
+   EXPECT_TRUE(found_ref) << "missing shadow ref staging at bank " << bank;
+
+   bool found_smp = false;
+   for (size_t at = 0; at + 20 <= code.size() && !found_smp; ++at) {
+      uint64_t f[AGX3_MAX_FIELDS];
+      found_smp = agx3_decode(&agx3b_table, &code[at], 20, AGX3_MN_smp, f) >= 0 &&
+                  f[19] == bank;
+   }
+   EXPECT_TRUE(found_smp) << "missing 20-byte SMP naming bank " << bank;
+}
+
 /* A 2D-array sample with a register texture descriptor stages through fixed
  * slot 6; keep it on bank 0 rather than relocating it. */
 TEST_F(AGX3PackBinary, TextureSample2DArrayRegisterOperandStaysOnBankZero)
