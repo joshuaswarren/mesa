@@ -316,6 +316,10 @@ struct hk_sync_stream {
    uint64_t prior[HK_SYNC_NUM_SQ];
 
    uint8_t kind;
+   /* Render stream had an optimal VK_IMAGE_CREATE_ALIAS_BIT attachment whose
+    * memory had no buffer binding at record time. Upgraded to HK_SYNC_GFX_MEM
+    * at submit if hk_device::buffer_alias_mem_gen advanced since recording. */
+   bool alias_image_render;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
 
@@ -494,6 +498,12 @@ struct hk_sync_state {
    /* The event wait being recorded (brl_sync_event_poll()): its latest poll
     * stream. */
    struct hk_cs *brl_event_poll;
+
+   /* Snapshot of hk_device::buffer_alias_mem_gen taken before the first
+    * alias-image-only render in this command buffer was exempted from
+    * HK_SYNC_GFX_MEM. */
+   bool has_alias_image_render;
+   uint32_t buffer_alias_mem_gen;
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
