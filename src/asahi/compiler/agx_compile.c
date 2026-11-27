@@ -19517,11 +19517,14 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, nir_opt_dce);
       /* The launch's copies, if any, sit above every export. */
       unsigned push_count = info->push_count;
+      const bool place_load_bases_low =
+         is_agx3b ||
+         (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d);
       NIR_PASS(post_opt_progress, nir, agx_nir_place_preamble_handles_low,
                key->reserved_preamble,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
-               &push_count, is_agx3b);
+               &push_count, place_load_bases_low);
       info->push_count = push_count;
    }
 
