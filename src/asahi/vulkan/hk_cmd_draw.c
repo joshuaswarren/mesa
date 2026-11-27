@@ -6453,6 +6453,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
+   cmd->state.pending_msaa_resolve.cs = NULL;
    hk_take_pending_z_store(cmd, pRenderingInfo);
 
    if (likely(!cmd->state.deferred_clear_count)) {
@@ -6483,6 +6484,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    struct hk_cs *cs = cmd->current_cs.gfx;
 
    struct hk_pending_z_store z_pending = {0};
+   struct hk_pending_msaa_resolve msaa_resolve_pending = {0};
+   cmd->state.pending_msaa_resolve.cs = NULL;
 
    /* M5: the next instance may continue in this stream, see
     * hk_m5_pass_merge_begin(). Where the draws ended and the chunk they
@@ -6579,6 +6582,77 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                render->empty_tiles_s &&
                (pending_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0,
          };
+      }
+   }
+
+   if (cs && !cmd->in_meta && cs == render->zls_first_cs &&
+       cs->stats.cmds > 0 && !render->view_mask && render->layer_count == 1 &&
+       render->cr.whole_attachments &&
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+       !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                          VK_RENDERING_RESUMING_BIT)) &&
+       render->tilebuffer.nr_samples > 1 &&
+       !agx_tilebuffer_spills(&render->tilebuffer) &&
+       !render->g17p_direct_color_resolve && !cs->render_pack_elided) {
+      unsigned active_count = 0, active_rt = 0;
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         if (render->color_att[i].iview) {
+            active_rt = i;
+            active_count++;
+         }
+      }
+      if (active_count == 1) {
+         const struct hk_attachment *att = &render->color_att[active_rt];
+         const struct hk_image_view *iview = att->iview;
+         const struct hk_image *src_image =
+            container_of(iview->vk.image, struct hk_image, vk);
+         const VkImageCreateFlags unsafe_flags =
+            VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+            VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+         if (att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+             att->resolve_mode == VK_RESOLVE_MODE_NONE &&
+             iview->planes[0].eot_pbe_valid &&
+             src_image->plane_count == 1 &&
+             src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
+             src_image->vk.samples == render->tilebuffer.nr_samples &&
+             iview->vk.format == src_image->vk.format &&
+             !(src_image->vk.create_flags & unsafe_flags)) {
+            struct agx_tilebuffer_layout compact_tib = render->tilebuffer;
+            if (active_rt != 0) {
+               const enum pipe_format fmt =
+                  render->tilebuffer.logical_format[active_rt];
+               compact_tib = hk_tilebuffer_layout(
+                  hk_cmd_buffer_device(cmd), &iview->vk.format, 0, 1,
+                  render->tilebuffer.nr_samples, false, false, 1);
+               (void)fmt;
+            }
+            if (!agx_tilebuffer_spills(&compact_tib) &&
+                agx_tilebuffer_offset_B(&compact_tib, 0) == 0 &&
+                !compact_tib.layered) {
+               const struct hk_image *z_img =
+                  render->depth_att.iview
+                     ? container_of(render->depth_att.iview->vk.image,
+                                    struct hk_image, vk)
+                     : NULL;
+               const struct hk_image *s_img =
+                  render->stencil_att.iview
+                     ? container_of(render->stencil_att.iview->vk.image,
+                                    struct hk_image, vk)
+                     : NULL;
+               msaa_resolve_pending = (struct hk_pending_msaa_resolve){
+                  .cs = cs,
+                  .src_image = src_image,
+                  .z_image = z_img,
+                  .s_image = s_img,
+                  .src_eot_pbe = iview->planes[0].eot,
+                  .tib = compact_tib,
+                  .src_format = src_image->vk.format,
+                  .src_load_op = att->load_op,
+                  .src_mip_level = iview->vk.base_mip_level,
+                  .src_base_layer = iview->vk.base_array_layer,
+               };
+            }
+         }
       }
    }
 
@@ -6733,9 +6807,307 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       hk_meta_resolve_rendering(cmd, &vk_render);
       hk_sync_resolve_end(cmd);
       z_pending.cs = NULL;
+      msaa_resolve_pending.cs = NULL;
    }
 
+   if (msaa_resolve_pending.cs &&
+       (cs->end != end_before || vk_command_buffer_has_error(&cmd->vk)))
+      msaa_resolve_pending.cs = NULL;
+   if (msaa_resolve_pending.cs)
+      msaa_resolve_pending.next_seq = cmd->sync.next_seq;
+
    cmd->state.pending_z_store = z_pending;
+   cmd->state.pending_msaa_resolve = msaa_resolve_pending;
+}
+
+static struct hk_bg_eot
+hk_build_agx3_store_and_resolve_eot(
+   struct hk_cmd_buffer *cmd, const struct hk_pending_msaa_resolve *p,
+   const struct hk_native_pbe_descriptor *dst_pbe_in, bool skip_srgb)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_native_pbe_descriptor pbe_arguments[2] = {
+      p->src_eot_pbe,
+      *dst_pbe_in,
+   };
+   const enum pipe_format logical = p->tib.logical_format[0];
+   if (util_format_is_srgb(logical) && !skip_srgb)
+      ((uint8_t *)&pbe_arguments[1])[15] |= 0x20;
+
+   struct agx_bg_eot_key key = {0};
+   key.tib = p->tib;
+   key.op[0] = AGX_EOT_STORE;
+   key.multisample_store = true;
+
+   if (agx_chip_native_agx3(dev->dev.chip)) {
+      const struct hk_agx3_g17p_store_and_resolve_target fused = {
+         .color_attachment_count = 1,
+         .final_store = true,
+         .whole_attachments = true,
+         .store_source = true,
+         .has_resolve_target = true,
+         .average_resolve = true,
+         .source_samples = p->src_image->vk.samples,
+         .resolve_samples = 1,
+         .resolve_format_matches = true,
+         .source_pbe_valid = true,
+         .resolve_pbe_valid = true,
+      };
+      if (!hk_agx3_g17p_multisample_store_supported(
+             &key.tib, 1, true, p->src_image->vk.samples) ||
+          !hk_agx3_g17p_store_and_resolve_supported(&key.tib, &fused))
+         return (struct hk_bg_eot){0};
+
+      const unsigned descriptor_generation =
+         agx_chip_descriptor_generation(dev->dev.chip);
+      if (hk_pbe_descriptor_size(descriptor_generation) !=
+          AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE)
+         return (struct hk_bg_eot){0};
+
+      key.store_and_resolve = true;
+      struct agx_bg_eot_shader *shader =
+         agx_get_bg_eot_shader(&dev->bg_eot, &key);
+      if (!hk_g17p_bg_eot_shader_supported(shader))
+         return (struct hk_bg_eot){0};
+
+      struct hk_ioto_reservation program_reservation;
+      if (!hk_g17p_bg_eot_reserve(cmd, NULL,
+                                  AGX_IOTO_G17P_OCTA_EOT_PROGRAM_MAX_SIZE,
+                                  "G17P folded resolve EOT Ioto program",
+                                  &program_reservation))
+         return (struct hk_bg_eot){0};
+
+      const uint64_t pbe_argument_va = hk_g17p_bg_eot_upload(
+         cmd, NULL, pbe_arguments, 2 * AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE, 32);
+      if (!pbe_argument_va)
+         return (struct hk_bg_eot){0};
+
+      const struct agx3_g17p_rt0_eot_program_desc desc = {
+         .program_va = program_reservation.va,
+         .shader_va = shader->ptr + shader->info.main_offset,
+         .pbe_argument_va = pbe_argument_va,
+         .imageblock_offset_B = agx_tilebuffer_offset_B(&key.tib, 0),
+         .attachment_count = 2,
+         .mixed_mrt = true,
+         .imageblock_offset1_B = agx_tilebuffer_offset_B(&key.tib, 0),
+         .shader_binary_size = shader->info.binary_size,
+         .scratch_size = shader->info.scratch_size,
+         .nr_gprs = shader->info.nr_gprs,
+         .staging_halfs =
+            shader->info.agx3_staging_known ? shader->info.agx3_staging_halfs : 0,
+         .imageblock = {
+            .sample_size_B = key.tib.sample_size_B,
+            .nr_samples = key.tib.nr_samples,
+            .tile_size_px = key.tib.tile_size,
+         },
+      };
+      struct agx3_g17p_rt0_eot_program program;
+      if (!agx3_g17p_rt0_eot_program_generate(dev->dev.chip, &desc, &program))
+         return (struct hk_bg_eot){0};
+
+      memcpy(program_reservation.map, program.bytes, program.length);
+      const uint64_t published = hk_g17p_bg_eot_publish(
+         cmd, NULL, &program_reservation, program.length);
+      if (!published)
+         return (struct hk_bg_eot){0};
+
+      return (struct hk_bg_eot){
+         .usc = published,
+         .rsrc_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC,
+      };
+   }
+
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      const bool multisample =
+         ((key.tib.nr_samples == 2 && key.tib.tile_size == 32 * 32) ||
+          (key.tib.nr_samples == 4 && key.tib.tile_size == 32 * 16) ||
+          (key.tib.nr_samples == 8 && key.tib.tile_size == 16 * 16));
+      if (!multisample || key.tib.sample_size_B != 8 ||
+          agx_g17p_mrt_eot_selector(logical) != 0x75 ||
+          hk_agx3_format_needs_shader_resolve(logical))
+         return (struct hk_bg_eot){0};
+
+      key.m5_store_and_resolve = true;
+      struct agx_bg_eot_shader *shader =
+         agx_get_bg_eot_shader(&dev->bg_eot, &key);
+      if (!shader || !shader->info.nr_gprs ||
+          !shader->info.agx3_staging_known || shader->info.scratch_size ||
+          shader->info.has_preamble)
+         return (struct hk_bg_eot){0};
+
+      const uint64_t pbe = hk_g17p_bg_eot_upload(
+         cmd, NULL, pbe_arguments, sizeof(pbe_arguments), 32);
+      if (!pbe)
+         return (struct hk_bg_eot){0};
+      const uint64_t arguments[3] = {
+         pbe, 0, pbe + sizeof(pbe_arguments[0]),
+      };
+      const uint64_t table = hk_g17p_bg_eot_upload(
+         cmd, NULL, arguments, sizeof(arguments), 16);
+      if (!table)
+         return (struct hk_bg_eot){0};
+
+      const struct agx3_ioto_uniform_range ranges[1] = {{0, 12, table}};
+      size_t capacity;
+      if (!hk_m5_tile_program_bound(dev->dev.chip, ranges, 1, &capacity))
+         return (struct hk_bg_eot){0};
+
+      struct hk_ioto_reservation reservation;
+      if (!hk_g17p_bg_eot_reserve(cmd, NULL, capacity,
+                                  "M5 folded resolve EOT program",
+                                  &reservation))
+         return (struct hk_bg_eot){0};
+
+      const struct agx3_g17p_graphics_program_desc desc = {
+         .program_va = reservation.va,
+         .shader_va = shader->ptr + shader->info.main_offset,
+         .shader_binary_size = shader->info.binary_size,
+         .scratch_size = shader->info.scratch_size,
+         .nr_gprs = shader->info.nr_gprs,
+         .compiler_d_valid = shader->info.agx3_staging_known,
+         .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
+         .fragment = true,
+         .imageblock = {key.tib.sample_size_B, key.tib.nr_samples,
+                        key.tib.tile_size},
+         .uniform_ranges = ranges,
+         .uniform_range_count = 1,
+      };
+      struct agx3_g17p_graphics_program program;
+      if (!hk_m5_tile_program(dev, shader, &desc, true, &program) ||
+          program.length > capacity)
+         return (struct hk_bg_eot){0};
+
+      memcpy(reservation.map, program.bytes, program.length);
+      hk_cmd_buffer_retain_bo(cmd, shader->bo);
+      const uint64_t published =
+         hk_g17p_bg_eot_publish(cmd, NULL, &reservation, program.length);
+      if (!published)
+         return (struct hk_bg_eot){0};
+
+      return (struct hk_bg_eot){
+         .usc = published,
+         .primary_storage_B = desc.scratch_size,
+         .staging_storage_B = desc.compiler_d,
+         .rsrc_spec = 0,
+      };
+   }
+
+   return (struct hk_bg_eot){0};
+}
+
+bool
+hk_try_fold_msaa_resolve(struct hk_cmd_buffer *cmd,
+                         const VkResolveImageInfo2 *info)
+{
+   struct hk_pending_msaa_resolve p = cmd->state.pending_msaa_resolve;
+   cmd->state.pending_msaa_resolve.cs = NULL;
+   if (likely(!p.cs))
+      return false;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_cs *cs = p.cs;
+
+   if (cmd->in_meta || cmd->state.deferred_clear_count ||
+       cmd->state.uses_events ||
+       cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
+       cmd->current_cs.post_gfx || cmd->state.oq_pending_render ||
+       cmd->sync.in_pass || cmd->sync.pending_start_ts.handle ||
+       cmd->sync.stamp_copy_count ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       list_is_empty(&cmd->control_streams) ||
+       list_last_entry(&cmd->control_streams, struct hk_cs, node) != cs ||
+       cmd->sync.next_seq != p.next_seq ||
+       cs->timestamp.start.handle || cs->timestamp.end.handle ||
+       (cs->fs_reads_images && p.fs_barrier_seen) ||
+       info->regionCount != 1)
+      return false;
+
+   VK_FROM_HANDLE(hk_image, src_image, info->srcImage);
+   VK_FROM_HANDLE(hk_image, dst_image, info->dstImage);
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if (src_image != p.src_image || dst_image == src_image ||
+       dst_image == p.z_image || dst_image == p.s_image ||
+       dst_image->plane_count != 1 ||
+       dst_image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       dst_image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       dst_image->vk.format != p.src_format ||
+       vk_format_is_int(p.src_format) ||
+       !vk_format_is_color(p.src_format) ||
+       (dst_image->vk.create_flags & unsafe_flags))
+      return false;
+
+   bool skip_srgb = false;
+   const VkResolveImageModeInfoKHR *mode_info =
+      vk_find_struct_const(info->pNext, RESOLVE_IMAGE_MODE_INFO_KHR);
+   if (mode_info) {
+      if (mode_info->resolveMode != VK_RESOLVE_MODE_AVERAGE_BIT ||
+          (mode_info->flags &
+           ~(VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR |
+             VK_RESOLVE_IMAGE_ENABLE_TRANSFER_FUNCTION_BIT_KHR)))
+         return false;
+      skip_srgb =
+         (mode_info->flags & VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR) != 0;
+   }
+
+   const VkImageResolve2 *region = &info->pRegions[0];
+   if (region->srcSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+       region->dstSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+       region->srcSubresource.mipLevel != p.src_mip_level ||
+       region->srcSubresource.baseArrayLayer != p.src_base_layer ||
+       vk_image_subresource_layer_count(&src_image->vk,
+                                        &region->srcSubresource) != 1 ||
+       vk_image_subresource_layer_count(&dst_image->vk,
+                                        &region->dstSubresource) != 1 ||
+       region->srcOffset.x != 0 || region->srcOffset.y != 0 ||
+       region->srcOffset.z != 0 || region->dstOffset.x != 0 ||
+       region->dstOffset.y != 0 || region->dstOffset.z != 0 ||
+       region->extent.width != cs->cr.width ||
+       region->extent.height != cs->cr.height || region->extent.depth != 1)
+      return false;
+
+   const uint32_t dst_level = region->dstSubresource.mipLevel;
+   const uint32_t dst_layer = region->dstSubresource.baseArrayLayer;
+   const VkExtent3D dst_extent =
+      vk_image_mip_level_extent(&dst_image->vk, dst_level);
+   if (dst_extent.width != cs->cr.width || dst_extent.height != cs->cr.height ||
+       dst_extent.depth != 1)
+      return false;
+
+   if (agx_chip_native_or_g18g(dev->dev.chip) &&
+       (!dst_image->planes[0].addr || !dst_image->planes[0].layout.size_B))
+      return false;
+
+   struct hk_native_pbe_descriptor dst_pbe;
+   if (!hk_image_pack_eot_pbe(dev, dst_image, dst_level, dst_layer, &dst_pbe))
+      return false;
+
+   struct hk_bg_eot eot =
+      hk_build_agx3_store_and_resolve_eot(cmd, &p, &dst_pbe, skip_srgb);
+   if (!eot.usc || vk_command_buffer_has_error(&cmd->vk))
+      return false;
+
+   memcpy(eot.anatomy_ops, cs->cr.eot.main.anatomy_ops, sizeof(eot.anatomy_ops));
+   cs->cr.eot.main = eot;
+   if (p.src_load_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
+      cs->cr.process_empty_tiles = true;
+
+   if (agx_chip_native_or_g18g(dev->dev.chip)) {
+      hk_drm_attachment_set_add(&cs->fragment_attachments,
+                                dst_image->planes[0].addr,
+                                dst_image->planes[0].layout.size_B);
+   }
+
+   hk_sync_fold_resolve(cmd, cs, dst_image, dst_level, dst_layer,
+                        region->extent.width, region->extent.height);
+
+   cmd->pass_merge.valid = false;
+   cmd->render_pack.tail_open = false;
+   cmd->render_pack.tail_why = "resolve";
+   perf_debug(cmd, "Folded trailing vkCmdResolveImage2 into render pass EOT");
+   return true;
 }
 
 static bool

@@ -1629,6 +1629,23 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       return;
    }
 
+   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass) {
+      const VkPipelineStageFlags2 fs_stages =
+         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+         VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+      bool fs_bar = false;
+      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->memoryBarrierCount; ++i)
+         fs_bar = (pDependencyInfo->pMemoryBarriers[i].srcStageMask & fs_stages) != 0;
+      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->bufferMemoryBarrierCount; ++i)
+         fs_bar = (pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask & fs_stages) != 0;
+      for (uint32_t i = 0; !fs_bar && i < pDependencyInfo->imageMemoryBarrierCount; ++i)
+         fs_bar = (pDependencyInfo->pImageMemoryBarriers[i].srcStageMask & fs_stages) != 0;
+      if (fs_bar)
+         cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
+   }
+
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->pass_merge.valid))
@@ -6324,6 +6341,8 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
    if (!hk_deferred_clear_eligible(cmd, image, aspects, range_count, ranges))
       return false;
 
+   cmd->state.pending_msaa_resolve.cs = NULL;
+
    /* The deferred clear overwrites the whole image, whether it becomes a
     * load-op clear or a fill: a pending store of those aspects is dead. */
    if (cmd->state.pending_z_store.cs &&
@@ -6418,6 +6437,7 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
+   cmd->state.pending_msaa_resolve.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;

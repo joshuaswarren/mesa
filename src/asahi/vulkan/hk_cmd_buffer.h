@@ -1609,6 +1609,9 @@ struct hk_cs {
 
    /* A graphics program recorded in this stream writes external memory. */
    bool m5_shader_writes_memory;
+   /* A fragment shader recorded in this stream reads textures, images, input
+    * attachments, or external memory. */
+   bool fs_reads_images;
 
    /* Per-render-stream memo of hoisted AGX3 vertex preamble outputs already
     * computed by a PREGFX dispatch for a given (vertex shader, root VA). */
@@ -2415,6 +2418,25 @@ struct hk_cmd_buffer {
          bool empty_tiles_s;
       } pending_z_store;
 
+      /* AGX3: the last ended single-stream multisample render pass stored one
+       * active colour attachment without resolving it. An immediately following
+       * full-image vkCmdResolveImage2 of that attachment can fold into cs's
+       * end-of-tile program via store_and_resolve, avoiding a meta resolve pass. */
+      struct hk_pending_msaa_resolve {
+         struct hk_cs *cs;
+         const struct hk_image *src_image;
+         const struct hk_image *z_image;
+         const struct hk_image *s_image;
+         struct hk_native_pbe_descriptor src_eot_pbe;
+         struct agx_tilebuffer_layout tib;
+         VkFormat src_format;
+         VkAttachmentLoadOp src_load_op;
+         uint32_t src_mip_level;
+         uint32_t src_base_layer;
+         uint32_t next_seq;
+         bool fs_barrier_seen;
+      } pending_msaa_resolve;
+
       /* M5: the open render stream is an ordered continuation (hk_cs::
        * m5_ordered) and a command recorded since may read the instance's
        * attachments through memory; the next draw ends the stream first. */
@@ -3112,6 +3134,8 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->state.pending_z_store.cs) &&
        !cmd->state.deferred_clear_hold)
       cmd->state.pending_z_store.cs = NULL;
+   if (unlikely(cmd->state.pending_msaa_resolve.cs))
+      cmd->state.pending_msaa_resolve.cs = NULL;
    if (unlikely(cmd->state.oq_pending_render) &&
        (ptr == &cmd->current_cs.post_gfx ||
         cmd->current_cs.gfx != cmd->state.oq_pending_render))
@@ -3634,6 +3658,8 @@ void hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
                                  const VkDependencyInfo *info);
 void hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd);
 void hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd);
+bool hk_try_fold_msaa_resolve(struct hk_cmd_buffer *cmd,
+                              const VkResolveImageInfo2 *info);
 
 /* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
  * break its memory equivalence (reason names the command). */
@@ -3775,6 +3801,12 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    /* Not scratch but this is the most convenient place for this... */
    cs->uses_sampler_heap |= s->b.info.uses_sampler_heap;
+   if (s->info.stage == MESA_SHADER_FRAGMENT &&
+       (s->b.info.uses_txf || s->b.info.uses_sampler_heap ||
+        s->b.info.texture_state_count || s->b.info.sampler_state_count ||
+        s->info.fs.has_input_attachments || s->info.fs.writes_memory ||
+        s->info.writes_external_memory))
+      cs->fs_reads_images = true;
 
    /* G17P and M5 publish a shader's spill frame as thread-private storage in their
     * SPECTPR. There is no helper-program stack, and the kernel rejects a
