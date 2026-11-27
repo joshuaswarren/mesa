@@ -25,7 +25,11 @@ jobs:
         run: |
           dnf -y install dnf-plugins-core git
           dnf -y builddep mesa
-          dnf -y install ccache clang
+          # The GLVND EGL dispatcher (libEGL.so.1). builddep installs
+          # libglvnd-core-devel but not libglvnd-egl, and Mesa built against
+          # GLVND provides just the vendor library, so the asahi-egl-priority
+          # tests' dlopen of libEGL.so.1 would find nothing.
+          dnf -y install ccache clang libglvnd-egl
 
       - name: Check out
         uses: actions/checkout@v4
