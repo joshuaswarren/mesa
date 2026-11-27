@@ -5221,10 +5221,15 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, selected);
-      const uint64_t wg = agx_workgroup_threads(local_size);
       const uint64_t threads = agx_is_indirect(grid) ? 0 :
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
-      hk_frame_anatomy_note_grid(cs, selected, threads, wg ? threads / wg : 0,
+      const uint64_t wgs =
+         agx_is_indirect(grid) || !local_size.x || !local_size.y || !local_size.z
+            ? 0
+            : (uint64_t)DIV_ROUND_UP(grid.count[0], local_size.x) *
+                 DIV_ROUND_UP(grid.count[1], local_size.y) *
+                 DIV_ROUND_UP(grid.count[2], local_size.z);
+      hk_frame_anatomy_note_grid(cs, selected, threads, wgs,
                                  agx_is_indirect(grid));
    }
    cs->stats.calls++;

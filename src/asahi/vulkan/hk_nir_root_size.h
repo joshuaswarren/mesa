@@ -25,10 +25,12 @@ bool hk_nir_can_coalesce_workgroup(const nir_shader *nir);
 
 /* Coalesce a pure-global API workgroup shape (<= 256, multiple of 32) up to
  * MIN2(MIN2(target_wg_threads, 512), max_wg_threads), bounded per axis by
- * max_wg_size[], while preserving exact divisibility on every grid axis (zero
- * partial workgroups), at least MAX2(min_workgroups, 256) workgroups up to 256
- * threads, and at least MAX2(min_workgroups, 1024) workgroups above 256
- * threads. Returns true if out_local differs from api_local. */
+ * max_wg_size[], keeping at least MAX2(min_workgroups, 256) workgroups up to
+ * 256 threads and at least MAX2(min_workgroups, 1024) workgroups above 256
+ * threads. Exact-divisor steps run first (zero partial workgroups); if room
+ * remains, bounded partial-edge steps (<= 6.25% inactive edge lanes, clipped
+ * natively by AGX3 global-thread CDM launches) choose the axis minimizing
+ * padded invocations. Returns true if out_local differs from api_local. */
 bool hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
                                    const uint32_t grid_threads[3],
                                    const uint32_t max_wg_size[3],
