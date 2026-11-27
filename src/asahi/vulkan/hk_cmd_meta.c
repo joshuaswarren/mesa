@@ -2268,15 +2268,20 @@ hk_compressed_mip_blit_supported(const struct hk_device *dev,
                                                  info->filter, true))
          return false;
 
-      /* Marking a level's tiles uncompressed needs all of its texels, and
-       * large compressed levels are cheaper stored compressed by a pass */
+      /* Marking a level's tiles uncompressed or writing whole compressed
+       * 32x32 tiles needs all of its texels. Large compressed levels that
+       * cannot take the compressed compute block-mip path fall back to a
+       * render pass so they stay compressed. */
       const uint32_t level = region->dstSubresource.mipLevel;
       const uint32_t width = u_minify(dst->vk.extent.width, level);
       const uint32_t height = u_minify(dst->vk.extent.height, level);
+      const uint32_t src_width = (uint32_t)region->srcOffsets[1].x;
+      const uint32_t src_height = (uint32_t)region->srcOffsets[1].y;
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_mip_level_through_pbe(chip, width, height)))
+           hk_compressed_mip_level_through_pbe(chip, src_width, src_height,
+                                               width, height)))
          return false;
    }
    return true;
@@ -2668,14 +2673,6 @@ struct hk_g17p_block_mip_key {
    enum hk_meta_object_key_type key_type;
 };
 
-static bool
-hk_g17p_block_mip_supported(const struct hk_device *dev)
-{
-   const enum agx_chip chip = dev->dev.chip;
-   return agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) &&
-          agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
-}
-
 static nir_shader *
 build_g17p_block_mip_shader(void)
 {
@@ -2928,7 +2925,7 @@ hk_compressed_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       /* An exact 2x level that stays compressed takes the compressed PBE,
        * where the PBE compresses it; the raw writes below leave it
        * uncompressed. */
-      if (exact_2x2 && metadata && hk_g17p_block_mip_supported(dev)) {
+      if (exact_2x2 && metadata && hk_g17p_block_mip_supported(dev->dev.chip)) {
          hk_g17p_block_mip_region(cmd, src, dst, info, region);
          continue;
       }
