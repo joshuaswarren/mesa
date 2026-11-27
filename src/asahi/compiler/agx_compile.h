@@ -854,6 +854,11 @@ bool agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 bool agx_compile_shader_nir_capture(nir_shader *nir, struct agx_shader_key *key,
                                     struct agx_shader_part *out,
                                     struct blob *pre_preamble_blob);
+bool agx_compile_shader_nir_capture_ex(nir_shader *nir,
+                                       struct agx_shader_key *key,
+                                       struct agx_shader_part *out,
+                                       struct blob *pre_preamble_blob,
+                                       nir_shader **post_opt_nir_out);
 void agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
                                          const struct agx_shader_key *key);
 bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
@@ -861,6 +866,8 @@ bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
                                          struct agx_shader_part *out,
                                          bool epilog_has_alu,
                                          bool preamble_newly_enabled);
+bool agx_compile_shader_nir_postopt(nir_shader *nir, struct agx_shader_key *key,
+                                    struct agx_shader_part *out);
 
 struct agx_occupancy {
    unsigned max_registers;
