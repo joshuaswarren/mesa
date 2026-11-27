@@ -1155,20 +1155,42 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
-/* Whether the open general compute stream may receive work of the given
- * kinds: every stream it would have to wait on must precede it. */
+/* Whether the compute stream cs already waits for every compute stream before
+ * it: for the one before it, which covers the earlier ones as a prefix. */
 static bool
-cs_reusable(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t kinds)
+cdm_waits_for_prefix(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   req_for_kinds(cmd, kinds, dep);
+   const struct hk_cs *prev = previous_on_sq(cmd, cs);
+   const struct hk_cs *cut = cs->sync.dep[HK_SYNC_CDM].cut;
+   return !prev || (cut && cut != cs && cut->sync.seq >= prev->sync.seq);
+}
 
+/* Whether work recorded into the open compute stream cs meets the requirement
+ * dep: every stream dep names must precede cs. A cut at cs itself names the
+ * compute streams before cs as well as the work inside it. The stream orders
+ * only its own work, and the kernel may run earlier compute streams of the
+ * queue on other firmware channels (DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL),
+ * so that cut is met only if cs already waits for those streams. */
+static bool
+cs_meets(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+         const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       if (dep[sq].cut && dep[sq].cut->sync.seq > cs->sync.seq)
          return false;
    }
 
-   return true;
+   return dep[HK_SYNC_CDM].cut != cs || cdm_waits_for_prefix(cmd, cs);
+}
+
+/* Whether the open general compute stream may receive work of the given
+ * kinds (cs_meets()). */
+static bool
+cs_reusable(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t kinds)
+{
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_kinds(cmd, kinds, dep);
+   return cs_meets(cmd, cs, dep);
 }
 
 /* Whether the compute stream cs already waits for the render r: directly,
@@ -1378,18 +1400,16 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
       dep_max(&full[sq], &dep[sq]);
 
-   if (cs && !cmd->sync.pin_cs) {
-      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-         if (full[sq].cut && full[sq].cut->sync.seq > cs->sync.seq) {
-            hk_cmd_buffer_end_compute(cmd);
-            break;
-         }
-      }
-   }
+   if (cs && !cmd->sync.pin_cs && !cs_meets(cmd, cs, full))
+      hk_cmd_buffer_end_compute(cmd);
 
    cs = hk_cmd_buffer_get_cs(cmd, true);
-   if (cs)
+   if (cs) {
+      /* A pinned stream stays open: it waits for the streams before it. */
+      if (full[HK_SYNC_CDM].cut == cs && !cdm_waits_for_prefix(cmd, cs))
+         full[HK_SYNC_CDM].cut = previous_on_sq(cmd, cs);
       hk_sync_stream_wait(cs, full);
+   }
    return cs;
 }
 
