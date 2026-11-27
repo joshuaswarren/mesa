@@ -17742,11 +17742,10 @@ hk_agx3_draw_indirect_gpu(struct hk_cmd_buffer *cmd, uint64_t in,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
-   const enum agx_command_stream_generation cs_gen =
-      agx_chip_command_stream_generation(dev->dev.chip);
-   if ((cs_gen != AGX_CS_GENERATION_HAL200 &&
-        cs_gen != AGX_CS_GENERATION_HAL300) ||
-       !agx_vdm_stream_link_core_supported(dev->dev.chip) ||
+   /* The sub-stream needs the returning VDM Stream Link record; every chip
+    * that has it (G15, G16G, G17P, M5, G18G) also writes the draw records the
+    * builder stamps. AGX2 has only its own non-returning link. */
+   if (!agx_vdm_stream_link_core_supported(dev->dev.chip) ||
        max_draw_count == 0 || max_draw_count > HK_INDIRECT_VDM_MAX_DRAWS ||
        in == 0 || (in & 3u) != 0)
       return false;
