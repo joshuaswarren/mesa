@@ -478,3 +478,84 @@ TEST_F(SpillRepeatPair, Agx2IsFilled)
    EXPECT_EQ(n.stores, 1u);
    EXPECT_EQ(n.fills, 1u);
 }
+
+TEST_F(SpillRepeatPair, RepeatsHalfFloatAndExtract)
+{
+   /* AGX3 repeats FP16 ALU chains (HMUL/HFMA) instead of spilling to scratch. */
+   agx_index s = agx_rcp(b, agx_uniform(0, AGX_SIZE_16));
+   agx_index c = agx_rcp(b, agx_uniform(2, AGX_SIZE_16));
+   agx_index t = agx_hmul(b, s, agx_uniform(4, AGX_SIZE_16));
+   agx_index v = agx_hfma(b, c, agx_uniform(6, AGX_SIZE_16), t);
+   agx_index q[5];
+   for (unsigned i = 0; i < 5; ++i)
+      q[i] = leaf(10 + i);
+
+   /* Keep original v live so DCE cannot sink it; spilling must repeat it. */
+   agx_unit_test(b, v);
+   use_after_peak(v, s, c, q, 5, 2);
+   spill();
+
+   counts n = count();
+   EXPECT_EQ(n.stores, 0u);
+   EXPECT_EQ(n.fills, 0u);
+
+   unsigned hmul = 0, hfma = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      hmul += I->op == AGX_OPCODE_HMUL;
+      hfma += I->op == AGX_OPCODE_HFMA;
+   }
+   EXPECT_GE(hmul, 2u);
+   EXPECT_GE(hfma, 2u);
+}
+
+TEST_F(SpillRepeatPair, LoopExitPenaltyProtectsHotLoopValues)
+{
+   /* A value used immediately after a loop exit has a larger effective
+    * next-use distance inside the loop than a value used on the next loop
+    * iteration, so the spiller evicts the cold post-loop value instead of
+    * filling the hot loop-carried value every iteration. */
+   agx_block *entry = b->cursor.block;
+   agx_block *hdr = agx_test_block(b->shader);
+   agx_block *exit_blk = agx_test_block(b->shader);
+   hdr->loop_header = true;
+   agx_block_add_successor(entry, hdr);
+   agx_block_add_successor(hdr, hdr);
+   agx_block_add_successor(hdr, exit_blk);
+
+   b->cursor = agx_after_block(entry);
+   agx_index hot = leaf(0);
+   agx_index cold = leaf(1);
+   agx_index keep[5];
+   for (unsigned i = 0; i < 5; ++i)
+      keep[i] = leaf(2 + i);
+
+   b->cursor = agx_after_block(hdr);
+   /* Use `keep` first, then trigger pressure peak before using `hot` so that
+    * without loop-exit weighting `cold` (distance 0 in exit_blk) looks closer
+    * than `hot` on the back-edge. */
+   for (unsigned i = 0; i < 5; ++i)
+      agx_unit_test(b, keep[i]);
+   agx_index spike[2] = { leaf(20), leaf(21) };
+   agx_unit_test(b, spike[0]);
+   agx_unit_test(b, spike[1]);
+   agx_unit_test(b, hot);
+
+   b->cursor = agx_after_block(exit_blk);
+   agx_unit_test(b, cold);
+
+   spill();
+
+   /* No memory fills inside the hot loop body; the cold post-loop value is
+    * filled after exiting the loop instead. */
+   unsigned loop_fills = 0, exit_fills = 0;
+   agx_foreach_instr_in_block(hdr, I) {
+      if (I->op == AGX_OPCODE_MOV && I->src[0].memory)
+         loop_fills++;
+   }
+   agx_foreach_instr_in_block(exit_blk, I) {
+      if (I->op == AGX_OPCODE_MOV && I->src[0].memory)
+         exit_fills++;
+   }
+   EXPECT_EQ(loop_fills, 0u);
+   EXPECT_GE(exit_fills, 1u);
+}

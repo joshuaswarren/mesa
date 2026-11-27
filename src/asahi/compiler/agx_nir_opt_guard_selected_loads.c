@@ -26,12 +26,17 @@
  *    matches the fallback skip those loads and address calculations.
  *
  * 2. agx_nir_opt_forward_merge_loads:
- *    When both arms of an if/else end with non-volatile, non-coherent
- *    store_agx instructions to the exact same base pointer, format, and
- *    canonical index expression, and the immediately following merge block
- *    re-reads that exact location via load_agx before any intervening memory
- *    write or barrier, forward the stored values through a phi instead of
- *    round-tripping through global memory.
+ *    Forward non-volatile, non-coherent raw-format store_agx values to
+ *    matching load_agx instructions instead of round-tripping through global
+ *    memory:
+ *    - Within a single basic block, track the latest store_agx in a linear
+ *      forward walk and forward it to matching load_agx instructions with no
+ *      intervening aliasing store or synchronization instruction, and into
+ *      the unaliased prefix of an immediately following `if` arm.
+ *    - Across an if/else merge, when both arms end with matching store_agx
+ *      instructions to the exact same base pointer, format, and canonical
+ *      index expression, and the merge block re-reads that location before
+ *      any intervening memory write or barrier, forward via a phi.
  */
 
 static bool
@@ -535,6 +540,14 @@ instr_may_alias_or_sync(const nir_instr *instr)
 }
 
 static bool
+is_raw_forwarding_format(enum pipe_format fmt, unsigned bit_size,
+                         unsigned num_components)
+{
+   return util_format_is_pure_integer(fmt) &&
+          util_format_get_blocksizebits(fmt) == bit_size * num_components;
+}
+
+static bool
 store_matches_load(const nir_intrinsic_instr *store,
                    const nir_intrinsic_instr *load)
 {
@@ -543,8 +556,8 @@ store_matches_load(const nir_intrinsic_instr *store,
            (ACCESS_VOLATILE | ACCESS_COHERENT)) == 0 &&
           (nir_intrinsic_access(load) &
            (ACCESS_VOLATILE | ACCESS_COHERENT)) == 0 &&
-          util_format_get_blocksizebits(fmt) ==
-             load->def.bit_size * load->def.num_components &&
+          is_raw_forwarding_format(fmt, load->def.bit_size,
+                                   load->def.num_components) &&
           nir_intrinsic_base(store) == nir_intrinsic_base(load) &&
           nir_intrinsic_format(store) == fmt &&
           nir_intrinsic_sign_extend(store) == nir_intrinsic_sign_extend(load) &&
@@ -628,9 +641,9 @@ agx_nir_opt_forward_merge_loads(nir_shader *shader)
                      if (load->intrinsic == nir_intrinsic_load_agx &&
                          !(nir_intrinsic_access(load) &
                            (ACCESS_VOLATILE | ACCESS_COHERENT))) {
-                        enum pipe_format fmt = nir_intrinsic_format(load);
-                        if (util_format_get_blocksizebits(fmt) ==
-                            load->def.bit_size * load->def.num_components) {
+                        if (is_raw_forwarding_format(
+                               nir_intrinsic_format(load), load->def.bit_size,
+                               load->def.num_components)) {
                            nir_intrinsic_instr *ts =
                               find_trailing_matching_store(then_blk, load);
                            nir_intrinsic_instr *es =
@@ -673,9 +686,9 @@ agx_nir_opt_forward_merge_loads(nir_shader *shader)
                   enum pipe_format fmt = nir_intrinsic_format(intr);
                   if (!(nir_intrinsic_access(intr) &
                         (ACCESS_VOLATILE | ACCESS_COHERENT)) &&
-                      util_format_get_blocksizebits(fmt) ==
-                         intr->src[0].ssa->bit_size *
-                            intr->src[0].ssa->num_components)
+                      is_raw_forwarding_format(
+                         fmt, intr->src[0].ssa->bit_size,
+                         intr->src[0].ssa->num_components))
                      cur_store = intr;
                   continue;
                }

@@ -163,12 +163,31 @@ enum agx_chip_cap {
     * reuse, push-descriptor elision, and direct fragment-root comparisons
     * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
+
+   /* Compute shaders skip the bottom-up register-pressure scheduler: it
+    * moves each load next to its use, which serializes the memory round
+    * trips of small compute kernels (the LLM decode chain). The ILP
+    * scheduler still runs. Measured on G13G and G13X (+1.7% tokens/s,
+    * bit-identical results); other generations keep the scheduler until
+    * they are measured. */
+   AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED = 1u << 23,
+
+   /* Constant deltas between a block's shared-memory accesses fold into the
+    * lload/lstore index immediate (4 elements of the access type per unit).
+    * Measured on G13G and G13X; other generations keep the unfolded
+    * addresses until they are measured. */
+   AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
 #define AGX_CAPS_AGX2                                                          \
    (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
     AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
+
+/* What the measured G13 chips (G13G, G13X) add over the AGX2 set. */
+#define AGX_CAPS_G13                                                           \
+   (AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |                      \
+    AGX_CAP_FOLD_SHARED_OFFSETS)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -205,8 +224,8 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
+   X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \

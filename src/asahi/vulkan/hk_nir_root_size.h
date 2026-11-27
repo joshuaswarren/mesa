@@ -13,13 +13,14 @@ unsigned hk_nir_root_size(const nir_shader *nir, unsigned full_size);
 bool hk_nir_root_reads_range(const nir_shader *nir, uint64_t start_B,
                              uint64_t end_B, unsigned full_size);
 
-/* True when a compute NIR shader with API workgroup size <= 256 (multiple of
- * 32) observes only global invocation ID / base_group (no shared memory,
- * barriers, local/workgroup/subgroup/quad/tile/ray/cmat intrinsics, calls, or
- * implicit derivatives), so direct zero-base dispatches may coalesce adjacent
- * workgroups without altering invocation coordinates or semantics.
- * Callers must also verify the shader never reads root.cs.group_count_addr via
- * hk_nir_root_reads_range(). */
+/* True when a compute NIR shader with API workgroup size <= 1024 (multiple of
+ * 32) observes only global invocation ID, base_group, API num_workgroups, and
+ * API workgroup_size (no shared memory, barriers, local/workgroup/subgroup/
+ * quad/tile/ray/cmat intrinsics, calls, or implicit derivatives), so direct
+ * zero-base dispatches may coalesce or split workgroups without altering
+ * invocation coordinates or semantics. On direct dispatches,
+ * root.cs.group_count_addr holds the unreshaped API group count and
+ * load_workgroup_size folds to the compile-time API local size. */
 bool hk_nir_can_coalesce_workgroup(const nir_shader *nir);
 
 /* Coalesce a pure-global API workgroup shape (<= 256, multiple of 32) up to
@@ -41,6 +42,16 @@ bool hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
 bool hk_coalesce_workgroup_size(const uint16_t api_local[3],
                                 const uint32_t grid_threads[3],
                                 uint32_t max_wg_threads,
+                                uint16_t out_local[3]);
+
+/* Split a pure-global multi-subgroup API workgroup shape (multiple of 32,
+ * >= 64 threads) along the outermost axis with extent > 1 when the dispatch
+ * has fewer than min_workgroups workgroups, increasing parallelism on wide
+ * multi-core GPUs while preserving exact 32-invocation subgroup membership.
+ * Returns true if out_local differs from api_local. */
+bool hk_split_workgroup_size_ex(const uint16_t api_local[3],
+                                const uint32_t grid_threads[3],
+                                uint64_t min_workgroups,
                                 uint16_t out_local[3]);
 
 static inline bool

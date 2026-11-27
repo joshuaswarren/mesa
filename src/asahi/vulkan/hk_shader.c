@@ -6318,11 +6318,6 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
-          !hk_nir_root_reads_range(
-             nir, hk_root_descriptor_offset(cs.group_count_addr),
-             hk_root_descriptor_offset(cs.group_count_addr) +
-                sizeof(uint64_t),
-             sizeof(struct hk_root_descriptor_table)) &&
           hk_nir_can_coalesce_workgroup(nir))
          wg_coalesce_cand = true;
    }
@@ -6546,7 +6541,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
-      !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
+      !preserve_raw_mono && agx_chip_native_or_m5(dev->dev.chip) &&
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
@@ -11321,17 +11316,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
        * either way. */
       if (vs) {
          const bool pre_raster_after_vs = tes || gs;
-         hk_prelink_vertex(dev, vs, !state || !pre_raster_after_vs,
+         hk_prelink_vertex(dev, vs, fs, state, !state || !pre_raster_after_vs,
                            !state || pre_raster_after_vs);
       }
 
       if (fs && !state) {
          hk_prelink_object_fragment(dev, fs);
-      } else if (fs && vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
-         const struct hk_shader *hw_vs =
-            gs    ? &gs->variants[HK_GS_VARIANT_RAST]
-            : tes ? &tes->variants[HK_VS_VARIANT_HW]
-                  : &vs->variants[HK_VS_VARIANT_HW];
+      } else if (fs && state) {
+         const struct hk_shader *hw_vs = NULL;
+         if (vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
+            hw_vs = gs    ? &gs->variants[HK_GS_VARIANT_RAST]
+                    : tes ? &tes->variants[HK_VS_VARIANT_HW]
+                          : &vs->variants[HK_VS_VARIANT_HW];
+         }
          hk_prelink_pipeline_fragment(dev, hw_vs, fs, state);
       }
    }

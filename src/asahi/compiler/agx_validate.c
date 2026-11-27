@@ -87,7 +87,7 @@ is_stack_valid(agx_instr *I)
 }
 
 static bool
-agx_validate_sources(agx_instr *I)
+agx_validate_sources(agx_instr *I, enum agx_isa_encoding enc)
 {
    agx_foreach_src(I, s) {
       agx_index src = I->src[s];
@@ -97,7 +97,7 @@ agx_validate_sources(agx_instr *I)
          agx_validate_assert(!src.cache);
          agx_validate_assert(!src.discard);
 
-         bool ldst = agx_allows_16bit_immediate(I);
+         bool ldst = agx_allows_16bit_immediate(I, enc);
 
          /* Immediates are encoded as 8-bit (16-bit for memory load/store). For
           * integers, they extend to 16-bit. For floating point, they are 8-bit
@@ -758,7 +758,7 @@ agx_validate(agx_context *ctx, const char *after)
    }
 
    agx_foreach_instr_global(ctx, I) {
-      if (!agx_validate_sources(I)) {
+      if (!agx_validate_sources(I, ctx->key->dev.encoding)) {
          fprintf(stderr, "Invalid sources form after %s\n", after);
          agx_print_instr(I, stderr);
          fail = true;

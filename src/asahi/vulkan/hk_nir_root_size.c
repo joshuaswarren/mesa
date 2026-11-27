@@ -152,12 +152,13 @@ hk_nir_intrinsic_refuses_wg_coalesce(const nir_intrinsic_instr *intr)
     * depend on workgroup boundaries, and subgroup barriers are excluded along
     * with all subgroup ops below. */
    case nir_intrinsic_barrier:
-   /* Workgroup / local / subgroup identity builtins. */
+   /* Workgroup / local / subgroup identity builtins. load_num_workgroups reads
+    * the API group_count_addr on direct dispatches and load_workgroup_size
+    * folds to the compile-time API local size, so neither depends on the
+    * reshaped launch geometry. */
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_local_invocation_index:
    case nir_intrinsic_load_workgroup_id:
-   case nir_intrinsic_load_workgroup_size:
-   case nir_intrinsic_load_num_workgroups:
    case nir_intrinsic_load_workgroup_index:
    case nir_intrinsic_load_subgroup_size:
    case nir_intrinsic_load_subgroup_invocation:
@@ -274,14 +275,16 @@ hk_nir_can_coalesce_workgroup(const nir_shader *nir)
       return false;
 
    const uint64_t threads = (uint64_t)wg[0] * wg[1] * wg[2];
-   if (threads > 256 || (threads % 32) != 0)
+   if (threads > 1024 || (threads % 32) != 0)
       return false;
 
    unsigned sv;
    BITSET_FOREACH_SET(sv, nir->info.system_values_read, SYSTEM_VALUE_MAX) {
       if (sv != SYSTEM_VALUE_GLOBAL_INVOCATION_ID &&
           sv != SYSTEM_VALUE_BASE_WORKGROUP_ID &&
-          sv != SYSTEM_VALUE_BASE_GLOBAL_INVOCATION_ID)
+          sv != SYSTEM_VALUE_BASE_GLOBAL_INVOCATION_ID &&
+          sv != SYSTEM_VALUE_NUM_WORKGROUPS &&
+          sv != SYSTEM_VALUE_WORKGROUP_SIZE)
          return false;
    }
 
@@ -387,4 +390,60 @@ hk_coalesce_workgroup_size(const uint16_t api_local[3],
    return hk_coalesce_workgroup_size_ex(api_local, grid_threads,
                                         default_max_wg_size, max_wg_threads,
                                         256u, 256ull, out_local);
+}
+
+bool
+hk_split_workgroup_size_ex(const uint16_t api_local[3],
+                           const uint32_t grid_threads[3],
+                           uint64_t min_workgroups,
+                           uint16_t out_local[3])
+{
+   out_local[0] = api_local[0];
+   out_local[1] = api_local[1];
+   out_local[2] = api_local[2];
+
+   if (!api_local[0] || !api_local[1] || !api_local[2] ||
+       !grid_threads[0] || !grid_threads[1] || !grid_threads[2] ||
+       min_workgroups <= 1ull)
+      return false;
+
+   uint64_t cur_threads =
+      (uint64_t)api_local[0] * api_local[1] * api_local[2];
+   if (cur_threads < 64ull || (cur_threads % 32ull) != 0)
+      return false;
+
+   if ((grid_threads[0] % api_local[0]) != 0 ||
+       (grid_threads[1] % api_local[1]) != 0 ||
+       (grid_threads[2] % api_local[2]) != 0)
+      return false;
+
+   uint64_t xy_threads = 0, total_threads = 0;
+   if (__builtin_mul_overflow((uint64_t)grid_threads[0],
+                              (uint64_t)grid_threads[1], &xy_threads) ||
+       __builtin_mul_overflow(xy_threads, (uint64_t)grid_threads[2],
+                              &total_threads))
+      return false;
+
+   uint64_t cur_wgs = total_threads / cur_threads;
+   if (cur_wgs >= min_workgroups)
+      return false;
+
+   bool changed = false;
+   while (cur_wgs < min_workgroups && cur_threads >= 64ull) {
+      const unsigned axis = out_local[2] > 1 ? 2 : out_local[1] > 1 ? 1 : 0;
+      if ((out_local[axis] % 2u) != 0)
+         break;
+      const uint16_t next_dim = (uint16_t)(out_local[axis] / 2u);
+      const uint64_t next_threads = cur_threads / 2ull;
+      if ((next_threads % 32ull) != 0)
+         break;
+      if ((grid_threads[axis] / next_dim) > 65535u)
+         break;
+      out_local[axis] = next_dim;
+      cur_threads = next_threads;
+      cur_wgs *= 2ull;
+      changed = true;
+   }
+
+   return changed;
 }

@@ -60,7 +60,7 @@
     }                                                                          \
   } while (0)
 
-enum enc { F16, F32, UN8, SN8, U8, I8, UN16, SN16, U16, I16 };
+enum enc { F16, F32, UN8, SN8, U8, I8, UN16, SN16, U16, I16, U32, I32 };
 struct fmt {
   VkFormat vk;
   const char *name;
@@ -103,6 +103,10 @@ static const struct fmt formats[] = {
    {VK_FORMAT_R8_SNORM, "r8_snorm", 1, SN8, 'f', 1.0f / 127},
    {VK_FORMAT_R8_UINT, "r8ui", 1, U8, 'u', 1},
    {VK_FORMAT_R8_SINT, "r8i", 1, I8, 'i', 1},
+   {VK_FORMAT_R32G32_UINT, "rg32ui", 2, U32, 'u', 1},
+   {VK_FORMAT_R32G32_SINT, "rg32i", 2, I32, 'i', 1},
+   {VK_FORMAT_R32G32B32A32_UINT, "rgba32ui", 4, U32, 'u', 1},
+   {VK_FORMAT_R32G32B32A32_SINT, "rgba32i", 4, I32, 'i', 1},
 };
 
 /* The byte offset of channel c within a texel. */
@@ -111,7 +115,9 @@ static unsigned channel_offset(const struct fmt *f, unsigned c, unsigned bytes) 
 }
 
 static unsigned channel_bytes(enum enc e) {
-  return e == F32 ? 4 : (e == UN8 || e == SN8 || e == U8 || e == I8) ? 1 : 2;
+  return (e == F32 || e == U32 || e == I32) ? 4
+         : (e == UN8 || e == SN8 || e == U8 || e == I8) ? 1
+                                                         : 2;
 }
 
 /* The format's bits for k (0 <= k <= 64). */

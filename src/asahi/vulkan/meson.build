@@ -908,6 +908,7 @@ if with_tests
     link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_bo_cache_evict_all',
       '-Wl,--wrap=agx_bo_export', '-Wl,--wrap=agx_bo_import',
+      '-Wl,--wrap=agx_bo_import_host_ptr',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
       '-Wl,--wrap=os_get_available_system_memory',
       '-Wl,--wrap=os_get_total_physical_memory']),
@@ -1075,6 +1076,14 @@ if with_tests and ld_args_gc_sections.length() > 0
   test(
     'hk_sparse_formats', executable('hk_sparse_formats_test',
       files('tests/test-hk-sparse-formats.c'),
+      include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+        inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+      dependencies : [hk_deps], link_with : [libhk, libasahi_layout],
+      link_args : [ld_args_gc_sections],
+      gnu_symbol_visibility : 'hidden'), suite : ['asahi'])
+  test(
+    'hk_buffer_view', executable('hk_buffer_view_test',
+      files('tests/test-hk-buffer-view.c'),
       include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
         inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
       dependencies : [hk_deps], link_with : [libhk, libasahi_layout],

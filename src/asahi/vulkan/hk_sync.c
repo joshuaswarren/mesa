@@ -1629,6 +1629,14 @@ hk_sync_replace_render(struct hk_cmd_buffer *cmd, struct hk_cs *from,
 }
 
 void
+hk_sync_apply_dep(struct hk_cmd_buffer *cmd, struct hk_cs *into,
+                  const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   cmd->sync.epoch++;
+   hk_sync_stream_wait(into, dep);
+}
+
+void
 hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
               struct hk_cs *from)
 {
