@@ -174,19 +174,22 @@ TEST(M5MeshTaskPayload, SizesSlotStrideAndRoundTrips)
       ASSERT_TRUE(agx_vdm_m5_mesh_set_task_payload(&info, c.payload_size_B));
       EXPECT_EQ(info.raw_tail[0], c.expected_blocks);
 
-      uint8_t bytes[AGX_VDM_MESH_STATE_LENGTH];
-      ASSERT_TRUE(agx_vdm_mesh_state_pack(AGX_CHIP_G17S, &info, bytes));
+      for (enum agx_chip chip :
+           {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D}) {
+         uint8_t bytes[AGX_VDM_MESH_STATE_LENGTH];
+         ASSERT_TRUE(agx_vdm_mesh_state_pack(chip, &info, bytes));
 
-      uint32_t packed_tail0 = 0;
-      memcpy(&packed_tail0, bytes + 36, sizeof(packed_tail0));
-      EXPECT_EQ(packed_tail0, c.expected_blocks);
+         uint32_t packed_tail0 = 0;
+         memcpy(&packed_tail0, bytes + 36, sizeof(packed_tail0));
+         EXPECT_EQ(packed_tail0, c.expected_blocks);
 
-      agx_vdm_mesh_state_info unpacked = {};
-      ASSERT_TRUE(
-         agx_vdm_mesh_state_unpack(AGX_CHIP_G17S, bytes, sizeof(bytes), &unpacked));
-      EXPECT_EQ(unpacked.raw_tail[0], c.expected_blocks);
-      EXPECT_EQ(unpacked.raw_tail[1], info.raw_tail[1]);
-      EXPECT_EQ(unpacked.raw_tail[4], info.raw_tail[4]);
+         agx_vdm_mesh_state_info unpacked = {};
+         ASSERT_TRUE(
+            agx_vdm_mesh_state_unpack(chip, bytes, sizeof(bytes), &unpacked));
+         EXPECT_EQ(unpacked.raw_tail[0], c.expected_blocks);
+         EXPECT_EQ(unpacked.raw_tail[1], info.raw_tail[1]);
+         EXPECT_EQ(unpacked.raw_tail[4], info.raw_tail[4]);
+      }
    }
 }
 
