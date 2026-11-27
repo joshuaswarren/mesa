@@ -616,6 +616,7 @@ struct hk_descriptor_state {
       uint8_t dirty_mask;
       bool bypass_launched;
       uint64_t dynbuf_dirty_mask;
+      uint64_t push_dirty_dwords;
    } root_change;
    uint64_t generation;
    /* Advances on every descriptor state change except hk_push_constants()
@@ -708,12 +709,35 @@ hk_root_mark_dirty(struct hk_descriptor_state *desc)
    desc->root_change.bypass_launched = false;
 }
 
-/* Root changed in its push constants. An earlier change of any other kind
- * since the last upload stays recorded in dirty_mask. */
+/* Root changed in its push constants at [offset, offset + size). An earlier
+ * change of any other kind since the last upload stays recorded in dirty_mask. */
+static inline void
+hk_root_mark_push_dirty_range(struct hk_descriptor_state *desc, uint32_t offset,
+                              uint32_t size)
+{
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   if (size > 0) {
+      const uint32_t first_dw = offset >> 2;
+      const uint32_t last_dw = (offset + size - 1) >> 2;
+      if (first_dw < 64) {
+         const uint32_t clamped_last = MIN2(last_dw, 63u);
+         const uint32_t count = clamped_last - first_dw + 1;
+         const uint64_t mask =
+            count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << first_dw;
+         desc->root_change.push_dirty_dwords |= mask;
+      }
+   } else {
+      desc->root_change.push_dirty_dwords = UINT64_MAX;
+   }
+   desc->root_change.bypass_launched = false;
+}
+
+/* Root changed in its push constants (unknown range). */
 static inline void
 hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
 {
    desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   desc->root_change.push_dirty_dwords = UINT64_MAX;
    desc->root_change.bypass_launched = false;
 }
 
@@ -762,12 +786,43 @@ hk_root_mark_clean(struct hk_descriptor_state *desc)
    desc->root_change.dirty_mask = 0;
    desc->root_change.bypass_launched = false;
    desc->root_change.dynbuf_dirty_mask = 0;
+   desc->root_change.push_dirty_dwords = 0;
 }
 
-/* Whether a shader reading root_reads / dynbuf_reads cannot observe any of the
- * root bytes currently dirty in desc. */
+/* Whether a root byte span [start, end) overlaps any of the four regions that
+ * may be dirty while hk_root_bypass_dirty() holds (push constants, dynamic
+ * buffers, or vertex attribute bases/clamps). Any other root field (such as
+ * draw.attrib_strides[]) marks HK_ROOT_DIRTY_OTHER when mutated, so a disjoint
+ * span stays current in gfx->root across root-bypass launches. */
+static inline bool
+hk_root_span_overlaps_bypassable(uint64_t start, uint64_t end)
+{
+   if (end <= start)
+      return false;
+   const uint64_t push_lo = hk_root_descriptor_offset(push);
+   const uint64_t push_hi = push_lo + HK_MAX_PUSH_SIZE;
+   const uint64_t dyn_lo = hk_root_descriptor_offset(dynamic_buffers);
+   const uint64_t dyn_hi =
+      dyn_lo + sizeof(((struct hk_root_descriptor_table *)0)->dynamic_buffers);
+   const uint64_t vb_base_lo = hk_root_descriptor_offset(draw.attrib_base);
+   const uint64_t vb_base_hi =
+      vb_base_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_base);
+   const uint64_t vb_clamp_lo = hk_root_descriptor_offset(draw.attrib_clamps);
+   const uint64_t vb_clamp_hi =
+      vb_clamp_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_clamps);
+   return (start < push_hi && end > push_lo) ||
+          (start < dyn_hi && end > dyn_lo) ||
+          (start < vb_base_hi && end > vb_base_lo) ||
+          (start < vb_clamp_hi && end > vb_clamp_lo);
+}
+
+/* Whether a shader reading root_reads / dynbuf_reads / push_reads cannot
+ * observe any of the root bytes currently dirty in desc. */
 static inline bool
 hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
+                           uint64_t push_reads,
                            const struct hk_descriptor_state *desc)
 {
    const uint8_t dm = desc->root_change.dirty_mask;
@@ -777,7 +832,8 @@ hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
       return false;
    if (root_reads & HK_ROOT_READS_ADDRESS)
       return false;
-   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH))
+   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH) &&
+       (!push_reads || (push_reads & desc->root_change.push_dirty_dwords)))
       return false;
    if ((dm & (HK_ROOT_DIRTY_VB_BASE | HK_ROOT_DIRTY_VB_CLAMP)) &&
        (root_reads & HK_ROOT_READS_VERTEX_INPUT))
@@ -884,6 +940,11 @@ struct hk_render_registers {
 
 struct hk_rendering_state {
    VkRenderingFlagBits flags;
+
+   /* Reopened in-CB from a suspended instance (hk_agx3_resume_suspended_pass).
+    * Begin-time direct-resolve setup was skipped while suspended, so late EOT
+    * rebuilds must not switch into g17p_direct_color_resolve. */
+   bool resumed_in_cb;
 
    /* May have written storage memory/XFB anywhere in this API pass, including
     * before a physical render split. Used only for conservative barriers. */
@@ -1702,6 +1763,9 @@ struct hk_cs {
 
    /* A graphics program recorded in this stream writes external memory. */
    bool m5_shader_writes_memory;
+   /* A fragment shader recorded in this stream reads textures, images, input
+    * attachments, or external memory. */
+   bool fs_reads_images;
 
    /* Per-render-stream memo of hoisted AGX3 vertex preamble outputs already
     * computed by a PREGFX dispatch for a given (vertex shader, root VA). */
@@ -2008,6 +2072,7 @@ struct hk_cs {
 
    struct util_dynarray scissor, depth_bias;
    uint64_t uploaded_scissor, uploaded_zbias;
+   uint32_t uploaded_scissor_size, uploaded_zbias_size;
 
    /* G17P: the last uploaded draw-state selector record and the scissor /
     * depth-bias array sizes and viewport count it selects for. */
@@ -2469,7 +2534,7 @@ struct hk_cmd_buffer {
       bool att_available;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
-   } pass_merge;
+   } pass_merge, suspended_pass;
 
    /* How the command buffer begins and ends, for submit-time render packing
     * (hk_render_pack.h). */
@@ -2544,6 +2609,25 @@ struct hk_cmd_buffer {
          bool empty_tiles_z;
          bool empty_tiles_s;
       } pending_z_store;
+
+      /* AGX3: the last ended single-stream multisample render pass stored one
+       * active colour attachment without resolving it. An immediately following
+       * full-image vkCmdResolveImage2 of that attachment can fold into cs's
+       * end-of-tile program via store_and_resolve, avoiding a meta resolve pass. */
+      struct hk_pending_msaa_resolve {
+         struct hk_cs *cs;
+         const struct hk_image *src_image;
+         const struct hk_image *z_image;
+         const struct hk_image *s_image;
+         struct hk_native_pbe_descriptor src_eot_pbe;
+         struct agx_tilebuffer_layout tib;
+         VkFormat src_format;
+         VkAttachmentLoadOp src_load_op;
+         uint32_t src_mip_level;
+         uint32_t src_base_layer;
+         uint32_t next_seq;
+         bool fs_barrier_seen;
+      } pending_msaa_resolve;
 
       /* M5: the open render stream is an ordered continuation (hk_cs::
        * m5_ordered) and a command recorded since may read the instance's
@@ -3244,6 +3328,8 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->state.pending_z_store.cs) &&
        !cmd->state.deferred_clear_hold)
       cmd->state.pending_z_store.cs = NULL;
+   if (unlikely(cmd->state.pending_msaa_resolve.cs))
+      cmd->state.pending_msaa_resolve.cs = NULL;
    if (unlikely(cmd->state.oq_pending_render) &&
        (ptr == &cmd->current_cs.post_gfx ||
         cmd->current_cs.gfx != cmd->state.oq_pending_render))
@@ -3704,17 +3790,25 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
        * addresses, matching native's USC-window allocations; a main-heap
        * address has bit 39 set and incorrectly selects the upper root.
        */
-      cs->uploaded_scissor =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
-            : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+      if (!cs->uploaded_scissor ||
+          cs->uploaded_scissor_size != cs->scissor.size) {
+         cs->uploaded_scissor =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
+               : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+         cs->uploaded_scissor_size = cs->scissor.size;
+      }
 
-      cs->uploaded_zbias =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
-                                 cs->depth_bias.size, 64)
-            : hk_pool_upload(cmd, cs->depth_bias.data,
-                             cs->depth_bias.size, 64);
+      if (!cs->uploaded_zbias ||
+          cs->uploaded_zbias_size != cs->depth_bias.size) {
+         cs->uploaded_zbias =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
+                                    cs->depth_bias.size, 64)
+               : hk_pool_upload(cmd, cs->depth_bias.data,
+                                cs->depth_bias.size, 64);
+         cs->uploaded_zbias_size = cs->depth_bias.size;
+      }
 
       /* TODO: maybe free scissor/depth_bias now? */
       cs->current = hk_cmd_buffer_emit_vdm_terminate(cmd, cs->current);
@@ -3788,6 +3882,8 @@ void hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
                                  const VkDependencyInfo *info);
 void hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd);
 void hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd);
+bool hk_try_fold_msaa_resolve(struct hk_cmd_buffer *cmd,
+                              const VkResolveImageInfo2 *info);
 
 /* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
  * break its memory equivalence (reason names the command). */
@@ -3929,6 +4025,12 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    /* Not scratch but this is the most convenient place for this... */
    cs->uses_sampler_heap |= s->b.info.uses_sampler_heap;
+   if (s->info.stage == MESA_SHADER_FRAGMENT &&
+       (s->b.info.uses_txf || s->b.info.uses_sampler_heap ||
+        s->b.info.texture_state_count || s->b.info.sampler_state_count ||
+        s->info.fs.has_input_attachments || s->info.fs.writes_memory ||
+        s->info.writes_external_memory))
+      cs->fs_reads_images = true;
 
    /* G17P and M5 publish a shader's spill frame as thread-private storage in their
     * SPECTPR. There is no helper-program stack, and the kernel rejects a

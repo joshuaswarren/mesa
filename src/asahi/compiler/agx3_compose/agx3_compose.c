@@ -199,6 +199,14 @@ static bool apply_node(ctx *c, const agx3_node *n)
    return true;
 }
 
+bool agx3_form_preds_match(const agx3_table *t, uint32_t form,
+                           const uint64_t fields[AGX3_MAX_FIELDS])
+{
+   if (form >= t->num_forms)
+      return false;
+   return preds_test(t, fields, &t->nodes[t->forms[form].node]);
+}
+
 bool agx3_compose_known(const agx3_table *t, uint32_t form,
                         const uint64_t fields[AGX3_MAX_FIELDS],
                         const uint64_t nonzero[3], uint8_t *out)

@@ -1605,6 +1605,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  executable(
+    'vulkan-compute-store-visibility',
+    files('tests/vulkan_compute_store_visibility.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
 endif
 
 if with_tests
@@ -1773,6 +1782,15 @@ if with_tests
     dependencies : [hk_deps], link_with : [libhk, libasahi_lib],
     link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
       '-Wl,--wrap=hk_ensure_cs_has_space']),
+    timeout : 30, suite : ['asahi'])
+
+  test('hk_resolve_fold_resume', executable('hk_resolve_fold_resume_test',
+    files('tests/test-hk-resolve-fold-resume.c'),
+    hk_entrypoints[0],
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_lib],
+    link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
 endif
 

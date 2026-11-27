@@ -851,6 +851,15 @@ bool hk_sync_submit_has_unretired_priors(const struct hk_queue *queue);
 void hk_sync_resolve_begin(struct hk_cmd_buffer *cmd);
 void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
 
+struct hk_image;
+/* Fold a trailing vkCmdResolveImage2 into cs's end-of-tile store_and_resolve:
+ * applies pending transfer waits to cs's fragment half, records dst_image's
+ * tile footprint and attachment bloom, and marks cs as transfer work for
+ * subsequent dependencies. */
+void hk_sync_fold_resolve(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                          const struct hk_image *dst_image, uint32_t level,
+                          uint32_t layer, uint32_t width, uint32_t height);
+
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class. Defined in hk_cmd_buffer.h. */
 

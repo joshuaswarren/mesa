@@ -4494,7 +4494,7 @@ compute_pair_exp_dw_gemm_match(const struct hk_compute_pair_dispatch *exp_im2,
                                const struct hk_dw_a_push *dw_push,
                                struct hk_exp_dw_a_push *exp_push_out)
 {
-   if (!exp_im2 || !exp || !dw || !gemm || !dw_cfg || !dw_push || !exp_push_out ||
+   if (!exp || !dw || !gemm || !dw_cfg || !dw_push || !exp_push_out ||
        exp->info.role != HK_COMPUTE_PAIR_GEMM ||
        dw->info.role != HK_COMPUTE_PAIR_DEPTHWISE ||
        gemm->info.role != HK_COMPUTE_PAIR_GEMM ||
@@ -4531,8 +4531,14 @@ compute_pair_exp_dw_gemm_match(const struct hk_compute_pair_dispatch *exp_im2,
       return false;
    memcpy(&k_proj, gemm->push + p->k_offset_B, sizeof(k_proj));
    memcpy(&k_exp, exp->push + ep_i->k_offset_B, sizeof(k_exp));
-   if (k_proj != 32 || k_exp <= 0 || (uint32_t)k_exp > 28u)
-      return false;
+   if (exp_im2) {
+      if (k_proj != 32 || k_exp <= 0 || (uint32_t)k_exp > 28u)
+         return false;
+   } else {
+      if (k_proj < 16 || (k_proj & 15) != 0 ||
+          k_exp < 8 || k_exp > 24 || (k_exp & 7) != 0)
+         return false;
+   }
 
    /* Gate fusion to large expand intermediates (>= 8 MiB, above L2 across AGX3
     * chips, chosen via A/B between 12 MiB stem and 4 MiB layers) so smaller
@@ -6315,8 +6321,6 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                               break;
                            }
                         }
-                        if (!has_found_im2)
-                           exp_chain_ok = false;
                         if (exp_chain_ok && has_exp) {
                            const struct hk_pack_fuse_plan *epl = &plans[found_exp];
                            const unsigned first_chk = has_found_im2 ? found_exp_im2 : found_exp;
@@ -7873,7 +7877,8 @@ struct hk_render_packet {
 };
 
 struct hk_render_pack_run {
-   unsigned first, count;
+   unsigned first, count, real_count;
+   bool ends_pass;
    /* The members whose scissor and depth-bias arrays serve every member's
     * draws (hk_render_pack_array_prefix()). */
    const struct hk_cs *scissor, *zbias;
@@ -8002,8 +8007,14 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       const struct hk_cs *first =
          hk_render_pack_member_streams(cmds[i], true, &first_pre, &first_post);
       struct hk_render_pack_run run = {
-         .first = i, .count = 1, .scissor = first, .zbias = first,
+         .first = i,
+         .count = 1,
+         .real_count = first ? 1 : 0,
+         .ends_pass = false,
+         .scissor = first,
+         .zbias = first,
       };
+      unsigned prev = i;
       enum u_tristate dbias = first ? first->cr.dbias_is_int : U_TRISTATE_UNSET;
       size_t resources = first ? first->render_resources.size : 0;
       uint8_t used_heap_slots =
@@ -8031,19 +8042,48 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          hk_render_pack_note_boundary(dev, cmds, i, i, true, NULL);
 
       while (first && i + run.count < n) {
-         const unsigned a = i + run.count - 1, b = a + 1;
+         const unsigned next = i + run.count;
+         unsigned b = next;
+         unsigned step = 1;
+         bool is_res = false, is_susp = false;
+         if (hk_render_pack_is_empty_fixup(cmds[next], &is_res, &is_susp) &&
+             is_res && cmds[prev]->render_pack.tail &&
+             (cmds[prev]->render_pack.tail_pass.flags &
+              VK_RENDERING_SUSPENDING_BIT) &&
+             hk_render_pack_fixup_matches(&cmds[next]->render_pack.empty_pass,
+                                          &cmds[prev]->render_pack.tail_pass)) {
+            bool next_res = false, next_susp = false;
+            if (next + 2 < n &&
+                hk_render_pack_is_empty_fixup(cmds[next + 1], &next_res,
+                                              &next_susp) &&
+                next_susp && cmds[next + 2]->render_pack.head &&
+                (cmds[next + 2]->render_pack.head_pass.flags &
+                 VK_RENDERING_RESUMING_BIT) &&
+                hk_render_pack_fixup_matches(
+                   &cmds[next + 1]->render_pack.empty_pass,
+                   &cmds[next + 2]->render_pack.head_pass)) {
+               b = next + 2;
+               step = 3;
+            } else if (run.real_count >= 2) {
+               run.count++;
+               run.ends_pass = true;
+               break;
+            }
+         }
+
          const struct hk_cs *bs_pre = NULL, *bs_post = NULL;
          const struct hk_cs *bs =
             hk_render_pack_member_streams(cmds[b], false, &bs_pre, &bs_post);
          if (unlikely(dev->frame_anatomy))
             cmds[b]->render_pack.next_why = NULL;
          if (!bs) {
-            hk_render_pack_note_boundary(dev, cmds, a, b, false, NULL);
+            if (step == 1)
+               hk_render_pack_note_boundary(dev, cmds, prev, b, false, NULL);
             break;
          }
 
          const char *why =
-            hk_render_pack_boundary(&state, cmds[a], cmds[b], bs, first);
+            hk_render_pack_boundary(&state, cmds[prev], cmds[b], bs, first);
          if (!why && bs_pre) {
             why = hk_render_pack_pre_cs_refusal(&state, bs_pre, run_post,
                                                 run_vdm_kinds,
@@ -8077,11 +8117,11 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (!why && !target)
             why = "stream link";
          if (why) {
-            hk_render_pack_note_boundary(dev, cmds, a, b, false, why);
+            hk_render_pack_note_boundary(dev, cmds, prev, b, false, why);
             break;
          }
 
-         targets[a] = target;
+         targets[prev] = target;
          if (scissor == &bs->scissor)
             run.scissor = bs;
          if (zbias == &bs->depth_bias)
@@ -8101,12 +8141,14 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (bs_post)
             run_post++;
          resources += bs->render_resources.size;
-         hk_render_pack_run_join(&state, cmds[a], cmds[b], bs);
+         hk_render_pack_run_join(&state, cmds[prev], cmds[b], bs);
          stamps |= hk_render_pack_stamp_slots(bs);
-         run.count++;
+         prev = b;
+         run.count += step;
+         run.real_count++;
       }
 
-      if (run.count >= 2) {
+      if (run.real_count >= 2) {
          runs[run_count++] = run;
          packed += run.count;
       }
@@ -8136,6 +8178,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       p->cmd.vk.base.device = &dev->vk;
       hk_render_pack_init(&p->cmd, &p->cs, cmds + run->first, run->count);
       uint8_t preceding = 0;
+      unsigned added = 0;
       uint8_t cdm_preceding = 0;
       uint8_t carried_req[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ] = {0};
       bool cdm_req_cut[HK_SYNC_NUM_KINDS] = {false};
@@ -8144,6 +8187,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       bool ok = true;
       for (unsigned m = 0; ok && m < run->count; ++m) {
          const struct hk_cmd_buffer *source = cmds[run->first + m];
+         if (list_is_empty(&source->control_streams))
+            continue;
          const struct hk_cs *pre = NULL, *post = NULL;
          const struct hk_cs *item = hk_render_pack_find_vdm(source, &pre, &post);
          if (!item)
@@ -8195,8 +8240,9 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             }
             cdm_preceding |= post->sync.kind;
          }
-         ok = hk_render_pack_add(&p->cmd, &p->cs, source, item, m == 0,
-                                 m + 1 == run->count, &preceding);
+         ok = hk_render_pack_add(&p->cmd, &p->cs, source, item, added == 0,
+                                 added + 1 == run->real_count, &preceding);
+         added++;
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
             const struct hk_sync_dep *creq = &source->sync.req[k][HK_SYNC_CDM];
             if (creq->cut || (creq->prior & cdm_preceding))
@@ -8209,6 +8255,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          run_count = 0;
          break;
       }
+      if (run->ends_pass)
+         p->cs.g17p_pass_ends = true;
       p->cs.uploaded_scissor = run->scissor->uploaded_scissor;
       p->cs.uploaded_zbias = run->zbias->uploaded_zbias;
       hk_render_pack_finish(&p->cmd, &p->cs);
@@ -8252,7 +8300,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
       perf_debug_dev(&dev->dev,
                      "Packing %u render command buffers (%u draws) into one "
-                     "render", run->count, p->cs.stats.cmds);
+                     "render", run->real_count, p->cs.stats.cmds);
       commands[out++] = &p->cmd.vk;
       i = run->first + run->count;
       if (++r == run_count) {

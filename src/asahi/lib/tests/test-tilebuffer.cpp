@@ -698,6 +698,68 @@ TEST(Tilebuffer, IndependentNativeStorageAndSampleLimits)
    EXPECT_FALSE(spilling.spilled[1]);
 }
 
+/* hk_tilebuffer_layout() builds a layout with the 48 KiB budget when the
+ * kernel reports DRM_ASAHI_FEATURE_TILE_BUFFER_48K, and keeps it only when it
+ * is 4x, 32x16 and spills nothing; otherwise it builds with 32 KiB. These are
+ * the layouts it chooses between.
+ */
+TEST(Tilebuffer, NativeTileBuffer48KLayouts)
+{
+   const auto build = [](const enum pipe_format *formats, unsigned count,
+                         unsigned samples, uint32_t budget) {
+      return agx_build_tilebuffer_layout_with_limits_resident(
+         formats, count, samples, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, budget,
+         2048, 0);
+   };
+
+   /* A deferred G-buffer pass and its lighting target: 24-byte samples. */
+   enum pipe_format gbuffer[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM, PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM, PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   for (unsigned count : {4u, 5u}) {
+      const auto narrow =
+         build(gbuffer, count, 4, AGX_NATIVE_TILE_BUFFER_BYTES);
+      EXPECT_FALSE(agx_tilebuffer_spills(&narrow));
+      EXPECT_EQ(narrow.sample_size_B, 24u);
+      EXPECT_EQ(narrow.tile_size, 16u * 16u);
+
+      /* The shape the 48 KiB budget is taken for. */
+      const auto wide =
+         build(gbuffer, count, 4, AGX_NATIVE_TILE_BUFFER_48K_BYTES);
+      EXPECT_FALSE(agx_tilebuffer_spills(&wide));
+      EXPECT_EQ(wide.nr_samples, 4u);
+      EXPECT_EQ(wide.sample_size_B, 24u);
+      EXPECT_EQ(wide.tile_size, 32u * 16u);
+      EXPECT_EQ(wide.sample_size_B * wide.nr_samples * wide.tile_size,
+                AGX_NATIVE_TILE_BUFFER_48K_BYTES);
+   }
+
+   /* Eight 2x RGBA32 targets spill under either budget, so they keep the
+    * 32 KiB layout: with 48 KiB six would stay resident, and the native
+    * background and end-of-tile programs take four raw 32-bit targets.
+    */
+   enum pipe_format rgba32[AGX_MAX_RENDER_TARGETS];
+   for (unsigned i = 0; i < AGX_MAX_RENDER_TARGETS; ++i)
+      rgba32[i] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+
+   const auto narrow =
+      build(rgba32, AGX_MAX_RENDER_TARGETS, 2, AGX_NATIVE_TILE_BUFFER_BYTES);
+   const auto wide =
+      build(rgba32, AGX_MAX_RENDER_TARGETS, 2, AGX_NATIVE_TILE_BUFFER_48K_BYTES);
+   EXPECT_TRUE(agx_tilebuffer_spills(&narrow));
+   EXPECT_TRUE(agx_tilebuffer_spills(&wide));
+
+   unsigned narrow_resident = 0, wide_resident = 0;
+   for (unsigned i = 0; i < AGX_MAX_RENDER_TARGETS; ++i) {
+      narrow_resident += !narrow.spilled[i];
+      wide_resident += !wide.spilled[i];
+   }
+   EXPECT_EQ(narrow_resident, 4u);
+   EXPECT_EQ(wide_resident, 6u);
+}
+
 TEST(Tilebuffer, ResidentAttachmentsStayInTheTilebuffer)
 {
    /* M5 at 4x: 64 bytes per sample. Four RGBA32F targets fill it, so the

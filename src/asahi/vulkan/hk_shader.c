@@ -4233,10 +4233,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * Reprocessing here and there divides preexisting element indices again.
     * The M5 task (object) branch likewise preprocesses after adding its
     * child-grid words, and the G17P task kernel after its payload lowering. */
+   const bool lowered_io_only =
+      lowered_desc || lowered_global_io || lowered_buf_io;
    const bool can_post_lower =
-      already_preprocessed && !lowered_complex && !lowered_desc &&
-      !lowered_global_io && !lowered_buf_io && !lowered_shared_io &&
-      !lowered_viewport && !lowered_tex && !lowered_mesh_out;
+      already_preprocessed && !lowered_complex && !lowered_shared_io &&
+      !lowered_viewport && !lowered_tex && !lowered_mesh_out &&
+      (!lowered_io_only || !agx_nir_has_loop(nir));
    if (nir->info.stage != MESA_SHADER_MESH &&
        !(nir->info.stage == MESA_SHADER_TASK &&
          agx_chip_g17p_or_m5(dev->dev.chip))) {
@@ -4724,24 +4726,36 @@ hk_nir_constant_offset(nir_scalar s, unsigned depth, uint64_t *value)
  * instead of the opaque HK_ROOT_READS_DYNAMIC_BUFFERS bit; anything else could
  * read any byte. */
 static uint8_t
-hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads)
+hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads,
+                      uint64_t *push_reads)
 {
    const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                        HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
    if (nir_src_is_if(use) ||
-       nir_src_use_instr(use)->type != nir_instr_type_alu)
+       nir_src_use_instr(use)->type != nir_instr_type_alu) {
+      *push_reads = UINT64_MAX;
       return any;
+   }
 
    nir_alu_instr *add = nir_instr_as_alu(nir_src_use_instr(use));
-   if (add->op != nir_op_iadd)
+   if (add->op != nir_op_iadd) {
+      *push_reads = UINT64_MAX;
       return any;
+   }
 
    const unsigned other = use == &add->src[0].src ? 1 : 0;
    uint64_t offset;
    if (!hk_nir_constant_offset(nir_get_scalar(add->src[other].src.ssa,
                                               add->src[other].swizzle[0]),
-                               8, &offset))
+                               8, &offset)) {
+      *push_reads = UINT64_MAX;
       return any;
+   }
+
+   const uint64_t push_start = hk_root_descriptor_offset(push);
+   const uint64_t push_end = push_start + HK_MAX_PUSH_SIZE;
+   static_assert(HK_MAX_PUSH_SIZE <= 64 * sizeof(uint32_t),
+                 "agx3_push_read_dwords bitmask fits all push constant dwords");
 
    const uint64_t dyn_start = hk_root_descriptor_offset(dynamic_buffers);
    const uint64_t dyn_stride = sizeof(struct hk_buffer_address);
@@ -4752,19 +4766,33 @@ hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads)
    uint8_t reads = 0;
    nir_foreach_use_including_if(load_use, &add->def) {
       if (nir_src_is_if(load_use) ||
-          nir_src_use_instr(load_use)->type != nir_instr_type_intrinsic)
+          nir_src_use_instr(load_use)->type != nir_instr_type_intrinsic) {
+         *push_reads = UINT64_MAX;
          return any;
+      }
 
       nir_intrinsic_instr *load =
          nir_instr_as_intrinsic(nir_src_use_instr(load_use));
       if ((load->intrinsic != nir_intrinsic_load_global_constant &&
            load->intrinsic != nir_intrinsic_load_global) ||
-          load_use != &load->src[0])
+          load_use != &load->src[0]) {
+         *push_reads = UINT64_MAX;
          return any;
+      }
 
       const uint64_t end =
          offset + load->def.num_components * load->def.bit_size / 8;
       uint8_t span_reads = hk_root_reads_of(offset, end);
+      if (span_reads & HK_ROOT_READS_PUSH) {
+         const uint64_t lo = MAX2(offset, push_start);
+         const uint64_t hi = MIN2(end, push_end);
+         if (hi > lo) {
+            const unsigned first = (unsigned)((lo - push_start) >> 2);
+            const unsigned last = (unsigned)((hi - 1 - push_start) >> 2);
+            for (unsigned dw = first; dw <= last; ++dw)
+               *push_reads |= BITFIELD64_BIT(dw);
+         }
+      }
       if (span_reads & HK_ROOT_READS_DYNAMIC_BUFFERS) {
          const uint64_t lo = MAX2(offset, dyn_start);
          const uint64_t hi = MIN2(end, dyn_end);
@@ -4781,13 +4809,15 @@ hk_nir_root_use_reads(nir_src *use, uint64_t *dynbuf_reads)
    return reads;
 }
 
-/* hk_shader_info::agx3_root_reads and agx3_dynbuf_reads, gathered where
- * hk_nir_uses_root() is. */
+/* hk_shader_info::agx3_root_reads, agx3_dynbuf_reads and agx3_push_read_dwords,
+ * gathered where hk_nir_uses_root() is. */
 static uint8_t
-hk_nir_root_reads(const nir_shader *nir, uint64_t *dynbuf_reads_out)
+hk_nir_root_reads(const nir_shader *nir, uint64_t *dynbuf_reads_out,
+                  uint64_t *push_reads_out)
 {
    uint8_t reads = 0;
    uint64_t dynbuf_reads = 0;
+   uint64_t push_reads = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -4798,12 +4828,13 @@ hk_nir_root_reads(const nir_shader *nir, uint64_t *dynbuf_reads_out)
 
             nir_foreach_use_including_if(use,
                                          &nir_instr_as_intrinsic(instr)->def)
-               reads |= hk_nir_root_use_reads(use, &dynbuf_reads);
+               reads |= hk_nir_root_use_reads(use, &dynbuf_reads, &push_reads);
          }
       }
    }
 
    *dynbuf_reads_out = dynbuf_reads;
+   *push_reads_out = push_reads;
    return reads;
 }
 
@@ -6381,7 +6412,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    if (agx_chip_agx3_path(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
       shader->info.agx3_root_reads =
-         hk_nir_root_reads(nir, &shader->info.agx3_dynbuf_reads);
+         hk_nir_root_reads(nir, &shader->info.agx3_dynbuf_reads,
+                           &shader->info.agx3_push_read_dwords);
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
@@ -6754,10 +6786,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             backend_key.g17p_uniform_dma = false;
       }
    }
+   nir_shader *post_opt_mono = NULL;
    if (!compiled)
-      compiled = agx_compile_shader_nir_capture(
+      compiled = agx_compile_shader_nir_capture_ex(
          nir, &backend_key, &shader->b,
-         capture_g17p_preopt_mono ? &mono_blob : NULL);
+         capture_g17p_preopt_mono ? &mono_blob : NULL,
+         (capture_g17p_preopt_mono && backend_key.no_preamble)
+            ? &post_opt_mono
+            : NULL);
 
    if (capture_g17p_preopt_mono) {
       if (compiled && mono_blob.size && !mono_blob.out_of_memory) {
@@ -6765,10 +6801,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          if (shader->g17p_mono_nir) {
             memcpy(shader->g17p_mono_nir, mono_blob.data, mono_blob.size);
             shader->g17p_mono_nir_size = mono_blob.size;
+            shader->g17p_mono_postopt_nir = post_opt_mono;
+            post_opt_mono = NULL;
             shader->g17p_mono_key = backend_key;
             shader->g17p_mono_preoptimized = true;
          }
       }
+      ralloc_free(post_opt_mono);
       blob_finish(&mono_blob);
    }
 
@@ -6941,6 +6980,7 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->uvs_linked = NULL;
    s->g17p_mono_nir = NULL;
    s->g17p_mono_nir_size = 0;
+   s->g17p_mono_postopt_nir = NULL;
    s->g17p_mono_preoptimized = false;
    s->local_read_nir = NULL;
    s->local_read_nir_size = 0;
@@ -6982,6 +7022,7 @@ hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
    s->info.agx3_uses_root = meta->agx3_uses_root;
    s->info.agx3_root_reads = meta->agx3_root_reads;
    s->info.agx3_dynbuf_reads = meta->agx3_dynbuf_reads;
+   s->info.agx3_push_read_dwords = meta->agx3_push_read_dwords;
    s->info.agx3_root_uniform = meta->agx3_root_uniform;
    s->info.agx3_gen1_fragment_rq = false;
    s->info.agx3_combined_sampler_valid = meta->agx3_combined_sampler_valid;
@@ -7029,6 +7070,8 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
    simple_mtx_destroy(&s->linked.lock);
    free(s->g17p_mono_nir);
    s->g17p_mono_nir = NULL;
+   ralloc_free(s->g17p_mono_postopt_nir);
+   s->g17p_mono_postopt_nir = NULL;
    s->g17p_mono_preoptimized = false;
    free(s->local_read_nir);
    s->local_read_nir = NULL;
@@ -7633,7 +7676,9 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, hk_lower_uvs_index, MESA_SHADER_FRAGMENT, 0, 0);
    meta.agx3_uses_root = hk_nir_uses_root(nir);
-   meta.agx3_root_reads = hk_nir_root_reads(nir, &meta.agx3_dynbuf_reads);
+   meta.agx3_root_reads =
+      hk_nir_root_reads(nir, &meta.agx3_dynbuf_reads,
+                        &meta.agx3_push_read_dwords);
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);
@@ -8833,7 +8878,7 @@ hk_maybe_build_byte_stencil(struct hk_device *dev, const nir_shader *nir,
                             struct hk_byte_stencil_candidate *out)
 {
    if (!nir || nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
-       !info || !info->robustness)
+       !info || !info->robustness || nir->info.num_ssbos < 2)
       return false;
 
    if (!hk_nir_match_byte_stencil(nir, info->set_layout_count, info->set_layouts,
@@ -8855,7 +8900,7 @@ hk_maybe_build_2d_stencil(struct hk_device *dev, const nir_shader *nir,
                           struct hk_2d_stencil_candidate *out)
 {
    if (!nir || nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
-       !info || !info->robustness)
+       !info || !info->robustness || nir->info.num_ssbos < 2)
       return false;
 
    if (!hk_nir_match_2d_stencil(nir, info->set_layout_count, info->set_layouts,
@@ -8882,7 +8927,7 @@ hk_maybe_build_compute_opt(struct hk_device *dev, const nir_shader *nir,
                            struct hk_compute_opt_candidate *out)
 {
    if (!nir || nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
-       !info || !info->robustness)
+       !info || !info->robustness || nir->info.num_ssbos < 2)
       return false;
 
    if (!hk_nir_match_compute_opt(nir, info->set_layout_count, info->set_layouts,
@@ -10179,34 +10224,112 @@ hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
 static void
 nir_opts(nir_shader *nir, void *data)
 {
-   bool progress;
+   bool single_block = true;
+   nir_foreach_function_impl(impl, nir) {
+      if (!exec_list_is_singular(&impl->body)) {
+         single_block = false;
+         break;
+      }
+   }
+   const bool has_loops = !single_block && agx_nir_has_loop(nir);
 
-   do {
-      progress = false;
+   const nir_opt_peephole_select_options peephole_select_options = {
+      .limit = 8,
+      .expensive_alu_ok = true,
+      .discard_ok = true,
+   };
 
-      NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_opt_copy_prop);
-      NIR_PASS(progress, nir, nir_opt_remove_phis);
-      NIR_PASS(progress, nir, nir_opt_dce);
+   enum {
+      OPT_LOOP = 0,
+      OPT_COPY_PROP = 1,
+      OPT_REMOVE_PHIS = 2,
+      OPT_DCE = 3,
+      OPT_IF = 4,
+      OPT_DEAD_CF = 5,
+      OPT_CSE = 6,
+      OPT_PEEPHOLE_SELECT = 7,
+      OPT_PHI_PRECISION = 8,
+      OPT_ALGEBRAIC = 9,
+      OPT_CONSTANT_FOLDING = 10,
+      OPT_UNDEF = 11,
+      OPT_LOOP_UNROLL = 12,
+      NUM_PASSES = 13,
+   };
 
-      NIR_PASS(progress, nir, nir_opt_if, 0);
-      NIR_PASS(progress, nir, nir_opt_dead_cf);
-      NIR_PASS(progress, nir, nir_opt_cse);
+   uint32_t active = (1u << NUM_PASSES) - 1u;
+   if (!has_loops)
+      active &= ~((1u << OPT_LOOP) | (1u << OPT_LOOP_UNROLL));
+   if (single_block)
+      active &= ~((1u << OPT_REMOVE_PHIS) | (1u << OPT_IF) |
+                  (1u << OPT_DEAD_CF) | (1u << OPT_PEEPHOLE_SELECT) |
+                  (1u << OPT_PHI_PRECISION));
 
-      NIR_PASS(progress, nir, nir_opt_peephole_select,
-               &(nir_opt_peephole_select_options){
-                  .limit = 8,
-                  .expensive_alu_ok = true,
-                  .discard_ok = true,
-               });
+   const uint32_t dce_wake =
+      ((1u << OPT_LOOP) | (1u << OPT_IF) | (1u << OPT_DEAD_CF) |
+       (1u << OPT_PEEPHOLE_SELECT) | (1u << OPT_PHI_PRECISION) |
+       (1u << OPT_ALGEBRAIC) | (1u << OPT_LOOP_UNROLL)) &
+      active;
 
-      NIR_PASS(progress, nir, nir_opt_phi_precision);
-      NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_opt_constant_folding);
+   uint32_t pending = active;
+   for (int p = 0; pending != 0; p = (p + 1) % NUM_PASSES) {
+      if (!(pending & (1u << p)))
+         continue;
+      pending &= ~(1u << p);
 
-      NIR_PASS(progress, nir, nir_opt_undef);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
-   } while (progress);
+      bool progress = false;
+      uint32_t wake = active;
+
+      switch (p) {
+      case OPT_LOOP:
+         NIR_PASS(progress, nir, nir_opt_loop);
+         break;
+      case OPT_COPY_PROP:
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
+         wake = active & ~(1u << OPT_COPY_PROP);
+         break;
+      case OPT_REMOVE_PHIS:
+         NIR_PASS(progress, nir, nir_opt_remove_phis);
+         break;
+      case OPT_DCE:
+         NIR_PASS(progress, nir, nir_opt_dce);
+         wake = dce_wake;
+         break;
+      case OPT_IF:
+         NIR_PASS(progress, nir, nir_opt_if, 0);
+         break;
+      case OPT_DEAD_CF:
+         NIR_PASS(progress, nir, nir_opt_dead_cf);
+         break;
+      case OPT_CSE:
+         NIR_PASS(progress, nir, nir_opt_cse);
+         wake = active & ~(1u << OPT_CSE);
+         break;
+      case OPT_PEEPHOLE_SELECT:
+         NIR_PASS(progress, nir, nir_opt_peephole_select,
+                  &peephole_select_options);
+         break;
+      case OPT_PHI_PRECISION:
+         NIR_PASS(progress, nir, nir_opt_phi_precision);
+         break;
+      case OPT_ALGEBRAIC:
+         NIR_PASS(progress, nir, nir_opt_algebraic);
+         break;
+      case OPT_CONSTANT_FOLDING:
+         NIR_PASS(progress, nir, nir_opt_constant_folding);
+         wake = active & ~(1u << OPT_CONSTANT_FOLDING);
+         break;
+      case OPT_UNDEF:
+         NIR_PASS(progress, nir, nir_opt_undef);
+         break;
+      case OPT_LOOP_UNROLL:
+         if (agx_nir_has_loop(nir))
+            NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         break;
+      }
+
+      if (progress)
+         pending |= wake;
+   }
 }
 
 /* Native varyings use 32-bit components. Widen narrow integer interfaces
@@ -10733,7 +10856,8 @@ hk_compile_identity_copy4(struct hk_device *dev,
    *fadd_dual_out = NULL;
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        info->stage != MESA_SHADER_COMPUTE || info->nir->info.internal ||
-       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
+       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts) ||
+       !hk_nir_copy_identity4_may_match(info->nir))
       return NULL;
 
    nir_shader *candidate = nir_shader_clone(NULL, info->nir);
@@ -10795,7 +10919,8 @@ hk_compile_tensor_op(struct hk_device *dev,
    *secondary_out = NULL;
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        info->stage != MESA_SHADER_COMPUTE || info->nir->info.internal ||
-       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
+       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts) ||
+       !hk_nir_tensor_op_may_match(info->nir))
       return NULL;
 
    nir_shader *candidate = nir_shader_clone(NULL, info->nir);
@@ -11403,6 +11528,14 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                           : &vs->variants[HK_VS_VARIANT_HW];
          }
          hk_prelink_pipeline_fragment(dev, hw_vs, fs, state);
+      }
+      if (fs) {
+         for (unsigned v = 0; v < hk_api_num_variants(fs); ++v) {
+            if (fs->variants[v].g17p_mono_postopt_nir) {
+               ralloc_free(fs->variants[v].g17p_mono_postopt_nir);
+               fs->variants[v].g17p_mono_postopt_nir = NULL;
+            }
+         }
       }
    }
 
@@ -12741,6 +12874,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       /* The clone owns its own copy of the inline-blend and local-read NIR. */
       dst->g17p_mono_nir = NULL;
       dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_postopt_nir = NULL;
       dst->g17p_mono_preoptimized = false;
       if (src->g17p_mono_nir) {
          dst->g17p_mono_nir = malloc(src->g17p_mono_nir_size);
@@ -12795,6 +12929,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       dst->bo = NULL;
       dst->g17p_mono_nir = NULL;
       dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_postopt_nir = NULL;
       simple_mtx_init(&dst->linked.lock, mtx_plain);
       dst->linked.lazy_ht = src->compiled;
       obj->byte_stencil = bs;
@@ -12816,6 +12951,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       dst->bo = NULL;
       dst->g17p_mono_nir = NULL;
       dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_postopt_nir = NULL;
       simple_mtx_init(&dst->linked.lock, mtx_plain);
       dst->linked.lazy_ht = src->compiled;
       obj->stencil_2d = s2d;
@@ -12837,6 +12973,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       dst->bo = NULL;
       dst->g17p_mono_nir = NULL;
       dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_postopt_nir = NULL;
       simple_mtx_init(&dst->linked.lock, mtx_plain);
       dst->linked.lazy_ht = src->compiled;
       obj->compute_opt = co;

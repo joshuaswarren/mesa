@@ -78,14 +78,20 @@ opt_alu_fp_math_ctrl(nir_alu_instr *alu, struct opt_fp_ctrl_state *state)
 
    const nir_op_info *op_info = &nir_op_infos[(int)alu->op];
    unsigned old_fp_math_ctrl = alu->fp_math_ctrl;
+   bool dest_is_float = nir_alu_type_get_base_type(op_info->output_type) == nir_type_float;
+
+   /* Drop preserve_signed_zero without running fp-class range analysis when
+    * no consumer observes the sign of zero and this op can propagate nsz. */
+   if (dest_is_float && (alu->fp_math_ctrl & nir_fp_preserve_signed_zero) &&
+       can_prop_nsz(alu) && !alu->instr.pass_flags)
+      alu->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
+
    if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) {
       fp_class_mask class_mask = 0;
 
-      bool dest_is_float = nir_alu_type_get_base_type(op_info->output_type) == nir_type_float;
-
       if (dest_is_float) {
          class_mask |= nir_analyze_fp_class(&state->fp_class_state, &alu->def);
-         if (can_prop_nsz(alu) && (!alu->instr.pass_flags || !(class_mask & FP_CLASS_ANY_ZERO)))
+         if (can_prop_nsz(alu) && !(class_mask & FP_CLASS_ANY_ZERO))
             alu->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
       }
 
@@ -282,6 +288,7 @@ opt_fp_math_ctrl_impl(nir_function_impl *impl)
     * For now, just disable opts for the back edges.
     * That could be improved, but not sure if it's worth it.
     */
+   bool any_work = false;
    nir_foreach_block_reverse(block, impl) {
       nir_block *preheader = block_get_loop_preheader(block);
 
@@ -293,9 +300,38 @@ opt_fp_math_ctrl_impl(nir_function_impl *impl)
                if (src->pred != preheader)
                   nir_def_instr(src->src.ssa)->pass_flags = true;
             }
+         } else if (!any_work) {
+            if (instr->type == nir_instr_type_alu) {
+               if (nir_instr_as_alu(instr)->fp_math_ctrl &
+                   nir_fp_preserve_sz_inf_nan)
+                  any_work = true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+               switch (intrin->intrinsic) {
+               case nir_intrinsic_ddx:
+               case nir_intrinsic_ddx_coarse:
+               case nir_intrinsic_ddx_fine:
+               case nir_intrinsic_ddy:
+               case nir_intrinsic_ddy_coarse:
+               case nir_intrinsic_ddy_fine:
+                  if (nir_intrinsic_fp_math_ctrl(intrin) &
+                      nir_fp_preserve_signed_zero)
+                     any_work = true;
+                  break;
+               default:
+                  if (nir_intrinsic_has_io_semantics(intrin) &&
+                      nir_intrinsic_infos[(int)intrin->intrinsic].has_dest &&
+                      !nir_intrinsic_io_semantics(intrin).no_signed_zero)
+                     any_work = true;
+                  break;
+               }
+            }
          }
       }
    }
+
+   if (!any_work)
+      return nir_no_progress(impl);
 
 
    struct opt_fp_ctrl_state state = {0};

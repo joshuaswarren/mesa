@@ -137,6 +137,10 @@ bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v);
 bool agx3_compose(const agx3_table *t, uint32_t form,
                   const uint64_t fields[AGX3_MAX_FIELDS], uint8_t *out);
 
+/* Whether form's root node predicates hold for fields[0..159]. */
+bool agx3_form_preds_match(const agx3_table *t, uint32_t form,
+                           const uint64_t fields[AGX3_MAX_FIELDS]);
+
 /* agx3_compose() for a caller that knows which fields are nonzero: bit i of
  * nonzero is set exactly when fields[i] != 0. */
 bool agx3_compose_known(const agx3_table *t, uint32_t form,

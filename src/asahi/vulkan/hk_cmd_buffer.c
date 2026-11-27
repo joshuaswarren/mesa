@@ -615,6 +615,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   cmd->suspended_pass.valid = false;
    memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
@@ -1568,6 +1569,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    if (HK_PERF(dev, NOBARRIER))
       return;
 
+   cmd->suspended_pass.valid = false;
+
    perf_debug(cmd, "Pipeline barrier");
 
    if (unlikely(dev->frame_anatomy)) {
@@ -1634,6 +1637,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          brl_discard_init_record(cmd, pDependencyInfo, init_dst);
       return;
    }
+
+   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass &&
+       hk_resolve_fold_barrier_orders_fs(pDependencyInfo))
+      cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
 
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
@@ -2043,12 +2050,40 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
    /* D3D translation layers re-push unchanged constants before most draws.
     * While the root is clean the uploaded root holds exactly these bytes, so
     * an identical push changes nothing; keep the root and every preparation
-    * keyed to the current descriptor generation. */
-   if (memcmp(desc->root.push + info->offset, info->pValues, info->size) == 0)
-      return;
-
-   memcpy(desc->root.push + info->offset, info->pValues, info->size);
-   hk_root_mark_push_dirty(desc);
+    * keyed to the current descriptor generation. Fast-path common 4/8/16-byte
+    * push updates (root constants and root CBV VAs) to avoid PLT memcmp/memcpy
+    * overhead on hot draw loops. */
+   uint8_t *dst = desc->root.push + info->offset;
+   if (info->size == 8) {
+      uint64_t cur, val;
+      memcpy(&cur, dst, 8);
+      memcpy(&val, info->pValues, 8);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 8);
+   } else if (info->size == 4) {
+      uint32_t cur, val;
+      memcpy(&cur, dst, 4);
+      memcpy(&val, info->pValues, 4);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 4);
+   } else if (info->size == 16) {
+      uint64_t c0, c1, v0, v1;
+      memcpy(&c0, dst, 8);
+      memcpy(&c1, dst + 8, 8);
+      memcpy(&v0, info->pValues, 8);
+      memcpy(&v1, (const uint8_t *)info->pValues + 8, 8);
+      if (c0 == v0 && c1 == v1)
+         return;
+      memcpy(dst, &v0, 8);
+      memcpy(dst + 8, &v1, 8);
+   } else {
+      if (memcmp(dst, info->pValues, info->size) == 0)
+         return;
+      memcpy(dst, info->pValues, info->size);
+   }
+   hk_root_mark_push_dirty_range(desc, info->offset, info->size);
    /* non_push_generation intentionally does not advance on push constants
     * (push constants carry no tracked resource addresses; BDA transfers
     * already set sync.xfer_any). */
@@ -2117,6 +2152,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
                                  const VkSetDescriptorBufferOffsetsInfoEXT *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+   bool changed = false;
 
    for (uint32_t i = 0; i < info->setCount; ++i) {
       const uint32_t s = info->firstSet + i;
@@ -2128,10 +2164,22 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
       const uint64_t addr =
          cmd->state.descriptor_buffers[info->pBufferIndices[i]] +
          info->pOffsets[i];
+      const uint32_t size = set_layout ? set_layout->max_buffer_size : 0;
+      const uint32_t bit = BITFIELD_BIT(s);
 
-      hk_bind_buffer_set(desc, pipeline_layout, s, addr,
-                         set_layout ? set_layout->max_buffer_size : 0);
+      if ((desc->buffer_active & bit) && !(desc->push_active & bit) &&
+          desc->sets[s] == NULL && desc->root.sets[s] == addr &&
+          desc->set_sizes[s] == size &&
+          desc->root.set_dynamic_buffer_start[s] ==
+             pipeline_layout->dynamic_descriptor_offset[s])
+         continue;
+
+      hk_bind_buffer_set(desc, pipeline_layout, s, addr, size);
+      changed = true;
    }
+
+   if (!changed)
+      return;
 
    hk_root_mark_dirty(desc);
    desc->generation++;
@@ -3828,17 +3876,28 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
       case HK_G17P_RANGE_SOURCE_CONSTANT:
          offset = ranges[i].address;
          break;
-      case HK_G17P_RANGE_SOURCE_ROOT:
+      case HK_G17P_RANGE_SOURCE_ROOT: {
          offset = ranges[i].address - root;
-         /* The root/set table header range at offset 0 only exposes the
-          * root_desc_addr pointer when the main body, preamble, or prolog
-          * reads it; otherwise it only supplies root.sets[], which never
-          * change on push, dynamic-buffer, or VB base/clamp updates. */
-         if (offset != 0 || !s->b.info.agx3_root_uniform_usage_valid ||
-             s->b.info.agx3_main_uses_root_uniform ||
-             s->b.info.has_preamble || linked->g17p_prolog_uses_root)
+         const uint64_t end = offset + 2u * ranges[i].size_halfs;
+         /* Offset 0 is the root/set header: it exposes root_desc_addr only
+          * when the main body, preamble, or prolog reads it; otherwise it only
+          * supplies root.sets[], which never change on bypassable updates.
+          * Non-zero root uniform-DMA spans (e.g. draw.attrib_strides[]) read
+          * only [offset, end), so they remain up to date in gfx->root whenever
+          * disjoint from the four bypass-dirtyable regions. */
+         if (offset == 0) {
+            if (!s->b.info.agx3_root_uniform_usage_valid ||
+                s->b.info.agx3_main_uses_root_uniform ||
+                (s->b.info.has_preamble &&
+                 s->b.info.agx3_preamble_uses_root_uniform) ||
+                linked->g17p_prolog_uses_root ||
+                hk_root_span_overlaps_bypassable(offset, end))
+               has_general_root = true;
+         } else if (hk_root_span_overlaps_bypassable(offset, end)) {
             has_general_root = true;
+         }
          break;
+      }
       case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
          offset = ranges[i].address - root;
          if (offset != hk_root_descriptor_offset(draw.attrib_base) ||
@@ -5001,7 +5060,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    if (launch->has_general_root &&
        !hk_root_reads_ignore_dirty(s->info.agx3_root_reads,
-                                   s->info.agx3_dynbuf_reads, desc))
+                                   s->info.agx3_dynbuf_reads,
+                                   s->info.agx3_push_read_dwords, desc))
       return 0;
 
    const uint8_t dirty_mask = desc->root_change.dirty_mask;
@@ -6103,8 +6163,7 @@ hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!agx_chip_native_or_m5(dev->dev.chip) || cmd->in_meta ||
        render->view_mask || render->layer_count != 1 ||
        (render->flags &
-        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT |
-         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) ||
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) ||
        hk_sync_xfer_pending(&cmd->sync))
       return false;
 
@@ -6467,6 +6526,8 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
    if (!hk_deferred_clear_eligible(cmd, image, aspects, range_count, ranges))
       return false;
 
+   cmd->state.pending_msaa_resolve.cs = NULL;
+
    /* The deferred clear overwrites the whole image, whether it becomes a
     * load-op clear or a fill: a pending store of those aspects is dead. */
    if (cmd->state.pending_z_store.cs &&
@@ -6561,6 +6622,7 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
+   cmd->state.pending_msaa_resolve.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;

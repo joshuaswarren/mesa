@@ -25,10 +25,10 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
                          const struct hk_render_pack_pass *b, bool ordered,
                          bool non_local_src, bool att_visible)
 {
-   const VkRenderingFlags open = VK_RENDERING_SUSPENDING_BIT |
-                                 VK_RENDERING_RESUMING_BIT |
-                                 VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
-   if ((a->flags | b->flags) & open)
+   const bool a_susp = (a->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
+   const bool b_res = (b->flags & VK_RENDERING_RESUMING_BIT) != 0;
+   const bool b_susp = (b->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
+   if (a_susp != b_res)
       return "flags";
    if (memcmp(&a->area, &b->area, sizeof(a->area)) ||
        a->layer_count != b->layer_count || a->view_mask != b->view_mask ||
@@ -56,15 +56,17 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
          return "view";
       if (x->samples != y->samples)
          return "sample count";
-      /* B continues what A left in the tiles: it must load it, and either keep
-       * A's store op or discard a stored colour attachment (STORE ->
-       * DONT_CARE). A must not have resolved; B may terminate the merged pass
-       * with a colour resolve across a framebuffer-local dependency. */
-      if (y->load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
+      /* B continues what A left in the tiles: it must load it (a resuming
+       * instance always continues A's tiles regardless of loadOp), and either
+       * keep A's store op or discard a stored colour attachment (STORE ->
+       * DONT_CARE) when B is not suspending. A must not have resolved; B may
+       * terminate the merged pass with a colour resolve across a
+       * framebuffer-local dependency. */
+      if (!b_res && y->load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
          return "load op";
       const bool is_color = i < a->color_count;
       const bool store_drop =
-         is_color &&
+         is_color && !b_susp &&
          x->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
          y->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE;
       if (y->store_op != x->store_op && !store_drop)
@@ -72,7 +74,7 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
       if (x->resolve_mode != VK_RESOLVE_MODE_NONE)
          return "resolve";
       const bool y_resolves = y->resolve_mode != VK_RESOLVE_MODE_NONE;
-      if (y_resolves && (!is_color || ordered || non_local_src))
+      if (y_resolves && (!is_color || ordered || non_local_src || b_susp))
          return "resolve";
       const uint32_t y_flags =
          y_resolves
@@ -144,6 +146,11 @@ background_object_unused(const struct hk_render_registers *r)
           (!r->stencil.buffer || zls.s_load);
 }
 
+/* Whether `b`'s ZLS control is compatible with continuing `a`'s: `a` may clear
+ * depth/stencil (z_load/s_load == 0) while `b` loads what `a` left in the
+ * tiles, and either stream may have dropped a dead z_store/s_store that
+ * hk_render_pack_add() unions back. Every other ZLS bit (formats, tiling,
+ * compression, resolve) must match. */
 static bool
 zls_control_compatible(const struct hk_cs *a, const struct hk_cs *b)
 {
@@ -151,13 +158,24 @@ zls_control_compatible(const struct hk_cs *a, const struct hk_cs *b)
                sizeof(a->cr.zls_control)))
       return true;
 
-   const uint8_t elided =
-      a->render_pack_zls_elided_store | b->render_pack_zls_elided_store;
-   if (!elided)
-      return false;
-
    agx_unpack(NULL, &a->cr.zls_control, ZLS_CONTROL, za);
    agx_unpack(NULL, &b->cr.zls_control, ZLS_CONTROL, zb);
+   if ((za.z_load && !zb.z_load) || (za.s_load && !zb.s_load))
+      return false;
+
+   if (!za.z_load && zb.z_load) {
+      za.z_load = true;
+      za.z_load_tiling = zb.z_load_tiling;
+      za.z_load_compress = zb.z_load_compress;
+   }
+   if (!za.s_load && zb.s_load) {
+      za.s_load = true;
+      za.s_load_tiling = zb.s_load_tiling;
+      za.s_load_compress = zb.s_load_compress;
+   }
+
+   const uint8_t elided =
+      a->render_pack_zls_elided_store | b->render_pack_zls_elided_store;
    if (elided & VK_IMAGE_ASPECT_DEPTH_BIT)
       za.z_store = zb.z_store = true;
    if (elided & VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -174,13 +192,6 @@ zls_control_compatible(const struct hk_cs *a, const struct hk_cs *b)
 }
 
 static const struct hk_bg_eot *
-full_bg_main(const struct hk_cs *cs)
-{
-   return cs->render_pack_has_full_programs ? &cs->render_pack_full_bg_main
-                                            : &cs->cr.bg.main;
-}
-
-static const struct hk_bg_eot *
 full_eot_main(const struct hk_cs *cs)
 {
    return cs->render_pack_has_full_programs ? &cs->render_pack_full_eot_main
@@ -193,7 +204,6 @@ full_eot_partial(const struct hk_cs *cs)
    return cs->render_pack_has_full_programs ? &cs->render_pack_full_eot_partial
                                             : &cs->cr.eot.partial;
 }
-
 /* Which of the render registers two streams program differently, or NULL.
  * `b` follows `a` in the tile pass, which begins with `a`'s background. When
  * `eot_changes` is set, `b` supplies a different final end-of-tile program
@@ -219,7 +229,7 @@ registers_differ(const struct hk_cs *cs_a, const struct hk_cs *cs_b,
        memcmp(&a->zls_control_partial, &b->zls_control_partial,
               sizeof(a->zls_control_partial)))
       return "depth/stencil control";
-   if ((!eot_changes && a->process_empty_tiles != b->process_empty_tiles) ||
+   if ((!eot_changes && b->process_empty_tiles && !a->process_empty_tiles) ||
        a->whole_attachments != b->whole_attachments)
       return "tile flags";
 
@@ -239,8 +249,10 @@ registers_differ(const struct hk_cs *cs_a, const struct hk_cs *cs_b,
        a->stencil.meta_stride != b->stencil.meta_stride)
       return "depth/stencil buffers";
 
-   if (!bg_eot_resources_equal(full_bg_main(cs_a), full_bg_main(cs_b)) ||
-       (!eot_changes &&
+   /* The merged packet runs `a`'s main background program (which may clear
+    * while `b` loads), `a`'s partial programs, and `b`'s main end-of-tile
+    * (which may differ when `eot_changes` is set). */
+   if ((!eot_changes &&
         !bg_eot_resources_equal(full_eot_main(cs_a), full_eot_main(cs_b))) ||
        !bg_eot_resources_equal(&a->bg.partial, &b->bg.partial) ||
        !bg_eot_resources_equal(full_eot_partial(cs_a), full_eot_partial(cs_b)))
@@ -691,7 +703,15 @@ hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
 
    if (!cs->stats.cmds)
       return "no draws";
-   if (!cs->g17p_pass_begins || !cs->g17p_pass_ends)
+   const bool pass_begins_ok =
+      cs->g17p_pass_begins ||
+      (cmd->render_pack.head &&
+       (cmd->render_pack.head_pass.flags & VK_RENDERING_RESUMING_BIT));
+   const bool pass_ends_ok =
+      cs->g17p_pass_ends ||
+      (cmd->render_pack.tail &&
+       (cmd->render_pack.tail_pass.flags & VK_RENDERING_SUSPENDING_BIT));
+   if (!pass_begins_ok || !pass_ends_ok)
       return "pass edges";
 
    /* No query or start timestamp rides on the render, nothing calls another
@@ -819,6 +839,72 @@ hk_render_pack_member(const struct hk_cmd_buffer *cmd)
 }
 
 bool
+hk_render_pack_is_empty_fixup(const struct hk_cmd_buffer *cmd,
+                              bool *is_resume, bool *is_suspend)
+{
+   if (is_resume)
+      *is_resume = false;
+   if (is_suspend)
+      *is_suspend = false;
+
+   if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+       !list_is_empty(&cmd->control_streams) || cmd->state.uses_events ||
+       cmd->uses_heap || cmd->sync.pending_start_ts.handle ||
+       cmd->sync.has_unordered_start_ts || cmd->sync.has_gpu_query_reset ||
+       cmd->sync.stamp_copy_count || cmd->state.deferred_clear_count ||
+       cmd->sync_pass_records.size != 0)
+      return false;
+
+   const bool res = cmd->render_pack.empty_resume;
+   const bool susp = cmd->render_pack.empty_suspend;
+   if (res == susp)
+      return false;
+
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+         if (cmd->sync.req[k][sq].cut || cmd->sync.req[k][sq].prior)
+            return false;
+      }
+   }
+
+   if (is_resume)
+      *is_resume = res;
+   if (is_suspend)
+      *is_suspend = susp;
+   return true;
+}
+
+bool
+hk_render_pack_fixup_matches(const struct hk_render_pack_pass *fixup,
+                             const struct hk_render_pack_pass *other)
+{
+   if (memcmp(&fixup->area, &other->area, sizeof(fixup->area)) ||
+       fixup->layer_count != other->layer_count ||
+       fixup->view_mask != other->view_mask ||
+       fixup->color_count != other->color_count || fixup->view_mask)
+      return false;
+
+   unsigned attachments = 0;
+   for (unsigned i = 0; i < HK_RENDER_PACK_SLOTS; ++i) {
+      if (i >= fixup->color_count && i < HK_RENDER_PACK_COLORS)
+         continue;
+      const struct hk_render_pack_att *x = &fixup->att[i];
+      const struct hk_render_pack_att *y = &other->att[i];
+      if ((x->iview != NULL) != (y->iview != NULL))
+         return false;
+      if (!x->iview)
+         continue;
+      attachments++;
+      if (x->iview != y->iview || x->samples != y->samples ||
+          x->store_op != y->store_op || x->resolve_mode != VK_RESOLVE_MODE_NONE ||
+          y->resolve_mode != VK_RESOLVE_MODE_NONE || x->flags != y->flags ||
+          x->layout != y->layout)
+         return false;
+   }
+   return attachments > 0;
+}
+
+bool
 hk_render_pack_tail_writable(const struct hk_cmd_buffer *cmd)
 {
    return !(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) &&
@@ -861,6 +947,8 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
    uint64_t att_bloom = 0;
    uint64_t vtx_img_bloom = 0;
    for (unsigned m = 0; m < count; ++m) {
+      if (list_is_empty(&members[m]->control_streams))
+         continue;
       const struct hk_cs *item = hk_render_pack_find_vdm(members[m], NULL, NULL);
       if (!item)
          item = list_first_entry(&members[m]->control_streams, struct hk_cs, node);

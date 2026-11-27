@@ -3205,6 +3205,22 @@ hoist_matcher_invariants(nir_shader *s)
    return moved;
 }
 
+static bool
+cf_list_has_any_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return true;
+      if (node->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(node);
+         if (cf_list_has_any_loop(&nif->then_list) ||
+             cf_list_has_any_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
 bool
 hk_nir_match_byte_stencil(const nir_shader *orig_nir,
                           uint32_t set_layout_count,
@@ -3218,26 +3234,21 @@ hk_nir_match_byte_stencil(const nir_shader *orig_nir,
        orig_nir->info.workgroup_size[1] == 0 ||
        orig_nir->info.workgroup_size[2] == 0 ||
        orig_nir->info.ray_queries > 0 ||
-       !exec_list_is_empty(&orig_nir->variables)) {
-      /* Note: orig_nir->variables may contain push_const/system-value vars;
-       * only reject if any shared/image/sampler variable exists. */
-      if (!orig_nir || orig_nir->info.stage != MESA_SHADER_COMPUTE ||
-          orig_nir->info.internal || orig_nir->info.shared_size != 0 ||
-          orig_nir->info.workgroup_size_variable ||
-          orig_nir->info.workgroup_size[0] == 0 ||
-          orig_nir->info.workgroup_size[1] == 0 ||
-          orig_nir->info.workgroup_size[2] == 0 ||
-          orig_nir->info.ray_queries > 0)
-         return false;
+       orig_nir->info.num_images > 0 || orig_nir->info.num_textures > 0 ||
+       orig_nir->info.num_ubos > 0 || orig_nir->info.num_ssbos == 1)
+      return false;
 
-      nir_foreach_variable_in_shader(var, orig_nir) {
-         if (var->data.mode & (nir_var_mem_shared | nir_var_image |
-                               nir_var_uniform))
-            return false;
-      }
+   nir_foreach_variable_in_shader(var, orig_nir) {
+      if (var->data.mode & (nir_var_mem_shared | nir_var_image |
+                            nir_var_uniform))
+         return false;
    }
 
    if (!exec_list_is_singular(&orig_nir->functions))
+      return false;
+
+   const nir_function_impl *orig_impl = nir_shader_get_entrypoint(orig_nir);
+   if (!orig_impl || !cf_list_has_any_loop(&orig_impl->body))
       return false;
 
    /* Canonicalize a scratch clone so we never mutate the caller's NIR. */
