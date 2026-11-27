@@ -591,12 +591,23 @@ struct hk_sync_queue {
     * (hk_sync.h, tile hazards). */
    bool load_hazard_frag;
    uint64_t last_preserve, evicted_preserve;
-
    /* Recent VDM renders' attachment blooms for exact-image HK_SYNC_GFX_IMG
     * narrowing across submissions. */
    struct hk_sync_vdm_att recent_vdm_att[HK_SYNC_RECENT_VDM_ATT];
    uint32_t recent_vdm_att_next, recent_vdm_att_count;
    uint64_t recent_vdm_att_evicted;
+
+   /* Retired-ordinal map for exact priors: each entry pairs a queue timeline
+    * point with the submitted VDM/CDM ordinals through that submission. Once
+    * `completed >= point`, every ordinal up to `ord[sq]` has retired and can
+    * be pruned to 0. */
+#define HK_SYNC_RETIRED_RING 64
+   struct {
+      uint64_t point;
+      uint64_t ord[HK_SYNC_NUM_SQ];
+   } retired[HK_SYNC_RETIRED_RING];
+   uint32_t retired_next, retired_count;
+   uint64_t retired_ord[HK_SYNC_NUM_SQ];
 };
 
 void hk_sync_reset(struct hk_cmd_buffer *cmd);
@@ -830,6 +841,7 @@ void hk_sync_apply_dep(struct hk_cmd_buffer *cmd, struct hk_cs *into,
 bool hk_sync_submit_needs_completed(const struct hk_queue *queue,
                                     struct hk_cmd_buffer *const *cmdbufs,
                                     unsigned count);
+bool hk_sync_submit_has_unretired_priors(const struct hk_queue *queue);
 
 /* The driver's own resolve pass after a render: waits on the render. */
 void hk_sync_resolve_begin(struct hk_cmd_buffer *cmd);
