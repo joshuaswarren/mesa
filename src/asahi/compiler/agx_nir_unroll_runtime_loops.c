@@ -209,12 +209,16 @@ lane_dependent(const nir_intrinsic_instr *intr)
 }
 
 /* Everything in the loop that is safe to execute F times in a row per
- * main-loop iteration. Returns the number of instructions, or -1. */
+ * main-loop iteration. Returns the number of instructions, or -1. When
+ * `top_level_out` is non-NULL, stores the number of instructions directly in
+ * the loop's unconditional top-level blocks (excluding nested `if` bodies). */
 static int
-count_unrollable(nir_loop *loop, nir_if *terminator)
+count_unrollable(nir_loop *loop, nir_if *terminator, int *top_level_out)
 {
    int count = 0;
+   int top_level = 0;
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      const bool is_top = block->cf_node.parent == &loop->cf_node;
       nir_foreach_instr(instr, block) {
          switch (instr->type) {
          case nir_instr_type_jump:
@@ -255,10 +259,15 @@ count_unrollable(nir_loop *loop, nir_if *terminator)
          }
          if (instr->type != nir_instr_type_phi &&
              instr->type != nir_instr_type_load_const &&
-             instr->type != nir_instr_type_undef)
+             instr->type != nir_instr_type_undef) {
             count++;
+            if (is_top)
+               top_level++;
+         }
       }
    }
+   if (top_level_out)
+      *top_level_out = top_level;
    return count;
 }
 
@@ -275,18 +284,17 @@ src_varies(nir_src *src, void *data)
    return true;
 }
 
-/* 32-bit registers one iteration's memory and texture reads fill, counting
- * the reads whose address depends on a value the loop carries (reads of
- * addresses that are the same every iteration, such as descriptors and the
- * bound's parameters, are shared by the unrolled copies). */
 static unsigned
-loaded_dwords(nir_function_impl *impl, nir_loop *loop)
+loaded_dwords_in_loop(nir_function_impl *impl, nir_loop *loop,
+                      bool top_level_only)
 {
    BITSET_WORD *varying =
       calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
    nir_block *header = nir_loop_first_block(loop);
    unsigned dwords = 0;
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      const bool count_block =
+         !top_level_only || block->cf_node.parent == &loop->cf_node;
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
          if (!def)
@@ -300,6 +308,8 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
             continue;
          BITSET_SET(varying, def->index);
 
+         if (!count_block)
+            continue;
          bool load = instr->type == nir_instr_type_tex;
          if (instr->type == nir_instr_type_intrinsic) {
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
@@ -315,8 +325,17 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
    return dwords;
 }
 
-static bool loop_is_readonly(nir_loop *loop);
+/* 32-bit registers one iteration's memory and texture reads fill, counting
+ * the reads whose address depends on a value the loop carries (reads of
+ * addresses that are the same every iteration, such as descriptors and the
+ * bound's parameters, are shared by the unrolled copies). */
+static unsigned
+loaded_dwords(nir_function_impl *impl, nir_loop *loop)
+{
+   return loaded_dwords_in_loop(impl, loop, false);
+}
 
+static bool loop_is_readonly(nir_loop *loop);
 static bool
 loop_is_readonly_with_loads(nir_function_impl *impl, nir_loop *loop)
 {
@@ -1077,6 +1096,45 @@ loop_step_exceeds_shared_size(const nir_shader *shader, nir_loop *loop,
    return false;
 }
 
+/* An upper bound on the iterations of a counting-up loop with a constant
+ * bound whose induction variable starts at a value that cannot be negative,
+ * such as a local invocation index, or UINT64_MAX when there is none. A start
+ * of 0 runs longest: the test that ends that run ends every larger start's
+ * run no later, as long as the largest start does not wrap by then. */
+static uint64_t
+max_trips(nir_shader *shader, const struct counted_loop *cl)
+{
+   if ((cl->rel != REL_LT && cl->rel != REL_LE) || cl->step <= 0 ||
+       cl->offset_is_step || !nir_scalar_is_const(cl->bound))
+      return UINT64_MAX;
+
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl->loop->cf_node));
+   nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
+   if (!init)
+      return UINT64_MAX;
+
+   struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
+   const int64_t start_max =
+      nir_unsigned_upper_bound(shader, ranges, nir_get_scalar(init->src.ssa, 0));
+   _mesa_hash_table_destroy(ranges, NULL);
+
+   const int64_t max = cl->is_unsigned ? UINT32_MAX : INT32_MAX;
+   if (start_max > max)
+      return UINT64_MAX;
+
+   /* From a start of 0, test k keeps the loop running while
+    * k * step + offset < bound (<= bound for REL_LE). */
+   const int64_t bound = cl->is_unsigned ? (int64_t)nir_scalar_as_uint(cl->bound)
+                                         : nir_scalar_as_int(cl->bound);
+   const int64_t room = bound - cl->offset + (cl->rel == REL_LE ? 1 : 0);
+   const int64_t trips = room > 0 ? DIV_ROUND_UP(room, cl->step) : 0;
+   if (start_max + trips * cl->step + cl->offset > max)
+      return UINT64_MAX;
+
+   /* A rotated loop runs its body once before the first test. */
+   return trips + (cl->bottom ? 1 : 0);
+}
+
 /* The iterations per test for a counted loop, or 0 when it is not unrolled. */
 static unsigned
 choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
@@ -1087,23 +1145,47 @@ choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
    if (loop_step_exceeds_shared_size(impl->function->shader, loop, cl))
       return 0;
 
-   int size = count_unrollable(loop, cl->nif);
+   int top_size = 0;
+   int size = count_unrollable(loop, cl->nif, &top_size);
    if (size < 0)
       return 0;
+   /* A guarded loop with a compact unconditional prefix and a larger nested
+    * conditional body executes only the prefix unconditionally per iteration.
+    * When 4x already fits the standard budget, allow 8x up to 2x total code
+    * size as long as the unconditional hot path stays within half the budget
+    * and unconditional in-flight loads stay within 16 dwords; backend
+    * occupancy / register-file checks fall back to 4x if pressure grows. */
+   const bool compact_guarded_prefix =
+      top_size < size && (unsigned)size * 4 <= max_instrs &&
+      (unsigned)top_size * factor <= max_instrs / 2 &&
+      (unsigned)size * factor <= max_instrs * 2;
+   const unsigned budget = compact_guarded_prefix ? max_instrs * 2 : max_instrs;
+
    /* A body too large for the full factor still gains from two
     * iterations per test when it fits the budget at half the factor. */
    unsigned f = factor;
-   while (f > 2 && (unsigned)size * f > max_instrs)
+   while (f > 2 && (unsigned)size * f > budget)
       f /= 2;
-   /* Beyond four iterations, keep the reads the unrolled body has in
-    * flight within 16 registers: more only raises register pressure
-    * (the scheduler issues them together) and can cost occupancy. */
+   /* Beyond four iterations, keep the unconditional reads the unrolled body
+    * has in flight within 16 registers: more only raises register pressure
+    * (the scheduler issues them together) and can cost occupancy. Loads inside
+    * nested `if` bodies are guarded and do not issue together across
+    * iterations. */
    if (f > 4) {
-      const unsigned dwords = loaded_dwords(impl, loop);
+      const unsigned dwords = loaded_dwords_in_loop(impl, loop, true);
       while (f > 4 && dwords * f > 16)
          f /= 2;
    }
-   return (unsigned)size * f > max_instrs ? 0 : f;
+   /* The main loop runs only while f iterations remain. One that can run
+    * at most once saves at most f - 1 loop tests, and its guard and its f
+    * copies of the body cost the same whether it runs or not: keep the
+    * loop as it is. */
+   const uint64_t trips = max_trips(impl->function->shader, cl);
+   while (f >= 2 && 2 * f > trips)
+      f /= 2;
+   if (f < 2)
+      return 0;
+   return (unsigned)size * f > budget ? 0 : f;
 }
 
 /* Computable before `outer` from values defined before it, without memory
@@ -1463,7 +1545,7 @@ peel_straight_prefix(nir_function_impl *impl, nir_loop *loop, unsigned count,
    struct counted_loop cl;
    if (!analyze_loop(loop, &cl) || cl.bottom)
       return false;
-   if (count_unrollable(loop, cl.nif) < 0)
+   if (count_unrollable(loop, cl.nif, NULL) < 0)
       return false;
 
    nir_foreach_block_in_cf_node(block, &loop->cf_node)

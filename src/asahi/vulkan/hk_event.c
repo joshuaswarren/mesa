@@ -119,6 +119,12 @@ hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs) {
+      if (src_kinds) {
+         /* A host observer polling vkGetEventStatus() may read query results
+          * once this event is set; withhold NO_QUERY_ACCESS so pending
+          * host-published stamps in the first scope land before the write. */
+         cs->query_access_untracked = true;
+      }
       if (host_kinds) {
          hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_visibility_flush(hk_cmd_buffer_device(cmd), cs, true);

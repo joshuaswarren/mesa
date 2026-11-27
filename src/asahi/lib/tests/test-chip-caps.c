@@ -51,7 +51,7 @@ static const unsigned all_caps =
    AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |
-   AGX_CAP_FOLD_SHARED_OFFSETS;
+   AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -299,6 +299,17 @@ test_g13_compute_codegen_caps(void)
    }
 }
 
+/* AGX_CAP_CDM_DEFER_FLUSH is enabled on the measured G13G row only. */
+static void
+test_cdm_defer_flush(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G13G;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_DEFER_FLUSH) == expected, c);
+   }
+}
+
 int
 main(void)
 {
@@ -317,6 +328,7 @@ main(void)
    test_hal200_msaa_color_compression();
    test_signed_zero_minmax_select();
    test_g13_compute_codegen_caps();
+   test_cdm_defer_flush();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

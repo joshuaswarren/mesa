@@ -143,15 +143,68 @@ background_object_unused(const struct hk_render_registers *r)
           (!r->stencil.buffer || zls.s_load);
 }
 
+static bool
+zls_control_compatible(const struct hk_cs *a, const struct hk_cs *b)
+{
+   if (!memcmp(&a->cr.zls_control, &b->cr.zls_control,
+               sizeof(a->cr.zls_control)))
+      return true;
+
+   const uint8_t elided =
+      a->render_pack_zls_elided_store | b->render_pack_zls_elided_store;
+   if (!elided)
+      return false;
+
+   agx_unpack(NULL, &a->cr.zls_control, ZLS_CONTROL, za);
+   agx_unpack(NULL, &b->cr.zls_control, ZLS_CONTROL, zb);
+   if (elided & VK_IMAGE_ASPECT_DEPTH_BIT)
+      za.z_store = zb.z_store = true;
+   if (elided & VK_IMAGE_ASPECT_STENCIL_BIT)
+      za.s_store = zb.s_store = true;
+
+   struct agx_zls_control_packed pa, pb;
+   agx_pack(&pa, ZLS_CONTROL, cfg) {
+      cfg = za;
+   }
+   agx_pack(&pb, ZLS_CONTROL, cfg) {
+      cfg = zb;
+   }
+   return !memcmp(&pa, &pb, sizeof(pa));
+}
+
+static const struct hk_bg_eot *
+full_bg_main(const struct hk_cs *cs)
+{
+   return cs->render_pack_has_full_programs ? &cs->render_pack_full_bg_main
+                                            : &cs->cr.bg.main;
+}
+
+static const struct hk_bg_eot *
+full_eot_main(const struct hk_cs *cs)
+{
+   return cs->render_pack_has_full_programs ? &cs->render_pack_full_eot_main
+                                            : &cs->cr.eot.main;
+}
+
+static const struct hk_bg_eot *
+full_eot_partial(const struct hk_cs *cs)
+{
+   return cs->render_pack_has_full_programs ? &cs->render_pack_full_eot_partial
+                                            : &cs->cr.eot.partial;
+}
+
 /* Which of the render registers two streams program differently, or NULL.
  * `b` follows `a` in the tile pass, which begins with `a`'s background. When
  * `eot_changes` is set, `b` supplies a different final end-of-tile program
  * (a colour STORE -> DONT_CARE discard or a final direct resolve), so its
  * `eot.main` resources and `process_empty_tiles` may differ from `a`'s. */
 static const char *
-registers_differ(const struct hk_render_registers *a,
-                 const struct hk_render_registers *b, bool eot_changes)
+registers_differ(const struct hk_cs *cs_a, const struct hk_cs *cs_b,
+                 bool eot_changes)
 {
+   const struct hk_render_registers *a = &cs_a->cr;
+   const struct hk_render_registers *b = &cs_b->cr;
+
    if (a->width != b->width || a->height != b->height ||
        a->layers != b->layers || a->zls_width != b->zls_width ||
        a->zls_height != b->zls_height ||
@@ -161,7 +214,7 @@ registers_differ(const struct hk_render_registers *a,
         a->isp_bgobjvals != b->isp_bgobjvals) &&
        !background_object_unused(b))
       return "background object";
-   if (memcmp(&a->zls_control, &b->zls_control, sizeof(a->zls_control)) ||
+   if (!zls_control_compatible(cs_a, cs_b) ||
        memcmp(&a->zls_control_partial, &b->zls_control_partial,
               sizeof(a->zls_control_partial)))
       return "depth/stencil control";
@@ -185,10 +238,11 @@ registers_differ(const struct hk_render_registers *a,
        a->stencil.meta_stride != b->stencil.meta_stride)
       return "depth/stencil buffers";
 
-   if (!bg_eot_resources_equal(&a->bg.main, &b->bg.main) ||
-       (!eot_changes && !bg_eot_resources_equal(&a->eot.main, &b->eot.main)) ||
+   if (!bg_eot_resources_equal(full_bg_main(cs_a), full_bg_main(cs_b)) ||
+       (!eot_changes &&
+        !bg_eot_resources_equal(full_eot_main(cs_a), full_eot_main(cs_b))) ||
        !bg_eot_resources_equal(&a->bg.partial, &b->bg.partial) ||
-       !bg_eot_resources_equal(&a->eot.partial, &b->eot.partial))
+       !bg_eot_resources_equal(full_eot_partial(cs_a), full_eot_partial(cs_b)))
       return "tile program resources";
    return NULL;
 }
@@ -231,23 +285,19 @@ render_pack_streams_match(const struct hk_cs *a, const struct hk_cs *b,
       return "tilebuffer";
    if (resolving && (!a->cr.whole_attachments || !b->cr.whole_attachments))
       return "partial render area resolve";
-   const char *why = registers_differ(&a->cr, &b->cr, eot_changes);
+   const char *why = registers_differ(a, b, eot_changes);
    if (why)
       return why;
-   /* The tile programs: the merged command runs A's background programs, B's
-    * end-of-tile program and A's partial-render programs. All are built from
-    * the attachments, their operations and the tilebuffer layout, which
-    * hk_render_pack_continues() and the checks above require the same (B
-    * loads every attachment, so A's own load semantics stand), and from
-    * nothing else but the untouched-attachment elision of the stream's last
-    * instance, which rebuilds the end-of-tile programs without the stores
-    * (and the background program without the loads) of attachments no draw
-    * wrote. With equal elision both streams' programs store the same
-    * attachments: one that only A writes, or only B, is elided in neither
-    * (it would be in both or in neither had neither written it), so no write
-    * is lost and no load skipped. A first draw that covers an attachment
-    * changes only the background program, A's own. */
-   if (a->render_pack_elided != b->render_pack_elided)
+   /* The tile programs: when both streams elided the same untouched colour
+    * attachments, the merged pass keeps the elided programs. When their
+    * elision masks differ and each elided stream preserved its full
+    * (unelided) tile programs before hk_g17p_elide_untouched_color() rewrote
+    * them, hk_render_pack_init()/hk_render_pack_add() restore the full
+    * programs so no attachment written by either member loses its load or
+    * store. */
+   if (a->render_pack_elided != b->render_pack_elided &&
+       ((a->render_pack_elided && !a->render_pack_has_full_programs) ||
+        (b->render_pack_elided && !b->render_pack_has_full_programs)))
       return "elided attachments";
    if (a->area_x1 != b->area_x1 || a->area_y1 != b->area_y1)
       return "render area";
@@ -418,13 +468,123 @@ hk_render_pack_array_prefix(const struct util_dynarray *a,
    return true;
 }
 
-const char *
-hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
+const struct hk_cs *
+hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
+                        const struct hk_cs **pre_out,
+                        const struct hk_cs **post_out)
 {
+   if (pre_out)
+      *pre_out = NULL;
+   if (post_out)
+      *post_out = NULL;
+
+   if (list_is_empty(&cmd->control_streams))
+      return NULL;
+
+   if (list_is_singular(&cmd->control_streams)) {
+      const struct hk_cs *cs =
+         list_first_entry(&cmd->control_streams, struct hk_cs, node);
+      return cs->type == HK_CS_VDM ? cs : NULL;
+   }
+
+   const struct hk_cs *pre = NULL, *vdm = NULL, *post = NULL;
+   for (const struct list_head *pos = cmd->control_streams.next;
+        pos != &cmd->control_streams; pos = pos->next) {
+      const struct hk_cs *s = list_entry(pos, const struct hk_cs, node);
+      if (s->type == HK_CS_VDM) {
+         if (vdm)
+            return NULL;
+         vdm = s;
+      } else if (s->type == HK_CS_CDM) {
+         if (!vdm) {
+            if (pre)
+               return NULL;
+            pre = s;
+         } else {
+            if (post)
+               return NULL;
+            post = s;
+         }
+      } else {
+         return NULL;
+      }
+   }
+
+   if (!vdm)
+      return NULL;
+   if (pre_out)
+      *pre_out = pre;
+   if (post_out)
+      *post_out = post;
+   return vdm;
+}
+
+static const char *
+hk_render_pack_aux_cdm_refusal(const struct hk_cs *cs, bool is_post)
+{
+   if (cs->type != HK_CS_CDM)
+      return "aux not compute";
+   if (cs->stats.calls != 0)
+      return "api compute";
+   if (is_post && !cs->stats.cmds)
+      return "empty post-graphics";
+   if (cs->sync.kind != (HK_SYNC_GFX | HK_SYNC_GFX_MEM))
+      return "aux sync kind";
+   if (cs->timestamp.start.handle || cs->timestamp.end.handle ||
+       cs->unordered_start_ts || cs->g17p_timestamp_query)
+      return "aux timestamp";
+   if (cs->oq_pending_count || cs->oq_stamps.size)
+      return "aux occlusion query";
+   for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
+      if (cs->oq_stamp[i].handle)
+         return "aux occlusion query";
+   }
+   if ((!is_post && cs->imm_writes.size) || cs->imm_write_query_ranges.size ||
+       cs->query_access || cs->query_access_ranges.size ||
+       cs->query_reset_pending)
+      return "aux query";
+   if (cs->calls_stream || cs->g18_dispatch_sealed)
+      return "aux stream call";
+   if (cs->gen1_native_rq || cs->gen1_native_fragment_rq ||
+       cs->gen1_native_vertex_rq)
+      return "aux ray query";
+   if (cs->alias_sites || cs->sparse_sites)
+      return "aux submission patch";
+   if (cs->as_build)
+      return "aux acceleration structure";
+   if (cs->sync.brl_transition)
+      return "aux layout transition";
+   return NULL;
+}
+
+static const char *
+hk_render_pack_member_refusal_streams(const struct hk_cmd_buffer *cmd,
+                                      const struct hk_cs **vdm_out,
+                                      const struct hk_cs **pre_out,
+                                      const struct hk_cs **post_out)
+{
+   if (vdm_out)
+      *vdm_out = NULL;
+   if (pre_out)
+      *pre_out = NULL;
+   if (post_out)
+      *post_out = NULL;
+
    if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
       return "secondary";
-   if (!list_is_singular(&cmd->control_streams))
-      return list_is_empty(&cmd->control_streams) ? "no stream" : "streams";
+
+   const struct hk_cs *pre = NULL, *cs = NULL, *post = NULL;
+   if (list_is_empty(&cmd->control_streams))
+      return "no stream";
+   if (list_is_singular(&cmd->control_streams)) {
+      cs = list_first_entry(&cmd->control_streams, struct hk_cs, node);
+      if (cs->type != HK_CS_VDM)
+         return "compute";
+   } else {
+      cs = hk_render_pack_find_vdm(cmd, &pre, &post);
+      if (!cs)
+         return "streams";
+   }
 
    /* Events can be observed before the submission completes; a pending or
     * unordered start stamp, a heap or a query reset carries work of its own
@@ -438,10 +598,6 @@ hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
    if (cmd->sync.has_gpu_query_reset)
       return "query reset";
 
-   const struct hk_cs *cs =
-      list_first_entry(&cmd->control_streams, struct hk_cs, node);
-   if (cs->type != HK_CS_VDM)
-      return "compute";
    if (!cs->stats.cmds)
       return "no draws";
    if (!cs->g17p_pass_begins || !cs->g17p_pass_ends)
@@ -475,23 +631,79 @@ hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
    if (cs->sync.brl_transition)
       return "layout transition";
 
-   /* The only stream has no in-buffer cut, and the tail requirements name
-    * nothing but it. */
-   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-      if (cs->sync.dep[sq].cut || cs->sync.dep_ta[sq].cut)
-         return "in-buffer dependency";
-      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
-         const struct hk_cs *cut = cmd->sync.req[k][sq].cut;
-         if (cut && cut != cs)
-            return "tail requirement";
+   if (pre) {
+      const char *why = hk_render_pack_aux_cdm_refusal(pre, false);
+      if (why)
+         return why;
+      if (pre->sync.heap_slot != cs->sync.heap_slot)
+         return "pre heap slot";
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (pre->sync.dep[sq].cut || pre->sync.dep_ta[sq].cut)
+            return "pre in-buffer dependency";
       }
+   }
+   if (post) {
+      const char *why = hk_render_pack_aux_cdm_refusal(post, true);
+      if (why)
+         return why;
+      if (!post->sync.heap_slot || post->sync.heap_slot != cs->sync.heap_slot)
+         return "post heap slot";
+      if ((post->sync.dep[HK_SYNC_VDM].cut &&
+           post->sync.dep[HK_SYNC_VDM].cut != cs) ||
+          (post->sync.dep_ta[HK_SYNC_VDM].cut &&
+           post->sync.dep_ta[HK_SYNC_VDM].cut != cs) ||
+          post->sync.dep[HK_SYNC_CDM].cut ||
+          post->sync.dep_ta[HK_SYNC_CDM].cut)
+         return "post in-buffer dependency";
+   }
+
+   /* The render stream has no in-buffer cut except its own pre-graphics CDM,
+    * and tail requirements name nothing outside {pre, cs, post}. */
+   if (cs->sync.dep[HK_SYNC_VDM].cut || cs->sync.dep_ta[HK_SYNC_VDM].cut)
+      return "in-buffer dependency";
+   if ((cs->sync.dep[HK_SYNC_CDM].cut &&
+        cs->sync.dep[HK_SYNC_CDM].cut != pre) ||
+       (cs->sync.dep_ta[HK_SYNC_CDM].cut &&
+        cs->sync.dep_ta[HK_SYNC_CDM].cut != pre))
+      return "in-buffer dependency";
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      const struct hk_cs *vcut = cmd->sync.req[k][HK_SYNC_VDM].cut;
+      if (vcut && vcut != cs)
+         return "tail requirement";
+      const struct hk_cs *ccut = cmd->sync.req[k][HK_SYNC_CDM].cut;
+      if (ccut && ccut != pre && ccut != post)
+         return "tail requirement";
    }
    util_dynarray_foreach(&cmd->sync_pass_records, struct hk_sync_pass_record,
                          rec) {
       if ((rec->first && rec->first != cs) || (rec->last && rec->last != cs))
          return "pass record";
    }
+
+   if (vdm_out)
+      *vdm_out = cs;
+   if (pre_out)
+      *pre_out = pre;
+   if (post_out)
+      *post_out = post;
    return NULL;
+}
+
+const char *
+hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd)
+{
+   return hk_render_pack_member_refusal_streams(cmd, NULL, NULL, NULL);
+}
+
+const struct hk_cs *
+hk_render_pack_member_streams(const struct hk_cmd_buffer *cmd,
+                              const struct hk_cs **pre_out,
+                              const struct hk_cs **post_out)
+{
+   const struct hk_cs *vdm = NULL;
+   if (hk_render_pack_member_refusal_streams(cmd, &vdm, pre_out, post_out))
+      return NULL;
+   return vdm;
 }
 
 /* The packet stamps the members' timestamps take: bit 0 the vertex end,
@@ -502,13 +714,10 @@ hk_render_pack_stamp_slots(const struct hk_cs *cs)
    return (cs->timestamp.vtx_end.handle ? 1 : 0) |
           (cs->timestamp.end.handle ? 2 : 0);
 }
-
 const struct hk_cs *
 hk_render_pack_member(const struct hk_cmd_buffer *cmd)
 {
-   return hk_render_pack_member_refusal(cmd)
-             ? NULL
-             : list_first_entry(&cmd->control_streams, struct hk_cs, node);
+   return hk_render_pack_member_streams(cmd, NULL, NULL);
 }
 
 bool
@@ -544,18 +753,23 @@ void
 hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
                     struct hk_cmd_buffer *const *members, unsigned count)
 {
-   const struct hk_cs *first =
-      list_first_entry(&members[0]->control_streams, struct hk_cs, node);
+   const struct hk_cs *first = hk_render_pack_find_vdm(members[0], NULL, NULL);
+   if (!first)
+      first = list_first_entry(&members[0]->control_streams, struct hk_cs, node);
    uint8_t kinds = 0;
    bool vtx_images = false;
+   bool elided_diff = false;
    bool vtx_img_unsafe = false;
    uint64_t att_bloom = 0;
    uint64_t vtx_img_bloom = 0;
    for (unsigned m = 0; m < count; ++m) {
-      const struct hk_cs *item =
-         list_first_entry(&members[m]->control_streams, struct hk_cs, node);
+      const struct hk_cs *item = hk_render_pack_find_vdm(members[m], NULL, NULL);
+      if (!item)
+         item = list_first_entry(&members[m]->control_streams, struct hk_cs, node);
       kinds |= item->sync.kind;
       vtx_images |= item->sync.vtx_images;
+      if (item->render_pack_elided != first->render_pack_elided)
+         elided_diff = true;
       vtx_img_unsafe |= item->sync.vtx_img_unsafe;
       att_bloom |= item->sync.att_bloom;
       vtx_img_bloom |= item->sync.vtx_img_bloom;
@@ -567,6 +781,13 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
    util_dynarray_clear(&resources);
    memcpy(cs, first, sizeof(*cs));
    cs->render_resources = resources;
+   if (elided_diff) {
+      if (first->render_pack_elided) {
+         cs->cr.bg.main = first->render_pack_full_bg_main;
+         cs->cr.eot.partial = first->render_pack_full_eot_partial;
+      }
+      cs->render_pack_elided = 0;
+   }
 
    list_inithead(&cs->node);
    cs->cmd = packet;
@@ -702,10 +923,26 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
    cs->tile_resources.secondary_bytes =
       MAX2(cs->tile_resources.secondary_bytes,
            item->tile_resources.secondary_bytes);
+   if (memcmp(&cs->cr.zls_control, &item->cr.zls_control,
+              sizeof(cs->cr.zls_control))) {
+      agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, za);
+      agx_unpack(NULL, &item->cr.zls_control, ZLS_CONTROL, zb);
+      za.z_store |= zb.z_store;
+      za.s_store |= zb.s_store;
+      agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
+         cfg = za;
+      }
+   }
    if (last) {
       /* The last instance stores or resolves the attachments, as the final
-       * instance of an in-buffer continuation does. */
-      cs->cr.eot.main = item->cr.eot.main;
+       * instance of an in-buffer continuation does. When members differed in
+       * untouched-RT elision (hk_render_pack_init() cleared
+       * cs->render_pack_elided), restore the unelided end-of-tile program so
+       * no earlier member's write is lost. */
+      cs->cr.eot.main =
+         item->render_pack_elided != cs->render_pack_elided
+            ? item->render_pack_full_eot_main
+            : item->cr.eot.main;
       cs->g17p_pass_ends = item->g17p_pass_ends;
       if (!attachment_set_merge(&cs->fragment_attachments,
                                 &item->fragment_attachments, true))
