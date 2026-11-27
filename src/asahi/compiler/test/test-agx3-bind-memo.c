@@ -170,6 +170,54 @@ check_other_mnemonic(void)
               "zero override", 0, sample_mnemonic);
       break;
    }
+
+   /* Verify agx3_bind_compose_ep_range matches looping agx3_bind_compose,
+    * honors skip_ep and max_length, and refuses AGX3D. */
+   uint8_t range_out[2 * AGX3_MAX_WORDS];
+   uint8_t range_len = 0;
+   checks++;
+   if (!agx3_bind_compose_ep_range(enc, sample_mnemonic, 0, 35, -1, 0, false,
+                                   kv, nkv, NULL, 0, range_out, &range_len)) {
+      fail("ep_range failed for valid sample", "ep_range", 0, sample_mnemonic);
+   } else {
+      uint8_t loop_out[2 * AGX3_MAX_WORDS];
+      uint8_t loop_len = 0;
+      bool loop_ok = false;
+      unsigned matched_ep = 0;
+      for (unsigned ep = 0; ep <= 35; ++ep) {
+         if (agx3_bind_compose(enc, sample_mnemonic, (int)ep, kv, nkv, NULL, 0,
+                               loop_out, &loop_len)) {
+            loop_ok = true;
+            matched_ep = ep;
+            break;
+         }
+      }
+      if (!loop_ok || range_len != loop_len ||
+          memcmp(range_out, loop_out, loop_len))
+         fail("ep_range differed from ep loop", "ep_range", 0, sample_mnemonic);
+
+      checks++;
+      uint8_t capped_out[2 * AGX3_MAX_WORDS];
+      uint8_t capped_len = 0;
+      if (agx3_bind_compose_ep_range(enc, sample_mnemonic, matched_ep,
+                                     matched_ep, -1, loop_len, true, kv, nkv,
+                                     NULL, 0, capped_out, &capped_len))
+         fail("ep_range ignored max_length cap", "ep_range", 0,
+              sample_mnemonic);
+
+      checks++;
+      if (agx3_bind_compose_ep_range(enc, sample_mnemonic, matched_ep,
+                                     matched_ep, (int)matched_ep, 0, false, kv,
+                                     nkv, NULL, 0, capped_out, &capped_len))
+         fail("ep_range ignored skip_ep", "ep_range", 0, sample_mnemonic);
+   }
+
+   checks++;
+   if (agx3_bind_compose_ep_range(AGX_ISA_ENCODING_AGX3D, sample_mnemonic, 0,
+                                  35, -1, 0, false, kv, nkv, NULL, 0,
+                                  range_out, &range_len))
+      fail("ep_range accepted AGX3D", "ep_range", 0, sample_mnemonic);
+
    return true;
 }
 

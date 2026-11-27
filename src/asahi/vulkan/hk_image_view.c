@@ -777,6 +777,34 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    return packed;
 }
 
+bool
+hk_image_pack_eot_pbe(struct hk_device *dev, struct hk_image *image,
+                      uint32_t mip_level, uint32_t base_layer,
+                      struct hk_native_pbe_descriptor *out)
+{
+   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       mip_level >= image->vk.mip_levels ||
+       base_layer >= image->vk.array_layers)
+      return false;
+
+   struct hk_image_view view = {
+      .vk = {
+         .image = &image->vk,
+         .view_type = VK_IMAGE_VIEW_TYPE_2D,
+         .format = image->vk.format,
+         .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+         .base_mip_level = mip_level,
+         .level_count = 1,
+         .base_array_layer = base_layer,
+         .layer_count = 1,
+      },
+      .planes = {
+         [0] = { .image_plane = 0 },
+      },
+   };
+   return pack_pbe(dev, &view, 0, HK_DESC_USAGE_BG_EOT, out, NULL, NULL);
+}
+
 /* Put a view texture in the device heap: at the captured index when the view
  * replays (VK_EXT_descriptor_buffer), else anywhere. *index is 0 on failure,
  * so the destroy path never frees an index the view does not own. */
