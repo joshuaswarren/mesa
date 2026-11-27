@@ -13,6 +13,7 @@
 #include "vk_image.h"
 
 struct hk_device;
+struct hk_image;
 
 #define HK_MAX_IMAGE_DESCS (10 * HK_MAX_PLANES)
 
@@ -51,6 +52,10 @@ struct hk_image_view {
          emrt_pbe_valid;
    } planes[3];
 };
+
+bool hk_image_pack_eot_pbe(struct hk_device *dev, struct hk_image *image,
+                           uint32_t mip_level, uint32_t base_layer,
+                           struct hk_native_pbe_descriptor *out);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image_view, vk.base, VkImageView,
                                VK_OBJECT_TYPE_IMAGE_VIEW)

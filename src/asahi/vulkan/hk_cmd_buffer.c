@@ -615,6 +615,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   cmd->suspended_pass.valid = false;
    memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
@@ -1568,6 +1569,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    if (HK_PERF(dev, NOBARRIER))
       return;
 
+   cmd->suspended_pass.valid = false;
+
    perf_debug(cmd, "Pipeline barrier");
 
    if (unlikely(dev->frame_anatomy)) {
@@ -1634,6 +1637,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          brl_discard_init_record(cmd, pDependencyInfo, init_dst);
       return;
    }
+
+   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass &&
+       hk_resolve_fold_barrier_orders_fs(pDependencyInfo))
+      cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
 
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
@@ -6156,8 +6163,7 @@ hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!agx_chip_native_or_m5(dev->dev.chip) || cmd->in_meta ||
        render->view_mask || render->layer_count != 1 ||
        (render->flags &
-        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT |
-         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) ||
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) ||
        hk_sync_xfer_pending(&cmd->sync))
       return false;
 
@@ -6520,6 +6526,8 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
    if (!hk_deferred_clear_eligible(cmd, image, aspects, range_count, ranges))
       return false;
 
+   cmd->state.pending_msaa_resolve.cs = NULL;
+
    /* The deferred clear overwrites the whole image, whether it becomes a
     * load-op clear or a fill: a pending store of those aspects is dead. */
    if (cmd->state.pending_z_store.cs &&
@@ -6614,6 +6622,7 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
+   cmd->state.pending_msaa_resolve.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;
