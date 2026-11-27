@@ -9220,8 +9220,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
-      if (dev->dev.chip != AGX_CHIP_G17P &&
-          dev->dev.chip != AGX_CHIP_G17S) {
+      if (!agx_chip_g17p_or_m5(dev->dev.chip)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -9295,7 +9294,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * fit the native output limits (agx_nir_lower_m5_mesh()). Keep the
        * shader as it was to compile instead where they do not. */
       nir_shader *m5_without_layer = NULL;
-      if (dev->dev.chip == AGX_CHIP_G17S && key_tmp.mesh.default_layer) {
+      if (m5_mesh && key_tmp.mesh.default_layer) {
          m5_without_layer = nir_shader_clone(NULL, nir);
          if (m5_without_layer && !hk_m5_mesh_default_layer(nir)) {
             ralloc_free(m5_without_layer);
@@ -9547,7 +9546,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       hk_m5_task_predicate(nir);
       const bool grid_record =
          hk_m5_task_record(dev->dev.params.features) && !m5_no_grid_record;
-      if (dev->dev.chip != AGX_CHIP_G17S ||
+      if (!agx_chip_g17_m5(dev->dev.chip) ||
           !agx_nir_lower_m5_task(nir,
               hk_m5_task_payload_limit(dev->dev.params.features),
               grid_record)) {
@@ -10249,7 +10248,7 @@ static bool
 hk_m5_no_grid_record(const struct hk_device *dev, uint32_t shader_count,
                      const struct vk_shader_compile_info *infos)
 {
-   if (dev->dev.chip != AGX_CHIP_G17S ||
+   if (!agx_chip_g17_m5(dev->dev.chip) ||
        !hk_m5_task_record(dev->dev.params.features))
       return false;
    const struct vk_shader_compile_info *task = NULL, *mesh = NULL;
@@ -11144,7 +11143,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     * unlinked shader object may meet a fragment shader that reads gl_Layer.
     * A complete pipeline without a fragment shader cannot. */
    const bool mesh_default_layer =
-      dev->dev.chip == AGX_CHIP_G17S && !has_fragment &&
+      agx_chip_g17_m5(dev->dev.chip) && !has_fragment &&
       !hk_pipeline_has_no_fragment_shader(state);
 
    for (uint32_t i = 0; i < shader_count; i++) {
