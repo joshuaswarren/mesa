@@ -917,12 +917,28 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
       agx_builder b =
          agx_init_builder(ctx->shader, agx_before_function(ctx->shader));
 
-      /* Copy immediate/uniform phi sources to memory variables at the start of
+      /* An immediate or uniform phi source needs no memory variable of its
+       * own: parallel copy lowering writes it to the phi's slot on the edge,
+       * through the scratch register a memory-memory copy uses
+       * (agx_lower_parallel_copy.c do_copy()). A variable made at the start
+       * of the program would instead stay live, in a slot of its own, until
+       * the phi, and the edge would copy it from memory to memory. That is
+       * a fill per traversal of the edge where a uniform read suffices.
+       *
+       * A uniform the program writes must still be read at the start.
+       */
+      if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
+          (I->src[s].type == AGX_INDEX_UNIFORM &&
+           !ctx->shader->uniforms_written)) {
+         record_spill(ctx);
+         continue;
+      }
+
+      /* Copy other uniform phi sources to memory variables at the start of
        * the program, where pressure is zero and hence the copy is legal.
        */
       if (I->src[s].type != AGX_INDEX_NORMAL) {
-         assert(I->src[s].type == AGX_INDEX_IMMEDIATE ||
-                I->src[s].type == AGX_INDEX_UNIFORM);
+         assert(I->src[s].type == AGX_INDEX_UNIFORM);
 
          agx_index mem = agx_temp_like(ctx->shader, I->dest[0]);
          assert(mem.memory);
