@@ -185,6 +185,15 @@ enum agx_chip_cap {
     * independent dispatches. Measured on G13G and G13X (0 regressions on
     * synchronization/memory_model/compute CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
+
+   /* Large buffer-to-buffer copies (>= 32 MiB, >= 64 MiB combined working set)
+    * benefit from writing the destination through a linear RGBA32_UINT PBE
+    * storage texel buffer instead of batched compute stores without serializing
+    * across queued copies. Measured on G17C (+11.5% at d=8, parity at d=1/4,
+    * avoiding the 24-28 MiB SLC-edge regression); G17P serializes queued PBE
+    * copies (-2.27% at d=4, -7.14% at d=8), and other M5 SKUs (G17G, G17S,
+    * G17D) remain off until measured on hardware. */
+   AGX_CAP_PBE_QUEUED_BUFFER_COPY = 1u << 26,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -270,7 +279,7 @@ enum agx_chip_cap {
    X(G17A, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
+   X(G17C, AGX_CAPS_M5 | AGX_CAP_PBE_QUEUED_BUFFER_COPY, __VA_ARGS__)          \
    X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
    X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
      __VA_ARGS__)
