@@ -2767,3 +2767,48 @@ TEST_F(Optimizer, AGX3BRedundantByteMaskNegative)
       ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
    }
 }
+
+TEST_F(Optimizer, Agx2ConvertByteMask)
+{
+   const struct {
+      const char *name;
+      enum agx_isa_encoding encoding;
+      unsigned mode;
+      uint16_t mask;
+      bool expect_fold;
+   } cases[] = {
+      {"agx2-u8-to-f-0xff", AGX_ISA_ENCODING_AGX2, AGX_CONVERT_U8_TO_F, 0xff,
+       true},
+      {"agx2-s8-to-f-0xff", AGX_ISA_ENCODING_AGX2, AGX_CONVERT_S8_TO_F, 0xff,
+       true},
+      {"agx2-u8-to-f-0x1ff", AGX_ISA_ENCODING_AGX2, AGX_CONVERT_U8_TO_F, 0x1ff,
+       true},
+      {"agx2-u8-to-f-0x7f", AGX_ISA_ENCODING_AGX2, AGX_CONVERT_U8_TO_F, 0x7f,
+       false},
+      {"agx2-u16-to-f-0xff", AGX_ISA_ENCODING_AGX2, AGX_CONVERT_U16_TO_F, 0xff,
+       false},
+      {"agx3-s8-to-f-0xff", AGX_ISA_ENCODING_AGX3B, AGX_CONVERT_S8_TO_F, 0xff,
+       false},
+   };
+
+   for (const auto &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      b->shader->key = &key;
+
+      agx_index raw = agx_temp(b->shader, AGX_SIZE_16);
+      agx_iadd_to(b, raw, hx, hy, 0);
+      agx_index masked = agx_temp(b->shader, AGX_SIZE_16);
+      agx_and_to(b, masked, raw, agx_immediate(c.mask));
+      agx_index flt = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *cvt = agx_convert_to(b, flt, agx_immediate(c.mode), masked,
+                                      AGX_ROUND_RTE);
+      agx_unit_test(b, flt);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(cvt->src[1].value, c.expect_fold ? raw.value : masked.value)
+         << c.name;
+   }
+}
