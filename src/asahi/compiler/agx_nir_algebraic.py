@@ -658,6 +658,12 @@ def u8_absdiff():
 reassoc_const_offsets = [
     (('ineg@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c')),
      ('iadd', ('ineg', a), ('ineg', c))),
+    (('iadd@32', ('iadd@32', 'a(is_not_const)', '#c'), ('ineg', ('iadd@32', 'b(is_not_const)', '#d'))),
+     ('iadd', ('isub', a, b), ('isub', c, d))),
+    (('iadd@32', 'a(is_not_const)', ('ineg', ('iadd@32', 'b(is_not_const)', '#d'))),
+     ('iadd', ('isub', a, b), ('ineg', d))),
+    (('iadd@32', ('iadd@32', 'a(is_not_const)', '#c'), ('ineg', 'b(is_not_const)')),
+     ('iadd', ('isub', a, b), c)),
     (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), ('iadd@32(is_used_once)', 'b(is_not_const)', '#d')),
      ('iadd', ('iadd', a, b), ('iadd', c, d))),
     (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), 'b(is_not_const)'),

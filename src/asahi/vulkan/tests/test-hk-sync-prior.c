@@ -10,6 +10,7 @@
 #include "hk_device.h"
 #include "hk_drm_prior_core.h"
 #include "hk_queue.h"
+#include "agx_chip_caps.h"
 _Static_assert(sizeof(struct drm_asahi_cmd_render) == 320, "legacy render");
 _Static_assert(sizeof(struct drm_asahi_cmd_compute) == 128,
                "legacy Mesa compute");
@@ -145,7 +146,7 @@ end_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
 /* Chips whose start stamps latch before a command's waits (hk_sync.c,
  * start_stamps_ordered()): G17P and M5. */
 static const enum agx_chip end_stamp_chips[] = {
-   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D};
 
 /* G17P and M5: ResetQueryPool leaves a reusable compute stream. A TOP_OF_PIPE
  * stamp after it ends that stream's command: start stamps latch before the
@@ -628,7 +629,7 @@ render_pass(struct hk_cmd_buffer *cmd, const void *image, uint32_t layers,
 {
    hk_sync_begin_rendering(cmd, false);
    hk_sync_pass_footprint(cmd, image, 0, 0, layers, 32, 32,
-                         (VkRect2D){{0, 0}, {32, 32}}, preserve_layers);
+                         (VkRect2D){{0, 0}, {32, 32}}, preserve_layers, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *cs = test_alloc(sizeof(*cs));
    cs->type = HK_CS_VDM;
@@ -935,7 +936,7 @@ compute_clear_pass(struct hk_cmd_buffer *cmd, const void *image,
 {
    hk_sync_begin_rendering(cmd, false);
    hk_sync_pass_footprint(cmd, image, 0, base_layer, base_layer + 1, 32, 32,
-                         (VkRect2D){{0, 0}, {32, 32}}, false);
+                         (VkRect2D){{0, 0}, {32, 32}}, false, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *render = test_alloc(sizeof(*render));
    render->type = HK_CS_VDM;
@@ -968,7 +969,7 @@ test_resume_after_compute_clear(void)
    hk_sync_end_rendering(cmd, true);
    hk_sync_begin_rendering(cmd, true);
    hk_sync_pass_footprint(cmd, image, 0, 0, 1, 32, 32,
-                          (VkRect2D){{0, 0}, {32, 32}}, false);
+                          (VkRect2D){{0, 0}, {32, 32}}, false, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *resumed = add(cmd, false);
    T("resumed instance waits on the suspended instance's compute clear",
@@ -1225,6 +1226,102 @@ test_history_tile_hazard_split(void)
    T("split history whole covers X",
      whole >= initial[HK_SYNC_VDM] + x->sync.index);
    T("split history tiling within whole", tiling <= whole);
+}
+
+/* A 64x64 pass instance of image over area, loading its attachment or not. */
+static struct hk_cs *
+load_pass(struct hk_cmd_buffer *cmd, const void *image, bool load,
+          VkRect2D area)
+{
+   hk_sync_begin_rendering(cmd, false);
+   hk_sync_pass_footprint(cmd, image, 0, 0, 1, 64, 64, area, false, load);
+   hk_sync_pass_footprints_done(cmd);
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   cs->type = HK_CS_VDM;
+   hk_sync_stream_created(cmd, cs, &cmd->current_cs.gfx, false);
+   list_addtail(&cs->node, &cmd->control_streams);
+   hk_sync_end_rendering(cmd, false);
+   return cs;
+}
+
+/* A pass that only loads whole tiles an earlier render stored waits for that
+ * render in its fragment half alone when the kernel orders fragment work
+ * after the previous render's (hk_sync_queue::load_hazard_frag), in the
+ * command buffer, across command buffers and across submissions. Partly
+ * covered tiles and compute producers keep both halves. */
+static void
+test_load_hazard_frag(void)
+{
+   const VkRect2D full = {{0, 0}, {64, 64}}, part = {{0, 0}, {40, 40}};
+   for (unsigned frag = 0; frag < 2; ++frag) {
+#define N(s) (frag ? s " (fragment-only)" : s " (both halves)")
+      const void *image = (void *)0x7171;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->load_hazard_frag = frag;
+      struct hk_cs *a = load_pass(cmd, image, false, full);
+      struct hk_cs *b = load_pass(cmd, image, true, full);
+      T(N("a loading pass waits for the earlier render"),
+        b->sync.dep[HK_SYNC_VDM].cut == a);
+      T(N("its tiling waits for it unless only whole tiles are loaded"),
+        b->sync.dep_ta[HK_SYNC_VDM].cut == (frag ? NULL : a));
+      struct hk_cs *c = load_pass(cmd, image, true, part);
+      T(N("a partly covered tile keeps both halves"),
+        c->sync.dep[HK_SYNC_VDM].cut == b &&
+           c->sync.dep_ta[HK_SYNC_VDM].cut == b);
+
+      /* A clear the empty-render optimizer runs on compute. */
+      struct hk_cmd_buffer *k = new_cmd();
+      hk_cmd_buffer_device(k)->load_hazard_frag = frag;
+      struct hk_cs *clear = compute_clear_pass(k, image, 0, true);
+      struct hk_cs *after = load_pass(k, image, true, full);
+      T(N("a compute producer keeps both halves"),
+        after->sync.dep[HK_SYNC_CDM].cut == clear &&
+           after->sync.dep_ta[HK_SYNC_CDM].cut == clear);
+
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         /* Across command buffers of one submission. */
+         struct hk_queue *q = new_queue(exact);
+         q->sync.precise_tile_evictions = true;
+         q->sync.load_hazard_frag = frag;
+         struct hk_cmd_buffer *x = new_cmd(), *y = new_cmd();
+         struct hk_cs *xa = load_pass(x, image, false, full);
+         struct hk_cs *yb = load_pass(y, image, true, full);
+         struct hk_cmd_buffer *both[] = {x, y};
+         T(N("two command buffers resolve"),
+           hk_sync_resolve_submit(q, both, 2, false, false, 0, NULL));
+         T(N("the loading pass's whole render waits for the earlier one"),
+           yb->sync.barrier[HK_SYNC_VDM] == xa->sync.index);
+         T(N("and its tiling unless only whole tiles are loaded"),
+           yb->sync.barrier_ta[HK_SYNC_VDM] ==
+              (frag ? DRM_ASAHI_BARRIER_NONE : xa->sync.index));
+
+         /* Across submissions, the earlier one possibly still running. */
+         struct hk_queue *h = new_queue(exact);
+         h->sync.precise_tile_evictions = true;
+         h->sync.load_hazard_frag = frag;
+         struct hk_cmd_buffer *first = new_cmd(), *later = new_cmd();
+         load_pass(first, image, false, full);
+         h->drm.timeline_value = 1;
+         T(N("earlier submission"), submit(h, first));
+         struct hk_cs *lb = load_pass(later, image, true, full);
+         const uint64_t start = h->sync.submitted[HK_SYNC_VDM];
+         h->drm.timeline_value = 2;
+         T(N("later submission"), submit(h, later));
+         if (exact) {
+            T(N("whole render waits for the earlier submission"),
+              lb->sync.prior[HK_SYNC_VDM] == start);
+            T(N("tiling too unless only whole tiles are loaded"),
+              lb->sync.prior_ta[HK_SYNC_VDM] == (frag ? 0 : start));
+         } else {
+            T(N("whole render waits for earlier ioctls"),
+              lb->sync.barrier[HK_SYNC_VDM] == 0);
+            T(N("tiling too unless only whole tiles are loaded"),
+              lb->sync.barrier_ta[HK_SYNC_VDM] ==
+                 (frag ? DRM_ASAHI_BARRIER_NONE : 0));
+         }
+      }
+#undef N
+   }
 }
 
 static void
@@ -2601,8 +2698,12 @@ test_draw_indirect_scope(void)
 static void
 test_cdm_overlap_splits(void)
 {
+   unsigned tested = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(end_stamp_chips); ++i) {
       const enum agx_chip chip = end_stamp_chips[i];
+      if (!agx_chip_has_cap(chip, AGX_CAP_CDM_OVERLAP_SPLIT))
+         continue;
+      tested++;
 
       /* U1 same-CB: R1 -> C1(indep) -> barrier(GFX->COMPUTE) -> C2 */
       {
@@ -2749,8 +2850,10 @@ test_cdm_overlap_splits(void)
       }
    }
 
-   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
-   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
+   T("at least one chip tests CDM overlap splits", tested > 0);
+
+   /* Unmeasured chips (G15, G16G, G17D) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17D};
    for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
       struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
       struct hk_cs *c1 = add(cmd, true);
@@ -2780,6 +2883,7 @@ main(void)
    test_resume_after_compute_clear();
    test_loaded_color_preservation();
    test_history_tile_hazard_split();
+   test_load_hazard_frag();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
    test_discard_transition();

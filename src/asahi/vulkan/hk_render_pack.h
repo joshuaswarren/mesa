@@ -237,9 +237,13 @@ const struct hk_cs *hk_render_pack_member_streams(
    const struct hk_cs **post_out);
 
 /* The only stream of `cmd` if it may be a member of a packed run (a render
- * stream with draws and no query, timestamp, event or in-buffer cut), or
- * NULL. */
+ * stream with draws and no query, start timestamp, event or in-buffer
+ * cut), or NULL. */
 const struct hk_cs *hk_render_pack_member(const struct hk_cmd_buffer *cmd);
+
+/* The merged render's timestamps a member's take (bit 0 vertex end, bit 1
+ * fragment end): a run holds at most one member timestamp of each. */
+unsigned hk_render_pack_stamp_slots(const struct hk_cs *cs);
 
 /* Why `cmd` is no member (hk_render_pack_member()), or NULL. */
 const char *hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd);

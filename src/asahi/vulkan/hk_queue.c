@@ -452,6 +452,11 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->ts_vtx.start.offset = cs->timestamp.start.offset_B;
    }
 
+   if (cs->timestamp.vtx_end.handle) {
+      c->ts_vtx.end.handle = cs->timestamp.vtx_end.handle;
+      c->ts_vtx.end.offset = cs->timestamp.vtx_end.offset_B;
+   }
+
    if (cs->timestamp.end.handle) {
       c->ts_frag.end.handle = cs->timestamp.end.handle;
       c->ts_frag.end.offset = cs->timestamp.end.offset_B;
@@ -1412,6 +1417,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    queue->sync.stage_overlap = old.stage_overlap;
    queue->sync.precise_tile_evictions = old.precise_tile_evictions;
    queue->sync.direct_single_footprints = old.direct_single_footprints;
+   queue->sync.load_hazard_frag = old.load_hazard_frag;
    /* The submission that starts it waits for all sibling work too. */
    memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
    queue->sib.used = false;
@@ -2525,7 +2531,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                        cs->stats.robust_index_dispatches,
                        cs->stats.robust_index_batches);
             assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles ||
-                   cs->timestamp.end.handle || cs->timestamp.start.handle);
+                   cs->timestamp.end.handle || cs->timestamp.start.handle ||
+                   cs->timestamp.vtx_end.handle);
 
             asahi_append_fragment_attachments(dev, &payload, cs);
             if (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES) {
@@ -7954,6 +7961,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       struct hk_render_pack_run_state state;
       if (first)
          hk_render_pack_run_start(&state, cmds[i], first);
+      unsigned stamps = first ? hk_render_pack_stamp_slots(first) : 0;
       if (unlikely(dev->frame_anatomy))
          cmds[i]->render_pack.next_why = NULL;
       if (!first && i + 1 < n)
@@ -7994,6 +8002,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (!why && resources + bs->render_resources.size >
                         UINT16_MAX - sizeof(struct drm_asahi_render_program_v2))
             why = "render resources";
+         if (!why && (stamps & hk_render_pack_stamp_slots(bs)))
+            why = "timestamp slot";
          const uint64_t target =
             why ? 0 : hk_render_pack_link_target(dev, cmds[b], bs);
          if (!why && !target)
@@ -8018,6 +8028,7 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             run_post++;
          resources += bs->render_resources.size;
          hk_render_pack_run_join(&state, cmds[a], cmds[b], bs);
+         stamps |= hk_render_pack_stamp_slots(bs);
          run.count++;
       }
 
@@ -8648,6 +8659,7 @@ hk_queue_create(struct hk_device *dev,
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.precise_tile_evictions = true;
    queue->sync.direct_single_footprints = true;
+   queue->sync.load_hazard_frag = dev->load_hazard_frag;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete

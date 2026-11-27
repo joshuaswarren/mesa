@@ -622,9 +622,9 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       agx_preprocess_nir_g18g(nir);
    else if (agx_chip_g17_m5(pre_chip)) {
       if (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal)
-         agx_preprocess_nir_m5_defer_idiv(nir);
+         agx_preprocess_nir_m5_defer_idiv_chip(nir, pre_chip);
       else
-         agx_preprocess_nir_m5(nir);
+         agx_preprocess_nir_m5_chip(nir, pre_chip);
    }
    else
       agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(pre_chip));
@@ -4180,7 +4180,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       else if (dev->dev.chip == AGX_CHIP_G18G)
          agx_preprocess_nir_g18g(nir);
       else if (agx_chip_g17_m5(dev->dev.chip))
-         agx_preprocess_nir_m5(nir);
+         agx_preprocess_nir_m5_chip(nir, dev->dev.chip);
       else
          agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->dev.chip));
    }
@@ -8069,7 +8069,7 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
    nir_store_object_childcount_agx(&b, nir_bcsel(&b, nir_load_var(&b, enabled),
                                                value, nir_imm_int(&b, 0)));
    if (agx_chip_g17_m5(chip))
-      agx_preprocess_nir_m5(b.shader);
+      agx_preprocess_nir_m5_chip(b.shader, chip);
    else
       agx_preprocess_nir_native(b.shader, chip);
    return b.shader;
@@ -9440,7 +9440,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* Per-primitive outputs can raise the exported vertex count. */
       shader->info.mesh.max_vertices = nir->info.mesh.max_vertices_out;
       if (agx_chip_g17_m5(dev->dev.chip))
-         agx_preprocess_nir_m5(nir);
+         agx_preprocess_nir_m5_chip(nir, dev->dev.chip);
       else
          agx_preprocess_nir_native(nir, dev->dev.chip);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
@@ -9559,7 +9559,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          (grid_record ? AGX_M5_TASK_RECORD_PAYLOAD_BYTES : 0u) +
          nir->info.task_payload_size;
       if (agx_chip_g17_m5(dev->dev.chip))
-         agx_preprocess_nir_m5(nir);
+         agx_preprocess_nir_m5_chip(nir, dev->dev.chip);
       else
          agx_preprocess_nir_native(nir, dev->dev.chip);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
@@ -13739,6 +13739,7 @@ hk_m5_fragment_variant_preflight(struct hk_device *dev,
            key->max_samples_per_tile);
    const uint32_t pass = linked->b.fragment_control.opaque[0] >> 29;
    struct hk_agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = dev->dev.shader_base + 0x20000,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,

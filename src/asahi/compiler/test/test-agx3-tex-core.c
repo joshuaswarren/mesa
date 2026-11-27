@@ -1358,6 +1358,51 @@ test_copy_witnesses(void)
    return 0;
 }
 
+/* AGX3B's 14-byte immediate-descriptor SMP names coordinate banks 0..60. A
+ * relocated sample beyond that (the ninth tap of a 3x3 PCF kernel on a
+ * shadow array lands on bank 64) takes the 20-byte form, which names the
+ * bank and keeps every other field of the short form. */
+static int
+test_sample_upper_coordinate_banks(void)
+{
+   for (unsigned variant = 0; variant < 4; ++variant) {
+      const bool shadow = variant & 1, array = variant & 2;
+      struct agx3_tex_sample_desc d = {
+         .dest = 0, .coord = 60, .width = AGX3_TEX_W32,
+         .mask = shadow ? 1 : 15, .lod = AGX3_TEX_LOD_AUTO, .slot = 1,
+         .wait_mask = 1u << 5, .final = true, .sample_group_end = true,
+         .shadow = shadow, .array = array, .array_layer = array ? 44 : 0,
+         .sampler = 1, .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
+      };
+      uint8_t short_form[AGX3_TEX_MAX_LENGTH], long_form[AGX3_TEX_MAX_LENGTH];
+      uint8_t short_len = 0, long_len = 0;
+      uint64_t short_fields[AGX3_MAX_FIELDS], long_fields[AGX3_MAX_FIELDS];
+      CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &d, short_form,
+                                   &short_len));
+      CHECK(short_len == 14);
+      CHECK(agx3_decode(&agx3b_table, short_form, short_len, AGX3_MN_smp,
+                        short_fields) >= 0);
+      CHECK(short_fields[19] == 60);
+
+      for (unsigned coord = 64; coord <= 252; coord += 4) {
+         d.coord = coord;
+         CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &d, long_form,
+                                      &long_len));
+         CHECK(long_len == 20);
+         CHECK(agx3_decode(&agx3b_table, long_form, long_len, AGX3_MN_smp,
+                           long_fields) >= 0);
+         CHECK(long_fields[19] == coord);
+         /* Destination, slot, mask, dimension, layer, comparison, sampler
+          * and wait fields are unchanged by the longer form. */
+         static const unsigned same[] = {2, 10, 12, 26, 31, 62 + 5, 75, 76,
+                                         77, 123, 143, 147};
+         for (unsigned i = 0; i < sizeof(same) / sizeof(same[0]); ++i)
+            CHECK(long_fields[same[i]] == short_fields[same[i]]);
+      }
+   }
+   return 0;
+}
+
 static int
 test_sample_fail_closed(void)
 {
@@ -4573,7 +4618,8 @@ main(void)
        test_staging_source_lifetime() || test_exact_witnesses() ||
        test_supported_axes() || test_fail_closed() ||
        test_sample_witnesses() || test_copy_witnesses() ||
-       test_sample_fail_closed() || test_array_fetch() || test_3d_fetch() ||
+       test_sample_fail_closed() || test_sample_upper_coordinate_banks() ||
+       test_array_fetch() || test_3d_fetch() ||
        test_bindless_operand_kinds() || test_indexed_sample_witnesses() ||
        test_sample_mask_domain() || test_indexed_fetch_native() ||
        test_gradient_and_register_bias() ||

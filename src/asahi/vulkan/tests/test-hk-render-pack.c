@@ -412,7 +412,20 @@ test_member(void)
 
    c = split(4);
    first_cs(c)->timestamp.end.handle = 1;
-   T("a render with an end stamp is not", !hk_render_pack_member(c));
+   T("a render with an end stamp is a member", hk_render_pack_member(c));
+   T("taking the fragment end",
+     hk_render_pack_stamp_slots(first_cs(c)) == 2);
+
+   c = split(4);
+   first_cs(c)->timestamp.vtx_end.handle = 1;
+   T("a render with a vertex-end stamp is a member",
+     hk_render_pack_member(c) && hk_render_pack_stamp_slots(first_cs(c)) == 1);
+
+   c = split(4);
+   first_cs(c)->timestamp.start.handle = 1;
+   T("a render with a start stamp is not", !hk_render_pack_member(c));
+   T("and says so",
+     !strcmp(hk_render_pack_member_refusal(c) ?: "", "timestamp"));
 
    c = split(4);
    first_cs(c)->oq_stamp[3].handle = 1;
@@ -740,6 +753,19 @@ test_fold(bool exact)
    T(N("a later member's image reads carry an earlier tail to the vertex half"),
      cs->sync.vtx_images &&
         (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
+
+   /* A leading top-of-pipe stamp on the first member's vertex end and an
+    * end stamp on the last member's fragment end ride on the packet. */
+   struct hk_cmd_buffer *a5 = split(10), *b5 = split(10);
+   first_cs(a5)->timestamp.vtx_end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 8};
+   first_cs(b5)->timestamp.end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 16};
+   struct hk_cmd_buffer *ab5[] = {a5, b5};
+   packet = pack(ab5, 2, &cs);
+   T(N("the packet carries the members' vertex-end and fragment-end stamps"),
+     cs->timestamp.vtx_end.offset_B == 8 && cs->timestamp.end.offset_B == 16 &&
+        !cs->timestamp.start.handle);
 #undef N
 }
 

@@ -2767,7 +2767,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * Gallium does on G17C) need it: their layer count does not shrink with
     * the selected mip level, unlike 3D depth.
     */
-   const bool layer_operand = !m5 || chip == AGX_CHIP_G17C;
+   const bool layer_operand = !m5 || agx_chip_m5_layer_operand(chip);
    const bool array = I->dim == AGX_DIM_2D_ARRAY && layer_operand;
    const bool three_d = I->dim == AGX_DIM_3D ||
                         (!layer_operand && I->dim == AGX_DIM_2D_ARRAY);
@@ -5223,8 +5223,17 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       .compute_stage = compute_stage,
       .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
    };
-   return agx3_tex_encode_sample(enc, &d, bytes, &len) &&
-          agx3_append(emission, bytes, len);
+   /* Every gate above passed, so a refusal here is the SMP form itself
+    * (an operand field it cannot name). Say so rather than leave only the
+    * caller's line, which reads like an operand-shape refusal. */
+   if (!agx3_tex_encode_sample(enc, &d, bytes, &len)) {
+      char why[64];
+      snprintf(why, sizeof(why), "no SMP form for coord=half%u slot=%u",
+               d.coord, d.slot);
+      agx3_report_refusal_why(I, __LINE__, why);
+      return false;
+   }
+   return agx3_append(emission, bytes, len);
 }
 
 static int
