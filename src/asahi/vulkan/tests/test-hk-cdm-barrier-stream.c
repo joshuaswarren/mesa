@@ -349,6 +349,7 @@ test_stream_open_limits(void)
 int
 main(void)
 {
+   test_pure_ssbo_narrows_between_launches(AGX_CHIP_G13G, 13);
    test_pure_ssbo_narrows_between_launches(AGX_CHIP_G13X, 13);
    test_pure_ssbo_narrows_between_launches(AGX_CHIP_G14X, 14);
    test_pure_ssbo_narrows_before_chunk_switch();
