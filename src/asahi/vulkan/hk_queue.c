@@ -3033,8 +3033,6 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(hk_pack_gemm_dw_opt, "HK_PACK_GEMM_DW", true)
-DEBUG_GET_ONCE_BOOL_OPTION(hk_pack_gemm_dw_proj_opt, "HK_PACK_GEMM_DW_PROJ", true)
-DEBUG_GET_ONCE_BOOL_OPTION(hk_pack_im2_exp_dw_a_opt, "HK_PACK_IM2_EXP_DW_A", true)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
 bool
@@ -4475,8 +4473,9 @@ compute_pair_exp_dw_gemm_match(const struct hk_compute_pair_dispatch *exp_im2,
    if (k_proj != 32 || k_exp <= 0 || (uint32_t)k_exp > 28u)
       return false;
 
-   /* Gate fusion to SLC-spilling expand intermediates (>= 8 MiB) so small
-    * SLC-resident layers keep standalone expand GEMMs. */
+   /* Gate fusion to large expand intermediates (>= 8 MiB, above L2 across AGX3
+    * chips, chosen via A/B between 12 MiB stem and 4 MiB layers) so smaller
+    * cache-resident layers avoid the 16 KiB shared-memory tile overhead. */
    const uint64_t exp_c_bytes =
       (uint64_t)in_w * (uint64_t)in_h * (uint64_t)k_proj * 4ull;
    if (exp_c_bytes < (8ull << 20))
@@ -5817,58 +5816,56 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
                            /* Look ahead for a following 1x1 Project GEMM (+ clamp + copy4)
                             * consuming DW's output to fuse the entire stride-2 block. */
-                           if (debug_get_option_hk_pack_gemm_dw_proj_opt()) {
-                              unsigned kp = last_gdw + 1;
-                              while (kp < end && kp - i < 20 && !planned_suppressed[kp] &&
-                                     members[kp].cs &&
-                                     hk_compute_pair_stream_eligible(members[kp].cs) &&
-                                     members[kp].cs->compute_pair->info.role ==
-                                        HK_COMPUTE_PAIR_SELF_COPY) {
-                                 kp++;
-                              }
-                              if (kp < end && !planned_suppressed[kp] && members[kp].cs &&
+                           unsigned kp = last_gdw + 1;
+                           while (kp < end && kp - i < 20 && !planned_suppressed[kp] &&
+                                  members[kp].cs &&
                                   hk_compute_pair_stream_eligible(members[kp].cs) &&
                                   members[kp].cs->compute_pair->info.role ==
-                                     HK_COMPUTE_PAIR_GEMM) {
-                                 const struct hk_cs *pj_cs = members[kp].cs;
-                                 unsigned last_pj = kp;
-                                 const struct hk_nir_clamp_epilogue *pj_ep = NULL;
-                                 unsigned kpc = kp + 1;
-                                 if (kpc < end && !planned_suppressed[kpc] && members[kpc].cs &&
-                                     compute_pair_can_replace(pj_cs, members[kpc].cs)) {
-                                    pj_ep = &members[kpc].cs->compute_pair->info.clamp.epilogue;
-                                    last_pj = kpc;
-                                    kpc++;
-                                 }
-                                 unsigned kpcp = kpc;
-                                 while (kpcp < end && kpcp - i < 24 && !planned_suppressed[kpcp] &&
-                                        members[kpcp].cs &&
-                                        hk_compute_pair_stream_eligible(members[kpcp].cs) &&
-                                        members[kpcp].cs->compute_pair->info.role ==
-                                           HK_COMPUTE_PAIR_SELF_COPY) {
-                                    kpcp++;
-                                 }
-                                 const struct hk_compute_pair_dispatch *pj_copy_d = NULL;
-                                 unsigned found_pj_copy = 0;
-                                 if (kpcp < end && !planned_suppressed[kpcp] && members[kpcp].cs &&
+                                     HK_COMPUTE_PAIR_SELF_COPY) {
+                              kp++;
+                           }
+                           if (kp < end && !planned_suppressed[kp] && members[kp].cs &&
+                               hk_compute_pair_stream_eligible(members[kp].cs) &&
+                               members[kp].cs->compute_pair->info.role ==
+                                  HK_COMPUTE_PAIR_GEMM) {
+                              const struct hk_cs *pj_cs = members[kp].cs;
+                              unsigned last_pj = kp;
+                              const struct hk_nir_clamp_epilogue *pj_ep = NULL;
+                              unsigned kpc = kp + 1;
+                              if (kpc < end && !planned_suppressed[kpc] && members[kpc].cs &&
+                                  compute_pair_can_replace(pj_cs, members[kpc].cs)) {
+                                 pj_ep = &members[kpc].cs->compute_pair->info.clamp.epilogue;
+                                 last_pj = kpc;
+                                 kpc++;
+                              }
+                              unsigned kpcp = kpc;
+                              while (kpcp < end && kpcp - i < 24 && !planned_suppressed[kpcp] &&
+                                     members[kpcp].cs &&
                                      hk_compute_pair_stream_eligible(members[kpcp].cs) &&
                                      members[kpcp].cs->compute_pair->info.role ==
-                                        HK_COMPUTE_PAIR_COPY4 &&
-                                     compute_pair_copy4_match(pj_cs->compute_pair,
-                                                              members[kpcp].cs->compute_pair)) {
-                                    pj_copy_d = members[kpcp].cs->compute_pair;
-                                    found_pj_copy = kpcp;
-                                    last_pj = kpcp;
-                                 }
-                                 if (compute_pair_gemm_dw_proj_match(
-                                        p, d, dw_cs->compute_pair, dw_copy_d,
-                                        pj_cs->compute_pair, pj_ep, pj_copy_d,
-                                        &gemm_dw_cfg, &gemm_dw_push,
-                                        &gemm_dw_proj_push)) {
-                                    gemm_dw_proj_idx = kp;
-                                    gemm_dw_proj_copy_idx = found_pj_copy;
-                                    gemm_dw_last_idx = last_pj;
-                                 }
+                                        HK_COMPUTE_PAIR_SELF_COPY) {
+                                 kpcp++;
+                              }
+                              const struct hk_compute_pair_dispatch *pj_copy_d = NULL;
+                              unsigned found_pj_copy = 0;
+                              if (kpcp < end && !planned_suppressed[kpcp] && members[kpcp].cs &&
+                                  hk_compute_pair_stream_eligible(members[kpcp].cs) &&
+                                  members[kpcp].cs->compute_pair->info.role ==
+                                     HK_COMPUTE_PAIR_COPY4 &&
+                                  compute_pair_copy4_match(pj_cs->compute_pair,
+                                                           members[kpcp].cs->compute_pair)) {
+                                 pj_copy_d = members[kpcp].cs->compute_pair;
+                                 found_pj_copy = kpcp;
+                                 last_pj = kpcp;
+                              }
+                              if (compute_pair_gemm_dw_proj_match(
+                                     p, d, dw_cs->compute_pair, dw_copy_d,
+                                     pj_cs->compute_pair, pj_ep, pj_copy_d,
+                                     &gemm_dw_cfg, &gemm_dw_push,
+                                     &gemm_dw_proj_push)) {
+                                 gemm_dw_proj_idx = kp;
+                                 gemm_dw_proj_copy_idx = found_pj_copy;
+                                 gemm_dw_last_idx = last_pj;
                               }
                            }
                         }
@@ -6184,8 +6181,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      default:
                         break;
                      }
-                     if (debug_get_option_hk_pack_im2_exp_dw_a_opt() &&
-                         hk_compute_pair_alt_is_gemm_unguarded_for(
+                     if (hk_compute_pair_alt_is_gemm_unguarded_for(
                             cand_exp_alt, p->info.gemm.is_guarded) &&
                          hk_compute_pair_alt_gemm_tile_m(cand_exp_alt) == 64u &&
                          p->exec_threads[0] == p->exec_local[0] &&
@@ -6240,8 +6236,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                            break;
                         }
                         if (exp_chain_ok && has_exp && !has_found_im2 &&
-                            !plans[found_exp].shader &&
-                            debug_get_option_hk_pack_im2_exp_dw_a_opt()) {
+                            !plans[found_exp].shader) {
                            unsigned icur = found_exp;
                            while (icur > start && found_exp - icur < 4 && i - icur < 16) {
                               icur--;
