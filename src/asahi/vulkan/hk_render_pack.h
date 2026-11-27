@@ -114,6 +114,7 @@ struct hk_render_pack_edges {
     * whether one would end a multisampled instance (head_msaa_end). */
    bool head_open;
    bool head_msaa_end;
+   bool head_non_local_src;
    bool transitions_overflow;
    bool head_undef_alias_overflow;
    uint8_t head_dep;
@@ -140,6 +141,7 @@ struct hk_render_pack_edges {
     * tail_next_seq and sync epoch tail_epoch. */
    bool tail_open;
    bool tail_msaa;
+   bool tail_non_local_src;
    uint8_t tail_dep;
    uint32_t tail_epoch, tail_next_seq, tail_seq;
    const struct hk_cs *tail_stream;
@@ -166,11 +168,14 @@ struct hk_render_pack_edges {
 
 /* Whether `b`, beginning, continues `a` as it ended, as two instances of one
  * command buffer continue (hk_m5_pass_merge_begin()). `ordered`: a recorded
- * dependency between them orders beyond attachment operations. Returns NULL
- * or why not. */
+ * dependency between them orders beyond attachment operations.
+ * `non_local_src`: a recorded barrier between them (or inside an earlier
+ * member of the run) has a graphics first scope outside the attachment stages
+ * (hk_m5_pass_merge_non_local_src()), forbidding a final-pass resolve.
+ * Returns NULL or why not. */
 const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
                                      const struct hk_render_pack_pass *b,
-                                     bool ordered);
+                                     bool ordered, bool non_local_src);
 
 /* What the members a packed run holds so far bring to its next boundary. In
  * one tile pass every member's vertex work may run ahead of every earlier
@@ -180,6 +185,9 @@ const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
 struct hk_render_pack_run_state {
    /* An ordered dependency inside the run, between members or inside one. */
    bool ordered;
+   /* A barrier inside the run (between members or inside one) has a graphics
+    * first scope outside the attachment stages, forbidding a final resolve. */
+   bool non_local_src;
    /* A member's shaders write memory other than its attachments. */
    bool writes_memory;
    /* A member draws with a stage that runs ahead of the tile pass

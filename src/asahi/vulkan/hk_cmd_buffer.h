@@ -1719,6 +1719,13 @@ struct hk_cs {
     * stream ends first (hk_m5_ordered_draw_hazard()). */
    bool m5_ordered;
 
+   /* M5: an earlier continuation of this stream crossed a barrier whose first
+    * scope covers graphics work outside the attachment stages
+    * (hk_m5_pass_merge_non_local_src()). A later instance may not terminate
+    * this stream with a final-pass resolve, since earlier fragment shaders in
+    * the stream may have read or written the resolve target. */
+   bool m5_non_local_src;
+
    /* M5: every attachment of the continued instances is in an
     * attachment-only layout, so no descriptor can access one of them and
     * descriptor sets bound for graphics need not end an ordered continuation
@@ -2442,6 +2449,11 @@ struct hk_cmd_buffer {
        * beyond attachment operations; continuing then needs the stronger
        * conditions of hk_m5_ordered_refusal(). */
       bool ordered;
+      /* A recorded barrier between this instance and the next has a graphics
+       * first scope outside the attachment stages
+       * (hk_m5_pass_merge_non_local_src()), so a final-pass resolve may not
+       * merge into this stream. */
+      bool non_local_src;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
    } pass_merge;
