@@ -16666,6 +16666,29 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
    agx_index *narrow_remap = rzalloc_array(memctx, agx_index, nalloc);
    bool any_narrow = false;
 
+   /* On AGX3B, 16-bit float loop operands stay in GPRs rather than uniforms.
+    * Hoist the 255.0h scale immediate to the entry block when any loop block
+    * emits f16 normflt pairs so it is materialized once per invocation instead
+    * of on every loop iteration. */
+   unsigned nr_blocks = 0;
+   bool *in_loop = NULL;
+   agx_index loop_scale_f16 = agx_null();
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+      agx_foreach_block(ctx, blk)
+         nr_blocks = MAX2(nr_blocks, blk->index + 1);
+      in_loop = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1u));
+      agx_foreach_block(ctx, blk) {
+         agx_foreach_successor(blk, succ) {
+            if (succ->loop_header && succ->index <= blk->index) {
+               for (unsigned i = succ->index; i <= blk->index; ++i)
+                  in_loop[i] = true;
+            }
+         }
+         if (blk->loop_header)
+            in_loop[blk->index] = true;
+      }
+   }
+
    agx_foreach_block(ctx, block) {
       unsigned ncands = 0;
       unsigned nword_cands = 0;
@@ -16806,8 +16829,21 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
       agx_index scale_f32 = agx_null();
       if (scale_anchor) {
          agx_builder bscale = agx_init_builder(ctx, agx_before_instr(scale_anchor));
-         if (need_f16_scale)
-            scale_f16 = agx_mov_imm(&bscale, 16, 0x5bf8); /* 255.0h */
+         if (need_f16_scale) {
+            const bool hoist_f16 =
+               in_loop && block->index < nr_blocks && in_loop[block->index] &&
+               block != agx_start_block(ctx);
+            if (hoist_f16) {
+               if (agx_is_null(loop_scale_f16)) {
+                  agx_builder bentry = agx_init_builder(
+                     ctx, agx_after_block_logical(agx_start_block(ctx)));
+                  loop_scale_f16 = agx_mov_imm(&bentry, 16, 0x5bf8); /* 255.0h */
+               }
+               scale_f16 = loop_scale_f16;
+            } else {
+               scale_f16 = agx_mov_imm(&bscale, 16, 0x5bf8); /* 255.0h */
+            }
+         }
          if (need_f32_scale)
             scale_f32 = agx_mov_imm(&bscale, 32, fui(255.0f));
       }
