@@ -37,10 +37,41 @@ struct hk_sync_queue;
 #define HK_PACK_MAX_DISPATCHES 256u
 #define HK_PACK_MAX_THREADS (UINT64_C(1) << 28)
 #define HK_PACK_MAX_STATIC_WORK (UINT64_C(1) << 35)
+/* Observed-duration packing bounds for repeated multi-CB looping submissions.
+ * Firmware compute command timeouts are ~2 s on AGX2/AGX3, so admitting only
+ * whole submissions observed at <= HK_PACK_OBS_ADMIT_NS (200 ms) keeps ~10x
+ * headroom below timeout even if data-dependent loop trip counts grow between
+ * submits. Because any packet holds a subset of the admitted command buffers,
+ * the whole-submission admission bound (200 ms) is the hard safety limit,
+ * while HK_PACK_MAX_OBS_NS (32 ms) splits admitted runs using the observed
+ * per-loop average and HK_PACK_OBS_BACKOFF_NS (150 ms) tightens or resets
+ * monitored packed runs if duration climbs. */
 #define HK_PACK_MAX_OBS_NS (UINT64_C(32) * 1000000)
 #define HK_PACK_OBS_ADMIT_NS (UINT64_C(200) * 1000000)
 #define HK_PACK_OBS_BACKOFF_NS (UINT64_C(150) * 1000000)
+#define HK_PACK_OBS_SLOTS 8u
 #define HK_PACK_CDM_TERMINATE_MAX 8u
+
+struct hk_pack_obs_entry {
+   uint64_t hash;
+   uint64_t pending_pt;
+   uint64_t submit_ns;
+   uint64_t obs_per_loop_ns;
+   uint64_t lru_tick;
+   uint32_t cb_count;
+   uint32_t loop_count;
+   bool in_flight_packed;
+};
+
+/* Retires completed observed-duration entries using a point-tagged completion
+ * timestamp: `sig_ns` is used only when `pending_pt <= sig_point` and
+ * `submit_ns < sig_ns <= now_ns`; otherwise `now_ns` is used conservatively so
+ * an untimestamped or stale `signalled_ns` can never under-report duration. */
+void hk_pack_obs_retire_entries(struct hk_pack_obs_entry *entries,
+                                unsigned slot_count, uint32_t *obs_pending,
+                                uint64_t *obs_epoch, uint64_t signalled,
+                                uint64_t sig_point, uint64_t sig_ns,
+                                uint64_t now_ns);
 
 /* One command buffer of a submission, as the planner sees it. */
 struct hk_pack_member {

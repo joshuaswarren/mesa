@@ -1578,8 +1578,6 @@ hk_QueueWaitIdle(VkQueue _queue)
          return vk_queue_set_lost(
             &queue->vk, "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT failed: %m");
 
-      if (p_atomic_read(&queue->pack.obs_pending))
-         p_atomic_set(&queue->drm.signalled_ns, (uint64_t)os_time_get_nano());
       hk_queue_note_signalled(queue, target);
    }
 
@@ -3138,53 +3136,17 @@ hk_pack_obs_retire(struct hk_device *dev, struct hk_queue *queue)
       uint64_t pt = 0;
       if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &pt, 1) == 0 &&
           pt > signalled) {
-         p_atomic_set(&queue->drm.signalled_ns, (uint64_t)os_time_get_nano());
          hk_queue_note_signalled(queue, pt);
-         signalled = pt;
+         signalled = p_atomic_read(&queue->drm.signalled_value);
       }
    }
 
-   const uint64_t now_ns = (uint64_t)os_time_get_nano();
+   const uint64_t sig_point = p_atomic_read(&queue->drm.signalled_ns_point);
    const uint64_t sig_ns = p_atomic_read(&queue->drm.signalled_ns);
-   for (unsigned i = 0; i < HK_PACK_OBS_SLOTS; ++i) {
-      struct hk_pack_obs_entry *e = &queue->pack.obs[i];
-      if (!e->pending_pt || e->pending_pt > signalled)
-         continue;
-      const uint64_t done_ns =
-         (sig_ns > e->submit_ns && sig_ns <= now_ns) ? sig_ns : now_ns;
-      const uint64_t elapsed_ns =
-         done_ns > e->submit_ns ? done_ns - e->submit_ns : 1000ull;
-      e->pending_pt = 0;
-      p_atomic_dec(&queue->pack.obs_pending);
-
-      if (!e->in_flight_packed) {
-         if (elapsed_ns <= HK_PACK_OBS_ADMIT_NS && e->loop_count >= 2) {
-            const uint64_t per =
-               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
-            if (per != e->obs_per_loop_ns) {
-               e->obs_per_loop_ns = per;
-               queue->pack.obs_epoch++;
-            }
-         } else if (e->obs_per_loop_ns != 0) {
-            e->obs_per_loop_ns = 0;
-            queue->pack.obs_epoch++;
-         }
-      } else {
-         if (elapsed_ns > HK_PACK_OBS_ADMIT_NS) {
-            if (e->obs_per_loop_ns != 0) {
-               e->obs_per_loop_ns = 0;
-               queue->pack.obs_epoch++;
-            }
-         } else if (elapsed_ns > HK_PACK_OBS_BACKOFF_NS && e->loop_count >= 2) {
-            const uint64_t per =
-               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
-            if (per > e->obs_per_loop_ns) {
-               e->obs_per_loop_ns = per;
-               queue->pack.obs_epoch++;
-            }
-         }
-      }
-   }
+   const uint64_t now_ns = (uint64_t)os_time_get_nano();
+   hk_pack_obs_retire_entries(queue->pack.obs, HK_PACK_OBS_SLOTS,
+                              &queue->pack.obs_pending, &queue->pack.obs_epoch,
+                              signalled, sig_point, sig_ns, now_ns);
 }
 
 static uint64_t

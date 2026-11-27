@@ -9,6 +9,7 @@
 #include <strings.h>
 
 #include "util/bitscan.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/macros.h"
 #include "hk_cmd_buffer.h"
@@ -775,4 +776,56 @@ hk_pack_liveness_step_backward(struct hk_pack_liveness_state *st,
       hk_pack_liveness_add_overwrite(st, &fp->writes[i]);
    for (unsigned i = 0; i < fp->num_reads; ++i)
       hk_pack_liveness_kill_read(st, &fp->reads[i]);
+}
+
+void
+hk_pack_obs_retire_entries(struct hk_pack_obs_entry *entries,
+                           unsigned slot_count, uint32_t *obs_pending,
+                           uint64_t *obs_epoch, uint64_t signalled,
+                           uint64_t sig_point, uint64_t sig_ns,
+                           uint64_t now_ns)
+{
+   for (unsigned i = 0; i < slot_count; ++i) {
+      struct hk_pack_obs_entry *e = &entries[i];
+      if (!e->pending_pt || e->pending_pt > signalled)
+         continue;
+
+      const uint64_t done_ns =
+         (e->pending_pt <= sig_point && sig_ns > e->submit_ns &&
+          sig_ns <= now_ns)
+            ? sig_ns
+            : now_ns;
+      const uint64_t elapsed_ns =
+         done_ns > e->submit_ns ? done_ns - e->submit_ns : 1000ull;
+      e->pending_pt = 0;
+      p_atomic_dec(obs_pending);
+
+      if (!e->in_flight_packed) {
+         if (elapsed_ns <= HK_PACK_OBS_ADMIT_NS && e->loop_count >= 2) {
+            const uint64_t per =
+               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
+            if (per != e->obs_per_loop_ns) {
+               e->obs_per_loop_ns = per;
+               (*obs_epoch)++;
+            }
+         } else if (e->obs_per_loop_ns != 0) {
+            e->obs_per_loop_ns = 0;
+            (*obs_epoch)++;
+         }
+      } else {
+         if (elapsed_ns > HK_PACK_OBS_ADMIT_NS) {
+            if (e->obs_per_loop_ns != 0) {
+               e->obs_per_loop_ns = 0;
+               (*obs_epoch)++;
+            }
+         } else if (elapsed_ns > HK_PACK_OBS_BACKOFF_NS && e->loop_count >= 2) {
+            const uint64_t per =
+               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
+            if (per > e->obs_per_loop_ns) {
+               e->obs_per_loop_ns = per;
+               (*obs_epoch)++;
+            }
+         }
+      }
+   }
 }
