@@ -4586,6 +4586,31 @@ hk_m5_ordered_draw_hazard(struct hk_cmd_buffer *cmd)
    return NULL;
 }
 
+static uint64_t
+hk_image_att_bloom(const struct vk_image *image)
+{
+   if (!image)
+      return 0;
+
+   const struct hk_image *hk_img = container_of(image, struct hk_image, vk);
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if (hk_img->plane_count == 0 || hk_img->swapchain_memory ||
+       image->external_handle_types ||
+       (image->create_flags & unsafe_flags) ||
+       image->tiling == VK_IMAGE_TILING_LINEAR)
+      return UINT64_MAX;
+
+   uint64_t bloom = 0;
+   for (uint8_t p = 0; p < hk_img->plane_count; ++p) {
+      if (!hk_img->planes[p].addr)
+         return UINT64_MAX;
+      bloom |= hk_sync_image_bloom(hk_img->planes[p].addr);
+   }
+   return bloom;
+}
+
 /* Continue the ended instance's render stream with the instance beginning
  * with info when everything above holds. Returns false, with the candidacy
  * ended, when the instance begins normally instead. */
@@ -4864,6 +4889,17 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
                                 attach_z, attach_s, incomplete_render_area,
                                 true);
       render->pending_zs_store_mask = 0;
+   }
+
+   if (any_resolve) {
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         const struct hk_image_view *res_iview =
+            render->color_att[i].resolve_iview;
+         if (res_iview)
+            render->att_bloom |= hk_image_att_bloom(res_iview->vk.image);
+      }
+      if (render->m5_attachments_reach_memory)
+         cs->sync.kind |= HK_SYNC_GFX_MEM;
    }
 
    hk_sync_merge_rendering(cmd, cs);
@@ -5910,6 +5946,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->g17p_zls_touched = 0;
    render->g17p_zls_written = 0;
    render->m5_attachments_reach_memory = false;
+   render->att_bloom = 0;
    {
       const struct hk_image_view *views[2 * HK_MAX_RTS + 4] = {
          render->depth_att.iview, render->stencil_att.iview,
@@ -5920,6 +5957,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       }
       for (unsigned i = 0; i < 4 + 2 * render->color_att_count; ++i) {
          const struct vk_image *image = views[i] ? views[i]->vk.image : NULL;
+         render->att_bloom |= hk_image_att_bloom(image);
          /* Swapchain memory aliases images only (hk_image::swapchain_memory),
           * which later work reads through an image. */
          const VkImageCreateFlags aliasing =
@@ -16225,17 +16263,48 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    if (!hk_sync_image_class(cmd) ||
-       (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch))
+       (cs->sync.vtx_img_unsafe && cs->sync.vtx_images_epoch == cmd->sync.epoch))
       return;
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
-   if (!hw_vs || hw_vs->info.reads_images ||
-       hw_vs->info.writes_external_memory || gfx->xfb_enabled ||
+   if (!hw_vs || hw_vs->info.writes_external_memory || gfx->xfb_enabled ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
-       gfx->shaders[MESA_SHADER_MESH])
+       gfx->shaders[MESA_SHADER_MESH]) {
       hk_sync_vertex_images(cmd, cs);
+      return;
+   }
+
+   if (!hw_vs->info.reads_images)
+      return;
+
+   const struct hk_descriptor_state *desc = &gfx->descriptors;
+   if (desc->buffer_active) {
+      hk_sync_vertex_images(cmd, cs);
+      return;
+   }
+
+   uint64_t draw_bloom = 0;
+   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+      if (desc->push_active & BITFIELD_BIT(s)) {
+         if (!desc->push[s] || desc->push[s]->vs_img_unsafe) {
+            hk_sync_vertex_images(cmd, cs);
+            return;
+         }
+         draw_bloom |= desc->push[s]->vs_img_bloom;
+      } else if (desc->sets[s]) {
+         const struct hk_descriptor_set *set = desc->sets[s];
+         if (!set->layout || set->layout->has_uab_vs_images ||
+             __atomic_load_n(&set->vs_img_unsafe, __ATOMIC_RELAXED)) {
+            hk_sync_vertex_images(cmd, cs);
+            return;
+         }
+         draw_bloom |= __atomic_load_n(&set->vs_img_bloom, __ATOMIC_RELAXED);
+      }
+   }
+
+   hk_sync_vertex_images_bloom(cmd, cs, draw_bloom);
 }
 
 static __attribute__((hot)) void

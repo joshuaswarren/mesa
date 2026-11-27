@@ -536,11 +536,17 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
       list_first_entry(&members[0]->control_streams, struct hk_cs, node);
    uint8_t kinds = 0;
    bool vtx_images = false;
+   bool vtx_img_unsafe = false;
+   uint64_t att_bloom = 0;
+   uint64_t vtx_img_bloom = 0;
    for (unsigned m = 0; m < count; ++m) {
       const struct hk_cs *item =
          list_first_entry(&members[m]->control_streams, struct hk_cs, node);
       kinds |= item->sync.kind;
       vtx_images |= item->sync.vtx_images;
+      vtx_img_unsafe |= item->sync.vtx_img_unsafe;
+      att_bloom |= item->sync.att_bloom;
+      vtx_img_bloom |= item->sync.vtx_img_bloom;
    }
 
    /* The packet keeps its own resource list across submissions; the rest of
@@ -564,6 +570,9 @@ hk_render_pack_init(struct hk_cmd_buffer *packet, struct hk_cs *cs,
     * there, as the resolver applies it to that command buffer's own render
     * (hk_render_pack_add()). */
    cs->sync.vtx_images = vtx_images;
+   cs->sync.vtx_img_unsafe = vtx_img_unsafe;
+   cs->sync.att_bloom = att_bloom;
+   cs->sync.vtx_img_bloom = vtx_img_bloom;
 
    /* Summed or joined over the members by hk_render_pack_add(). */
    memset(&cs->stats, 0, sizeof(cs->stats));
@@ -711,8 +720,10 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
     * member makes later command buffers wait for the packet; so does a
     * prior-only render tail of a kind an earlier member already ran. */
    const uint8_t carry = hk_sync_full_kinds(cs->sync.kind);
+   const bool exact_bloom = cs->sync.vtx_images && !cs->sync.vtx_img_unsafe;
    const uint8_t ta_carry =
       cs->sync.kind | (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0);
+   cs->sync.dep_ta_img_prior |= item->sync.dep_ta_img_prior;
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       cs->sync.dep[sq].prior |= item->sync.dep[sq].prior;
       cs->sync.dep_ta[sq].prior |= item->sync.dep_ta[sq].prior;
@@ -724,8 +735,13 @@ hk_render_pack_add(struct hk_cmd_buffer *packet, struct hk_cs *cs,
             packet->sync.req[k][sq].cut = cs;
          if (!last && (carry & BITFIELD_BIT(k)))
             cs->sync.dep[sq].prior |= req->prior;
-         if (!last && (ta_carry & BITFIELD_BIT(k)))
-            cs->sync.dep_ta[sq].prior |= req->prior;
+         if (!last && (ta_carry & BITFIELD_BIT(k))) {
+            if (sq == HK_SYNC_VDM && exact_bloom &&
+                BITFIELD_BIT(k) == HK_SYNC_GFX_IMG)
+               cs->sync.dep_ta_img_prior |= req->prior;
+            else
+               cs->sync.dep_ta[sq].prior |= req->prior;
+         }
       }
    }
    *preceding_kinds |= item->sync.kind;

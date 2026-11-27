@@ -839,3 +839,87 @@ TEST(LocalRead, CfJoinPreservesLoadOnlySlotsAndDrainsCleanly)
       free(part.binary);
    }
 }
+
+TEST(InlineMRT, LocalReadMsaaEntryProbeLoadsBatchWithinCap)
+{
+   /* Multisample entry-block probe loads (4x 4-dword chunk + 4x 1-dword probe)
+    * batch back-to-back within the 32-half register cap: all four 4-dword loads
+    * issue together (32 halves) and all four 1-dword loads issue together (8
+    * halves) without blowing peak register pressure. */
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+      SCOPED_TRACE(chip);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "local_read msaa batch");
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      key.no_preamble = true;
+      key.reserved_preamble = 8;
+      key.agx3_local_read = true;
+      key.fs.nr_samples = 4;
+
+      const unsigned offsets[5] = {0, 4, 8, 16, 20};
+      for (unsigned off : offsets)
+         BITSET_SET(key.g17p_tile_partitions, off);
+
+      nir_def *cov = nir_load_active_samples_agx(&b);
+      nir_def *masks[4];
+      for (unsigned s = 0; s < 4; ++s)
+         masks[s] = nir_iand_imm(&b, cov, BITFIELD_BIT(s));
+
+      nir_def *c0 = nir_load_local_pixel_agx(
+         &b, 4, 32, masks[0], .base = 4, .format = PIPE_FORMAT_R32_UINT,
+         .target = 1);
+      nir_def *diff = nir_imm_int(&b, 0);
+      for (unsigned s = 1; s < 4; ++s) {
+         nir_def *cs = nir_load_local_pixel_agx(
+            &b, 4, 32, masks[s], .base = 4, .format = PIPE_FORMAT_R32_UINT,
+            .target = 1);
+         nir_def *x = nir_ixor(&b, c0, cs);
+         for (unsigned i = 0; i < 4; ++i)
+            diff = nir_ior(&b, diff, nir_channel(&b, x, i));
+      }
+
+      nir_def *p0 = nir_load_local_pixel_agx(
+         &b, 1, 32, masks[0], .base = 20, .format = PIPE_FORMAT_R32_UINT,
+         .target = 4);
+      for (unsigned s = 1; s < 4; ++s) {
+         nir_def *ps = nir_load_local_pixel_agx(
+            &b, 1, 32, masks[s], .base = 20, .format = PIPE_FORMAT_R32_UINT,
+            .target = 4);
+         diff = nir_ior(&b, diff, nir_ixor(&b, p0, ps));
+      }
+
+      nir_def *any = nir_ballot(&b, 1, 32, nir_ine_imm(&b, diff, 0));
+      nir_def *cov_low = nir_iand_imm(&b, cov, 0xf);
+      nir_def *out = nir_vec4(&b, nir_channel(&b, c0, 0),
+                              nir_channel(&b, c0, 1), nir_channel(&b, c0, 2),
+                              p0);
+      nir_if *nif = nir_push_if(&b, nir_ieq_imm(&b, any, 0));
+      {
+         nir_store_local_pixel_agx(&b, out, cov_low, nir_undef(&b, 2, 16),
+                                   .base = 0, .write_mask = 0xf,
+                                   .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+      }
+      nir_push_else(&b, nif);
+      {
+         nir_store_local_pixel_agx(&b, out, masks[0], nir_undef(&b, 2, 16),
+                                   .base = 0, .write_mask = 0xf,
+                                   .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+      }
+      nir_pop_if(&b, nif);
+
+      b.shader->info.outputs_read = BITFIELD64_RANGE(FRAG_RESULT_DATA1, 4);
+      b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      b.shader->info.fs.uses_fbfetch_output = true;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx3_last_pack_refusal();
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_LE(part.info.nr_gprs, 48u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}

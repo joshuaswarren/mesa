@@ -9,10 +9,10 @@
 #include <unistd.h>
 
 static bool
-parse_hex(const char **p, const char *end, uintptr_t *out)
+parse_hex64(const char **p, const char *end, uint64_t *out)
 {
    const char *s = *p;
-   uintptr_t v = 0;
+   uint64_t v = 0;
    unsigned digits = 0;
    for (; s < end; ++s, ++digits) {
       unsigned d;
@@ -24,7 +24,7 @@ parse_hex(const char **p, const char *end, uintptr_t *out)
          d = *s - 'A' + 10;
       else
          break;
-      if (v > (UINTPTR_MAX >> 4))
+      if (v > (UINT64_MAX >> 4))
          return false;
       v = (v << 4) | d;
    }
@@ -32,6 +32,18 @@ parse_hex(const char **p, const char *end, uintptr_t *out)
       return false;
    *p = s;
    *out = v;
+   return true;
+}
+
+/* Addresses fit the process's pointer width; the file offset does not
+ * (a 32-bit process maps DRM buffers at offsets above 4 GiB). */
+static bool
+parse_hex(const char **p, const char *end, uintptr_t *out)
+{
+   uint64_t v;
+   if (!parse_hex64(p, end, &v) || v > UINTPTR_MAX)
+      return false;
+   *out = (uintptr_t)v;
    return true;
 }
 
@@ -75,8 +87,8 @@ hk_host_maps_parse_line(const char *line, size_t len, uintptr_t *start,
                         uintptr_t *end, enum hk_host_map_class *cls)
 {
    const char *p = line, *e = line + len;
-   uintptr_t lo, hi, offset, major, minor;
-   uint64_t inode;
+   uintptr_t lo, hi, major, minor;
+   uint64_t offset, inode;
    if (!parse_hex(&p, e, &lo) || !expect(&p, e, '-') ||
        !parse_hex(&p, e, &hi) || !expect(&p, e, ' ') || e - p < 5 ||
        p[4] != ' ' || hi <= lo)
@@ -84,7 +96,7 @@ hk_host_maps_parse_line(const char *line, size_t len, uintptr_t *start,
 
    const char *perms = p;
    p += 5;
-   if (!parse_hex(&p, e, &offset) || !expect(&p, e, ' ') ||
+   if (!parse_hex64(&p, e, &offset) || !expect(&p, e, ' ') ||
        !parse_hex(&p, e, &major) || !expect(&p, e, ':') ||
        !parse_hex(&p, e, &minor) || !expect(&p, e, ' ') ||
        !parse_dec(&p, e, &inode))
