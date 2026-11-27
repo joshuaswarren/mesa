@@ -1086,8 +1086,189 @@ splittable_outer(nir_loop *loop)
  * Both copies compute the same values, so the test only picks the faster.
  */
 static bool
+loop_has_nested_loop(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return true;
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (loop_has_nested_loop(&nif->then_list) ||
+             loop_has_nested_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static nir_loop *
+nth_loop_in_list(struct exec_list *list, unsigned *index)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         nir_loop *hit = nth_loop_in_list(&nif->then_list, index);
+         if (hit)
+            return hit;
+         hit = nth_loop_in_list(&nif->else_list, index);
+         if (hit)
+            return hit;
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *lp = nir_cf_node_as_loop(node);
+         nir_loop *hit = nth_loop_in_list(&lp->body, index);
+         if (hit)
+            return hit;
+         if (*index == 0)
+            return lp;
+         (*index)--;
+      }
+   }
+   return NULL;
+}
+
+static bool
+loop_ordinal_in_list(struct exec_list *list, nir_loop *target, unsigned *index)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (loop_ordinal_in_list(&nif->then_list, target, index) ||
+             loop_ordinal_in_list(&nif->else_list, target, index))
+            return true;
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *lp = nir_cf_node_as_loop(node);
+         if (loop_ordinal_in_list(&lp->body, target, index))
+            return true;
+         if (lp == target)
+            return true;
+         (*index)++;
+      }
+   }
+   return false;
+}
+
+/* Overflow-free exact trip-count equality predicate (trip == exact_n) for a
+ * unit-step top-tested counted loop with offset == 0. */
+static nir_def *
+exact_trip_cond(nir_builder *b, const struct counted_loop *cl, nir_def *iv0,
+                nir_def *bound, uint32_t exact_n)
+{
+   const bool u = cl->is_unsigned;
+   const uint32_t max_u = u ? UINT32_MAX : (uint32_t)INT32_MAX;
+   const uint32_t min_u = u ? 0u : (uint32_t)INT32_MIN;
+   nir_def *ord, *diff, *no_wrap;
+
+   switch (cl->rel) {
+   case REL_LT:
+      ord = u ? nir_ult(b, iv0, bound) : nir_ilt(b, iv0, bound);
+      diff = nir_ieq_imm(b, nir_isub(b, bound, iv0), exact_n);
+      return nir_iand(b, ord, diff);
+   case REL_LE:
+      ord = u ? nir_uge(b, bound, iv0) : nir_ige(b, bound, iv0);
+      diff = nir_ieq_imm(b, nir_isub(b, bound, iv0), exact_n - 1);
+      no_wrap = nir_ine_imm(b, bound, max_u);
+      return nir_iand(b, nir_iand(b, ord, diff), no_wrap);
+   case REL_GT:
+      ord = u ? nir_ult(b, bound, iv0) : nir_ilt(b, bound, iv0);
+      diff = nir_ieq_imm(b, nir_isub(b, iv0, bound), exact_n);
+      return nir_iand(b, ord, diff);
+   default: /* REL_GE */
+      ord = u ? nir_uge(b, iv0, bound) : nir_ige(b, iv0, bound);
+      diff = nir_ieq_imm(b, nir_isub(b, iv0, bound), exact_n - 1);
+      no_wrap = nir_ine_imm(b, bound, min_u);
+      return nir_iand(b, nir_iand(b, ord, diff), no_wrap);
+   }
+}
+
+/* Peel `count` guaranteed straight-line iterations of a simple top-tested
+ * counted loop. When `keep_tail` is false (exact trip == count), remove the
+ * loop completely; when true (trip >= count), keep the original loop as the
+ * compact remainder loop after the straight-line prefix. */
+static bool
+peel_straight_prefix(nir_function_impl *impl, nir_loop *loop, unsigned count,
+                     bool keep_tail)
+{
+   struct counted_loop cl;
+   if (!analyze_loop(loop, &cl) || cl.bottom)
+      return false;
+   if (count_unrollable(loop, cl.nif) < 0)
+      return false;
+
+   nir_foreach_block_in_cf_node(block, &loop->cf_node)
+      nir_lower_phis_to_regs_block(block, true);
+   nir_foreach_block_in_cf_node(block, &loop->cf_node)
+      nir_lower_ssa_defs_to_regs_block(block);
+
+   nir_cf_list head, rest;
+   nir_cf_extract(&head, nir_before_cf_list(&loop->body),
+                  nir_before_cf_node(&cl.nif->cf_node));
+   nir_cf_extract(&rest, nir_after_cf_node(&cl.nif->cf_node),
+                  nir_after_cf_list(&loop->body));
+
+   nir_cf_list copies[2 * 4];
+   assert(count >= 1 && count <= 4);
+   for (unsigned i = 0; i < count; ++i) {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      nir_cf_list_clone(&copies[2 * i], &head, loop->cf_node.parent, remap);
+      nir_cf_list_clone(&copies[2 * i + 1], &rest, loop->cf_node.parent, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+   }
+
+   for (unsigned i = 0; i < count; ++i) {
+      nir_cf_reinsert(&copies[2 * i], nir_before_cf_node(&loop->cf_node));
+      nir_cf_reinsert(&copies[2 * i + 1], nir_before_cf_node(&loop->cf_node));
+   }
+
+   if (keep_tail) {
+      nir_cf_reinsert(&head, nir_before_cf_node(&cl.nif->cf_node));
+      nir_cf_reinsert(&rest, nir_after_cf_list(&loop->body));
+      loop->partially_unrolled = true;
+   } else {
+      /* On the exiting iteration (trip == count), the original top-tested loop
+       * executes `head` once more before breaking, writing the final header-phi
+       * values into their SSA-def registers. */
+      nir_cf_reinsert(&head, nir_before_cf_node(&loop->cf_node));
+      nir_cf_delete(&rest);
+      nir_cf_node_remove(&loop->cf_node);
+   }
+   return true;
+}
+
+struct small_peel_rec {
+   nir_loop *loop;
+   unsigned count;
+   bool keep_tail;
+};
+
+static bool
+loop_has_8bit_load(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_global:
+         case nir_intrinsic_load_global_constant:
+         case nir_intrinsic_load_agx:
+         case nir_intrinsic_load_constant_agx:
+         case nir_intrinsic_load_ssbo:
+            if (intr->def.bit_size == 8 && intr->def.num_components == 1)
+               return true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
 unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
-                struct set *skip_runtime_unroll)
+                struct set *skip_runtime_unroll,
+                struct util_dynarray *small_peels)
 {
    /* With maximal reconvergence the outer loop's invocations must stay
     * together; the split could separate them. */
@@ -1141,6 +1322,28 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       else
          cond = cl.is_unsigned ? nir_ult(&b, g, iv0) : nir_ilt(&b, g, iv0);
 
+      /* For compact 2D stencils / box filters with f >= 8, also specialize
+       * the small-window else arm (4 <= trip < 8 -> straight-line 4x + tail,
+       * and trip == 3 -> straight-line 3x with zero inner loop) so 3x3..7x7
+       * windows vectorize into u8x3/u8x4 loads instead of scalar byte loops. */
+      const bool split_small =
+         f >= 8 && !cl.bottom && cl.offset == 0 &&
+         (cl.step == 1 || cl.step == -1) &&
+         count_instrs(outer) <= 96 && !loop_has_nested_loop(&inner->body) &&
+         loop_has_8bit_load(inner);
+      nir_def *cond4 = NULL, *cond3 = NULL;
+      unsigned inner_ord = 0;
+      if (split_small) {
+         nir_def *g4 = guard_bound(&b, &cl, bound, 4);
+         if (cl.rel == REL_LT || cl.rel == REL_LE)
+            cond4 = cl.is_unsigned ? nir_ult(&b, iv0, g4) : nir_ilt(&b, iv0, g4);
+         else
+            cond4 = cl.is_unsigned ? nir_ult(&b, g4, iv0) : nir_ilt(&b, g4, iv0);
+         cond3 = exact_trip_cond(&b, &cl, iv0, bound, 3);
+         bool found_ord = loop_ordinal_in_list(&outer->body, inner, &inner_ord);
+         assert(found_ord);
+      }
+
       /* Values of the outer loop through registers, so both copies write
        * the same ones and the code after reads them whichever ran. Phi
        * sources are written in their own predecessor: hoisted into the arms
@@ -1160,15 +1363,56 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       nir_cf_list list, copy;
       nir_cf_extract(&list, nir_before_cf_node(&outer->cf_node),
                      nir_after_cf_node(&outer->cf_node));
-      /* The copy keeps this inner loop as it is (clones copy the flag); its
-       * other loops stay candidates. */
-      inner->partially_unrolled = true;
-      struct hash_table *cmap = _mesa_pointer_hash_table_create(NULL);
-      nir_cf_list_clone(&copy, &list, &nif->cf_node, cmap);
-      _mesa_hash_table_destroy(cmap, NULL);
-      inner->partially_unrolled = false;
-      nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
-      nir_cf_reinsert(&copy, nir_before_cf_list(&nif->else_list));
+      if (split_small) {
+         b.cursor = nir_before_cf_list(&nif->else_list);
+         nir_if *nif4 = nir_push_if(&b, cond4);
+         nir_push_else(&b, nif4);
+         nir_if *nif3 = nir_push_if(&b, cond3);
+         nir_pop_if(&b, nif3);
+         nir_pop_if(&b, nif4);
+
+         nir_cf_list copy4, copy3;
+         struct hash_table *cmap4 = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copy4, &list, &nif4->cf_node, cmap4);
+         _mesa_hash_table_destroy(cmap4, NULL);
+
+         struct hash_table *cmap3 = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copy3, &list, &nif3->cf_node, cmap3);
+         _mesa_hash_table_destroy(cmap3, NULL);
+
+         inner->partially_unrolled = true;
+         struct hash_table *cmap = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copy, &list, &nif3->cf_node, cmap);
+         _mesa_hash_table_destroy(cmap, NULL);
+         inner->partially_unrolled = false;
+
+         nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
+         nir_cf_reinsert(&copy4, nir_before_cf_list(&nif4->then_list));
+         nir_cf_reinsert(&copy3, nir_before_cf_list(&nif3->then_list));
+         nir_cf_reinsert(&copy, nir_before_cf_list(&nif3->else_list));
+
+         unsigned idx4 = inner_ord;
+         nir_loop *inner4 = nth_loop_in_list(&nif4->then_list, &idx4);
+         assert(inner4);
+         struct small_peel_rec r4 = {inner4, 4, true};
+         util_dynarray_append(small_peels, r4);
+
+         unsigned idx3 = inner_ord;
+         nir_loop *inner3 = nth_loop_in_list(&nif3->then_list, &idx3);
+         assert(inner3);
+         struct small_peel_rec r3 = {inner3, 3, false};
+         util_dynarray_append(small_peels, r3);
+      } else {
+         /* The copy keeps this inner loop as it is (clones copy the flag); its
+          * other loops stay candidates. */
+         inner->partially_unrolled = true;
+         struct hash_table *cmap = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copy, &list, &nif->cf_node, cmap);
+         _mesa_hash_table_destroy(cmap, NULL);
+         inner->partially_unrolled = false;
+         nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
+         nir_cf_reinsert(&copy, nir_before_cf_list(&nif->else_list));
+      }
       _mesa_set_add(done, outer);
       progress = true;
    }
@@ -2056,14 +2300,32 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          unswitched = true;
          any = true;
       }
-      if (unswitch_nested(impl, factor, max_instrs, skip_runtime_unroll)) {
+      struct util_dynarray small_peels;
+      util_dynarray_init(&small_peels, NULL);
+      if (unswitch_nested(impl, factor, max_instrs, skip_runtime_unroll,
+                          &small_peels)) {
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
          nir_metadata_require(impl, nir_metadata_block_index);
          nir_index_ssa_defs(impl);
+         bool peeled = false;
+         util_dynarray_foreach(&small_peels, struct small_peel_rec, rec) {
+            if (peel_straight_prefix(impl, rec->loop, rec->count,
+                                     rec->keep_tail))
+               peeled = true;
+            else
+               rec->loop->partially_unrolled = true;
+         }
+         if (peeled) {
+            nir_progress(true, impl, nir_metadata_none);
+            nir_lower_reg_intrinsics_to_ssa_impl(impl);
+            nir_metadata_require(impl, nir_metadata_block_index);
+            nir_index_ssa_defs(impl);
+         }
          unswitched = true;
          any = true;
       }
+      util_dynarray_fini(&small_peels);
 
       /* One loop at a time, each analyzed on the shader the unrolls before it
        * left, back in SSA form: an unroll turns its loop's header phis into

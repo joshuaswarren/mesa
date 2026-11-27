@@ -2300,25 +2300,27 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
     * Extract from its packed word so a useful operation can carry the wait.
     */
    if (unpack_w8_word) {
+      const unsigned nr = instr->def.num_components;
       assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
              b->shader->stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
              fmt == AGX_FORMAT_I8 && dest.size == AGX_SIZE_32 &&
-             instr->def.num_components == 4 && packed_count == 0);
+             (nr == 3 || nr == 4) && packed_count == 0);
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, packed, addr, offset, fmt,
-                                           0xf, shift, nir_is_coherent(instr));
+                                           BITFIELD_MASK(nr), shift,
+                                           nir_is_coherent(instr));
       load->memory_index_is_bytes = index_bytes;
       load->memory_byte_offset = byte_offset;
       load->memory_is_packed = true;
 
       agx_index channels[4];
-      for (unsigned i = 0; i < ARRAY_SIZE(channels); ++i) {
+      for (unsigned i = 0; i < nr; ++i) {
          agx_index shifted = i ? agx_ushr(b, packed, agx_immediate(8 * i))
                                : packed;
          channels[i] = i == 3 ? shifted
                               : agx_and(b, shifted, agx_immediate(0xff));
       }
-      agx_emit_collect_to(b, dest, ARRAY_SIZE(channels), channels);
+      agx_emit_collect_to(b, dest, nr, channels);
       return;
    }
 
@@ -15073,9 +15075,9 @@ agx_nir_fragment_output_temporaries(nir_shader *nir)
 }
 
 /* Fold 8-to-32 unsigned conversion into the selected result type. The
- * four-byte transaction is still determined by the format and lane count.
+ * 3- or 4-byte transaction is still determined by the format and lane count.
  * agx_emit_load() then extracts the lanes from the byte-packed word that a
- * four-lane W8 load returns on AGX3B.
+ * 3- or 4-lane W8 load returns on AGX3B.
  */
 static bool
 fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
@@ -15084,7 +15086,8 @@ fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
    if (b->impl->function->is_preamble ||
        (load->intrinsic != nir_intrinsic_load_agx &&
         load->intrinsic != nir_intrinsic_load_constant_agx) ||
-       load->def.bit_size != 8 || load->def.num_components != 4 ||
+       load->def.bit_size != 8 ||
+       (load->def.num_components != 3 && load->def.num_components != 4) ||
        nir_intrinsic_format(load) != PIPE_FORMAT_R8_UINT ||
        (nir_intrinsic_base(load) & (AGX_NIR_MEMORY_PACKED_COUNT_MASK |
                                    AGX_NIR_MEMORY_UNPACK_W8_WORD)) ||
@@ -15100,7 +15103,8 @@ fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
          return false;
       const nir_alu_instr *alu = nir_instr_as_alu(parent);
       if (alu->op != nir_op_u2u32 || alu->def.bit_size != 32 ||
-          alu->def.num_components != 1 || alu->src[0].swizzle[0] >= 4)
+          alu->def.num_components != 1 ||
+          alu->src[0].swizzle[0] >= load->def.num_components)
          return false;
       used = true;
    }
@@ -19435,7 +19439,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       if (nir->info.shared_size)
          NIR_PASS(_, nir, agx_nir_opt_shared_phase_cse);
 
-      /* Every AGX3B part returns a four-lane W8 load as one byte-packed
+      /* Every AGX3B part returns a 3- or 4-lane W8 load as one byte-packed
        * word (the W8 path of agx_emit_load()), which the fold extracts with
        * integer shifts. AGX2 returns one byte per 16-bit lane, so there is no
        * word to fold to. AGX3C (M5, and G18 through it) widens bytes to
