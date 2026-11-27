@@ -15,6 +15,7 @@
 
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_image.h"
 #include "hk_queue.h"
 
 #include "agx_chip_caps.h"
@@ -1924,6 +1925,11 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       into->sync.brl_transition = true;
    }
    into->sync.kind |= from->sync.kind;
+   if (from->sync.heap_slot) {
+      assert(!into->sync.heap_slot ||
+             into->sync.heap_slot == from->sync.heap_slot);
+      into->sync.heap_slot = from->sync.heap_slot;
+   }
    into->sync.att_bloom |= from->sync.att_bloom;
    into->sync.vtx_images |= from->sync.vtx_images;
    into->sync.vtx_img_bloom |= from->sync.vtx_img_bloom;
@@ -1945,6 +1951,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->brl_transition_last[sq], from, into);
    replace_pointer(&st->brl_event_poll, from, into);
    replace_pointer(&st->stamp_copy_after[sq], from, into);
+   replace_pointer(&st->pass_heap_last[sq], from, into);
+   for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs)
+      replace_pointer(&st->last_heap_slot[hs][sq], from, into);
    records_replace_stream(cmd, from, into);
    xfer_replace_stream(st, from, into);
 
@@ -2679,6 +2688,79 @@ hk_sync_resolve_end(struct hk_cmd_buffer *cmd)
    st->internal[0] = (struct hk_sync_dep){0};
    st->internal[1] = (struct hk_sync_dep){0};
    st->kind_override = 0;
+}
+
+void
+hk_sync_fold_resolve(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     const struct hk_image *dst_image, uint32_t level,
+                     uint32_t layer, uint32_t width, uint32_t height)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(!st->in_pass && cs->type == HK_CS_VDM);
+   assert(cs == list_last_entry(&cmd->control_streams, struct hk_cs, node));
+   st->epoch++;
+
+   /* Apply pending transfer requirements to cs's fragment half. If an
+    * intervening render->transfer barrier overwrote the VDM cut with cs
+    * itself, conservatively preserve ordering against the latest VDM stream
+    * strictly before cs so earlier passes touching dst_image stay ordered. */
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_mask(cmd, HK_SYNC_XFER, dep);
+   if (dep[HK_SYNC_VDM].cut == cs)
+      dep[HK_SYNC_VDM].cut = latest_before(cmd, HK_SYNC_VDM, cs);
+   stream_wait_frag(cs, dep);
+   if (st->internal_active)
+      stream_wait_frag(cs, st->internal);
+
+   const struct hk_sync_footprint fp = {
+      .preserve = false,
+      .image = &dst_image->vk,
+      .level = level,
+      .layer0 = layer,
+      .layer1 = layer + 1,
+      .cx0 = 0,
+      .cx1 = (int32_t)((width - 1) >> HK_SYNC_TILE_CELL_LOG2),
+      .cy0 = 0,
+      .cy1 = (int32_t)((height - 1) >> HK_SYNC_TILE_CELL_LOG2),
+   };
+   struct hk_sync_dep tile_wait[HK_SYNC_NUM_SQ] = {{0}, {0}};
+   util_dynarray_foreach(&cmd->sync_pass_records, struct hk_sync_pass_record,
+                         rec) {
+      if (!rec->last || rec->last == cs)
+         continue;
+      if (footprints_share_tile(&rec->fp, &fp)) {
+         const unsigned sq = hk_sync_sq(rec->last);
+         tile_wait[sq].cut = hk_sync_later(tile_wait[sq].cut, rec->last);
+      }
+   }
+   stream_wait_frag(cs, tile_wait);
+
+   const struct hk_sync_pass_record rec = {
+      .fp = fp,
+      .first = cs,
+      .last = cs,
+   };
+   util_dynarray_append(&cmd->sync_pass_records, rec);
+
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if (dst_image->plane_count == 0 || dst_image->swapchain_memory ||
+       dst_image->vk.external_handle_types ||
+       (dst_image->vk.create_flags & unsafe_flags) ||
+       dst_image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
+       !dst_image->planes[0].addr) {
+      cs->sync.att_bloom = UINT64_MAX;
+   } else {
+      cs->sync.att_bloom |= hk_sync_image_bloom(dst_image->planes[0].addr);
+   }
+
+   cs->sync.kind |= HK_SYNC_XFER;
+   u_foreach_bit(k, HK_SYNC_XFER)
+      st->last[k][HK_SYNC_VDM] = cs;
+   st->last_any[HK_SYNC_VDM] = cs;
+   if (dst_image->vk.tiling == VK_IMAGE_TILING_LINEAR)
+      hk_sync_note_memory_write(cmd, cs);
 }
 
 /*

@@ -1,0 +1,147 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+layout(local_size_x = 64) in;
+
+/* Intentionally non-coherent SSBOs so stores exercise the packer's
+ * AGX_CAP_COMPUTE_COHERENT_STORE path (stdev f75=1 on G17P). */
+layout(std430, set = 0, binding = 0) buffer Buf32 { uint d32[]; };
+layout(std430, set = 0, binding = 1) buffer Buf64 { uvec2 d64[]; };
+layout(std430, set = 0, binding = 2) buffer Buf128 { uvec4 d128[]; };
+layout(std430, set = 0, binding = 3) coherent buffer Result {
+   uint errs;
+   uint first_idx;
+   uint first_got;
+   uint first_want;
+} res;
+
+layout(push_constant) uniform PC {
+   uint mode;     /* 0=prewarm_read, 1=produce, 2=consume_shifted, 3=same_core_and_wg_raw */
+   uint count;    /* element count (multiple of 64) */
+   uint round_id; /* monotonically increasing pattern seed */
+   uint shift;    /* workgroup shift for mode 2; 0 at runtime for mode 3 */
+} pc;
+
+uint
+pat32(uint idx, uint r)
+{
+   uint x = (idx * 2654435761u) ^ (r * 2246822519u) ^ 0x9e3779b9u;
+   x ^= x >> 16;
+   x *= 0x7feb352du;
+   x ^= x >> 15;
+   return x | 1u; /* never 0 */
+}
+
+uvec2
+pat64(uint idx, uint r)
+{
+   return uvec2(pat32(idx, r ^ 0x11111111u), pat32(idx + 17u, r ^ 0x22222222u));
+}
+
+uvec4
+pat128(uint idx, uint r)
+{
+   return uvec4(pat32(idx, r ^ 0x33333333u), pat32(idx + 3u, r ^ 0x44444444u),
+                pat32(idx + 7u, r ^ 0x55555555u), pat32(idx + 11u, r ^ 0x66666666u));
+}
+
+void
+record_err(uint idx, uint got, uint want)
+{
+   if (atomicAdd(res.errs, 1u) == 0u) {
+      res.first_idx = idx;
+      res.first_got = got;
+      res.first_want = want;
+   }
+}
+
+void
+main()
+{
+   uint idx = gl_GlobalInvocationID.x;
+   if (idx >= pc.count)
+      return;
+
+   if (pc.mode == 0u) {
+      /* Pre-warm consumer L1 cache with previous round's data. */
+      uint a = d32[idx];
+      uvec2 b = d64[idx];
+      uvec4 c = d128[idx];
+      if ((a ^ b.x ^ b.y ^ c.x ^ c.y ^ c.z ^ c.w) == 0xdeadbeefu &&
+          pc.round_id == 0xffffffffu) {
+         atomicAdd(res.errs, 1u);
+      }
+      return;
+   }
+
+   if (pc.mode == 1u) {
+      d32[idx] = pat32(idx, pc.round_id);
+      d64[idx] = pat64(idx, pc.round_id);
+      d128[idx] = pat128(idx, pc.round_id);
+      return;
+   }
+
+   if (pc.mode == 2u) {
+      uint num_wgs = pc.count >> 6;
+      uint src_wg = (gl_WorkGroupID.x + pc.shift) % num_wgs;
+      uint src_idx = (src_wg << 6) + gl_LocalInvocationID.x;
+
+      uint w32 = pat32(src_idx, pc.round_id);
+      uint g32 = d32[src_idx];
+      if (g32 != w32)
+         record_err(src_idx, g32, w32);
+
+      uvec2 w64 = pat64(src_idx, pc.round_id);
+      uvec2 g64 = d64[src_idx];
+      if (any(notEqual(g64, w64)))
+         record_err(src_idx | 0x40000000u, g64.x ^ g64.y, w64.x ^ w64.y);
+
+      uvec4 w128 = pat128(src_idx, pc.round_id);
+      uvec4 g128 = d128[src_idx];
+      if (any(notEqual(g128, w128)))
+         record_err(src_idx | 0x80000000u,
+                    g128.x ^ g128.y ^ g128.z ^ g128.w,
+                    w128.x ^ w128.y ^ w128.z ^ w128.w);
+      return;
+   }
+
+   /* mode == 3: same-thread RAW (with runtime-zero push-constant offset so the
+    * compiler emits a real hardware load after stdev f75=1) plus intra-workgroup
+    * cross-thread RAW after memoryBarrierBuffer() + barrier(). */
+   uint old = d32[idx];
+   uint w32 = pat32(idx, pc.round_id);
+   uvec2 w64 = pat64(idx, pc.round_id);
+   uvec4 w128 = pat128(idx, pc.round_id);
+   d32[idx] = w32;
+   d64[idx] = w64;
+   d128[idx] = w128;
+
+   uint rt_idx = idx + pc.shift + (old & 0u);
+   uint same32 = d32[rt_idx];
+   if (same32 != w32)
+      record_err(idx | 0x10000000u, same32, w32);
+   uvec2 same64 = d64[rt_idx];
+   if (any(notEqual(same64, w64)))
+      record_err(idx | 0x20000000u, same64.x ^ same64.y, w64.x ^ w64.y);
+   uvec4 same128 = d128[rt_idx];
+   if (any(notEqual(same128, w128)))
+      record_err(idx | 0x30000000u,
+                 same128.x ^ same128.y ^ same128.z ^ same128.w,
+                 w128.x ^ w128.y ^ w128.z ^ w128.w);
+
+   memoryBarrierBuffer();
+   barrier();
+
+   uint peer = (gl_WorkGroupID.x << 6) + (gl_LocalInvocationID.x ^ 1u);
+   uint pw32 = pat32(peer, pc.round_id);
+   uint pg32 = d32[peer];
+   if (pg32 != pw32)
+      record_err(peer | 0x50000000u, pg32, pw32);
+   uvec4 pw128 = pat128(peer, pc.round_id);
+   uvec4 pg128 = d128[peer];
+   if (any(notEqual(pg128, pw128)))
+      record_err(peer | 0x60000000u,
+                 pg128.x ^ pg128.y ^ pg128.z ^ pg128.w,
+                 pw128.x ^ pw128.y ^ pw128.z ^ pw128.w);
+}

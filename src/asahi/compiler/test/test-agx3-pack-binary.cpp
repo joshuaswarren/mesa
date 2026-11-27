@@ -49,6 +49,7 @@ extern "C" {
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 extern "C" {
 #include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
@@ -18931,6 +18932,9 @@ TEST_F(AGX3PackBinary, AGX3SignedMemoryByteOffsetLoadAndStore)
                }
                if (!is_store)
                   d.slot = 1;
+               else if (agx_chip_has_cap(t.chip,
+                                         AGX_CAP_COMPUTE_COHERENT_STORE))
+                  d.coherent = true;
 
                uint8_t bytes[AGX3_MEM_MAX_LENGTH], len = 0;
                ASSERT_TRUE(is_store
@@ -19900,4 +19904,62 @@ TEST_F(AGX3PackBinary, ComputeImageblockBlockStorePacks)
    ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
    append(want, end.bytes, end.length);
    EXPECT_EQ(pack(b), want);
+}
+
+TEST_F(AGX3PackBinary, G17PComputeDeviceStoreSetsCoherentPolicy)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      mesa_shader_stage stage;
+      bool expect_coherent;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_COMPUTE, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_VERTEX, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, MESA_SHADER_COMPUTE, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_COMPUTE, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, MESA_SHADER_COMPUTE, false},
+   };
+   for (const auto &c : cases) {
+      EXPECT_EQ(c.expect_coherent,
+                c.stage == MESA_SHADER_COMPUTE &&
+                   agx_chip_has_cap(c.chip, AGX_CAP_COMPUTE_COHERENT_STORE));
+      agx_builder *b = builder(c.enc);
+      key.dev.chip = c.chip;
+      b->shader->stage = c.stage;
+      agx_device_store(b, agx_register(0, AGX_SIZE_32),
+                       agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                       AGX_FORMAT_I32, 1, 0, false);
+      agx_stop(b);
+
+      struct agx3_mem_desc d = {};
+      d.data = 0;
+      d.width = AGX3_MEM_W32;
+      d.mask = 1;
+      d.shift = 0;
+      d.base_is_uniform = true;
+      d.base = 0;
+      d.idx_kind = AGX3_MEM_IDX_IMM;
+      d.byte_off = 0;
+      d.slot = 0;
+      d.wait_mask = 0;
+      d.coherent = c.expect_coherent;
+
+      uint8_t st[AGX3_MEM_MAX_LENGTH], st_len = 0;
+      ASSERT_TRUE(agx3_mem_encode_store(c.enc, &d, st, &st_len));
+      struct agx3_encoded_end end;
+      ASSERT_TRUE(agx3_pack_end(c.enc, &end));
+      std::vector<uint8_t> want;
+      append(want, st, st_len);
+      append(want, end.bytes, end.length);
+      const auto got = pack(b);
+      ASSERT_GE(got.size(), want.size());
+      if (c.stage == MESA_SHADER_FRAGMENT) {
+         EXPECT_EQ(std::vector<uint8_t>(got.end() - want.size(), got.end()),
+                   want);
+      } else {
+         EXPECT_EQ(got, want);
+      }
+   }
 }

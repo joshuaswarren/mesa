@@ -477,4 +477,94 @@ TEST(M5ByteToFloat, AGX3NormfltHalfBitopAndDedupScale)
    }
 }
 
+TEST(M5ByteToFloat, AGX3BNormfltLoopKeepsScaleInGpr)
+{
+   /* Inside a loop on AGX3B, agx_opt_agx3_normflt_byte_pairs hoists the 255.0h
+    * scale constant to the entry block and agx_opt_promote_constants keeps it
+    * in a GPR instead of promoting it to a 16-bit uniform read on every HMUL. */
+   const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+      bool expect_gpr_hoisted;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false},
+   };
+   for (auto t : targets) {
+      SCOPED_TRACE(t.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = t.encoding;
+      key.dev.chip = t.chip;
+      key.promote_constants = true;
+      b->shader->key = &key;
+      b->shader->out = rzalloc(mem, struct agx_shader_info);
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *loop = agx_test_block(b->shader);
+      agx_block *exit_blk = agx_test_block(b->shader);
+      loop->loop_header = true;
+      agx_block_add_successor(entry, loop);
+      agx_block_add_successor(loop, loop);
+      agx_block_add_successor(loop, exit_blk);
+
+      b->cursor = agx_after_block(entry);
+      agx_index h0 = agx_preload(b, agx_register(0, AGX_SIZE_16));
+      agx_index weight = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+
+      b->cursor = agx_after_block(loop);
+      agx_index mask = agx_mov_imm(b, 16, 0xff);
+      agx_index zero = agx_mov_imm(b, 16, 0);
+      agx_index sh8 = agx_mov_imm(b, 16, 8);
+      agx_index b0 = agx_and(b, h0, mask);
+      agx_index b1 = agx_bfeil(b, zero, h0, sh8, 0);
+      agx_index f0 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index f1 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_convert_to(b, f0, agx_immediate(AGX_CONVERT_U16_TO_F), b0, AGX_ROUND_RTE);
+      agx_convert_to(b, f1, agx_immediate(AGX_CONVERT_U16_TO_F), b1, AGX_ROUND_RTE);
+      acc = agx_ffma(b, f0, weight, acc);
+      acc = agx_ffma(b, f1, weight, acc);
+
+      b->cursor = agx_after_block(exit_blk);
+      agx_unit_test(b, acc);
+
+      agx_opt_agx3_normflt_byte_pairs(b->shader);
+      agx_opt_promote_constants(b->shader);
+
+      unsigned entry_scale = 0, loop_scale = 0;
+      unsigned hmul_uniform = 0, hmul_gpr = 0;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM &&
+             I->dest[0].size == AGX_SIZE_16 && I->imm == 0x5bf8)
+            entry_scale++;
+      }
+      agx_foreach_instr_in_block(loop, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM &&
+             I->dest[0].size == AGX_SIZE_16 && I->imm == 0x5bf8)
+            loop_scale++;
+         if (I->op == AGX_OPCODE_HMUL) {
+            if (I->src[1].type == AGX_INDEX_UNIFORM)
+               hmul_uniform++;
+            else if (I->src[1].type == AGX_INDEX_NORMAL)
+               hmul_gpr++;
+         }
+      }
+
+      if (t.expect_gpr_hoisted) {
+         EXPECT_EQ(entry_scale, 1u);
+         EXPECT_EQ(loop_scale, 0u);
+         EXPECT_EQ(hmul_uniform, 0u);
+         EXPECT_EQ(hmul_gpr, 2u);
+      } else {
+         EXPECT_EQ(entry_scale, 0u);
+         EXPECT_EQ(loop_scale, 1u);
+         EXPECT_EQ(hmul_uniform, 0u);
+         EXPECT_EQ(hmul_gpr, 2u);
+      }
+      ralloc_free(mem);
+   }
+}
+
 } // namespace

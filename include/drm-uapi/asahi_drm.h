@@ -482,6 +482,14 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
 
 /*
+ * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands accept tile buffers of
+ * up to 48 KiB (sample_size_B * utile_width_px * utile_height_px * samples),
+ * instead of 32 KiB. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_TILE_BUFFER_48K ((1ULL) << 46)
+
+/*
  * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
  * independent compute commands of one queue on several firmware compute
  * queues of its context, so that they overlap. Userspace needs no further
