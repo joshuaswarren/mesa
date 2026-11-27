@@ -13,6 +13,7 @@
 #include "hk_image.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,7 +214,7 @@ reserved(const void *addr, size_t size)
    while (fgets(line, sizeof(line), maps)) {
       uintptr_t lo, hi;
       char perms[5];
-      if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) != 3)
+      if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &lo, &hi, perms) != 3)
          continue;
       if (lo <= (uintptr_t)addr && (uintptr_t)addr + size <= hi) {
          found = !strcmp(perms, "---p");
@@ -236,7 +237,7 @@ mapped_rw(const void *addr, size_t size)
    while (fgets(line, sizeof(line), maps)) {
       uintptr_t lo, hi;
       char perms[5];
-      if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) != 3)
+      if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &lo, &hi, perms) != 3)
          continue;
       if (lo <= (uintptr_t)addr && (uintptr_t)addr + size <= hi) {
          found = !strncmp(perms, "rw", 2);

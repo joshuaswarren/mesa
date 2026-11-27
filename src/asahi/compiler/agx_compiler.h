@@ -423,6 +423,10 @@ typedef struct {
    /* Invert icond/fcond */
    bool invert_cond : 1;
 
+   /* if_*cmp/else_*cmp of a NIR if whose condition is the same for every lane
+    * of the subgroup. */
+   bool uniform_cond : 1;
+
    /*
     * G17P carries a texture coordinate offset as an immediate field in the
     * sample instruction (f43), while the depth comparator is a staged
@@ -1499,7 +1503,7 @@ agx_validate_ra(UNUSED agx_context *ctx)
 #endif
 
 enum agx_size agx_split_width(const agx_instr *I);
-bool agx_allows_16bit_immediate(agx_instr *I);
+bool agx_allows_16bit_immediate(agx_instr *I, enum agx_isa_encoding enc);
 unsigned agx_negate_src_index(agx_instr *I);
 
 static inline bool
@@ -1675,6 +1679,7 @@ void agx_lower_agx3_half_converts(agx_context *ctx);
 void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
+void agx_lower_m5_alu_operands(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);
 
 struct agx_cycle_estimate {

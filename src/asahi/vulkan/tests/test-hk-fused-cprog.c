@@ -191,7 +191,7 @@ test_g17p_fused_cprog_emit_matches_program(void)
     * byte-for-byte equality with what hk_emit_fused_compute_dispatch packed. */
    struct agx3_ioto_uniform_range range = {0};
    CHECK(hk_agx3_g17p_root_range(s.info.agx3_root_uniform, s.info.set_count,
-                                 p.root_va, &range));
+                                 p.root_va, hk_shader_root_size(&s), &range));
 
    struct hk_agx3_g17p_compute_program_desc expected_desc = {0};
    CHECK(agx3_cdm_direct_template_sources_compute(
@@ -280,7 +280,7 @@ test_g17p_fused_cprog_emit_matches_program(void)
    p.root_va += 0x400;
    const uint64_t ioto_va2 = dev.dev.shader_base + 0x301000;
    CHECK(hk_agx3_g17p_root_range(s.info.agx3_root_uniform, s.info.set_count,
-                                 p.root_va, &range));
+                                 p.root_va, hk_shader_root_size(&s), &range));
    no_cprog_desc.program_va = ioto_va2;
    no_cprog_desc.uniform_ranges = &range;
    CHECK(hk_agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &no_cprog_desc,

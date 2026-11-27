@@ -52,6 +52,45 @@ hk_rt_group_from_create_info(struct hk_ray_tracing_group *out,
    return true;
 }
 
+static bool
+hk_rt_index_valid(uint32_t index, uint32_t stage_count)
+{
+   return index == VK_SHADER_UNUSED_KHR || index < stage_count;
+}
+
+bool
+hk_rt_group_indices_valid(const struct hk_ray_tracing_group *group,
+                          uint32_t stage_count)
+{
+   return hk_rt_index_valid(group->recursive_index, stage_count) &&
+          hk_rt_index_valid(group->ahit_index, stage_count) &&
+          hk_rt_index_valid(group->isec_index, stage_count);
+}
+
+static bool
+hk_rt_slot_takes(uint32_t index, const VkShaderStageFlagBits *stages,
+                 VkShaderStageFlags allowed)
+{
+   return index == VK_SHADER_UNUSED_KHR || (stages[index] & allowed);
+}
+
+bool
+hk_rt_group_stages_valid(const struct hk_ray_tracing_group *group,
+                         uint32_t stage_count,
+                         const VkShaderStageFlagBits *stages)
+{
+   return hk_rt_group_indices_valid(group, stage_count) &&
+          hk_rt_slot_takes(group->recursive_index, stages,
+                           VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                              VK_SHADER_STAGE_MISS_BIT_KHR |
+                              VK_SHADER_STAGE_CALLABLE_BIT_KHR |
+                              VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) &&
+          hk_rt_slot_takes(group->ahit_index, stages,
+                           VK_SHADER_STAGE_ANY_HIT_BIT_KHR) &&
+          hk_rt_slot_takes(group->isec_index, stages,
+                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR);
+}
+
 struct hk_ray_tracing_group
 hk_rt_group_rebase(struct hk_ray_tracing_group src, uint32_t stage_base)
 {

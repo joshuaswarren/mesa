@@ -175,11 +175,16 @@ agx_fence_snapshot_syncobj(struct agx_context *ctx, uint32_t *out_syncobj)
       return false;
 
    /* Common path with no deferred server-wait fence: snapshot ctx->syncobj
-    * directly into a fresh syncobj via DRM_IOCTL_SYNCOBJ_TRANSFER, avoiding
-    * sync_file allocation and fd install/close on every glFenceSync().
-    * agx_fence_get_fd() exports a sync_file lazily only when requested.
-    */
+    * without allocating a sync_file. */
    if (ctx->in_sync_fd < 0) {
+      /* The private submit output already contains an immutable snapshot.
+       * Further fences on the same batch can snapshot its reusable syncobj. */
+      if (ctx->last_submit_fence) {
+         *out_syncobj = ctx->last_submit_fence;
+         ctx->last_submit_fence = 0;
+         return true;
+      }
+
       uint32_t syncobj = 0;
 
       ret = drmSyncobjCreate(dev->fd, 0, &syncobj);

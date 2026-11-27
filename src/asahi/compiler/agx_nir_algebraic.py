@@ -622,6 +622,14 @@ fold_ubyte_to_float = [
 ]
 
 # |a - b| of two unsigned bytes: their 16-bit differences a - b and b - a are
+# opt_selects hoists single-use negations out of select trees so the final
+# negation can fold into a downstream add, but it runs after
+# nir_opt_algebraic_late, which is what forms isub. Fold it here: a separate
+# ineg costs a zero and a subtract on AGX3, the isub is one instruction.
+fold_ineg_add = [
+    (('iadd', a, ('ineg', b)), ('isub', a, b)),
+]
+
 # |a - b| and 2^16 - |a - b| > 255 (or both 0), so the smaller one is the
 # magnitude. Two independent 16-bit subtracts and an unsigned minimum replace
 # the widened subtract, its negation and the signed maximum.
@@ -823,6 +831,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       opt_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pixel_coord",
                                       fold_pixel_coord).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_ineg_add",
+                                      fold_ineg_add).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_extract16_bfe",
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_doubled_add",

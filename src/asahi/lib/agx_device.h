@@ -700,6 +700,40 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
    };
 }
 
+/* Sibling kernel queues for one context's compute work. Firmware runs the
+ * compute kicks of one context's kernel queues at the same time, so
+ * independent compute submissions spread over several of them overlap
+ * instead of running back to back. Borealis measured three queues as the
+ * best split, and a gain only with at least two earlier submissions still in
+ * flight: with one, both kicks run at half speed and finish together
+ * (hk_queue.c). Overlap pays where one dispatch cannot fill the GPU's memory
+ * pipeline and costs where two compete for the same execution units: on the
+ * A18 Pro a stream of 4M-thread copy dispatches went 42 % faster, 262144-
+ * thread FMA dispatches broke even (+0.3 %) and 65536-thread divergent ones
+ * lost 4.6 %, so dispatches below 262144 threads stay on one queue.
+ */
+#define AGX_SIBLING_COMPUTE_QUEUES      3
+#define AGX_SIBLING_COMPUTE_MIN_IN_FLIGHT 2
+#define AGX_SIBLING_COMPUTE_MIN_THREADS (1u << 18)
+
+/* Whether the kernel lets userspace spread a context's compute over sibling
+ * kernel queues and keep completion ordered: independent queues, cumulative
+ * output signals (a submission's outputs include the earlier points of a
+ * private timeline) and input syncs that every command of a submission
+ * waits on. A kernel that already spreads one queue's compute over firmware
+ * channels itself (COMPUTE_MULTI_CHANNEL) needs no siblings.
+ */
+static inline bool
+agx_sibling_compute_supported(const struct agx_device *dev)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
+                             DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
+                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) &&
+          (dev->params.features & required) == required &&
+          !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
+}
+
 /*
  * Whether the kernel sizes each render's firmware pools from the programs the
  * render runs. The M5 Pro and M5 Max (G17S, G17C) run on the G17 kernel

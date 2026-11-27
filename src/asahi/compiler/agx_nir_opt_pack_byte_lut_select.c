@@ -15,7 +15,7 @@
  * dynamic byte extract:
  *
  *    w   = select_word(idx, w0 .. w_{W-1})
- *    val = (w >> ((idx & 3) << 3)) & 0xff
+ *    val = ubitfield_extract(w, (idx & 3) << 3, 8)
  *
  * This cuts both live register pressure across the loop (up to 4x) and dynamic
  * select count inside the loop body.
@@ -280,6 +280,27 @@ emit_byte_as_u16(nir_builder *b, nir_scalar leaf)
    return nir_u2u16(b, v);
 }
 
+/* idx & 3, the byte of the selected word. When the index is itself a
+ * constant mask of a wider value (the usual idx = i & 15), mask that value
+ * directly: (x & c) & 3 == x & (c & 3). */
+static nir_def *
+byte_lane_of_index(nir_builder *b, nir_scalar idx)
+{
+   nir_scalar s = nir_scalar_chase_movs(idx);
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iand) {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar c = nir_scalar_chase_alu_src(s, i);
+         if (nir_scalar_is_const(c)) {
+            nir_scalar x = nir_scalar_chase_alu_src(s, 1 - i);
+            return nir_iand_imm(b, nir_channel(b, x.def, x.comp),
+                                nir_scalar_as_uint(c) & 3);
+         }
+      }
+   }
+
+   return nir_iand_imm(b, nir_channel(b, idx.def, idx.comp), 3);
+}
+
 static bool
 try_pack_lut_select(nir_alu_instr *root, nir_loop *loop, nir_block *pre,
                     struct set *visited)
@@ -428,8 +449,12 @@ try_pack_lut_select(nir_alu_instr *root, nir_loop *loop, nir_block *pre,
       word = nir_bcsel(&b, nir_ult_imm(&b, idx_val, 8), w01, w23);
    }
 
-   nir_def *shift = nir_ishl_imm(&b, nir_iand_imm(&b, idx_val, 3), 3);
-   nir_def *val32 = nir_iand_imm(&b, nir_ushr(&b, word, shift), 0xff);
+   /* The byte offset is 0, 8, 16 or 24: always inside the word, so the
+    * extract needs no modulo-32 count and is one masked bitfield extract,
+    * where a shift and a separate 0xff mask would be two operations plus the
+    * count wrap a variable shift needs. */
+   nir_def *offset = nir_ishl_imm(&b, byte_lane_of_index(&b, idx), 3);
+   nir_def *val32 = nir_ubitfield_extract(&b, word, offset, nir_imm_int(&b, 8));
 
    /* When a narrowed select tree feeds u2u32 directly, bypass the narrow->wide
     * round-trip since `val32` is already zero-extended in [0, 255]. */

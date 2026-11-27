@@ -346,14 +346,16 @@ enum agx_chip_quirk {
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
      AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS |                \
-        AGX_QUIRK_HW_TXF_BOUNDS,                                               \
+        AGX_QUIRK_HW_TXF_BOUNDS | AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,     \
      __VA_ARGS__)                                                              \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
      AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
-        AGX_QUIRK_M5_LAYER_OPERAND,                                            \
+        AGX_QUIRK_M5_LAYER_OPERAND |                                           \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS,                               \
      __VA_ARGS__)                                                              \
    X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY,                    \
@@ -804,6 +806,13 @@ agx_chip_command_stream_generation(enum agx_chip chip)
  * agx_cdm_barrier() emitter produces. */
 #define AGX_CDM_BARRIER_FULL_WORD 0xfffffu
 
+/* Pure compute-to-compute SSBO CDM barrier word on AGX2: bits {5,6,8}
+ * (cross-core L1/L2 memory coherency + execution drain) without bit 3
+ * (USC cache invalidate) or PBE/texture-cache maintenance bits {0,1,2,4,7}.
+ * Valid only between compute launches in the same open CDM stream when no
+ * images, textures, samplers, UBOs, transfers, or host accesses intervene. */
+#define AGX_CDM_BARRIER_SSBO_WORD 0x160u
+
 /* The default flag word of the AGX2 CDM barrier record Borealis emits at a
  * tracked compute dependency (hk_cdm_flush()). The reduced word 0x1ff
  * (unk_0..8, PBE/texture-cache maintenance included) is the set measured on
@@ -823,9 +832,21 @@ agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
    return AGX_CDM_BARRIER_FULL_WORD;
 }
 
+/* The reduced AGX2 CDM barrier word for pure compute-to-compute storage-buffer
+ * dependencies inside an open CDM stream (hk_CmdPipelineBarrier2 /
+ * hk_cdm_flush()). Derived from the device's measured default word so no chip
+ * list is added: parts already on the 0x1ff default word drop bit 3 (USC cache
+ * invalidate) and PBE/texture-cache maintenance bits {0,1,2,4,7} to emit
+ * 0x160; parts still on the full word keep their default word unchanged. */
+static inline uint32_t
+agx2_cdm_barrier_ssbo_word(uint32_t default_word)
+{
+   return default_word == 0x1ffu ? AGX_CDM_BARRIER_SSBO_WORD : default_word;
+}
+
 /* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
  * full word once the device holds a sparse resource or under
- * fullcdmbarrier, the chip's default word otherwise. */
+ * fullcdmbarrier, the caller-selected chip word otherwise. */
 static inline uint32_t
 agx2_cdm_barrier_emit_word(uint32_t default_word, bool sparse_used,
                            bool force_full)
@@ -1120,6 +1141,18 @@ static inline bool
 agx_chip_has_depth_clip_control(enum agx_chip chip)
 {
    return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether Borealis enables shader-reconstructed single-plane packed 4:2:2
+ * YCbCr formats (8/10/12/16-bit views backed by plain RGBA word textures and
+ * reconstructed in NIR) and 10/12-bit YCbCr plane UNORM range restoration.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C); AGX2 keeps
+ * its existing path and other HAL300 encodings such as AGX3D (G18G) stay off
+ * until qualified on their hardware. */
+static inline bool
+agx_chip_has_packed_ycbcr(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15

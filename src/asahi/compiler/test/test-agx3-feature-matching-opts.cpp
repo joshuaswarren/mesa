@@ -236,6 +236,10 @@ TEST(FeatureMatchingOpts, PackByteLutSelect16Exact)
    NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
    NIR_PASS(_, b.shader, nir_opt_dce);
    ASSERT_EQ(count_alu_op(b.shader, nir_op_bcsel), 15u);
+   /* The loop position i (its phi, past the copy nir_lower_vars_to_ssa
+    * leaves), from which idx = i & 15. */
+   nir_def *i_def =
+      nir_scalar_chase_movs(nir_get_scalar(nir_def_as_alu(idx_def)->src[0].src.ssa, 0)).def;
 
    EXPECT_TRUE(agx_nir_opt_pack_byte_lut_select(b.shader));
    NIR_PASS(_, b.shader, nir_opt_dce);
@@ -245,17 +249,24 @@ TEST(FeatureMatchingOpts, PackByteLutSelect16Exact)
    EXPECT_EQ(count_alu_op(b.shader, nir_op_bcsel), 3u);
    EXPECT_EQ(count_alu_op(b.shader, nir_op_pack_32_2x16_split), 4u);
 
-   /* Exhaustively check all 16 indices against distinct byte values. */
+   /* Exhaustively check every loop position (the index is i & 15, so 16..23
+    * wrap) against distinct byte values, evaluating from i itself: the packed
+    * read may take its byte lane straight from i. */
    const uint8_t sample[16] = {
       0x13, 0xa7, 0x00, 0xff, 0x42, 0x89, 0x5c, 0xde,
       0x01, 0x7f, 0x80, 0x3b, 0xc4, 0x61, 0x9e, 0x28,
    };
    nir_alu_instr *sum_alu = nir_def_as_alu(lut_user);
    nir_scalar val_s = nir_scalar_resolved(sum_alu->src[1].src.ssa, 0);
-   for (unsigned k = 0; k < 16; ++k) {
-      EXPECT_EQ(eval_lut_expr(val_s, sample, leaves, idx_def, k), sample[k])
-         << "index " << k;
+   for (unsigned k = 0; k < 24; ++k) {
+      EXPECT_EQ(eval_lut_expr(val_s, sample, leaves, i_def, k),
+                sample[k & 15])
+         << "position " << k;
    }
+
+   /* One bitfield extract reads the byte: no variable shift and mask. */
+   EXPECT_EQ(count_alu_in_loops(b.shader, nir_op_ubitfield_extract), 1u);
+   EXPECT_EQ(count_alu_in_loops(b.shader, nir_op_ushr), 0u);
    ralloc_free(b.shader);
 }
 

@@ -70,10 +70,8 @@ target_chip(const char *target)
       return AGX_CHIP_G15G;
    else if (!strcmp(target, "g16g"))
       return AGX_CHIP_G16G;
-   /* G18G compiles as G17G (agx3c) and re-encodes its code as agx3d, exactly
-    * as the driver's own compiles do (agx_device_key::emit_agx3d). */
    else if (!strcmp(target, "g18g"))
-      return AGX_CHIP_G17G;
+      return AGX_CHIP_G18G;
    else if (!strcmp(target, "g13x"))
       return AGX_CHIP_G13X;
    else
@@ -94,26 +92,21 @@ target_is_native_hal200(const char *target)
    return agx_chip_native_hal200(target_chip(target));
 }
 
-/* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
- * one. */
+/* Whether a target executes AGX3 code. */
 static bool
 target_is_agx3(const char *target)
 {
-   const enum agx_chip chip = target_chip(target);
-   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+   return agx_encoding_is_agx3(agx_chip_isa_encoding(target_chip(target)));
 }
 
 /* Whether a target decompresses spilled compressed colour attachments in place
  * (libagx_agx3_decompress, and libagx_reset_compression_metadata for the
  * attachments a pass discards): native HAL200, and the chips with private
- * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). g18g compiles as G17G
- * (target_chip()) but is asked about as itself, which has no Gen10
- * compression. */
+ * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). */
 static bool
 target_has_spill_decompress(const char *target)
 {
-   const enum agx_chip chip =
-      !strcmp(target, "g18g") ? AGX_CHIP_G18G : target_chip(target);
+   const enum agx_chip chip = target_chip(target);
    return agx_chip_native_hal200(chip) ||
           agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION);
 }
@@ -377,7 +370,7 @@ target_supports_program(const char *target, const nir_function *func)
     *
     * G18G launches these through the G17G-family compute profile; it takes
     * the qualified list below, without fast clear and with the hardware
-    * tessellator. target_is_agx3() covers it: its target chip is G17G.
+    * tessellator.
     *
     * Tessellation runs as libagx_tess_isoline/tri/quad (libagx_tessellate is
     * only the tessellator.h macro choosing one), qualified below for every
@@ -735,19 +728,7 @@ main(int argc, char **argv)
                .has_scratch = target_is_agx3(*target),
             };
 
-            key.dev.encoding = !strcmp(*target, "g17g")
-                                  ? AGX_ISA_ENCODING_AGX3C
-                                  : target_is_native_agx3(*target)
-                                  ? AGX_ISA_ENCODING_AGX3B
-                                  : AGX_ISA_ENCODING_AGX2;
-            key.dev.chip = target_chip(*target);
-
-            if (!strcmp(*target, "g18g")) {
-               /* The device key agx_gather_device_key() builds for G18G. */
-               key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-               key.dev.chip = AGX_CHIP_G17G;
-               key.dev.emit_agx3d = true;
-            }
+            agx_device_key_set_target(&key.dev, target_chip(*target));
 
             if (has_atomic) {
                key.dev.needs_g13x_coherency =

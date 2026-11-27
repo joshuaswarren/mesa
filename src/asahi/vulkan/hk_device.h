@@ -135,10 +135,10 @@ struct hk_device {
    struct agx_device dev;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
-   /* Live buffers and image planes with a GPU virtual address of their own
-    * (sparse binding, capture/replay buffers), and memory mapped again for
-    * descriptor buffer capture/replay, atomic (hk_device_va_alias_get()).
-    * Their memory is also mapped at another address, see
+   /* Live resources through which memory has or may have a second GPU virtual
+    * address: sparse/capture-replay buffers and image planes, capture/replay
+    * memory mappings (hk_device_va_alias_get()), fd/dma-buf imports, and host
+    * imports that may alias (hk_host_import_track()). Atomic; see
     * hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
@@ -460,10 +460,6 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
-   /* Unconditional per-launch CDM barrier (disables tracking). */
-   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(9),
-   /* Opt into dependency tracking on chips where it is not the default. */
-   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(10),
    /* Force the full CDM barrier word on every chip (perftest only). */
    HK_PERF_FULLCDMBARRIER = BITFIELD_BIT(11),
 };
@@ -487,7 +483,7 @@ enum hk_perftest {
  * dynamic mode is active.
  *
  * On G17P, memory scope is selected at barrier recording time whenever
- * va_alias_resources != 0 (live sparse, capture/replay, fd, or writable host
+ * va_alias_resources != 0 (live sparse, capture/replay, fd, or aliasing host
  * imports). The flush is emitted into an open compute stream holding work;
  * earlier closed streams already flushed at stream end.
  *
@@ -685,6 +681,9 @@ hk_device_alloc_scratch(struct hk_device *dev, mesa_shader_stage stage,
  * launch programs (hk_cmd_draw.c). */
 void hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev);
 void hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev);
+
+/* Alignment of every hk_code_alloc() offset. */
+#define HK_CODE_ALIGNMENT 256
 
 /* Allocate size bytes of executable memory. Returns a reference to the chunk
  * BO holding it, with the allocation at *offset; release it with

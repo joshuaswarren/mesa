@@ -187,6 +187,8 @@ static const struct drm_asahi_params_global params_g16s_as = {
  * generation 3, HAL 200, and soft faults on because fault_control defaults to
  * 0xb.  Select with ASAHI_SHIM_CHIP=g17p.  This exists so the Honeykrisp G17P
  * shader and command-stream paths can be exercised without hardware.
+ * ASAHI_SHIM_RENDER_RAY_QUERY=1 adds the render ray query feature of kernels
+ * that admit them, which G17P ray tracing pipelines need (shim_features()).
  */
 static const struct drm_asahi_params_global params_g17p = {
    .features = DRM_ASAHI_FEATURE_SOFT_FAULTS |
@@ -1573,6 +1575,10 @@ shim_features(void)
       features |= DRM_ASAHI_FEATURE_VM_STATUS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS_MIRROR"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
+   /* A kernel that admits render ray queries, which G17P ray tracing
+    * pipelines need; the shim executes nothing either way. */
+   if (shim_env_on("ASAHI_SHIM_RENDER_RAY_QUERY"))
+      features |= DRM_ASAHI_FEATURE_RENDER_RAY_QUERY;
    /* An M5 kernel without the compressed multisample ZLS opt-in, as the
     * M5 Max (J775c) kernel reports its features: its render validation, and
     * so the M5 submission gate, then refuses a single-layer multisample

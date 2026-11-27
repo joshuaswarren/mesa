@@ -198,6 +198,9 @@ enum agx3_barrier_scope {
    /* A memory-only fence over threadgroup memory: the threadgroup-memory
     * barrier without its rendezvous (see agx3_pack_scoped_barrier()). */
    AGX3_BARRIER_SCOPE_THREADGROUP_FENCE,
+   /* AGX3B only: a workgroup barrier over the compute imageblock, between a
+    * workgroup's imageblock stores and its block store. */
+   AGX3_BARRIER_SCOPE_IMAGEBLOCK,
 };
 
 struct agx3_encoded_scoped_barrier {
