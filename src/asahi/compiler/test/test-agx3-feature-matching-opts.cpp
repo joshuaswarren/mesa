@@ -1026,9 +1026,10 @@ TEST(FeatureMatchingOpts, LicmDirectConstLoadsHoistsSpeculatableBoundedUbo)
       nir_break_if(&b, nir_ige(&b, i, n));
 
       nir_def *desc = nir_load_global_constant(
-         &b, 4, 32, nir_iadd_imm(&b, root, 64), .align_mul = 16,
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
          .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
-                                         ACCESS_BUFFER_DESCRIPTOR_AGX));
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
       nir_def *bound = nir_usub_sat(&b, nir_channel(&b, desc, 2), nir_imm_int(&b, 3));
       nir_def *valid = nir_ult(&b, nir_imm_int(&b, 4), bound);
       nir_def *base = nir_bcsel(
@@ -1036,10 +1037,11 @@ TEST(FeatureMatchingOpts, LicmDirectConstLoadsHoistsSpeculatableBoundedUbo)
          nir_pack_64_2x32_split(&b, nir_channel(&b, desc, 0), nir_channel(&b, desc, 1)),
          nir_imm_int64(&b, AGX_ZERO_PAGE_ADDRESS));
       nir_def *k = nir_load_global_constant(
-         &b, 1, 32, nir_iadd_imm(&b, base, 4), .align_mul = 4,
+         &b, 1, 32, nir_iadd_imm(&b, base, 4),
          .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
                                          ACCESS_CAN_REORDER |
-                                         ACCESS_CAN_SPECULATE));
+                                         ACCESS_CAN_SPECULATE),
+         .align_mul = 4);
 
       /* Unrelated loop-invariant integer math stays inside the loop. */
       nir_def *row_off = nir_imul(&b, tid, stride);
@@ -1079,14 +1081,16 @@ TEST(FeatureMatchingOpts, LicmDirectConstLoadsRejectsUnspeculatable)
       nir_def *i = nir_load_var(&b, iv);
       nir_break_if(&b, nir_ige(&b, i, n));
       nir_def *desc = nir_load_global_constant(
-         &b, 4, 32, nir_iadd_imm(&b, root, 64), .align_mul = 16,
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
          .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
-                                         ACCESS_BUFFER_DESCRIPTOR_AGX));
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
       nir_def *base =
          nir_pack_64_2x32_split(&b, nir_channel(&b, desc, 0), nir_channel(&b, desc, 1));
       nir_def *k = nir_load_global_constant(
-         &b, 1, 32, nir_iadd_imm(&b, base, 4), .align_mul = 4,
-         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER));
+         &b, 1, 32, nir_iadd_imm(&b, base, 4),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .align_mul = 4);
       nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), k), 1);
       nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
    }
@@ -1114,10 +1118,11 @@ TEST(FeatureMatchingOpts, BoundedDynamicUboPromotesToUniformDma)
          nir_pack_64_2x32_split(b, nir_channel(b, desc, 0), nir_channel(b, desc, 1)),
          nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
       return nir_load_global_constant(
-         b, 1, 32, nir_iadd_imm(b, base, offset_B), .align_mul = 4,
+         b, 1, 32, nir_iadd_imm(b, base, offset_B),
          .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
                                          ACCESS_CAN_REORDER |
-                                         ACCESS_CAN_SPECULATE));
+                                         ACCESS_CAN_SPECULATE),
+         .align_mul = 4);
    };
 
    /* 1. Vertex shader with bounded dynamic UBO load + 1 cheap ALU op drops its
@@ -1130,9 +1135,10 @@ TEST(FeatureMatchingOpts, BoundedDynamicUboPromotesToUniformDma)
 
       nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
       nir_def *desc = nir_load_global_constant(
-         &b, 4, 32, nir_iadd_imm(&b, root, 64), .align_mul = 16,
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
          .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
-                                         ACCESS_BUFFER_DESCRIPTOR_AGX));
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
       nir_def *v0 = make_bounded_read(&b, desc, 0, 3);
       nir_def *v1 = make_bounded_read(&b, desc, 4, 3);
       nir_def *vid = nir_load_vertex_id(&b);
@@ -1175,9 +1181,10 @@ TEST(FeatureMatchingOpts, BoundedDynamicUboPromotesToUniformDma)
 
       nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
       nir_def *desc = nir_load_global_constant(
-         &b, 4, 32, nir_iadd_imm(&b, root, 64), .align_mul = 16,
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
          .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
-                                         ACCESS_BUFFER_DESCRIPTOR_AGX));
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
       nir_def *v = make_bounded_read(&b, desc, 4, 7);
       nir_def *vid = nir_load_vertex_id(&b);
       nir_def *x = nir_fadd(&b, nir_u2f32(&b, vid), v);

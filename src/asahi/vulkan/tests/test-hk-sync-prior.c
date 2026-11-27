@@ -2308,6 +2308,19 @@ test_discard_transition_carry(void)
    T("merged transition does not take the carried transfer requirement",
      dispatch->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
         dispatch->sync.prior[HK_SYNC_VDM] == 0);
+
+   /* Merging a pre-graphics CDM stream that carries a geometry heap slot into
+    * a preceding compute stream preserves the heap slot and slot pointer. */
+   struct hk_cmd_buffer *hc = new_cmd();
+   struct hk_cs *api_cs = add(hc, true);
+   struct hk_cs *pre_cs = add(hc, true);
+   pre_cs->sync.heap_slot = 3;
+   hc->sync.last_heap_slot[2][HK_SYNC_CDM] = pre_cs;
+   hk_sync_merge(hc, api_cs, pre_cs);
+   list_del(&pre_cs->node);
+   T("merged pre-graphics stream preserves heap_slot and last_heap_slot",
+     api_cs->sync.heap_slot == 3 &&
+        hc->sync.last_heap_slot[2][HK_SYNC_CDM] == api_cs);
 }
 
 static void
