@@ -9,6 +9,7 @@
 #include <strings.h>
 
 #include "util/bitscan.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/macros.h"
 #include "hk_cmd_buffer.h"
@@ -303,6 +304,7 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
    return cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
           cs->pack_threads <= HK_PACK_MAX_THREADS &&
           cs->pack_static_work <= HK_PACK_MAX_STATIC_WORK &&
+          (!cs->pack_loops || m->obs_ns <= HK_PACK_MAX_OBS_NS) &&
           m->bytes <= UINT32_MAX - limits->overhead &&
           cs->compute_resources.size <= UINT16_MAX &&
           cs->compute_attachments.count <= limits->max_attachments;
@@ -335,7 +337,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    size_t resources = 0;
    uint32_t attachments = 0;
    uint8_t kinds = 0, waits = 0, tails[HK_SYNC_NUM_KINDS] = {0};
-   bool loops = false;
+   bool unbounded_loops = false;
+   uint64_t obs_ns = 0;
 
    *packed_members = 0;
    *total = 0;
@@ -343,12 +346,16 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    for (unsigned i = 0; i <= n; ++i) {
       const struct hk_pack_member *m = i < n ? &members[i] : NULL;
       const struct hk_cs *cs = m ? m->cs : NULL;
+      const bool m_unbounded = cs && cs->pack_loops && !m->obs_ns;
+      const uint64_t m_obs = (cs && cs->pack_loops) ? m->obs_ns : 0;
 
       const bool fits = cs && run.count &&
          !(m->render_ran && (m->kinds & ~kinds)) &&
          !((m->render_waits | hk_pack_tail(tails, kinds | m->kinds)) &
            ~waits) &&
-         !(loops && cs->pack_loops) &&
+         !(unbounded_loops && cs->pack_loops) &&
+         !(m_unbounded && obs_ns > 0) &&
+         m_obs <= HK_PACK_MAX_OBS_NS - obs_ns &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
          cs->pack_threads <= HK_PACK_MAX_THREADS - threads &&
          cs->pack_static_work <= HK_PACK_MAX_STATIC_WORK - work &&
@@ -367,7 +374,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          kinds |= m->kinds;
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
             tails[k] |= m->render_tail[k];
-         loops |= cs->pack_loops;
+         unbounded_loops |= m_unbounded;
+         obs_ns += m_obs;
          continue;
       }
 
@@ -383,6 +391,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       dispatches = threads = work = 0;
       resources = 0;
       attachments = 0;
+      unbounded_loops = false;
+      obs_ns = 0;
 
       /* Start a new run with this member when it is within the bounds. */
       if (cs && hk_pack_within_bounds(m, limits)) {
@@ -395,7 +405,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          kinds = m->kinds;
          waits = m->render_waits;
          memcpy(tails, m->render_tail, sizeof(tails));
-         loops = cs->pack_loops;
+         unbounded_loops = m_unbounded;
+         obs_ns = m_obs;
       }
    }
 
@@ -765,4 +776,56 @@ hk_pack_liveness_step_backward(struct hk_pack_liveness_state *st,
       hk_pack_liveness_add_overwrite(st, &fp->writes[i]);
    for (unsigned i = 0; i < fp->num_reads; ++i)
       hk_pack_liveness_kill_read(st, &fp->reads[i]);
+}
+
+void
+hk_pack_obs_retire_entries(struct hk_pack_obs_entry *entries,
+                           unsigned slot_count, uint32_t *obs_pending,
+                           uint64_t *obs_epoch, uint64_t signalled,
+                           uint64_t sig_point, uint64_t sig_ns,
+                           uint64_t now_ns)
+{
+   for (unsigned i = 0; i < slot_count; ++i) {
+      struct hk_pack_obs_entry *e = &entries[i];
+      if (!e->pending_pt || e->pending_pt > signalled)
+         continue;
+
+      const uint64_t done_ns =
+         (e->pending_pt <= sig_point && sig_ns > e->submit_ns &&
+          sig_ns <= now_ns)
+            ? sig_ns
+            : now_ns;
+      const uint64_t elapsed_ns =
+         done_ns > e->submit_ns ? done_ns - e->submit_ns : 1000ull;
+      e->pending_pt = 0;
+      p_atomic_dec(obs_pending);
+
+      if (!e->in_flight_packed) {
+         if (elapsed_ns <= HK_PACK_OBS_ADMIT_NS && e->loop_count >= 2) {
+            const uint64_t per =
+               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
+            if (per != e->obs_per_loop_ns) {
+               e->obs_per_loop_ns = per;
+               (*obs_epoch)++;
+            }
+         } else if (e->obs_per_loop_ns != 0) {
+            e->obs_per_loop_ns = 0;
+            (*obs_epoch)++;
+         }
+      } else {
+         if (elapsed_ns > HK_PACK_OBS_ADMIT_NS) {
+            if (e->obs_per_loop_ns != 0) {
+               e->obs_per_loop_ns = 0;
+               (*obs_epoch)++;
+            }
+         } else if (elapsed_ns > HK_PACK_OBS_BACKOFF_NS && e->loop_count >= 2) {
+            const uint64_t per =
+               MAX2(1000ull, (elapsed_ns + e->loop_count - 1u) / e->loop_count);
+            if (per > e->obs_per_loop_ns) {
+               e->obs_per_loop_ns = per;
+               (*obs_epoch)++;
+            }
+         }
+      }
+   }
 }

@@ -3087,7 +3087,119 @@ struct hk_packed_runs {
    struct hk_packed_submit *packets;
    struct vk_command_buffer **commands;
    unsigned command_count;
+   uint64_t cb_hash;
+   uint32_t loop_count;
+   bool obs_used;
 };
+
+static uint64_t
+hk_pack_obs_hash(const struct vk_queue_submit *submit,
+                 const struct hk_pack_member *members)
+{
+   uint64_t h = UINT64_C(14695981039346656037);
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      h ^= (uint64_t)(uintptr_t)submit->command_buffers[i];
+      h *= UINT64_C(1099511628211);
+      const struct hk_cs *cs = members[i].cs;
+      if (cs) {
+         h ^= cs->addr;
+         h *= UINT64_C(1099511628211);
+         h ^= (uint64_t)members[i].bytes;
+         h *= UINT64_C(1099511628211);
+         h ^= ((uint64_t)cs->stats.cmds << 1) | (uint64_t)cs->pack_loops;
+         h *= UINT64_C(1099511628211);
+         h ^= cs->pack_threads ^ cs->pack_static_work;
+         h *= UINT64_C(1099511628211);
+      } else {
+         h ^= UINT64_C(0x9e3779b97f4a7c15);
+         h *= UINT64_C(1099511628211);
+      }
+   }
+   return h ? h : 1u;
+}
+
+static void
+hk_pack_obs_retire(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!p_atomic_read(&queue->pack.obs_pending))
+      return;
+
+   uint64_t signalled = p_atomic_read(&queue->drm.signalled_value);
+   bool need_query = false;
+   for (unsigned i = 0; i < HK_PACK_OBS_SLOTS; ++i) {
+      if (queue->pack.obs[i].pending_pt > signalled) {
+         need_query = true;
+         break;
+      }
+   }
+   if (need_query && queue->drm.syncobj) {
+      uint64_t pt = 0;
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &pt, 1) == 0 &&
+          pt > signalled) {
+         hk_queue_note_signalled(queue, pt);
+         signalled = p_atomic_read(&queue->drm.signalled_value);
+      }
+   }
+
+   const uint64_t sig_point = p_atomic_read(&queue->drm.signalled_ns_point);
+   const uint64_t sig_ns = p_atomic_read(&queue->drm.signalled_ns);
+   const uint64_t now_ns = (uint64_t)os_time_get_nano();
+   hk_pack_obs_retire_entries(queue->pack.obs, HK_PACK_OBS_SLOTS,
+                              &queue->pack.obs_pending, &queue->pack.obs_epoch,
+                              signalled, sig_point, sig_ns, now_ns);
+}
+
+static uint64_t
+hk_pack_obs_lookup(struct hk_queue *queue, uint64_t hash, uint32_t cb_count)
+{
+   for (unsigned i = 0; i < HK_PACK_OBS_SLOTS; ++i) {
+      struct hk_pack_obs_entry *e = &queue->pack.obs[i];
+      if (e->hash == hash && e->cb_count == cb_count) {
+         e->lru_tick = ++queue->pack.obs_tick;
+         return e->obs_per_loop_ns;
+      }
+   }
+   return 0;
+}
+
+static void
+hk_pack_obs_arm(struct hk_queue *queue, uint64_t hash, uint32_t cb_count,
+                uint32_t loop_count, bool packed, uint64_t pt)
+{
+   if (!hash || loop_count < 2 || !pt)
+      return;
+
+   struct hk_pack_obs_entry *slot = NULL;
+   for (unsigned i = 0; i < HK_PACK_OBS_SLOTS; ++i) {
+      struct hk_pack_obs_entry *e = &queue->pack.obs[i];
+      if (e->hash == hash && e->cb_count == cb_count) {
+         slot = e;
+         break;
+      }
+   }
+   if (!slot) {
+      for (unsigned i = 0; i < HK_PACK_OBS_SLOTS; ++i) {
+         struct hk_pack_obs_entry *e = &queue->pack.obs[i];
+         if (e->pending_pt)
+            continue;
+         if (!slot || e->lru_tick < slot->lru_tick)
+            slot = e;
+      }
+      if (!slot)
+         return;
+      memset(slot, 0, sizeof(*slot));
+      slot->hash = hash;
+      slot->cb_count = cb_count;
+   }
+   if (slot->pending_pt)
+      return;
+   slot->loop_count = loop_count;
+   slot->pending_pt = pt;
+   slot->submit_ns = (uint64_t)os_time_get_nano();
+   slot->in_flight_packed = packed;
+   slot->lru_tick = ++queue->pack.obs_tick;
+   p_atomic_inc(&queue->pack.obs_pending);
+}
 
 static void
 hk_queue_pack_free_packets(struct hk_queue *queue)
@@ -4931,7 +5043,8 @@ compute_pair_emitted_footprint(const struct vk_queue_submit *submit,
 
 static bool
 hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
-             const struct vk_queue_submit *submit, struct hk_packed_runs *out)
+             const struct vk_queue_submit *submit, bool submit_is_original,
+             struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
    const unsigned n = submit->command_buffer_count;
@@ -4943,6 +5056,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    const size_t terminate_size = hk_pack_cdm_terminate(dev->dev.chip, terminate);
    if (!terminate_size)
       return false;
+
+   hk_pack_obs_retire(dev, queue);
 
    const bool visible_completion =
       hk_pack_boundary(dev) == HK_PACK_BOUNDARY_VISIBLE_COMPLETION;
@@ -4975,6 +5090,25 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       members, dev, &queue->sync,
       (struct hk_cmd_buffer *const *)submit->command_buffers, n, terminate,
       atomics);
+
+   uint32_t loop_count = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      if (members[i].cs && members[i].cs->pack_loops)
+         loop_count++;
+   }
+   out->loop_count = loop_count;
+   if (submit_is_original && !dev->dev.is_virtio && loop_count >= 2) {
+      out->cb_hash = hk_pack_obs_hash(submit, members);
+      const uint64_t obs_per_loop_ns =
+         hk_pack_obs_lookup(queue, out->cb_hash, n);
+      if (obs_per_loop_ns > 0) {
+         for (unsigned i = 0; i < n; ++i) {
+            if (members[i].cs && members[i].cs->pack_loops)
+               members[i].obs_ns = obs_per_loop_ns;
+         }
+         out->obs_used = true;
+      }
+   }
 
    const bool pair_safe =
       agx_chip_native_or_m5(dev->dev.chip) && compute_pair_submit_safe(submit);
@@ -5018,7 +5152,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                run_work = members[j].cs->pack_static_work > UINT64_MAX - run_work
                              ? UINT64_MAX
                              : run_work + members[j].cs->pack_static_work;
-               if (members[j].cs->pack_loops)
+               if (members[j].cs->pack_loops && !members[j].obs_ns)
                   run_loops++;
             }
          }
@@ -5523,7 +5657,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                         replaced_overflow = true;
                         break;
                      }
-                     if (members[j].cs->pack_loops)
+                     if (members[j].cs->pack_loops && !members[j].obs_ns)
                         replaced_loops++;
                   }
                }
@@ -5533,7 +5667,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                              members[dual2_idx].cs->pack_static_work,
                                              &replaced_work)) {
                      replaced_overflow = true;
-                  } else if (members[dual2_idx].cs->pack_loops) {
+                  } else if (members[dual2_idx].cs->pack_loops &&
+                             !members[dual2_idx].obs_ns) {
                      replaced_loops++;
                   }
                }
@@ -5542,7 +5677,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                              members[im2_idx].cs->pack_static_work,
                                              &replaced_work)) {
                      replaced_overflow = true;
-                  } else if (members[im2_idx].cs->pack_loops) {
+                  } else if (members[im2_idx].cs->pack_loops &&
+                             !members[im2_idx].obs_ns) {
                      replaced_loops++;
                   }
                }
@@ -5569,7 +5705,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                            replaced_overflow = true;
                            break;
                         }
-                        if (members[j].cs->pack_loops)
+                        if (members[j].cs->pack_loops && !members[j].obs_ns)
                            replaced_loops++;
                      }
                   }
@@ -7015,13 +7151,21 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(alias_dynamic))
       u_rwlock_rdlock(&dev->host_alias.patch_lock);
    struct hk_packed_runs runs;
-   const bool have_runs = hk_pack_runs(dev, queue, submit, &runs);
+   const bool have_runs =
+      hk_pack_runs(dev, queue, submit, submit == original, &runs);
    if (unlikely(alias_dynamic))
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
 
-   if (!have_runs)
-      return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
-                                     untouched);
+   const uint64_t prev_pt = queue->drm.timeline_value;
+   if (!have_runs) {
+      VkResult result = queue_submit_recordings(dev, queue, submit, original,
+                                                NULL, 0, untouched);
+      if (result == VK_SUCCESS && runs.loop_count >= 2 && runs.cb_hash != 0 &&
+          queue->drm.timeline_value > prev_pt)
+         hk_pack_obs_arm(queue, runs.cb_hash, submit->command_buffer_count,
+                         runs.loop_count, false, queue->drm.timeline_value);
+      return result;
+   }
 
    struct vk_queue_submit effective = *submit;
    effective.command_buffer_count = runs.command_count;
@@ -7031,6 +7175,11 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
                                              util_dynarray_num_elements(
                                                 runs.extra_bos, struct agx_bo *),
                                              untouched);
+   if (result == VK_SUCCESS && runs.loop_count >= 2 && runs.cb_hash != 0 &&
+       queue->drm.timeline_value > prev_pt)
+      hk_pack_obs_arm(queue, runs.cb_hash, submit->command_buffer_count,
+                      runs.loop_count, runs.obs_used,
+                      queue->drm.timeline_value);
    hk_packed_runs_free(dev, &runs);
    return result;
 }
