@@ -4494,7 +4494,7 @@ compute_pair_exp_dw_gemm_match(const struct hk_compute_pair_dispatch *exp_im2,
                                const struct hk_dw_a_push *dw_push,
                                struct hk_exp_dw_a_push *exp_push_out)
 {
-   if (!exp_im2 || !exp || !dw || !gemm || !dw_cfg || !dw_push || !exp_push_out ||
+   if (!exp || !dw || !gemm || !dw_cfg || !dw_push || !exp_push_out ||
        exp->info.role != HK_COMPUTE_PAIR_GEMM ||
        dw->info.role != HK_COMPUTE_PAIR_DEPTHWISE ||
        gemm->info.role != HK_COMPUTE_PAIR_GEMM ||
@@ -4531,8 +4531,14 @@ compute_pair_exp_dw_gemm_match(const struct hk_compute_pair_dispatch *exp_im2,
       return false;
    memcpy(&k_proj, gemm->push + p->k_offset_B, sizeof(k_proj));
    memcpy(&k_exp, exp->push + ep_i->k_offset_B, sizeof(k_exp));
-   if (k_proj != 32 || k_exp <= 0 || (uint32_t)k_exp > 28u)
-      return false;
+   if (exp_im2) {
+      if (k_proj != 32 || k_exp <= 0 || (uint32_t)k_exp > 28u)
+         return false;
+   } else {
+      if (k_proj < 16 || (k_proj & 15) != 0 ||
+          k_exp < 8 || k_exp > 24 || (k_exp & 7) != 0)
+         return false;
+   }
 
    /* Gate fusion to large expand intermediates (>= 8 MiB, above L2 across AGX3
     * chips, chosen via A/B between 12 MiB stem and 4 MiB layers) so smaller
@@ -6315,8 +6321,6 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                               break;
                            }
                         }
-                        if (!has_found_im2)
-                           exp_chain_ok = false;
                         if (exp_chain_ok && has_exp) {
                            const struct hk_pack_fuse_plan *epl = &plans[found_exp];
                            const unsigned first_chk = has_found_im2 ? found_exp_im2 : found_exp;

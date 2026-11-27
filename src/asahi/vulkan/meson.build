@@ -1605,6 +1605,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  executable(
+    'vulkan-compute-store-visibility',
+    files('tests/vulkan_compute_store_visibility.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
 endif
 
 if with_tests
