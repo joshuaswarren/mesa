@@ -183,129 +183,186 @@ is_link_to(const uint8_t *at, uint64_t target)
 }
 
 static void
+test_non_local_src(void)
+{
+   const VkPipelineStageFlags2 color =
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+   const VkPipelineStageFlags2 attach =
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | color;
+   const VkAccessFlags2 color_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+
+   T("FS -> color output classifies LOCAL but non-local src",
+     hk_m5_pass_merge_dependency(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, color,
+                                 color_write, false, false) ==
+           HK_M5_MERGE_DEP_LOCAL &&
+        hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                       color));
+   T("ALL_GRAPHICS -> color output is non-local src",
+     hk_m5_pass_merge_dependency(VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, color,
+                                 color_write, false, false) ==
+           HK_M5_MERGE_DEP_LOCAL &&
+        hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                                       color));
+   T("BOTTOM_OF_PIPE -> color output is non-local src",
+     hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                                    color));
+   T("color|FS -> color output is non-local src",
+     hk_m5_pass_merge_non_local_src(
+        color | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, color));
+   T("color -> color output is attachment-local src",
+     !hk_m5_pass_merge_non_local_src(color, color));
+   T("attachment stages -> color output is attachment-local src",
+     !hk_m5_pass_merge_non_local_src(attach, color));
+   T("compute -> color output is outside graphics src",
+     !hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                     color));
+   T("TOP_OF_PIPE -> color output is empty src",
+     !hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                     color));
+   T("FS -> compute does not reach graphics dst",
+     !hk_m5_pass_merge_non_local_src(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+}
+
+static void
 test_continues(void)
 {
    struct hk_render_pack_pass a, b;
 #define RESET() (gbuffer(&a), gbuffer(&b))
    RESET();
    T("identical G-buffer edges continue",
-     !hk_render_pack_continues(&a, &b, false));
+     !hk_render_pack_continues(&a, &b, false, false));
    T("identical G-buffer edges continue across an ordered dependency",
-     !hk_render_pack_continues(&a, &b, true));
+     !hk_render_pack_continues(&a, &b, true, false));
 
    RESET();
    b.att[1].iview = views[3];
-   T("another view refuses", hk_render_pack_continues(&a, &b, false));
+   T("another view refuses", hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[HK_RENDER_PACK_STENCIL] = a.att[HK_RENDER_PACK_DEPTH];
    T("an attachment only B has refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[0].load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
-   T("B clearing refuses", hk_render_pack_continues(&a, &b, false));
+   T("B clearing refuses", hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[HK_RENDER_PACK_DEPTH].load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-   T("B discarding depth refuses", hk_render_pack_continues(&a, &b, false));
+   T("B discarding depth refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[2].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
    T("colour STORE -> DONT_CARE continues",
-     !hk_render_pack_continues(&a, &b, false) &&
-        !hk_render_pack_continues(&a, &b, true));
+     !hk_render_pack_continues(&a, &b, false, false) &&
+        !hk_render_pack_continues(&a, &b, true, false) &&
+        !hk_render_pack_continues(&a, &b, false, true));
    RESET();
    b.att[2].store_op = VK_ATTACHMENT_STORE_OP_NONE;
-   T("colour STORE -> NONE refuses", hk_render_pack_continues(&a, &b, false));
+   T("colour STORE -> NONE refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    a.att[2].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
    b.att[2].store_op = VK_ATTACHMENT_STORE_OP_STORE;
    T("colour DONT_CARE -> STORE refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[HK_RENDER_PACK_DEPTH].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
    T("depth STORE -> DONT_CARE refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
    b.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
    T("final-member colour resolve continues locally",
-     !hk_render_pack_continues(&a, &b, false));
+     !hk_render_pack_continues(&a, &b, false, false));
    b.att[0].flags =
       VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
    T("final-member resolve skip-transfer flag continues",
-     !hk_render_pack_continues(&a, &b, false));
+     !hk_render_pack_continues(&a, &b, false, false));
    T("final-member colour resolve refuses across an ordered dependency",
-     hk_render_pack_continues(&a, &b, true));
+     hk_render_pack_continues(&a, &b, true, false));
+   T("final-member colour resolve refuses after a non-local graphics source",
+     hk_render_pack_continues(&a, &b, false, true));
    RESET();
    b.att[HK_RENDER_PACK_DEPTH].resolve_mode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-   T("depth resolve refuses", hk_render_pack_continues(&a, &b, false));
+   T("depth resolve refuses", hk_render_pack_continues(&a, &b, false, false));
    RESET();
    a.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
    T("continuing after a resolve refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    b.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
-   T("two resolves refuse", hk_render_pack_continues(&a, &b, false));
+   T("two resolves refuse", hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.area.extent.width = 2268;
-   T("another render area refuses", hk_render_pack_continues(&a, &b, false));
+   T("another render area refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.layer_count = 2;
-   T("another layer count refuses", hk_render_pack_continues(&a, &b, false));
+   T("another layer count refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.color_count = 2;
    b.att[2] = (struct hk_render_pack_att){0};
-   T("another colour count refuses", hk_render_pack_continues(&a, &b, false));
+   T("another colour count refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    a.view_mask = b.view_mask = 3;
-   T("multiview refuses", hk_render_pack_continues(&a, &b, false));
+   T("multiview refuses", hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.flags = VK_RENDERING_RESUMING_BIT;
-   T("a resuming instance refuses", hk_render_pack_continues(&a, &b, false));
+   T("a resuming instance refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    a.flags = VK_RENDERING_SUSPENDING_BIT;
-   T("a suspending instance refuses", hk_render_pack_continues(&a, &b, false));
+   T("a suspending instance refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s)
       a.att[s].samples = b.att[s].samples = a.att[s].iview ? 4 : 0;
    b.att[0].layout = VK_IMAGE_LAYOUT_GENERAL;
    T("multisampled attachments in another layout refuse",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[0].layout = VK_IMAGE_LAYOUT_GENERAL;
    T("attachments in another layout refuse",
-     hk_render_pack_continues(&a, &b, false) &&
-        hk_render_pack_continues(&a, &b, true));
+     hk_render_pack_continues(&a, &b, false, false) &&
+        hk_render_pack_continues(&a, &b, true, false));
    RESET();
    b.att[1].layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
    a.att[1].layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
-   T("a feedback loop layout refuses", hk_render_pack_continues(&a, &b, false));
+   T("a feedback loop layout refuses",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[1].feedback_loop = true;
    T("an enabled feedback loop refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    a.att[0].flags = b.att[0].flags =
       VK_RENDERING_ATTACHMENT_INPUT_ATTACHMENT_FEEDBACK_BIT_KHR;
    T("input attachment feedback refuses",
-     hk_render_pack_continues(&a, &b, false));
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[0].flags = VK_RENDERING_ATTACHMENT_INPUT_ATTACHMENT_FEEDBACK_BIT_KHR;
-   T("other attachment flags refuse", hk_render_pack_continues(&a, &b, false));
+   T("other attachment flags refuse",
+     hk_render_pack_continues(&a, &b, false, false));
    RESET();
    b.att[2].aliasable = true;
    T("an aliasable image continues after a framebuffer-local dependency",
-     !hk_render_pack_continues(&a, &b, false));
+     !hk_render_pack_continues(&a, &b, false, false));
    b.layout_proof = true;
-   T("but refuses an ordered one", hk_render_pack_continues(&a, &b, true));
+   T("but refuses an ordered one",
+     hk_render_pack_continues(&a, &b, true, false));
    RESET();
    b.layout_proof = false;
    T("without attachment-only layouts, a local dependency continues",
-     !hk_render_pack_continues(&a, &b, false));
+     !hk_render_pack_continues(&a, &b, false, false));
    T("without attachment-only layouts, an ordered one does not",
-     hk_render_pack_continues(&a, &b, true));
+     hk_render_pack_continues(&a, &b, true, false));
    RESET();
    memset(&a.att, 0, sizeof(a.att));
    memset(&b.att, 0, sizeof(b.att));
    a.color_count = b.color_count = 0;
-   T("attachmentless passes refuse", hk_render_pack_continues(&a, &b, false));
+   T("attachmentless passes refuse",
+     hk_render_pack_continues(&a, &b, false, false));
 #undef RESET
 }
 
@@ -570,6 +627,18 @@ test_boundary(void)
    T("final-member colour resolve refuses ordered dependencies",
      boundary(a, b));
    b->render_pack.head_dep = HK_M5_MERGE_DEP_LOCAL;
+   b->render_pack.head_non_local_src = true;
+   T("final-member colour resolve refuses head non-local graphics barrier",
+     boundary(a, b));
+   b->render_pack.head_non_local_src = false;
+   a->render_pack.tail_non_local_src = true;
+   T("final-member colour resolve refuses tail non-local graphics barrier",
+     boundary(a, b));
+   a->render_pack.tail_non_local_src = false;
+   as->m5_non_local_src = true;
+   T("final-member colour resolve refuses prior in-buffer non-local barrier",
+     boundary(a, b));
+   as->m5_non_local_src = false;
    struct hk_cmd_buffer *c_after = split(5);
    T("no member continues after a resolving tail", boundary(b, c_after));
 }
@@ -677,6 +746,24 @@ test_run_hazard(void)
    hk_render_pack_run_start(&run, c0, first_cs(c0));
    hk_render_pack_run_join(&run, c0, c1, first_cs(c1));
    T("CB0's hazard draw refuses an ordered CB2",
+     hk_render_pack_boundary(&run, c1, c2, first_cs(c2), first_cs(c0)));
+
+   /* [CB0, CB1, CB2(resolve)]: CB0 -> CB1 has a FRAGMENT_SHADER ->
+    * COLOR_ATTACHMENT_OUTPUT barrier (head_non_local_src), so CB0 and CB1
+    * still pack, but a later resolving CB2 must not join the run because CB0's
+    * fragment shaders may still read or write CB2's resolve target. */
+   c0 = split(10), c1 = split(10), c2 = split(10);
+   first_cs(c0)->cr.whole_attachments = first_cs(c1)->cr.whole_attachments =
+      first_cs(c2)->cr.whole_attachments = true;
+   c1->render_pack.head_non_local_src = true;
+   c2->render_pack.head_pass.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   c2->render_pack.head_pass.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   c2->render_pack.tail = false;
+   hk_render_pack_run_start(&run, c0, first_cs(c0));
+   T("CB0 and CB1 pack across a non-local graphics source barrier",
+     !hk_render_pack_boundary(&run, c0, c1, first_cs(c1), first_cs(c0)));
+   hk_render_pack_run_join(&run, c0, c1, first_cs(c1));
+   T("a resolving CB2 does not join a run with an earlier non-local barrier",
      hk_render_pack_boundary(&run, c1, c2, first_cs(c2), first_cs(c0)));
 }
 
@@ -943,6 +1030,7 @@ main(void)
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
       chip = chips[i];
       printf("# %s\n", agx_chip_name(chip));
+      test_non_local_src();
       test_continues();
       test_streams_match();
       test_arrays();

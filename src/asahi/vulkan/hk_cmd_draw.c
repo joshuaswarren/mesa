@@ -4244,6 +4244,9 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
       return;
    }
 
+   if (hk_m5_pass_merge_non_local_src(src, dst))
+      m->non_local_src = true;
+
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
    case HK_M5_MERGE_DEP_LOCAL:
@@ -4642,15 +4645,23 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 
    /* An ordered dependency, or one recorded before an earlier continuation
     * of this stream, needs the merged pass to be memory-equivalent. Keep
-    * final-pass resolves out of ordered continuations so the first instance
-    * cannot have a WAR hazard against the newly added resolve target. */
+    * final-pass resolves out of ordered continuations and out of streams
+    * preceded by a barrier whose first scope covers non-attachment graphics
+    * stages, so earlier fragment shaders cannot race against the newly added
+    * resolve target. */
    const bool ordered = m->ordered || cs->m5_ordered;
+   const bool non_local_src = m->non_local_src || cs->m5_non_local_src;
    if (ordered) {
       why = any_resolve ? "resolve" : hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
          hk_frame_anatomy_note(dev, "pass-merge end: ordered, %s", why);
          return false;
       }
+   }
+   if (any_resolve && non_local_src) {
+      hk_frame_anatomy_note(dev,
+                            "pass-merge end: resolve after non-attachment barrier");
+      return false;
    }
 
    /* A newly added resolve target must not overlap an existing attachment, a
@@ -4706,6 +4717,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
+   cs->m5_non_local_src = non_local_src;
    cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
@@ -4949,7 +4961,7 @@ static uint8_t
 hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
                         const struct hk_render_pack_pass *pass,
                         struct hk_render_pack_edges *e, bool *msaa_end,
-                        const char **why)
+                        bool *non_local_src, const char **why)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    const bool msaa = pass && hk_render_pack_samples(pass) > 1;
@@ -4957,6 +4969,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
 
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       dep = MAX2(dep, hk_m5_pass_merge_dependency(b->srcStageMask,
                                                   b->dstStageMask,
                                                   b->dstAccessMask, false,
@@ -4965,6 +4979,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       const bool transfer = b->srcQueueFamilyIndex != b->dstQueueFamilyIndex;
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, true,
@@ -4983,6 +4999,8 @@ hk_render_pack_classify(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
          transition && !transfer && hk_pass_merge_layout_proof_supported(chip) &&
          !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
                                   VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
+      *non_local_src |=
+         hk_m5_pass_merge_non_local_src(b->srcStageMask, b->dstStageMask);
       const uint8_t d = hk_m5_pass_merge_dependency(b->srcStageMask,
                                                     b->dstStageMask,
                                                     b->dstAccessMask, false,
@@ -5024,6 +5042,7 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
          e->head_dep = MAX2(e->head_dep,
                             hk_render_pack_classify(cmd, info, NULL, e,
                                                     &e->head_msaa_end,
+                                                    &e->head_non_local_src,
                                                     &e->head_why));
    }
    if (e->tail_open) {
@@ -5031,7 +5050,8 @@ hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
       const char *why = "barrier";
       e->tail_dep = MAX2(e->tail_dep,
                          hk_render_pack_classify(cmd, info, &e->tail_pass, e,
-                                                 &msaa_end, &why));
+                                                 &msaa_end,
+                                                 &e->tail_non_local_src, &why));
       if (msaa_end && e->tail_msaa)
          why = "multisampled transition";
       if ((msaa_end && e->tail_msaa) || e->tail_dep == HK_M5_MERGE_DEP_END) {
@@ -5170,6 +5190,7 @@ hk_render_pack_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * stream counts for a later one too (hk_m5_pass_merge_begin()). */
    e->tail_dep = cs->m5_ordered ? HK_M5_MERGE_DEP_ORDERED
                                 : HK_M5_MERGE_DEP_LOCAL;
+   e->tail_non_local_src = cs->m5_non_local_src;
    e->tail_stream = cs;
    e->tail_seq = cs->sync.seq;
    e->tail_current = cs->current;
@@ -6540,6 +6561,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       merge->open_cs_current =
          cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
       merge->ordered = false;
+      merge->non_local_src = false;
       merge->valid = true;
    }
    /* The render state is cleared by now; the candidate kept a copy. */

@@ -22,7 +22,8 @@ static_assert(AGX_VDM_STREAM_TERMINATE_CORE_LENGTH <=
 
 const char *
 hk_render_pack_continues(const struct hk_render_pack_pass *a,
-                         const struct hk_render_pack_pass *b, bool ordered)
+                         const struct hk_render_pack_pass *b, bool ordered,
+                         bool non_local_src)
 {
    const VkRenderingFlags open = VK_RENDERING_SUSPENDING_BIT |
                                  VK_RENDERING_RESUMING_BIT |
@@ -71,7 +72,7 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
       if (x->resolve_mode != VK_RESOLVE_MODE_NONE)
          return "resolve";
       const bool y_resolves = y->resolve_mode != VK_RESOLVE_MODE_NONE;
-      if (y_resolves && (!is_color || ordered))
+      if (y_resolves && (!is_color || ordered || non_local_src))
          return "resolve";
       const uint32_t y_flags =
          y_resolves
@@ -313,6 +314,7 @@ hk_render_pack_run_start(struct hk_render_pack_run_state *run,
 {
    *run = (struct hk_render_pack_run_state){
       .ordered = cs->m5_ordered,
+      .non_local_src = cs->m5_non_local_src,
       .writes_memory = cs->m5_shader_writes_memory,
       .unsafe = cs->render_pack_unsafe,
       .pushed_attachment =
@@ -332,6 +334,17 @@ run_ordered(const struct hk_render_pack_run_state *run,
 {
    const uint8_t dep = MAX2(a->render_pack.tail_dep, b->render_pack.head_dep);
    return run->ordered || dep == HK_M5_MERGE_DEP_ORDERED || bs->m5_ordered;
+}
+
+/* Whether any barrier between or inside the run's members had a graphics first
+ * scope outside the attachment stages (hk_m5_pass_merge_non_local_src()). */
+static bool
+run_non_local_src(const struct hk_render_pack_run_state *run,
+                  const struct hk_cmd_buffer *a, const struct hk_cmd_buffer *b,
+                  const struct hk_cs *bs)
+{
+   return run->non_local_src || a->render_pack.tail_non_local_src ||
+          b->render_pack.head_non_local_src || bs->m5_non_local_src;
 }
 
 const char *
@@ -354,8 +367,9 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
       return "dependency";
 
    const bool ordered = run_ordered(run, a, b, bs);
+   const bool non_local_src = run_non_local_src(run, a, b, bs);
    const char *why = hk_render_pack_continues(&ea->tail_pass, &eb->head_pass,
-                                              ordered);
+                                              ordered, non_local_src);
    if (why)
       return why;
 
@@ -393,6 +407,7 @@ hk_render_pack_run_join(struct hk_render_pack_run_state *run,
                         const struct hk_cmd_buffer *b, const struct hk_cs *bs)
 {
    run->ordered = run_ordered(run, a, b, bs);
+   run->non_local_src = run_non_local_src(run, a, b, bs);
    run->writes_memory |= bs->m5_shader_writes_memory;
    run->unsafe |= bs->render_pack_unsafe;
    run->pushed_attachment |= pushes_attachment(b, &b->render_pack.head_pass);
