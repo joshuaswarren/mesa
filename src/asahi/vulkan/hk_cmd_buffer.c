@@ -5958,8 +5958,7 @@ hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!agx_chip_native_or_m5(dev->dev.chip) || cmd->in_meta ||
        render->view_mask || render->layer_count != 1 ||
        (render->flags &
-        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT |
-         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) ||
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) ||
        hk_sync_xfer_pending(&cmd->sync))
       return false;
 

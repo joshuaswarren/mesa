@@ -3458,8 +3458,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
        (m5 ? !hk_m5_color_imageblock_supported(&render->tilebuffer)
            : agx_tilebuffer_spills(&render->tilebuffer)) ||
        (render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                         VK_RENDERING_RESUMING_BIT |
-                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)))
+                         VK_RENDERING_RESUMING_BIT)))
       return;
 
    const bool incomplete_render_area =
@@ -4143,8 +4142,7 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    }
 
    if (render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                        VK_RENDERING_RESUMING_BIT |
-                        VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
+                        VK_RENDERING_RESUMING_BIT))
       return "rendering flags";
 
    /* In-tilebuffer rendering without resolves. Multisample continuation
@@ -4685,8 +4683,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             cs->timestamp.start.handle)
       why = "stream";
    else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
-                           VK_RENDERING_RESUMING_BIT |
-                           VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
+                           VK_RENDERING_RESUMING_BIT))
       why = "flags";
    else if (memcmp(&info->renderArea, &prev->area, sizeof(info->renderArea)) ||
             info->layerCount != prev->layer_count ||
@@ -5892,15 +5889,10 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       }
    }
    render->g17p_zls_elide_mask = 0;
-   if (agx3 && !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                                 VK_RENDERING_RESUMING_BIT))) {
-      const bool secondary =
-         render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
-      if (z_layout && hk_g17p_zls_attachment_elidable(attach_z) &&
-          (!secondary || hk_g17p_zls_attachment_none(attach_z)))
+   if (agx3 && !(render->flags & VK_RENDERING_RESUMING_BIT)) {
+      if (z_layout && hk_g17p_zls_attachment_elidable(attach_z))
          render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-      if (s_layout && hk_g17p_zls_attachment_elidable(attach_s) &&
-          (!secondary || hk_g17p_zls_attachment_none(attach_s)))
+      if (s_layout && hk_g17p_zls_attachment_elidable(attach_s))
          render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
    }
    if (render->zls_precise) {
@@ -6395,12 +6387,13 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    void *const resume_current = cs ? cs->current : NULL;
    void *const end_before = cs ? cs->end : NULL;
 
-   /* An in-pass barrier may have closed the final stream already. Elide
-    * untouched planes from the whole pass even then: NONE/NONE attachments
-    * must not retain a forced store of uninitialized tile contents.
-    */
+   /* Apply after the final control word, including already closed streams. A
+    * suspended pass may still resume and touch/write depth or stencil in a
+    * later command buffer, so keep its planes intact until the pass ends. */
+   const bool suspending_pass =
+      (render->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
    const VkImageAspectFlags zls_elided =
-      render->g17p_zls_elide_mask & ~render->g17p_zls_touched;
+      suspending_pass ? 0 : render->g17p_zls_elide_mask & ~render->g17p_zls_touched;
 
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
@@ -6421,8 +6414,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    /* Apply after the final control word, including already closed streams. */
    const VkImageAspectFlags zls_elided_store =
-      render->g17p_zls_elide_mask & render->g17p_zls_touched &
-      ~render->g17p_zls_written;
+      suspending_pass ? 0
+                      : render->g17p_zls_elide_mask & render->g17p_zls_touched &
+                           ~render->g17p_zls_written;
    hk_g17p_zls_elide(cmd, zls_elided);
    hk_g17p_zls_elide_store(cmd, zls_elided_store);
 
@@ -6431,9 +6425,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * may turn out dead; see hk_take_pending_z_store(). */
    if (cs && !cmd->in_meta && cs == render->zls_first_cs &&
        cs->stats.cmds > 0 && !render->view_mask &&
-       !(render->flags &
-         (VK_RENDERING_SUSPENDING_BIT |
-          VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))) {
+       !(render->flags & VK_RENDERING_SUSPENDING_BIT)) {
       const VkImageAspectFlags pending_aspects =
          render->pending_zs_store_mask & ~(zls_elided | zls_elided_store);
       const struct hk_image_view *z_view =

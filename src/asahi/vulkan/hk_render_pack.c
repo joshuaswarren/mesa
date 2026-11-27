@@ -25,8 +25,7 @@ hk_render_pack_continues(const struct hk_render_pack_pass *a,
                          const struct hk_render_pack_pass *b, bool ordered)
 {
    const VkRenderingFlags open = VK_RENDERING_SUSPENDING_BIT |
-                                 VK_RENDERING_RESUMING_BIT |
-                                 VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+                                 VK_RENDERING_RESUMING_BIT;
    if ((a->flags | b->flags) & open)
       return "flags";
    if (memcmp(&a->area, &b->area, sizeof(a->area)) ||
