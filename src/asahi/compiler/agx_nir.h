@@ -441,6 +441,7 @@ bool agx_nir_unroll_and_jam(struct nir_shader *shader, unsigned factor,
                             unsigned *widest);
 bool agx_nir_opt_u8_absdiff_fp(struct nir_shader *shader);
 bool agx_nir_reassoc_const_offsets(struct nir_shader *shader);
+bool agx_nir_fold_aligned_masks(struct nir_shader *shader);
 bool agx_nir_opt_guard_selected_loads(struct nir_shader *shader);
 bool agx_nir_opt_forward_merge_loads(struct nir_shader *shader);
 bool agx_nir_fold_const_select_alu(struct nir_shader *shader);

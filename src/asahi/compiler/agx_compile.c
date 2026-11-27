@@ -13027,6 +13027,19 @@ pre_preamble:
        * as a 32-bit shift), so agx_nir_fold_ubyte_to_float is skipped here. */
    }
 
+   /* Drop aligned addends under low-bit masks and merge disjoint mask sums
+    * before constant-mul factoring and imad fusion. */
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, agx_nir_fold_aligned_masks);
+      if (progress) {
+         late_progress = true;
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_dce);
+         NIR_PASS(_, nir, nir_opt_cse);
+      }
+   } while (progress);
+
    /* Factor shared constant multipliers and shifts in integer add trees before
     * multiply-add fusion turns them into opaque imadshl_agx instructions.
     */
