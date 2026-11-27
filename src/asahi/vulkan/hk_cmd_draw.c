@@ -4106,7 +4106,8 @@ hk_xfer_check_draw(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
  * (hk_m5_pass_merge_begin()).
  */
 static const char *
-hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+hk_m5_pass_merge_refusal_ex(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                            bool allow_suspend_resume)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -4141,8 +4142,9 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
       return why;
    }
 
-   if (render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                        VK_RENDERING_RESUMING_BIT))
+   if (!allow_suspend_resume &&
+       (render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                         VK_RENDERING_RESUMING_BIT)))
       return "rendering flags";
 
    /* In-tilebuffer rendering without resolves. Multisample continuation
@@ -4179,6 +4181,12 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    attachments += render->depth_att.iview != NULL;
    attachments += render->stencil_att.iview != NULL;
    return attachments > 0 ? NULL : "no attachments";
+}
+
+static const char *
+hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   return hk_m5_pass_merge_refusal_ex(cmd, cs, false);
 }
 
 static bool
@@ -5177,6 +5185,10 @@ hk_render_pack_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
    struct hk_render_pack_edges *e = &cmd->render_pack;
    e->tail_open = false;
+   if (e->empty_resume || e->empty_suspend) {
+      e->empty_resume = false;
+      e->empty_suspend = false;
+   }
    if (likely(!e->head_open))
       return;
    e->head_open = false;
@@ -5311,8 +5323,15 @@ hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd)
        cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
        !list_is_singular(&cmd->control_streams)) {
       e->head = false;
+      if (!list_is_empty(&cmd->control_streams) ||
+          cmd->state.deferred_clear_count) {
+         e->empty_resume = false;
+         e->empty_suspend = false;
+      }
       return;
    }
+   e->empty_resume = false;
+   e->empty_suspend = false;
 
    struct hk_cs *cs =
       list_first_entry(&cmd->control_streams, struct hk_cs, node);
@@ -6495,7 +6514,10 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    struct hk_pass_merge_candidate *susp = &cmd->suspended_pass;
    susp->valid = false;
    const char *refusal = cs ? hk_m5_pass_merge_refusal(cmd, cs) : "no stream";
+   const char *rp_refusal =
+      cs ? hk_m5_pass_merge_refusal_ex(cmd, cs, true) : "no stream";
    const bool continuable = !refusal;
+   const bool rp_continuable = !rp_refusal;
    const bool suspend_resumable =
       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
       (render->flags & VK_RENDERING_SUSPENDING_BIT) && !cmd->in_meta && cs &&
@@ -6656,10 +6678,22 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       }
    }
 
+   const VkRenderingFlags sr_flags =
+      render->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT);
+   const bool empty_fixup_cand =
+      !cmd->in_meta && cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+      !cmd->state.deferred_clear_count && !cmd->render_pack.empty_resume &&
+      !cmd->render_pack.empty_suspend &&
+      (sr_flags == VK_RENDERING_RESUMING_BIT ||
+       sr_flags == VK_RENDERING_SUSPENDING_BIT);
+   struct hk_render_pack_pass empty_fixup_pass;
+   if (empty_fixup_cand)
+      hk_render_pack_pass_from_render(&empty_fixup_pass, render);
+
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
 
-   if (continuable)
+   if (continuable || rp_continuable)
       merge->render = *render;
    if (suspend_resumable)
       susp->render = *render;
@@ -6787,12 +6821,20 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
    /* The render state is cleared by now; the candidate kept a copy. */
    hk_render_pack_end(cmd, cs, &merge->render,
-                      !continuable                  ? refusal
-                      : need_resolve                ? "resolve"
+                      !rp_continuable                ? rp_refusal
+                      : need_resolve                 ? "resolve"
                       : cs->end != end_before ||
                             vk_command_buffer_has_error(&cmd->vk)
                          ? "stream"
                          : NULL);
+   if (empty_fixup_cand && !need_resolve &&
+       list_is_empty(&cmd->control_streams) &&
+       !cmd->state.deferred_clear_count &&
+       !vk_command_buffer_has_error(&cmd->vk)) {
+      cmd->render_pack.empty_resume = sr_flags == VK_RENDERING_RESUMING_BIT;
+      cmd->render_pack.empty_suspend = sr_flags == VK_RENDERING_SUSPENDING_BIT;
+      cmd->render_pack.empty_pass = empty_fixup_pass;
+   }
 
    if (need_resolve) {
       perf_debug(cmd, "Resolving render pass, colour store op %u",

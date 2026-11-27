@@ -233,6 +233,19 @@ test_continues(void)
    a.flags = VK_RENDERING_SUSPENDING_BIT;
    T("a suspending instance refuses", hk_render_pack_continues(&a, &b, false));
    RESET();
+   a.flags = VK_RENDERING_SUSPENDING_BIT;
+   b.flags = VK_RENDERING_RESUMING_BIT | VK_RENDERING_SUSPENDING_BIT;
+   T("a resuming instance continues a suspending one",
+     !hk_render_pack_continues(&a, &b, false));
+   b.att[0].load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+   T("and ignores loadOp when resuming",
+     !hk_render_pack_continues(&a, &b, false));
+   RESET();
+   a.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+   b.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+   T("inline-replayed secondary passes continue",
+     !hk_render_pack_continues(&a, &b, false));
+   RESET();
    for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s)
       a.att[s].samples = b.att[s].samples = a.att[s].iview ? 4 : 0;
    b.att[0].layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -312,6 +325,44 @@ test_streams_match(void)
    b->cr.zls_control.opaque[0] ^= 1;
    T("other depth/stencil load or store refuses",
      hk_render_pack_streams_match(a, b));
+   b->cr.zls_control = a->cr.zls_control;
+   agx_pack(&a->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = false;
+      cfg.z_store = true;
+      cfg.z_store_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_store_compress = true;
+   }
+   agx_pack(&b->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_load_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_load_compress = true;
+      cfg.z_store = true;
+      cfg.z_store_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_store_compress = true;
+   }
+   a->cr.process_empty_tiles = true;
+   b->cr.process_empty_tiles = false;
+   a->cr.bg.main.rsrc_spec = 0x111;
+   b->cr.bg.main.rsrc_spec = 0x222;
+   T("clear-then-load continues across ZLS, empty tiles, and main BG",
+     !hk_render_pack_streams_match(a, b));
+   a->cr.process_empty_tiles = false;
+   b->cr.process_empty_tiles = true;
+   T("load-then-clear empty-tiles mismatch refuses",
+     hk_render_pack_streams_match(a, b));
+   b->cr.process_empty_tiles = false;
+   agx_pack(&a->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_store = true;
+   }
+   agx_pack(&b->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = false;
+      cfg.z_store = true;
+   }
+   T("load-then-clear ZLS mismatch refuses",
+     hk_render_pack_streams_match(a, b));
+   a->cr.bg.main.rsrc_spec = b->cr.bg.main.rsrc_spec = 0;
+   memset(&a->cr.zls_control, 0, sizeof(a->cr.zls_control));
    b->cr.zls_control = a->cr.zls_control;
    b->cr.depth.buffer += 0x1000;
    T("another depth buffer refuses", hk_render_pack_streams_match(a, b));
@@ -395,6 +446,36 @@ test_member(void)
    T("a single-render command buffer is a member", hk_render_pack_member(c));
 
    T("a member has no refusal", !hk_render_pack_member_refusal(c));
+
+   c = split(4);
+   first_cs(c)->g17p_pass_ends = false;
+   T("a split pass without SUSPENDING_BIT is not a member",
+     !hk_render_pack_member(c));
+   c->render_pack.tail_pass.flags = VK_RENDERING_SUSPENDING_BIT;
+   T("a suspending pass is a member", hk_render_pack_member(c));
+   first_cs(c)->g17p_pass_begins = false;
+   T("without RESUMING_BIT it refuses", !hk_render_pack_member(c));
+   c->render_pack.head_pass.flags = VK_RENDERING_RESUMING_BIT;
+   T("a resuming+suspending pass is a member", hk_render_pack_member(c));
+
+   struct hk_cmd_buffer *fixup = new_cmd();
+   bool is_res = false, is_susp = false;
+   T("plain empty cmd is not a suspend/resume fixup",
+     !hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp));
+   fixup->render_pack.empty_resume = true;
+   gbuffer(&fixup->render_pack.empty_pass);
+   T("empty resume fixup is recognized",
+     hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp) && is_res && !is_susp);
+   T("matching fixup pass matches member",
+     hk_render_pack_fixup_matches(&fixup->render_pack.empty_pass,
+                                  &c->render_pack.tail_pass));
+   fixup->render_pack.empty_pass.att[0].iview = views[3];
+   T("mismatched fixup view refuses",
+     !hk_render_pack_fixup_matches(&fixup->render_pack.empty_pass,
+                                   &c->render_pack.tail_pass));
+   fixup->sync.req[0][HK_SYNC_VDM].prior = HK_SYNC_GFX;
+   T("empty fixup with barrier requirement refuses",
+     !hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp));
 
    c = split(4);
    first_cs(c)->stats.cmds = 0;
