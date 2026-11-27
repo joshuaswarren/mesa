@@ -757,6 +757,7 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
    case AGX_OPCODE_IMAGE_LOAD:
       if (I->nr_srcs < 2 ||
           (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_ARRAY &&
+           I->dim != AGX_DIM_2D_MS && I->dim != AGX_DIM_2D_MS_ARRAY &&
            I->dim != AGX_DIM_3D))
          return false;
 
