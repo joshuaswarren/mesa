@@ -120,6 +120,8 @@ bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
 bool agx_nir_opt_licm_agx2_integer(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_licm_direct_sfu(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_licm_direct_const_loads(struct nir_shader *shader,
+                                         unsigned budget);
 bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
 bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
