@@ -12118,11 +12118,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * iterations per loop test where the bound allows it. On AGX3 the loop
     * control of a short body costs about as much as the body, and the
     * unrolled body's loads issue together and vectorize below. Bodies of up
-    * to 40 instructions run 8 iterations per test (Metal's compiler unrolls
-    * such loops by 8 when the source asks for it, as Geekbench's Hamming
-    * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
-    * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
-    * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
+    * to 40 non-constant instructions run 8 iterations per test (Metal's
+    * compiler unrolls such loops by 8 when the source asks for it, as
+    * Geekbench's Hamming distance does; SPIR-V carries no such hint), up to
+    * 80 run 4, up to 160 run 2. agx_compile_shader_nir compiles again with 4
+    * if 8 costs occupancy (AGX3C) or Dynamic Caching register pressure
+    * (AGX3B). */
    if (runtime_loop_opts && m5_unroll_factor >= 2) {
       /* Hoist loop-invariant transcendental (SFU) chains from direct loop
        * bodies before unrolling so body-size budgets see the true

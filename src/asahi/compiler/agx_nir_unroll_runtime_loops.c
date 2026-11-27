@@ -250,7 +250,9 @@ count_unrollable(nir_loop *loop, nir_if *terminator)
          default:
             break;
          }
-         if (instr->type != nir_instr_type_phi)
+         if (instr->type != nir_instr_type_phi &&
+             instr->type != nir_instr_type_load_const &&
+             instr->type != nir_instr_type_undef)
             count++;
       }
    }

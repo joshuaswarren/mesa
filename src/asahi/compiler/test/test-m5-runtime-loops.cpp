@@ -332,6 +332,52 @@ TEST(M5RuntimeLoops, BudgetRefused)
    ralloc_free(s);
 }
 
+/* load_const and undef instructions are cheap and should not inflate the
+ * unroll instruction budget. */
+TEST(M5RuntimeLoops, ConstAndUndefExcludedFromBudget)
+{
+   nir_builder b = compute_shader("const-undef-budget");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      /* Add many distinct load_const and undef instructions inside the loop
+       * body; they should not count toward the unroll budget. */
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .align_mul = 4);
+      nir_def *u0 = nir_undef(&b, 1, 32);
+      nir_def *u1 = nir_undef(&b, 1, 32);
+      (void)u0;
+      (void)u1;
+      for (unsigned k = 0; k < 24; ++k)
+         (void)nir_imm_int(&b, 0x11 + k);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   /* Keep load_const/undef in place (no DCE) to verify count_unrollable skips
+    * them under a budget (72) that fits factor 4 for the 17 non-const/non-undef
+    * instructions (17 * 4 = 68 <= 72) while refusing even factor 2 if the 26+
+    * const/undef ops are counted ((17 + 26) * 2 = 86 > 72). */
+   unsigned widest = 0;
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 72, &widest));
+   nir_validate_shader(s, "const-undef-budget after");
+   EXPECT_EQ(widest, 4u);
+   EXPECT_EQ(count_loops(s), 2u);
+   ralloc_free(s);
+}
+
 /* while (++i < n) acc += buf[i]: the back-edge value of i is defined in the
  * header, before the exit test. Every copy of the body must advance it. */
 TEST(M5RuntimeLoops, HeaderDefinedBackEdge)
