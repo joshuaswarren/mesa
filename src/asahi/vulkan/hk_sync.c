@@ -581,6 +581,20 @@ hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 static void hk_sync_stream_wait(struct hk_cs *cs,
                                 const struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 
+static void stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
+
+/* What every timestamp write waits for, whatever its stage: the earlier
+ * resets of timestamp queries (HK_SYNC_QRESET), which are in no application
+ * dependency. A stamp written ahead of a reset of its query would be zeroed
+ * by it. */
+static void
+qreset_dep(struct hk_cmd_buffer *cmd, struct hk_cs *self,
+           struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   hk_sync_src_dep(cmd, HK_SYNC_QRESET, self, dep);
+}
+
 /* G17P transfer writes: see hk_sync.h. Drop the notes of streams positioned
  * at or before seq on the compute subqueue: a dependency orders them. */
 static void
@@ -1256,14 +1270,47 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              cs->sync.dep_ta[HK_SYNC_CDM].cut == cmd->current_cs.cs))
       st->cs_check_pending = true;
 
-   /* A top-of-pipe timestamp waiting for a command to ride on. */
+   /* A top-of-pipe timestamp waiting for a command to ride on. An ordered
+    * start stamp latches after the command's barriers, which then include the
+    * resets of timestamp queries; an unordered one is checked against them at
+    * submission (hk_queue.c). */
    if (st->pending_start_ts.handle) {
       cs->timestamp.start = st->pending_start_ts;
       cs->unordered_start_ts = st->pending_start_ts_unordered;
-      if (cs->unordered_start_ts)
+      if (cs->unordered_start_ts) {
          st->has_unordered_start_ts = true;
+      } else {
+         struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+         qreset_dep(cmd, cs, dep);
+         hk_sync_stream_wait(cs, dep);
+      }
       st->pending_start_ts = (struct agx_timestamp_req){0};
       st->pending_start_ts_unordered = false;
+   }
+
+   /* The command buffer's leading timestamp rides on the first stream's
+    * first end stamp (hk_sync_write_timestamp()), which waits for the
+    * stamp's first scope: a render's vertex half, or the compute stream.
+    * Nothing was recorded between the stamp and this stream, so the scope
+    * names the same earlier work it did then. */
+   if (st->lead_ts.handle) {
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, st->lead_scope, cs, dep);
+      if (cs->type == HK_CS_VDM) {
+         assert(!cs->timestamp.vtx_end.handle);
+         cs->timestamp.vtx_end = st->lead_ts;
+         hk_sync_stream_wait(cs, dep);
+      } else {
+         assert(!cs->timestamp.end.handle);
+         cs->timestamp.end = st->lead_ts;
+         stamp_wait(cmd, cs, dep);
+      }
+      st->lead_ts = (struct agx_timestamp_req){0};
+      /* Later stamps recorded before this stream are copies of it. */
+      if (st->stamp_copy_count) {
+         const unsigned sq = hk_sync_sq(cs);
+         st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], cs);
+      }
    }
 }
 
@@ -1518,8 +1565,8 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
  * marks later streams as ordered after it where the command's semantics require
  * that.
  */
-struct hk_cs *
-hk_query_command_cs(struct hk_cmd_buffer *cmd)
+static struct hk_cs *
+query_cs(struct hk_cmd_buffer *cmd, uint8_t scope)
 {
    hk_sync_flush_pending_timestamp(cmd);
    /* Timestamps written as copies of earlier ones are query results too. */
@@ -1527,11 +1574,42 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    hk_sync_end_cs_if_timestamped(cmd);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
+   hk_sync_src_dep(cmd, scope, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_timestamp_query = true;
    return cs;
+}
+
+struct hk_cs *
+hk_query_command_cs(struct hk_cmd_buffer *cmd)
+{
+   return query_cs(cmd, HK_SYNC_QUERY_SCOPE);
+}
+
+/* A timestamp query reset is ordered only against the commands that
+ * reference the same queries (Vulkan 1.4, 17.2). Of those, timestamp writes
+ * and query commands name HK_SYNC_QRESET in their first scope
+ * (hk_sync_write_timestamp(), HK_SYNC_QUERY_SCOPE), so nothing else waits
+ * for the reset; and the reset waits for every earlier stream but other
+ * timestamp resets, which write the same values. */
+struct hk_cs *
+hk_query_reset_cs(struct hk_cmd_buffer *cmd)
+{
+   assert(cmd->sync.kind_override == HK_SYNC_QRESET);
+   return query_cs(cmd, HK_SYNC_QRESET_SCOPE);
+}
+
+/* The stream holding the reset is a reset stream whatever else it holds:
+ * later timestamps and query commands find it through cmd->sync.last. */
+void
+hk_sync_query_reset_done(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   cmd->sync.epoch++;
+   if (cs->sync.kind & HK_SYNC_QRESET)
+      return;
+   cs->sync.kind |= HK_SYNC_QRESET;
+   note_last(cmd, cs);
 }
 
 /* A host-availability flush is recorded at its dependency into the open
@@ -2001,6 +2079,8 @@ stamp_copies_follow(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    return true;
 }
 
+static void flush_lead_timestamp(struct hk_cmd_buffer *cmd);
+
 void
 hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
 {
@@ -2008,9 +2088,18 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    if (!st->stamp_copy_count)
       return;
 
+   /* Copies of a leading stamp that no stream took yet read it after the
+    * command it then gets of its own. */
+   if (st->lead_ts.handle)
+      flush_lead_timestamp(cmd);
+
+   /* And the copies write timestamp queries: after their resets. */
    struct hk_sync_dep after[HK_SYNC_NUM_SQ];
-   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
-      after[sq] = (struct hk_sync_dep){.cut = st->stamp_copy_after[sq]};
+   qreset_dep(cmd, NULL, after);
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      const struct hk_sync_dep read = {.cut = st->stamp_copy_after[sq]};
+      dep_max(&after[sq], &read);
+   }
 
    /* The copies wait for the commands whose stamps they read. Recorded in
     * an open stream that holds application work, they would make that work
@@ -2042,10 +2131,37 @@ sync_state_has_req(const struct hk_sync_state *st)
    return false;
 }
 
+/* A leading timestamp (hk_sync_state::lead_ts) that no stream took: a
+ * command of its own, ordered after its first scope, as
+ * hk_sync_write_timestamp() records one. */
+static void
+flush_lead_timestamp(struct hk_cmd_buffer *cmd)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   const struct agx_timestamp_req req = st->lead_ts;
+   st->lead_ts = (struct agx_timestamp_req){0};
+   st->epoch++;
+
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   hk_sync_src_dep(cmd, st->lead_scope, NULL, dep);
+   struct hk_cs *cs = timestamp_only_stream(cmd, dep);
+   if (!cs)
+      return;
+   cs->timestamp.end = req;
+   if (st->stamp_copy_count) {
+      st->stamp_copy_after[HK_SYNC_CDM] =
+         hk_sync_later(st->stamp_copy_after[HK_SYNC_CDM], cs);
+   }
+   stamp_carrier_launch(cmd);
+   hk_cmd_buffer_end_compute(cmd);
+}
+
 void
 hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (st->lead_ts.handle)
+      flush_lead_timestamp(cmd);
    if (!st->pending_start_ts.handle)
       return;
 
@@ -2059,8 +2175,11 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
    st->epoch++;
 
    struct hk_cs *tail = last_stream(cmd);
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    if (tail && !tail->timestamp.end.handle) {
       tail->timestamp.end = req;
+      qreset_dep(cmd, tail, dep);
+      stamp_wait(cmd, tail, dep);
       if (tail == cmd->current_cs.cs) {
          stamp_carrier_launch(cmd);
          hk_cmd_buffer_end_compute(cmd);
@@ -2068,9 +2187,10 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
       return;
    }
 
-   /* Nothing to ride on: a command of its own, ordered after nothing. */
-   const struct hk_sync_dep none[HK_SYNC_NUM_SQ] = {{0}, {0}};
-   struct hk_cs *cs = timestamp_only_stream(cmd, none);
+   /* Nothing to ride on: a command of its own, ordered after nothing but
+    * the resets of timestamp queries. */
+   qreset_dep(cmd, NULL, dep);
+   struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
    cs->timestamp.start = req;
@@ -2087,7 +2207,7 @@ hk_sync_can_defer_unordered_start_ts(struct hk_cmd_buffer *cmd)
    const struct hk_sync_state *st = &cmd->sync;
 
    return !last_stream(cmd) && !st->pending_start_ts.handle &&
-          !sync_state_has_req(st);
+          !st->lead_ts.handle && !sync_state_has_req(st);
 }
 
 void
@@ -2108,12 +2228,16 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
        * stamp is copied from the first after the render. */
       if (!src_kinds && !gfx->timestamp.start.handle &&
           !gfx->timestamp.end.handle && start_stamps_ordered(cmd)) {
+         struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+         qreset_dep(cmd, gfx, dep);
+         hk_sync_stream_wait(gfx, dep);
          gfx->timestamp.start = req;
          return;
       }
 
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), gfx, dep);
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds) | HK_SYNC_QRESET,
+                      gfx, dep);
       /* The render can only wait on streams positioned before it. The
        * latest stream of a kind may be this render's own post-graphics
        * stream (an in-pass stamp's copy, an occlusion query's availability
@@ -2174,9 +2298,25 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       }
    }
 
+   /* Another stamp while the leading one still waits for the command
+    * buffer's first stream: a copy of it. The first stream carries the
+    * leading stamp after the first scopes of both, a valid later latch for
+    * the earlier one, and the copy launches after that stream
+    * (hk_sync_flush_stamp_copies()). Neither gets a command of its own. */
+   if (st->lead_ts.handle && st->stamp_copy_count < HK_SYNC_STAMP_COPIES) {
+      assert(!last_stream(cmd));
+      st->lead_scope |= src_kinds ? hk_sync_stamp_scope(src_kinds) | HK_SYNC_QRESET
+                                  : HK_SYNC_QRESET;
+      st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
+         .dst = req,
+         .src = st->lead_ts,
+      };
+      return;
+   }
+
    hk_sync_flush_pending_timestamp(cmd);
 
-   const uint8_t scope = hk_sync_stamp_scope(src_kinds);
+   const uint8_t scope = hk_sync_stamp_scope(src_kinds) | HK_SYNC_QRESET;
    struct hk_cs *tail = last_stream(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, scope, tail, dep);
@@ -2216,6 +2356,21 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
           last_stream(cmd) == tail &&
           cmd->sync.next_seq == cmd->pass_merge.next_seq)
          cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+      return;
+   }
+
+   /* A stamp ahead of every stream of the command buffer, on a chip whose
+    * start stamps latch before barriers resolve: the first stream carries it
+    * on an end stamp and waits for its first scope (hk_sync_state::lead_ts).
+    * A command of its own would sit between that stream and the command
+    * buffer's earlier neighbours, and every later timestamp would wait for
+    * it: a render ending in a timestamp would wait for a compute command
+    * that waits for the previous render. A top-of-pipe stamp keeps the wait
+    * on the resets of timestamp queries alone, as its first scope is empty.
+    */
+   if (!tail && !start_stamps_ordered(cmd)) {
+      st->lead_ts = req;
+      st->lead_scope = src_kinds ? scope : HK_SYNC_QRESET;
       return;
    }
 

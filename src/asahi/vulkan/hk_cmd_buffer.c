@@ -6146,7 +6146,8 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    /* A timestamp belongs to this render. A direct AGX2 resolve also needs
     * the neutral raster state below when there are no draws.
     */
-   if ((cs->timestamp.start.handle || cs->timestamp.end.handle) &&
+   if ((cs->timestamp.start.handle || cs->timestamp.end.handle ||
+        cs->timestamp.vtx_end.handle) &&
        !(render->agx2_resolve_mask && cs->cr.process_empty_tiles))
       return false;
 

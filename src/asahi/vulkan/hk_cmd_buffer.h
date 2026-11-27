@@ -1842,10 +1842,16 @@ struct hk_cs {
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
     * kernel writes both from the firmware's native pass record.
+    *
+    * vtx_end, render only: the vertex end, for a command buffer's leading
+    * top-of-pipe timestamp (hk_sync_write_timestamp()). Like every end stamp
+    * it is latched after the command's barriers resolve, here those of the
+    * vertex half.
     */
    struct {
       struct agx_timestamp_req start;
       struct agx_timestamp_req end;
+      struct agx_timestamp_req vtx_end;
    } timestamp;
 
    /* G17P and M5: timestamp.start came from a leading TOP_OF_PIPE write on a
@@ -1855,7 +1861,8 @@ struct hk_cs {
 
    /* Render only: occlusion availability slots written by the kernel at
     * retirement, indexed vertex start, vertex end, fragment start, fragment
-    * end. Slots 0 and 3 are only used when timestamp.start/end are not. */
+    * end. Slots 0, 1 and 3 are only used when timestamp.start, vtx_end and
+    * end are not. */
    struct agx_timestamp_req oq_stamp[4];
 
    /* G17P query commands observe timestamp writes from earlier streams.

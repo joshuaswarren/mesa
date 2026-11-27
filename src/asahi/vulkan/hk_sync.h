@@ -103,17 +103,32 @@ enum hk_sync_kind {
     * does not order later work after it. It waits like work of every class
     * (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
+
+   /* Stream kinds and first scopes only, never named by an application
+    * dependency: a command that resets timestamp queries
+    * (hk_CmdResetQueryPool()). Like HK_SYNC_STAMP it writes nothing but
+    * query memory, and only later query commands and timestamps are in its
+    * second scope (Vulkan 1.4, 17.2: the reset is ordered against the
+    * commands that reference the same queries). Unlike a timestamp write it
+    * is not in the first scope of another reset: two resets write the same
+    * values, so their order does not matter. It waits like work of every
+    * class. */
+   HK_SYNC_QRESET = 1 << 7,
 };
 
-#define HK_SYNC_NUM_KINDS 7
+#define HK_SYNC_NUM_KINDS 8
 
 /* Every kind a stream can be of: a first scope naming all of them is every
  * earlier stream on a subqueue. */
-#define HK_SYNC_STREAM_KINDS (HK_SYNC_ALL | HK_SYNC_STAMP)
+#define HK_SYNC_STREAM_KINDS (HK_SYNC_ALL | HK_SYNC_STAMP | HK_SYNC_QRESET)
 
 /* The first scope of a query command (reset, result copy, property write):
  * every earlier stream, timestamp carriers included. */
 #define HK_SYNC_QUERY_SCOPE HK_SYNC_STREAM_KINDS
+
+/* The first scope of a timestamp query reset: every earlier stream but other
+ * timestamp query resets. */
+#define HK_SYNC_QRESET_SCOPE (HK_SYNC_STREAM_KINDS & ~HK_SYNC_QRESET)
 
 /* The first scope of a timestamp or event of the given source kinds: an
  * earlier timestamp write is in it unless it is empty (TOP_OF_PIPE). */
@@ -130,7 +145,7 @@ hk_sync_stamp_scope(uint8_t src_kinds)
 static inline uint8_t
 hk_sync_full_kinds(uint8_t kinds)
 {
-   if (kinds & HK_SYNC_STAMP)
+   if (kinds & (HK_SYNC_STAMP | HK_SYNC_QRESET))
       kinds |= HK_SYNC_ALL;
    return kinds & HK_SYNC_GFX
              ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
@@ -452,6 +467,18 @@ struct hk_sync_state {
     * it, and otherwise moves it to an ordered end-stamp carrier. */
    struct agx_timestamp_req pending_start_ts;
    bool pending_start_ts_unordered;
+
+   /* On chips whose start stamps latch before barriers resolve: a
+    * timestamp recorded before any stream of the command buffer, waiting for
+    * the first one to carry it on an end stamp, which is latched after that
+    * stream's barriers (a render's vertex end, a compute stream's end). That
+    * stream waits for lead_scope, the kinds of the stamp's first scope as
+    * hk_sync_src_dep() takes them: the resets of timestamp queries alone for
+    * a top-of-pipe stamp, whose first scope is empty; the earlier work of
+    * its stages and the earlier timestamps for any other. Then the end stamp
+    * is latched no earlier than a command of its own could latch it. */
+   struct agx_timestamp_req lead_ts;
+   uint8_t lead_scope;
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
 
@@ -725,6 +752,13 @@ void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
  * end it. Every later first scope that names HK_SYNC_STAMP orders after
  * them; no application dependency does. */
 void hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd);
+
+/* The compute stream a timestamp query reset records into: after every
+ * earlier stream but other such resets (HK_SYNC_QRESET_SCOPE). Record with
+ * hk_sync_state::kind_override set to HK_SYNC_QRESET, then call
+ * hk_sync_query_reset_done() with the stream that holds the reset. */
+struct hk_cs *hk_query_reset_cs(struct hk_cmd_buffer *cmd);
+void hk_sync_query_reset_done(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
  * being recorded writes into cs. */
