@@ -6657,17 +6657,26 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
              iview->vk.format == src_image->vk.format &&
              !(src_image->vk.create_flags & unsafe_flags)) {
             struct agx_tilebuffer_layout compact_tib = render->tilebuffer;
-            if (active_rt != 0) {
-               const enum pipe_format fmt =
-                  render->tilebuffer.logical_format[active_rt];
+            bool tib_matches =
+               !render->tilebuffer.layered &&
+               agx_tilebuffer_offset_B(&render->tilebuffer, active_rt) == 0;
+            if (tib_matches && active_rt != 0) {
                compact_tib = hk_tilebuffer_layout(
                   hk_cmd_buffer_device(cmd), &iview->vk.format, 0, 1,
                   render->tilebuffer.nr_samples, false, false, 1);
-               (void)fmt;
+               tib_matches =
+                  !agx_tilebuffer_spills(&compact_tib) &&
+                  !compact_tib.layered &&
+                  agx_tilebuffer_offset_B(&compact_tib, 0) == 0 &&
+                  compact_tib.logical_format[0] ==
+                     render->tilebuffer.logical_format[active_rt] &&
+                  compact_tib.sample_size_B == render->tilebuffer.sample_size_B &&
+                  compact_tib.tile_size == render->tilebuffer.tile_size &&
+                  compact_tib.nr_samples == render->tilebuffer.nr_samples &&
+                  compact_tib.native_imageblock ==
+                     render->tilebuffer.native_imageblock;
             }
-            if (!agx_tilebuffer_spills(&compact_tib) &&
-                agx_tilebuffer_offset_B(&compact_tib, 0) == 0 &&
-                !compact_tib.layered) {
+            if (tib_matches) {
                const struct hk_image *z_img =
                   render->depth_att.iview
                      ? container_of(render->depth_att.iview->vk.image,
