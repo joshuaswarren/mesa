@@ -8,7 +8,7 @@
 static bool
 supported(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17P;
+   return agx_chip_g17p_or_m5(chip);
 }
 bool
 agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word)

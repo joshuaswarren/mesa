@@ -8,6 +8,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_constant_expressions.h"
 extern "C" {
+#include "asahi/lib/agx_abi.h"
 #include "agx_nir.h"
 }
 
@@ -1002,4 +1003,214 @@ TEST(FeatureMatchingOpts, SinkImmediatesAcrossInnerLoop)
    }
    EXPECT_TRUE(found_in_after);
    ralloc_free(memctx);
+}
+
+/* Pre-unroll direct-body constant-load LICM hoists speculatable bounded UBO
+ * loads and their descriptor/bounds chains out of loops while leaving
+ * unrelated loop-invariant integer math unhoisted. */
+TEST(FeatureMatchingOpts, LicmDirectConstLoadsHoistsSpeculatableBoundedUbo)
+{
+   nir_builder b = make_compute("licm-const-load-chain");
+   nir_def *n = load_push_u32(&b, 0);
+   nir_def *stride = load_push_u32(&b, 4);
+   nir_def *root = load_preamble_base(&b, 1, 64, 0);
+   nir_def *tid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_float(&b, 0.0f), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+
+      nir_def *desc = nir_load_global_constant(
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
+         .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
+      nir_def *bound = nir_usub_sat(&b, nir_channel(&b, desc, 2), nir_imm_int(&b, 3));
+      nir_def *valid = nir_ult(&b, nir_imm_int(&b, 4), bound);
+      nir_def *base = nir_bcsel(
+         &b, valid,
+         nir_pack_64_2x32_split(&b, nir_channel(&b, desc, 0), nir_channel(&b, desc, 1)),
+         nir_imm_int64(&b, AGX_ZERO_PAGE_ADDRESS));
+      nir_def *k = nir_load_global_constant(
+         &b, 1, 32, nir_iadd_imm(&b, base, 4),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                         ACCESS_CAN_REORDER |
+                                         ACCESS_CAN_SPECULATE),
+         .align_mul = 4);
+
+      /* Unrelated loop-invariant integer math stays inside the loop. */
+      nir_def *row_off = nir_imul(&b, tid, stride);
+      nir_def *addr = buffer_addr(&b, nir_ishl_imm(&b, nir_iadd(&b, row_off, i), 2));
+      nir_def *w = load_global_ex(&b, 1, 32, addr, 4);
+      nir_store_var(&b, acc,
+                    nir_fadd(&b, nir_load_var(&b, acc), nir_fmul(&b, k, w)), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   store_global_ex(&b, nir_load_var(&b, acc),
+                   buffer_addr(&b, nir_imm_int(&b, 0)), 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+
+   EXPECT_TRUE(agx_nir_opt_licm_direct_const_loads(b.shader, 56));
+   nir_validate_shader(b.shader, "licm-const-load-chain");
+   EXPECT_EQ(count_alu_in_loops(b.shader, nir_op_usub_sat), 0u);
+   EXPECT_EQ(count_alu_in_loops(b.shader, nir_op_imul), 1u);
+   ralloc_free(b.shader);
+}
+
+/* Non-speculatable loads and descriptor-only loads (feeding a non-speculatable
+ * read) must NOT trigger direct constant-load LICM. */
+TEST(FeatureMatchingOpts, LicmDirectConstLoadsRejectsUnspeculatable)
+{
+   nir_builder b = make_compute("licm-const-load-reject");
+   nir_def *n = load_push_u32(&b, 0);
+   nir_def *root = load_preamble_base(&b, 1, 64, 0);
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_float(&b, 0.0f), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      nir_def *desc = nir_load_global_constant(
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
+         .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
+      nir_def *base =
+         nir_pack_64_2x32_split(&b, nir_channel(&b, desc, 0), nir_channel(&b, desc, 1));
+      nir_def *k = nir_load_global_constant(
+         &b, 1, 32, nir_iadd_imm(&b, base, 4),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .align_mul = 4);
+      nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), k), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   store_global_ex(&b, nir_load_var(&b, acc),
+                   buffer_addr(&b, nir_imm_int(&b, 0)), 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+
+   EXPECT_FALSE(agx_nir_opt_licm_direct_const_loads(b.shader, 56));
+   ralloc_free(b.shader);
+}
+
+/* G17P bounded dynamic-UBO loads (bcsel onto AGX_ZERO_PAGE_ADDRESS) promote to
+ * AGX3_UNIFORM_DMA_BUFFER in compute and vertex stages; mismatched bounds stay
+ * in the software preamble. */
+TEST(FeatureMatchingOpts, BoundedDynamicUboPromotesToUniformDma)
+{
+   auto make_bounded_read = [](nir_builder *b, nir_def *desc, uint32_t offset_B,
+                               uint32_t sub_val) {
+      nir_def *adj = nir_usub_sat(b, nir_channel(b, desc, 2), nir_imm_int(b, sub_val));
+      nir_def *valid = nir_ult(b, nir_imm_int(b, offset_B), adj);
+      nir_def *base = nir_bcsel(
+         b, valid,
+         nir_pack_64_2x32_split(b, nir_channel(b, desc, 0), nir_channel(b, desc, 1)),
+         nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      return nir_load_global_constant(
+         b, 1, 32, nir_iadd_imm(b, base, offset_B),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                         ACCESS_CAN_REORDER |
+                                         ACCESS_CAN_SPECULATE),
+         .align_mul = 4);
+   };
+
+   /* 1. Vertex shader with bounded dynamic UBO load + 1 cheap ALU op drops its
+    * entire software preamble once uniform DMA replaces the bounded read. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "agx3-bounded-ubo-vs");
+      b.shader->info.io_lowered = true;
+      b.shader->info.outputs_written = VARYING_BIT_POS;
+
+      nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *desc = nir_load_global_constant(
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
+         .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
+      nir_def *v0 = make_bounded_read(&b, desc, 0, 3);
+      nir_def *v1 = make_bounded_read(&b, desc, 4, 3);
+      nir_def *vid = nir_load_vertex_id(&b);
+      nir_def *x = nir_fadd(&b, nir_u2f32(&b, nir_iadd(&b, vid, nir_ineg(&b, v0))), v1);
+      nir_def *pos[4] = {x, v1, nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)};
+      for (unsigned c = 0; c < 4; ++c)
+         nir_store_uvs_agx(&b, pos[c], nir_imm_intN_t(&b, c, 16));
+      agx_preprocess_nir(b.shader);
+
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.reserved_preamble = 4;
+      key.agx3_native_cprog = true;
+      key.g17p_native_uniforms = true;
+      key.g17p_uniform_dma = true;
+      key.g17p_dma_root = 0;
+      key.g17p_dma_buffers_B = 64;
+      key.g17p_dma_buffer_count = 4;
+
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_FALSE(part.info.has_preamble);
+      ASSERT_EQ(part.info.agx3_uniform_dma_count, 1u);
+      EXPECT_EQ(part.info.agx3_uniform_dma[0].source, AGX3_UNIFORM_DMA_BUFFER);
+      EXPECT_EQ(part.info.agx3_uniform_dma[0].descriptor_B, 64u);
+      EXPECT_EQ(part.info.agx3_uniform_dma[0].offset_B, 0u);
+      EXPECT_EQ(part.info.agx3_uniform_dma[0].halfs, 4u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 2. Negative control: wrong bounds subtraction (sub=7 instead of 3 for a
+    * 4-byte load) must NOT be promoted to AGX3_UNIFORM_DMA_BUFFER. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "agx3-bounded-ubo-bad-bound");
+      b.shader->info.io_lowered = true;
+      b.shader->info.outputs_written = VARYING_BIT_POS;
+
+      nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *desc = nir_load_global_constant(
+         &b, 4, 32, nir_iadd_imm(&b, root, 64),
+         .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX),
+         .align_mul = 16);
+      nir_def *v = make_bounded_read(&b, desc, 4, 7);
+      nir_def *vid = nir_load_vertex_id(&b);
+      nir_def *x = nir_fadd(&b, nir_u2f32(&b, vid), v);
+      nir_def *pos[4] = {x, v, nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)};
+      for (unsigned c = 0; c < 4; ++c)
+         nir_store_uvs_agx(&b, pos[c], nir_imm_intN_t(&b, c, 16));
+      agx_preprocess_nir(b.shader);
+
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.reserved_preamble = 4;
+      key.agx3_native_cprog = true;
+      key.g17p_native_uniforms = true;
+      key.g17p_uniform_dma = true;
+      key.g17p_dma_root = 0;
+      key.g17p_dma_buffers_B = 64;
+      key.g17p_dma_buffer_count = 4;
+
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      bool has_buf_dma = false;
+      for (unsigned i = 0; i < part.info.agx3_uniform_dma_count; ++i)
+         has_buf_dma |= part.info.agx3_uniform_dma[i].source == AGX3_UNIFORM_DMA_BUFFER;
+      EXPECT_FALSE(has_buf_dma);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
 }

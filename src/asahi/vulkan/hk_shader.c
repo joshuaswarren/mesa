@@ -1790,7 +1790,8 @@ hk_nir_merge_buffer_words(nir_shader *nir)
 }
 
 static nir_def *
-bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
+bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset,
+             unsigned load_size)
 {
    /* If we can, clamp the source of an amul instead of the result, to remain
     * compatible with the hardware address mode.
@@ -1813,8 +1814,8 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
       nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
 
       if (is_op(x, nir_op_amul) || is_op(y, nir_op_amul)) {
-         return nir_iadd(b, bound_offset(b, valid, x),
-                         bound_offset(b, valid, y));
+         return nir_iadd(b, bound_offset(b, valid, x, load_size),
+                         bound_offset(b, valid, y, load_size));
       }
    }
 
@@ -1822,29 +1823,93 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
 
    /* If the offset fits within the zero page, clamping is pointless */
    if (nir_scalar_is_const(offset) &&
-       (nir_scalar_as_uint(offset) + 16) < AGX_ZERO_PAGE_SIZE)
+       (uint64_t)nir_scalar_as_uint(offset) + load_size <= AGX_ZERO_PAGE_SIZE)
       return def;
 
    /* Otherwise, fallback on clamping the offset */
    return nir_bcsel(b, valid, def, nir_imm_int(b, 0));
 }
 
+/* Whether a bounded load's (base, bound) pair comes from a statically indexed,
+ * non-partially-bound buffer descriptor (ACCESS_BUFFER_DESCRIPTOR_AGX). Such a
+ * descriptor is either mapped for [base, base + bound) or a null descriptor
+ * with bound == 0, so a read guarded onto AGX_ZERO_PAGE_ADDRESS cannot fault
+ * when speculated out of control flow or loops. */
+static bool
+bounded_descriptor_always_valid(nir_def *base, nir_def *bound)
+{
+   nir_scalar bound_s = nir_scalar_resolved(bound, 0);
+   nir_intrinsic_instr *desc = nir_def_as_intrinsic_or_null(bound_s.def);
+   if (!desc || bound_s.comp != 2 ||
+       (desc->intrinsic != nir_intrinsic_load_global_constant &&
+        desc->intrinsic != nir_intrinsic_load_global_constant_offset) ||
+       !(nir_intrinsic_access(desc) & ACCESS_BUFFER_DESCRIPTOR_AGX))
+      return false;
+
+   nir_scalar base_s = nir_scalar_resolved(base, 0);
+   if (!nir_scalar_is_alu(base_s))
+      return false;
+
+   nir_scalar lo, hi;
+   nir_op op = nir_scalar_alu_op(base_s);
+   if (op == nir_op_pack_64_2x32_split) {
+      lo = nir_scalar_chase_alu_src(base_s, 0);
+      hi = nir_scalar_chase_alu_src(base_s, 1);
+   } else if (op == nir_op_pack_64_2x32) {
+      nir_scalar vec = nir_scalar_chase_alu_src(base_s, 0);
+      lo = nir_scalar_resolved(vec.def, 0);
+      hi = nir_scalar_resolved(vec.def, 1);
+   } else {
+      return false;
+   }
+
+   lo = nir_scalar_resolved(lo.def, lo.comp);
+   hi = nir_scalar_resolved(hi.def, hi.comp);
+   return lo.def == &desc->def && lo.comp == 0 &&
+          hi.def == &desc->def && hi.comp == 1;
+}
+
+static bool
+ubo_root_always_valid(nir_def *desc_vec)
+{
+   nir_scalar s0 = nir_scalar_resolved(desc_vec, 0);
+   nir_scalar s1 = nir_scalar_resolved(desc_vec, 1);
+   nir_scalar s2 = nir_scalar_resolved(desc_vec, 2);
+   nir_intrinsic_instr *desc = nir_def_as_intrinsic_or_null(s0.def);
+   return desc && s0.comp == 0 &&
+          s1.def == &desc->def && s1.comp == 1 &&
+          s2.def == &desc->def && s2.comp == 2 &&
+          (desc->intrinsic == nir_intrinsic_load_global_constant ||
+           desc->intrinsic == nir_intrinsic_load_global_constant_offset) &&
+          (nir_intrinsic_access(desc) & ACCESS_BUFFER_DESCRIPTOR_AGX);
+}
+
 static void
 lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 {
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def *base = intr->src[0].ssa;
+   nir_def *orig_base = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
+   nir_def *orig_bound = intr->src[2].ssa;
+   unsigned load_size = (intr->def.bit_size / 8) * intr->num_components;
 
    /* Bounds check compatibly with the hardware address mode */
    nir_def *valid = check_in_bounds(b, intr);
-   base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+   nir_def *base =
+      nir_bcsel(b, valid, orig_base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0), load_size);
 
    enum gl_access_qualifier access = nir_intrinsic_access(intr);
 
    if (intr->intrinsic == nir_intrinsic_load_global_constant_bounded) {
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   }
+
+   if ((access & (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)) ==
+          (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER) &&
+       !(access & (ACCESS_COHERENT | ACCESS_VOLATILE)) &&
+       bounded_descriptor_always_valid(orig_base, orig_bound)) {
+      access |= ACCESS_CAN_SPECULATE;
    }
 
    nir_def *address = nir_iadd(b, base, nir_u2u64(b, offset));
@@ -2012,12 +2077,14 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *index =
       nir_iand_imm(b, off, (AGX_ZERO_PAGE_SIZE - 1u) & ~(alignment - 1u));
    index = nir_ior_imm(b, index, disp % alignment);
+   const bool can_speculate = ubo_root_always_valid(root->parent.ssa);
    nir_def *address = nir_iadd(b, safe, nir_u2u64(b, index));
    nir_def *value = nir_load_global_constant(
       b, intr->num_components, 32, address,
       .align_mul = alignment, .align_offset = disp % alignment,
       .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE |
-                ACCESS_CAN_REORDER);
+                ACCESS_CAN_REORDER |
+                (can_speculate ? ACCESS_CAN_SPECULATE : 0));
    nir_def_replace(&intr->def, value);
    return true;
 }
@@ -9220,8 +9287,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
-      if (dev->dev.chip != AGX_CHIP_G17P &&
-          dev->dev.chip != AGX_CHIP_G17S) {
+      if (!agx_chip_g17p_or_m5(dev->dev.chip)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -9272,8 +9338,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          NIR_PASS(_, nir, hk_lower_mesh_queries, !sw_task);
       const bool clip_m1_1 =
          hk_mesh_clip_m1_1(dev->vk.enabled_features.depthClipControl, state);
-      /* G17P remaps the exported z instead (agx_nir_lower_gen1_mesh). */
-      if (clip_m1_1 && dev->dev.chip != AGX_CHIP_G17P) {
+      /* G17P and M5 remap the exported z instead (agx_nir_lower_gen1_mesh /
+       * agx_nir_lower_m5_mesh). */
+      if (clip_m1_1 && !agx_chip_g17p_or_m5(dev->dev.chip)) {
          /* Mesh outputs cannot go through output temporaries. Refuse what
           * the lowering cannot convert rather than render the wrong depth. */
          if (!agx_nir_clip_m1_1_complete(nir)) {
@@ -9294,7 +9361,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * fit the native output limits (agx_nir_lower_m5_mesh()). Keep the
        * shader as it was to compile instead where they do not. */
       nir_shader *m5_without_layer = NULL;
-      if (dev->dev.chip == AGX_CHIP_G17S && key_tmp.mesh.default_layer) {
+      if (m5_mesh && key_tmp.mesh.default_layer) {
          m5_without_layer = nir_shader_clone(NULL, nir);
          if (m5_without_layer && !hk_m5_mesh_default_layer(nir)) {
             ralloc_free(m5_without_layer);
@@ -9304,7 +9371,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    m5_mesh_layout:;
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
-      varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
+      varyings.clip_m1_1 = clip_m1_1 && agx_chip_g17p_or_m5(dev->dev.chip);
       if ((dev->dev.chip == AGX_CHIP_G17P || m5_mesh) &&
           nir->info.mesh.primitive_type == MESA_PRIM_LINES)
          varyings.line_bias_root_B = hk_root_descriptor_offset(line_y_bias);
@@ -9546,7 +9613,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       hk_m5_task_predicate(nir);
       const bool grid_record =
          hk_m5_task_record(dev->dev.params.features) && !m5_no_grid_record;
-      if (dev->dev.chip != AGX_CHIP_G17S ||
+      if (!agx_chip_g17_m5(dev->dev.chip) ||
           !agx_nir_lower_m5_task(nir,
               hk_m5_task_payload_limit(dev->dev.params.features),
               grid_record)) {
@@ -10248,7 +10315,7 @@ static bool
 hk_m5_no_grid_record(const struct hk_device *dev, uint32_t shader_count,
                      const struct vk_shader_compile_info *infos)
 {
-   if (dev->dev.chip != AGX_CHIP_G17S ||
+   if (!agx_chip_g17_m5(dev->dev.chip) ||
        !hk_m5_task_record(dev->dev.params.features))
       return false;
    const struct vk_shader_compile_info *task = NULL, *mesh = NULL;
@@ -11143,7 +11210,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     * unlinked shader object may meet a fragment shader that reads gl_Layer.
     * A complete pipeline without a fragment shader cannot. */
    const bool mesh_default_layer =
-      dev->dev.chip == AGX_CHIP_G17S && !has_fragment &&
+      agx_chip_g17_m5(dev->dev.chip) && !has_fragment &&
       !hk_pipeline_has_no_fragment_shader(state);
 
    for (uint32_t i = 0; i < shader_count; i++) {

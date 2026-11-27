@@ -19257,8 +19257,9 @@ TEST_F(AGX3PackBinary, ComputeShadow2DArrayRegisterDescRetiresLiveSlot6OnAGX3C)
    EXPECT_EQ(b->shader->agx3_staging_halfs, 32u);
 }
 
-/* Negative cases: compute 2D-array shadow samples with register LOD stay on
- * bank 0 for AGX3B, for AGX3D (emit_agx3d), and for non-compute stages. */
+/* Negative cases: register-descriptor 2D-array shadow samples with register
+ * LOD stay on bank 0 outside AGX3C compute (uniform/immediate descriptors use
+ * relocatable_2d_array on both AGX3B and non-AGX3D AGX3C). */
 TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
 {
    const struct {
@@ -19284,6 +19285,8 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
       b->shader->stage = c.stage;
       b->shader->max_reg = 127;
 
+      const agx_index tex = agx_register(40, AGX_SIZE_64);
+      const agx_index smp = agx_register(44, AGX_SIZE_64);
       for (unsigned i = 0; i < 2; ++i) {
          agx_index dest = agx_register(60 + 8 * i, AGX_SIZE_32);
          dest.channels_m1 = 3;
@@ -19296,7 +19299,7 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
          ref.discard = true;
          auto *I = agx_texture_sample_to(
             b, dest, coord, lod, agx_immediate(0),
-            agx_immediate(0), agx_immediate(0), ref,
+            tex, smp, ref,
             AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0,
             false, true, false, AGX_GATHER_NONE, false);
          I->mask = 1;
@@ -19310,6 +19313,105 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
        * only non-G18G cases keep staging_halfs == 8. */
       if (!c.agx3d) {
          EXPECT_EQ(b->shader->agx3_staging_halfs, 8u);
+      }
+   }
+}
+
+/* Consecutive 2D register-LOD / register-bias samples and 9-tap 2D-array
+ * shadow register-LOD samples (e.g. VK_EXT_image_view_min_lod lowering of
+ * SampleLevel/SampleCmpLevelZero) allocate disjoint 8-half staging banks on
+ * AGX3B without early slot-1 retirement. */
+TEST_F(AGX3PackBinary, RegisterLodAndBias2DAnd2DArrayUseDisjointBanksOnAGX3B)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   for (enum agx_lod_mode mode :
+        {AGX_LOD_MODE_LOD_MIN, AGX_LOD_MODE_AUTO_LOD_BIAS}) {
+      SCOPED_TRACE(mode);
+      agx_builder *b = builder(enc);
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 127;
+
+      const agx_index lod = agx_register(4, AGX_SIZE_16);
+      for (unsigned i = 0; i < 5; ++i) {
+         agx_index dest = agx_register(48 + 8 * i, AGX_SIZE_32);
+         dest.channels_m1 = 3;
+         agx_index coord = agx_register(8 + 4 * i, AGX_SIZE_32);
+         coord.channels_m1 = 1;
+         auto *I = agx_texture_sample_to(
+            b, dest, coord, lod, agx_immediate(0),
+            agx_uniform(0, AGX_SIZE_64), agx_uniform(4, AGX_SIZE_64),
+            agx_null(), AGX_DIM_2D, mode, 0, false, false, false,
+            AGX_GATHER_NONE, false);
+         I->mask = 15;
+      }
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+      EXPECT_TRUE(b->shader->agx3_staging_known);
+      EXPECT_EQ(b->shader->agx3_staging_halfs, 40u);
+
+      for (unsigned i = 0; i < 5; ++i) {
+         uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_tex_stage_typed_lod_at(
+            enc, 8 * i, 4, 1 + i, 0, false, false, AGX3_TEX_LEVEL_FLOAT,
+            bytes, &len));
+         EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                   code.end())
+            << "missing typed LOD staging at bank " << (8 * i);
+      }
+
+      /* Later taps must not retire slot 1 early to reclaim bank 0. */
+      for (unsigned i = 1; i < 5; ++i) {
+         uint8_t retire_s1[AGX3_ALU_MAX_LENGTH], rlen = 0;
+         ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 48 + 8 * i, 0x1,
+                                                 retire_s1, &rlen));
+         EXPECT_EQ(std::search(code.begin(), code.end(), retire_s1,
+                               retire_s1 + rlen),
+                   code.end())
+            << "unexpected early slot-1 retirement on tap " << i;
+      }
+   }
+
+   /* 9-tap 2D-array shadow comparison with register LOD (3x3 PCF with
+    * image_view_min_lod): stages on slot 6, spreads across banks 0..64
+    * (escalating bank 64 to ep4), and keeps all 9 taps in flight. */
+   {
+      agx_builder *b = builder(enc);
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 127;
+
+      const agx_index lod = agx_register(4, AGX_SIZE_16);
+      const agx_index ref = agx_register(6, AGX_SIZE_32);
+      for (unsigned i = 0; i < 9; ++i) {
+         agx_index dest = agx_register(24 + 8 * i, AGX_SIZE_32);
+         dest.channels_m1 = 3;
+         agx_index coord = agx_register(8 + 8 * (i % 2), AGX_SIZE_32);
+         coord.channels_m1 = 2;
+         auto *I = agx_texture_sample_to(
+            b, dest, coord, lod, agx_immediate(0),
+            agx_uniform(0, AGX_SIZE_64), agx_uniform(4, AGX_SIZE_64),
+            ref, AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0, false, true, false,
+            AGX_GATHER_NONE, false);
+         I->mask = 1;
+      }
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+      EXPECT_TRUE(b->shader->agx3_staging_known);
+      EXPECT_EQ(b->shader->agx3_staging_halfs, 72u);
+
+      for (unsigned i = 0; i < 9; ++i) {
+         uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_tex_stage_array_lod_at(
+            enc, 8 * i, (8 + 8 * (i % 2)) + 4, 4, 6, 0,
+            false, false, false, false, bytes, &len));
+         EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                   code.end())
+            << "missing array+LOD staging at bank " << (8 * i);
       }
    }
 }

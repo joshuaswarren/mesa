@@ -1125,6 +1125,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
+          !(last->sync.heap_slot && cs->sync.heap_slot &&
+            last->sync.heap_slot != cs->sync.heap_slot) &&
           !hk_sync_merge_delays(cmd, last, cs)) {
 
          hk_sync_merge(cmd, last, cs);
@@ -1262,9 +1264,14 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool rpack_tail_clean =
+      cmd->render_pack.tail_open &&
+      cmd->render_pack.tail_epoch == cmd->sync.epoch;
    if (likely(!(dev->dev.debug & AGX_DBG_NOMERGE))) {
       merge_control_streams(cmd);
    }
+   if (rpack_tail_clean)
+      cmd->render_pack.tail_epoch = cmd->sync.epoch;
 
    /* We cannot terminate CDM control streams until after merging, since merging
     * needs to append stream links late. Now that we've merged, insert all the
@@ -4220,14 +4227,14 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
           ? !linked->b.g17p_compiler_d_valid
-          : (dev->dev.chip != AGX_CHIP_G17S ||
+          : (!agx_chip_g17_m5(dev->dev.chip) ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
    /* An API task shader is a compiled object program with the ordinary
     * driver-root/descriptor ranges and its own threadgroup memory. */
-   const bool task_object = object && task && dev->dev.chip == AGX_CHIP_G17S &&
+   const bool task_object = object && task && agx_chip_g17_m5(dev->dev.chip) &&
                             s->info.stage == MESA_SHADER_TASK;
    if (task_object) {
       if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
@@ -5495,6 +5502,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
       if (!cs)
          return;
+      if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+         cs->render_pack_compute_internal = true;
 
       const uint32_t shared_bytes =
          prog->info.local_size
@@ -5579,6 +5588,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct agx_ptr t = hk_pool_usc_alloc(cmd, agx_usc_size(15), 64);
    uint64_t uploaded_data = hk_pool_upload(cmd, data, data_size, 4);

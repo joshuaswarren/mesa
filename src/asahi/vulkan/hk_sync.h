@@ -95,13 +95,14 @@ enum hk_sync_kind {
    HK_SYNC_GFX_MEM = 1 << 5,
 
    /* Stream kinds and first scopes only, never named by an application
-    * dependency: a command the driver records to carry a timestamp alone, or
-    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
-    * query memory, which only query commands and later timestamps read, so
-    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
-    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
-    * does not order later work after it. It waits like work of every class
-    * (hk_sync_full_kinds()). */
+    * dependency: a command the driver records to carry a timestamp alone, to
+    * copy timestamps (hk_sync_write_timestamp()), or to publish post-graphics
+    * query availability (hk_flush_oq_pending(),
+    * hk_queue_query_available_write()). It writes nothing but query memory,
+    * which only query commands, events, and later timestamps observe, so only
+    * their first scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope());
+    * a pipeline barrier, even an ALL_COMMANDS one, does not order later work
+    * after it. It waits like work of every class (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
 
    /* Stream kinds and first scopes only, never named by an application

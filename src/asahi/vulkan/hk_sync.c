@@ -561,14 +561,17 @@ brl_sync_transition_kinds(const VkDependencyInfo *info,
 
 static struct hk_cs *previous_on_sq(struct hk_cmd_buffer *cmd,
                                     struct hk_cs *cs);
+static struct hk_cs *previous_on_sq_kinds(struct hk_cmd_buffer *cmd,
+                                          struct hk_cs *cs, uint8_t kinds);
 
 void
 hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
-   /* Graphics scope includes availability writes staged on the render.
-    * Materialize their post-graphics stream before taking the CDM cut. */
-   if ((src_kinds & HK_SYNC_GFX) && unlikely(cmd->state.oq_pending_render))
+   /* Query, timestamp, and event scopes include availability writes staged on
+    * the render (HK_SYNC_STAMP). Materialize their post-graphics stream before
+    * taking the CDM cut. */
+   if ((src_kinds & HK_SYNC_STAMP) && unlikely(cmd->state.oq_pending_render))
       hk_flush_oq_pending(cmd);
 
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
@@ -868,6 +871,8 @@ brl_sync_transition_prepare(struct hk_cmd_buffer *cmd, uint8_t src_kinds)
 void
 brl_sync_transition_begin(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    assert(!st->brl_transition_active && !st->kind_override);
    st->brl_transition_active = true;
@@ -1329,42 +1334,57 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
-/* Whether the compute stream cs already waits for every compute stream before
- * it: for the one before it, which covers the earlier ones as a prefix. */
+/* Whether the compute stream cs already waits for every earlier compute stream
+ * matching kinds: for the latest one before it, which covers the rest as a
+ * prefix. When kinds is HK_SYNC_STREAM_KINDS, every earlier compute stream
+ * counts; application requirements (HK_SYNC_ALL) ignore pure query-memory
+ * streams (HK_SYNC_STAMP, HK_SYNC_QRESET), which no application dependency
+ * names. */
 static bool
-cdm_waits_for_prefix(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+cdm_waits_for_prefix(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     uint8_t kinds)
 {
-   const struct hk_cs *prev = previous_on_sq(cmd, cs);
+   const struct hk_cs *prev =
+      kinds == HK_SYNC_STREAM_KINDS ? previous_on_sq(cmd, cs)
+                                    : previous_on_sq_kinds(cmd, cs, kinds);
    const struct hk_cs *cut = cs->sync.dep[HK_SYNC_CDM].cut;
    return !prev || (cut && cut != cs && cut->sync.seq >= prev->sync.seq);
 }
 
 /* Whether work recorded into the open compute stream cs meets the requirement
  * dep: every stream dep names must precede cs. A cut at cs itself names the
- * compute streams before cs as well as the work inside it. The stream orders
- * only its own work, and the kernel may run earlier compute streams of the
- * queue on other firmware channels (DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL),
- * so that cut is met only if cs already waits for those streams. */
+ * earlier compute streams of prefix_kinds as well as the work inside cs. The
+ * stream orders only its own work, and the kernel may run earlier compute
+ * streams of the queue on other firmware channels
+ * (DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL), so that cut is met only if cs
+ * already waits for those streams. */
 static bool
 cs_meets(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
-         const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+         const struct hk_sync_dep dep[HK_SYNC_NUM_SQ], uint8_t prefix_kinds)
 {
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       if (dep[sq].cut && dep[sq].cut->sync.seq > cs->sync.seq)
          return false;
    }
 
-   return dep[HK_SYNC_CDM].cut != cs || cdm_waits_for_prefix(cmd, cs);
+   return dep[HK_SYNC_CDM].cut != cs ||
+          cdm_waits_for_prefix(cmd, cs, prefix_kinds);
 }
 
 /* Whether the open general compute stream may receive work of the given
- * kinds (cs_meets()). */
+ * kinds (cs_meets()). Recorded requirements (cmd->sync.req) come from
+ * application dependencies and never name pure query-memory streams
+ * (HK_SYNC_STAMP, HK_SYNC_QRESET), so application work only needs the open
+ * stream to cover earlier HK_SYNC_ALL compute streams. */
 static bool
 cs_reusable(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t kinds)
 {
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    req_for_kinds(cmd, kinds, dep);
-   return cs_meets(cmd, cs, dep);
+   const uint8_t prefix_kinds =
+      (kinds & (HK_SYNC_STAMP | HK_SYNC_QRESET)) ? HK_SYNC_STREAM_KINDS
+                                                 : HK_SYNC_ALL;
+   return cs_meets(cmd, cs, dep, prefix_kinds);
 }
 
 /* Whether the compute stream cs already waits for the render r: directly,
@@ -1574,13 +1594,14 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
       dep_max(&full[sq], &dep[sq]);
 
-   if (cs && !cmd->sync.pin_cs && !cs_meets(cmd, cs, full))
+   if (cs && !cmd->sync.pin_cs && !cs_meets(cmd, cs, full, HK_SYNC_STREAM_KINDS))
       hk_cmd_buffer_end_compute(cmd);
 
    cs = hk_cmd_buffer_get_cs(cmd, true);
    if (cs) {
       /* A pinned stream stays open: it waits for the streams before it. */
-      if (full[HK_SYNC_CDM].cut == cs && !cdm_waits_for_prefix(cmd, cs))
+      if (full[HK_SYNC_CDM].cut == cs &&
+          !cdm_waits_for_prefix(cmd, cs, HK_SYNC_STREAM_KINDS))
          full[HK_SYNC_CDM].cut = previous_on_sq(cmd, cs);
       hk_sync_stream_wait(cs, full);
    }
@@ -1757,6 +1778,21 @@ previous_on_sq(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    return NULL;
 }
 
+/* The latest stream of any of the given kinds on the same subqueue that
+ * precedes cs in the list. */
+static struct hk_cs *
+previous_on_sq_kinds(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     uint8_t kinds)
+{
+   for (struct list_head *n = cs->node.prev; n != &cmd->control_streams;
+        n = n->prev) {
+      struct hk_cs *it = list_entry(n, struct hk_cs, node);
+      if (it->type == cs->type && (it->sync.kind & kinds))
+         return it;
+   }
+   return NULL;
+}
+
 static void
 replace_pointer(struct hk_cs **slot, struct hk_cs *from, struct hk_cs *to)
 {
@@ -1888,6 +1924,11 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       into->sync.brl_transition = true;
    }
    into->sync.kind |= from->sync.kind;
+   if (from->sync.heap_slot) {
+      assert(!into->sync.heap_slot ||
+             into->sync.heap_slot == from->sync.heap_slot);
+      into->sync.heap_slot = from->sync.heap_slot;
+   }
    into->sync.att_bloom |= from->sync.att_bloom;
    into->sync.vtx_images |= from->sync.vtx_images;
    into->sync.vtx_img_bloom |= from->sync.vtx_img_bloom;
@@ -1909,6 +1950,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->brl_transition_last[sq], from, into);
    replace_pointer(&st->brl_event_poll, from, into);
    replace_pointer(&st->stamp_copy_after[sq], from, into);
+   replace_pointer(&st->pass_heap_last[sq], from, into);
+   for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs)
+      replace_pointer(&st->last_heap_slot[hs][sq], from, into);
    records_replace_stream(cmd, from, into);
    xfer_replace_stream(st, from, into);
 
@@ -2572,8 +2616,18 @@ hk_sync_heap_used(struct hk_cmd_buffer *cmd)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.gfx);
    if (cmd->current_cs.pre_gfx)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.pre_gfx);
-   if (cmd->current_cs.post_gfx)
-      hk_sync_stream_wait_all(cmd, cmd->current_cs.post_gfx);
+   if (cmd->current_cs.post_gfx) {
+      /* A post-graphics stream opened for query availability alone carries
+       * HK_SYNC_STAMP. Once this pass uses the geometry heap, hk_heap()
+       * appends the heap-reset write to it, so promote it to HK_SYNC_GFX so
+       * later heap passes and graphics barriers wait for the reset. */
+      struct hk_cs *post = cmd->current_cs.post_gfx;
+      if (!(post->sync.kind & HK_SYNC_GFX)) {
+         post->sync.kind |= HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+         note_last(cmd, post);
+      }
+      hk_sync_stream_wait_all(cmd, post);
+   }
 }
 
 void
