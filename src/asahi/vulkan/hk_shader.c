@@ -1121,6 +1121,8 @@ hk_hash_graphics_state(struct vk_physical_device *device,
    if (agx_chip_native_or_m5(pdev->dev.chip)) {
       const uint32_t border = p_atomic_read(&pdev->border_emulation);
       _mesa_blake3_update(&blake3_ctx, &border, sizeof(border));
+      const uint32_t min_lod = p_atomic_read(&pdev->min_lod_emulation);
+      _mesa_blake3_update(&blake3_ctx, &min_lod, sizeof(min_lod));
    }
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
@@ -3681,12 +3683,121 @@ static uint8_t
 hk_static_set_mask(uint32_t set_layout_count,
                    struct vk_descriptor_set_layout *const *set_layouts);
 
+static bool
+hk_lazy_min_lod_enabled(struct hk_device *dev, const nir_shader *nir,
+                        enum hk_feature_key features)
+{
+   struct hk_instance *instance =
+      hk_physical_device_instance(hk_device_physical(dev));
+   return agx_chip_native_or_m5(dev->dev.chip) &&
+          instance->drirc.misc.image_view_min_lod &&
+          (features & HK_FEAT_IMAGE_VIEW_MIN_LOD) &&
+          !nir->info.internal;
+}
+
 static void
-hk_lower_nir(struct hk_device *dev, nir_shader *nir,
-             const struct vk_pipeline_robustness_state *rs, bool is_multiview,
-             VkShaderStageFlags next_stage_mask, uint32_t set_layout_count,
-             struct vk_descriptor_set_layout *const *set_layouts,
-             enum hk_feature_key features)
+hk_lower_nir_post_tex(struct hk_device *dev, nir_shader *nir,
+                      const struct vk_pipeline_robustness_state *rs,
+                      bool lower_min_lod, bool can_post_lower)
+{
+   if (HK_PERF(dev, NOROBUST))
+      rs = &vk_robustness_disabled;
+
+   bool lowered_complex = false;
+   if (lower_min_lod) {
+      NIR_PASS(lowered_complex, nir, hk_nir_lower_image_view_min_lod_post_desc,
+               agx_chip_descriptor_generation(dev->dev.chip));
+   }
+
+   const bool hw_txf_bounds =
+      agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   const bool native_robust_images =
+      agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   const bool lower_agx3_robust_fetches =
+      agx_chip_agx3_path(dev->dev.chip) &&
+      !native_robust_images &&
+      !hw_txf_bounds &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+
+   if (agx_chip_descriptor_generation(dev->dev.chip) == 9) {
+      NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
+               lower_scaled_storage, nir_metadata_none,
+               hk_device_physical(dev));
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_scaled_sample,
+               hk_scaled_sample_guard(nir) ? nir_metadata_none
+                                           : nir_metadata_control_flow,
+               hk_device_physical(dev));
+   }
+
+   bool lowered_tex = false;
+   if (agx_chip_agx3_path(dev->dev.chip)) {
+      /* hk_nir_lower_robust_image_access() leaves formatless loads to this
+       * pass. */
+      unsigned tex_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (dev->dev.chip == AGX_CHIP_G18G)
+         tex_gen |= AGX_NIR_TEXTURE_IMAGE_SIDEBAND;
+      if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+          !nir->info.internal)
+         tex_gen |= AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT;
+      if (hw_txf_bounds)
+         tex_gen |= AGX_NIR_TEXTURE_HW_TXF_BOUNDS;
+      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_with_buffer_metadata,
+               tex_gen, lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
+               dev->vk.enabled_features.sparseResidencyBuffer);
+   } else {
+      if (dev->physical_sparse_map &&
+          hk_sparse_texel_residency_from_map(&dev->dev)) {
+         NIR_PASS(lowered_complex, nir, nir_shader_instructions_pass,
+                  lower_sparse_texel_buffer_residency, nir_metadata_none,
+                  (void *)dev);
+      }
+
+      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_for_generation,
+               agx_chip_descriptor_generation(dev->dev.chip));
+   }
+   NIR_PASS(lowered_complex, nir, agx_nir_lower_multisampled_image_store);
+
+   /* Mesh adds its native UVB shared arena after this frontend lowering.
+    * Keep application shared accesses byte addressed until that arena exists;
+    * the mesh branch then preprocesses every shared access exactly once.
+    * Reprocessing here and there divides preexisting element indices again.
+    * The M5 task (object) branch likewise preprocesses after adding its
+    * child-grid words, and the G17P task kernel after its payload lowering. */
+   const bool post_lower = can_post_lower && !lowered_complex && !lowered_tex;
+   if (nir->info.stage != MESA_SHADER_MESH &&
+       !(nir->info.stage == MESA_SHADER_TASK &&
+         agx_chip_g17p_or_m5(dev->dev.chip))) {
+      if (post_lower)
+         agx_preprocess_nir_post_lower(nir, dev->dev.chip);
+      else if (agx_chip_native_agx3(dev->dev.chip))
+         agx_preprocess_nir_native(nir, dev->dev.chip);
+      else if (dev->dev.chip == AGX_CHIP_G18G)
+         agx_preprocess_nir_g18g(nir);
+      else if (agx_chip_g17_m5(dev->dev.chip))
+         agx_preprocess_nir_m5_chip(nir, dev->dev.chip);
+      else
+         agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->dev.chip));
+   }
+
+   nir_opt_peephole_select_options peephole_select_options = {
+      .limit = 0,
+      .discard_ok = true,
+   };
+   NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
+   NIR_PASS(_, nir, nir_opt_if,
+            nir_opt_if_optimize_phi_true_false |
+               nir_opt_if_avoid_64bit_phis);
+}
+
+static void
+hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
+                const struct vk_pipeline_robustness_state *rs,
+                bool is_multiview, VkShaderStageFlags next_stage_mask,
+                uint32_t set_layout_count,
+                struct vk_descriptor_set_layout *const *set_layouts,
+                enum hk_feature_key features, bool defer_min_lod)
 {
    const bool already_preprocessed = nir->info.io_lowered;
    bool lowered_complex = false;
@@ -3814,19 +3925,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool lower_g17p_robust_images =
       dev->dev.chip == AGX_CHIP_G17P &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
-   /* Where the texture unit bounds texel fetches to the view, only the wide
-    * operands are saturated (AGX_NIR_TEXTURE_HW_TXF_BOUNDS below); see
-    * agx_chip_hw_texel_fetch_bounds(). */
-   const bool hw_txf_bounds =
-      agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
-      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
-      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
-   const bool lower_agx3_robust_fetches =
-      agx_chip_agx3_path(dev->dev.chip) &&
-      !native_robust_images &&
-      !hw_txf_bounds &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
 
    /* A G17P image load does not see a store made earlier in the same
@@ -3900,7 +4000,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);
 
-   if (instance->drirc.misc.image_view_min_lod &&
+   if (!defer_min_lod && instance->drirc.misc.image_view_min_lod &&
        (features & HK_FEAT_IMAGE_VIEW_MIN_LOD)) {
       NIR_PASS(lowered_complex, nir, hk_nir_lower_image_view_min_lod);
    }
@@ -4189,77 +4289,25 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                lower_viewport_fs, nir_metadata_control_flow, NULL);
    }
 
-   if (agx_chip_descriptor_generation(dev->dev.chip) == 9) {
-      NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
-               lower_scaled_storage, nir_metadata_none,
-               hk_device_physical(dev));
-      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_scaled_sample,
-               hk_scaled_sample_guard(nir) ? nir_metadata_none
-                                           : nir_metadata_control_flow,
-               hk_device_physical(dev));
-   }
+   if (defer_min_lod)
+      return;
 
-   bool lowered_tex = false;
-   if (agx_chip_agx3_path(dev->dev.chip)) {
-      /* hk_nir_lower_robust_image_access() leaves formatless loads to this
-       * pass. */
-      unsigned tex_gen = agx_chip_descriptor_generation(dev->dev.chip);
-      if (dev->dev.chip == AGX_CHIP_G18G)
-         tex_gen |= AGX_NIR_TEXTURE_IMAGE_SIDEBAND;
-      if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
-          !nir->info.internal)
-         tex_gen |= AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT;
-      if (hw_txf_bounds)
-         tex_gen |= AGX_NIR_TEXTURE_HW_TXF_BOUNDS;
-      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_with_buffer_metadata,
-               tex_gen, lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
-               dev->vk.enabled_features.sparseResidencyBuffer);
-   } else {
-      if (dev->physical_sparse_map &&
-          hk_sparse_texel_residency_from_map(&dev->dev)) {
-         NIR_PASS(lowered_complex, nir, nir_shader_instructions_pass,
-                  lower_sparse_texel_buffer_residency, nir_metadata_none,
-                  (void *)dev);
-      }
-
-      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_for_generation,
-               agx_chip_descriptor_generation(dev->dev.chip));
-   }
-   NIR_PASS(lowered_complex, nir, agx_nir_lower_multisampled_image_store);
-
-   /* Mesh adds its native UVB shared arena after this frontend lowering.
-    * Keep application shared accesses byte addressed until that arena exists;
-    * the mesh branch then preprocesses every shared access exactly once.
-    * Reprocessing here and there divides preexisting element indices again.
-    * The M5 task (object) branch likewise preprocesses after adding its
-    * child-grid words, and the G17P task kernel after its payload lowering. */
    const bool can_post_lower =
       already_preprocessed && !lowered_complex && !lowered_desc &&
       !lowered_global_io && !lowered_buf_io && !lowered_shared_io &&
-      !lowered_viewport && !lowered_tex && !lowered_mesh_out;
-   if (nir->info.stage != MESA_SHADER_MESH &&
-       !(nir->info.stage == MESA_SHADER_TASK &&
-         agx_chip_g17p_or_m5(dev->dev.chip))) {
-      if (can_post_lower)
-         agx_preprocess_nir_post_lower(nir, dev->dev.chip);
-      else if (agx_chip_native_agx3(dev->dev.chip))
-         agx_preprocess_nir_native(nir, dev->dev.chip);
-      else if (dev->dev.chip == AGX_CHIP_G18G)
-         agx_preprocess_nir_g18g(nir);
-      else if (agx_chip_g17_m5(dev->dev.chip))
-         agx_preprocess_nir_m5_chip(nir, dev->dev.chip);
-      else
-         agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->dev.chip));
-   }
+      !lowered_viewport && !lowered_mesh_out;
+   hk_lower_nir_post_tex(dev, nir, rs, false, can_post_lower);
+}
 
-   nir_opt_peephole_select_options peephole_select_options = {
-      .limit = 0,
-      .discard_ok = true,
-   };
-   NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
-   NIR_PASS(_, nir, nir_opt_if,
-            nir_opt_if_optimize_phi_true_false |
-               nir_opt_if_avoid_64bit_phis);
+static void
+hk_lower_nir(struct hk_device *dev, nir_shader *nir,
+             const struct vk_pipeline_robustness_state *rs, bool is_multiview,
+             VkShaderStageFlags next_stage_mask, uint32_t set_layout_count,
+             struct vk_descriptor_set_layout *const *set_layouts,
+             enum hk_feature_key features)
+{
+   hk_lower_nir_ex(dev, nir, rs, is_multiview, next_stage_mask,
+                   set_layout_count, set_layouts, features, false);
 }
 
 /* Upload the part of the binary the GPU reads from the shader itself: its
@@ -7149,6 +7197,7 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
 
    hk_fs_sample_source_destroy(obj->sample_source);
    hk_border_source_destroy(dev, obj->border_source);
+   hk_border_source_destroy(dev, obj->min_lod_source);
    for (struct hk_mesh_fs_twin *twin = obj->mesh_twins, *next; twin;
         twin = next) {
       next = twin->next;
@@ -8954,6 +9003,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   nir_shader *lr_nir,
                   const struct hk_local_read_info *lr_info_in,
                   bool has_ia_in,
+                  bool deferred_min_lod_in,
+                  bool min_lod_lowered_in,
+                  bool twin_for_min_lod,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -9010,7 +9062,18 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "mesh gl_NumWorkGroups under a task stage needs the task record");
    }
+   bool deferred_min_lod = deferred_min_lod_in;
+   bool min_lod_emulating = min_lod_lowered_in;
    if (!nir->info.io_lowered) {
+      const bool want_lazy_min_lod =
+         !twin_of && hk_lazy_min_lod_enabled(dev, nir, features) &&
+         hk_nir_needs_image_view_min_lod(nir);
+      if (want_lazy_min_lod) {
+         if (p_atomic_read(&hk_device_physical(dev)->min_lod_emulation))
+            min_lod_emulating = true;
+         else
+            deferred_min_lod = true;
+      }
       if (nir->info.stage == MESA_SHADER_FRAGMENT && !lr_nir) {
          bool scanned_ia = false;
          const bool lr_ok =
@@ -9021,9 +9084,12 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             lr_nir = nir_shader_clone(NULL, nir);
             if (lr_nir) {
                hk_nir_lower_input_attachments_to_outputs(lr_nir);
-               hk_lower_nir(dev, lr_nir, info->robustness, false,
-                            info->next_stage_mask, info->set_layout_count,
-                            info->set_layouts, features);
+               hk_lower_nir_ex(dev, lr_nir, info->robustness, false,
+                               info->next_stage_mask, info->set_layout_count,
+                               info->set_layouts, features, deferred_min_lod);
+               if (deferred_min_lod)
+                  hk_lower_nir_post_tex(dev, lr_nir, info->robustness, false,
+                                        false);
                NIR_PASS(_, lr_nir, hk_nir_widen_16bit_varyings,
                         HK_NIR_WIDEN_16BIT_INPUTS);
                NIR_PASS(_, lr_nir, nir_shader_intrinsics_pass,
@@ -9031,9 +9097,40 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             }
          }
       }
-      hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
-                   info->set_layout_count, info->set_layouts, features);
+      hk_lower_nir_ex(dev, nir, info->robustness, false, info->next_stage_mask,
+                      info->set_layout_count, info->set_layouts, features,
+                      deferred_min_lod);
    }
+
+   /* Defer image-view minLod emulation until the physical device creates an
+    * image view with minLod > baseMipLevel (hk_image_view_init). Until then,
+    * serialize the post-descriptor / pre-texture-lowering NIR to compile the
+    * minLod-emulating twin from, and finish texture lowering without minLod. */
+   void *min_lod_nir = NULL;
+   size_t min_lod_nir_size = 0;
+   if (twin_for_min_lod) {
+      hk_lower_nir_post_tex(dev, nir, info->robustness, true, false);
+      min_lod_emulating = true;
+   } else if (deferred_min_lod) {
+      struct hk_physical_device *pdev = hk_device_physical(dev);
+      if (p_atomic_read(&pdev->min_lod_emulation)) {
+         hk_lower_nir_post_tex(dev, nir, info->robustness, true, false);
+         min_lod_emulating = true;
+      } else {
+         struct blob blob;
+         blob_init(&blob);
+         nir_serialize(&blob, nir, false);
+         if (blob.out_of_memory) {
+            blob_finish(&blob);
+            ralloc_free(lr_nir);
+            ralloc_free(nir);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         blob_finish_get_buffer(&blob, &min_lod_nir, &min_lod_nir_size);
+         hk_lower_nir_post_tex(dev, nir, info->robustness, false, false);
+      }
+   }
+
    /* A G17P fragment shader compiled without its mesh shader cannot know
     * where that shader's per-primitive records keep each input. Keep the NIR,
     * before custom-border emulation may be dropped below, to compile the
@@ -9052,6 +9149,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       nir_serialize(&blob, nir, false);
       if (blob.out_of_memory) {
          blob_finish(&blob);
+         free(min_lod_nir);
          ralloc_free(lr_nir);
          ralloc_free(nir);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -9092,6 +9190,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             if (blob.out_of_memory) {
                blob_finish(&blob);
                util_dynarray_fini(&ifs);
+               free(min_lod_nir);
                free(mesh_nir);
                ralloc_free(lr_nir);
                ralloc_free(nir);
@@ -9144,6 +9243,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (blob.out_of_memory) {
          blob_finish(&blob);
          free(border_nir);
+         free(min_lod_nir);
          free(mesh_nir);
          ralloc_free(lr_nir);
          ralloc_free(nir);
@@ -9211,6 +9311,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (obj == NULL) {
       free(border_nir);
+      free(min_lod_nir);
       free(mesh_nir);
       free(fbl_nir);
       ralloc_free(lr_nir);
@@ -9220,6 +9321,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    obj->g17p_sample_variants = sample_variant_count;
    obj->border_emulating = border_emulating;
+   obj->min_lod_emulating = min_lod_emulating;
    /* Mesh shaders decide with the pipeline state (hk_mesh_clip_m1_1()). */
    obj->clip_m1_1 = info->stage == MESA_SHADER_MESH
                        ? dev->vk.enabled_features.depthClipControl
@@ -9231,6 +9333,13 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          static_set_mask);
       if (!obj->border_source)
          free(border_nir);
+   }
+   if (min_lod_nir) {
+      obj->min_lod_source = hk_compile_source_create(
+         min_lod_nir, min_lod_nir_size, &key_tmp, has_key, info, features,
+         static_set_mask);
+      if (!obj->min_lod_source)
+         free(min_lod_nir);
    }
    if (mesh_nir) {
       obj->mesh_source = hk_compile_source_create(
@@ -9248,7 +9357,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (!obj->fbl_source)
          free(fbl_nir);
    }
-   if ((border_nir && !obj->border_source) || (mesh_nir && !obj->mesh_source) ||
+   if ((border_nir && !obj->border_source) ||
+       (min_lod_nir && !obj->min_lod_source) ||
+       (mesh_nir && !obj->mesh_source) ||
        (fbl_nir && !obj->fbl_source)) {
       ralloc_free(lr_nir);
       ralloc_free(nir);
@@ -9536,6 +9647,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          /* A twin compiles with what this shader compiled with. */
          if (obj->border_source)
             obj->border_source->key.mesh.default_layer = m5_default_layer;
+         if (obj->min_lod_source)
+            obj->min_lod_source->key.mesh.default_layer = m5_default_layer;
       }
       /* Per-primitive outputs can raise the exported vertex count. */
       shader->info.mesh.max_vertices = nir->info.mesh.max_vertices_out;
@@ -10094,8 +10207,8 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    VkResult result = hk_compile_shader_impl(dev, info, state, features,
                                             allocator, NULL, NULL, false, false,
                                             -1, false, false, bs_ptr, s2d_ptr,
-                                            co_ptr, NULL, NULL, false,
-                                            shader_out);
+                                            co_ptr, NULL, NULL, false, false,
+                                            false, false, shader_out);
    if (bs_cand.tiled_nir)
       ralloc_free(bs_cand.tiled_nir);
    if (s2d_cand.tiled_nir)
@@ -10105,11 +10218,14 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    return result;
 }
 
+static struct hk_border_source *
+hk_border_source_clone(const struct hk_border_source *from);
+
 static VkResult
 hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                 const struct hk_border_source *src,
                 const struct agx_m5_mesh_varyings *mesh_fs,
-                struct hk_api_shader **built)
+                bool for_min_lod, struct hk_api_shader **built)
 {
    *built = NULL;
    nir_shader *nir =
@@ -10140,14 +10256,24 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                                             m5_no_grid_record,
                                             twin_has_vertex_robustness, NULL,
                                             NULL, NULL, NULL, NULL, has_ia,
+                                            false, false, for_min_lod,
                                             &shader);
+   if (result == VK_SUCCESS && !for_min_lod && obj->min_lod_source &&
+       !shader->min_lod_source) {
+      shader->min_lod_source = hk_border_source_clone(obj->min_lod_source);
+      if (!shader->min_lod_source) {
+         hk_api_shader_destroy(&dev->vk, &shader->vk, NULL);
+         shader = NULL;
+         result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
 
 static struct hk_api_shader *
 hk_source_twin(struct hk_device *dev, struct hk_api_shader *obj,
-               struct hk_border_source *src)
+               struct hk_border_source *src, bool for_min_lod)
 {
    struct hk_api_shader *twin = p_atomic_read(&src->twin);
    if (twin)
@@ -10155,7 +10281,7 @@ hk_source_twin(struct hk_device *dev, struct hk_api_shader *obj,
 
    simple_mtx_lock(&src->lock);
    if (!src->twin) {
-      hk_compile_twin(dev, obj, src, NULL, &twin);
+      hk_compile_twin(dev, obj, src, NULL, for_min_lod, &twin);
       p_atomic_set(&src->twin, twin);
    }
    twin = src->twin;
@@ -10166,13 +10292,19 @@ hk_source_twin(struct hk_device *dev, struct hk_api_shader *obj,
 struct hk_api_shader *
 hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
 {
-   return hk_source_twin(dev, obj, obj->border_source);
+   return hk_source_twin(dev, obj, obj->border_source, false);
+}
+
+struct hk_api_shader *
+hk_min_lod_twin(struct hk_device *dev, struct hk_api_shader *obj)
+{
+   return hk_source_twin(dev, obj, obj->min_lod_source, true);
 }
 
 struct hk_api_shader *
 hk_fbl_twin(struct hk_device *dev, struct hk_api_shader *obj)
 {
-   return hk_source_twin(dev, obj, obj->fbl_source);
+   return hk_source_twin(dev, obj, obj->fbl_source, false);
 }
 
 VkResult
@@ -10194,7 +10326,7 @@ hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
       struct agx_m5_mesh_varyings layout = {0};
       memcpy(layout.primitive_comps, comps, sizeof(twin->comps));
       agx_gen1_mesh_record_layout(&layout);
-      result = hk_compile_twin(dev, obj, src, &layout, &twin->shader);
+      result = hk_compile_twin(dev, obj, src, &layout, false, &twin->shader);
       if (result == VK_SUCCESS) {
          memcpy(twin->comps, comps, sizeof(twin->comps));
          twin->next = obj->mesh_twins;
@@ -10914,6 +11046,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    memset(lr_nirs, 0, sizeof(lr_nirs));
    memset(lr_infos, 0, sizeof(lr_infos));
    memset(has_ias, 0, sizeof(has_ias));
+   bool deferred_min_lod[shader_count];
+   bool min_lod_lowered[shader_count];
+   memset(deferred_min_lod, 0, sizeof(deferred_min_lod));
+   memset(min_lod_lowered, 0, sizeof(min_lod_lowered));
    for (uint32_t i = 0; i < shader_count; i++)
       vs_covers[i] = -1;
    bool has_mesh = false;
@@ -10993,6 +11129,15 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
              !hk_maybe_build_2d_stencil(dev, nir, info, &s2d_cands[i]))
             hk_maybe_build_compute_opt(dev, nir, info, &co_cands[i]);
       }
+      const bool want_lazy_min_lod =
+         hk_lazy_min_lod_enabled(dev, nir, hk_features) &&
+         hk_nir_needs_image_view_min_lod(nir);
+      if (want_lazy_min_lod) {
+         if (p_atomic_read(&hk_device_physical(dev)->min_lod_emulation))
+            min_lod_lowered[i] = true;
+         else
+            deferred_min_lod[i] = true;
+      }
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_infos[i], &has_ias[i]);
@@ -11001,9 +11146,13 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             lr_nirs[i] = nir_shader_clone(NULL, nir);
             if (lr_nirs[i]) {
                hk_nir_lower_input_attachments_to_outputs(lr_nirs[i]);
-               hk_lower_nir(dev, lr_nirs[i], info->robustness, is_multiview,
-                            info->next_stage_mask, info->set_layout_count,
-                            info->set_layouts, hk_features);
+               hk_lower_nir_ex(dev, lr_nirs[i], info->robustness, is_multiview,
+                               info->next_stage_mask, info->set_layout_count,
+                               info->set_layouts, hk_features,
+                               deferred_min_lod[i]);
+               if (deferred_min_lod[i])
+                  hk_lower_nir_post_tex(dev, lr_nirs[i], info->robustness,
+                                        false, false);
                NIR_PASS(_, lr_nirs[i], hk_nir_widen_16bit_varyings,
                         HK_NIR_WIDEN_16BIT_INPUTS);
                NIR_PASS(_, lr_nirs[i], nir_shader_intrinsics_pass,
@@ -11075,9 +11224,9 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          }
       }
 
-      hk_lower_nir(dev, nir, info->robustness, is_multiview,
-                   info->next_stage_mask, info->set_layout_count,
-                    info->set_layouts, hk_features);
+      hk_lower_nir_ex(dev, nir, info->robustness, is_multiview,
+                      info->next_stage_mask, info->set_layout_count,
+                      info->set_layouts, hk_features, deferred_min_lod[i]);
       if (nir->info.stage == MESA_SHADER_FRAGMENT && has_mesh)
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
@@ -11263,6 +11412,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 s2d_cands[i].tiled_nir ? &s2d_cands[i] : NULL,
                                 co_cands[i].opt_nir ? &co_cands[i] : NULL,
                                 lr_nirs[i], &lr_infos[i], has_ias[i],
+                                deferred_min_lod[i], min_lod_lowered[i], false,
                                 (struct hk_api_shader **)&shaders_out[i]);
       if (bs_cands[i].tiled_nir) {
          ralloc_free(bs_cands[i].tiled_nir);
@@ -12154,6 +12304,9 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_compute_opt = (variant_flags3 & 32) != 0;
    const bool has_tensor_op = (variant_flags3 & 64) != 0;
    const bool has_tensor_op_alt = (variant_flags3 & 128) != 0;
+   const unsigned variant_flags4 = blob_read_uint8(blob);
+   const bool has_min_lod_source = (variant_flags4 & 1) != 0;
+   const bool min_lod_emulating = (variant_flags4 & 2) != 0;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
@@ -12197,6 +12350,10 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        !p_atomic_read(&hk_device_physical(dev)->border_emulation))
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
+   if (min_lod_emulating &&
+       !p_atomic_read(&hk_device_physical(dev)->min_lod_emulation))
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
    if (cache_candidate && (has_identity_copy4 || has_compute_pair || has_tensor_op))
       return VK_NOT_READY;
 
@@ -12212,6 +12369,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
 
    obj->g17p_sample_variants = sample_variant_count;
    obj->border_emulating = border_emulating;
+   obj->min_lod_emulating = min_lod_emulating;
    obj->clip_m1_1 = clip_z;
 
    if (has_compute_pair) {
@@ -12456,6 +12614,15 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       }
    }
 
+   if (has_min_lod_source) {
+      VkResult result =
+         hk_border_source_deserialize(&obj->min_lod_source, blob, stage);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, result);
+      }
+   }
+
    if (has_byte_stencil) {
       struct hk_byte_stencil_variant *bs = calloc(1, sizeof(*bs));
       if (!bs) {
@@ -12689,6 +12856,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    obj->is_passthrough = src_obj->is_passthrough;
    obj->g17p_sample_variants = src_obj->g17p_sample_variants;
    obj->border_emulating = src_obj->border_emulating;
+   obj->min_lod_emulating = src_obj->min_lod_emulating;
    obj->clip_m1_1 = src_obj->clip_m1_1;
    obj->binary_cache_entry = entry;
 
@@ -12753,6 +12921,19 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    if (src_obj->fbl_source) {
       obj->fbl_source = hk_border_source_clone(src_obj->fbl_source);
       if (!obj->fbl_source) {
+         hk_border_source_destroy(dev, obj->mesh_source);
+         hk_border_source_destroy(dev, obj->border_source);
+         hk_fs_sample_source_destroy(obj->sample_source);
+         vk_shader_free(&dev->vk, pAllocator, &obj->vk);
+         hk_shader_binary_cache_entry_unref(dev, entry);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
+   if (src_obj->min_lod_source) {
+      obj->min_lod_source = hk_border_source_clone(src_obj->min_lod_source);
+      if (!obj->min_lod_source) {
+         hk_border_source_destroy(dev, obj->fbl_source);
          hk_border_source_destroy(dev, obj->mesh_source);
          hk_border_source_destroy(dev, obj->border_source);
          hk_fs_sample_source_destroy(obj->sample_source);
@@ -13099,6 +13280,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->compute_opt ? 32 : 0) |
                              (obj->tensor_op_primary ? 64 : 0) |
                              (obj->tensor_op_secondary ? 128 : 0));
+   blob_write_uint8(blob, (obj->min_lod_source ? 1 : 0) |
+                             (obj->min_lod_emulating ? 2 : 0));
    if (obj->compute_pair) {
       hk_compute_pair_info_serialize(blob, obj->compute_pair);
       if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
@@ -13197,7 +13380,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
     * its mesh shader what its mesh twins compile from, and a fragment shader
     * with a dynamic feedback loop what its zs_self_dep twin compiles from. */
    const struct hk_border_source *sources[] = {border, obj->mesh_source,
-                                               obj->fbl_source};
+                                               obj->fbl_source,
+                                               obj->min_lod_source};
    for (unsigned i = 0; i < ARRAY_SIZE(sources); ++i) {
       if (!sources[i])
          continue;

@@ -843,6 +843,12 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
    const float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
    view->sampled_min_lod_fp16 = _mesa_float_to_half(min_lod);
    view->sampled_min_lod_uint16 = min_lod;
+   if (unlikely(min_lod > 0.0f)) {
+      struct hk_physical_device *pdev = hk_device_physical(dev);
+      if (!p_atomic_read(&pdev->min_lod_emulation) &&
+          p_atomic_cmpxchg(&pdev->min_lod_emulation, 0, 1) == 0)
+         hk_min_lod_emulation_remember(pdev);
+   }
 
    {
       const enum pipe_format logical = hk_format_to_pipe_format(view->vk.format);

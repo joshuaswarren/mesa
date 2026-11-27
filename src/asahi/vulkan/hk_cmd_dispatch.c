@@ -587,6 +587,17 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
    struct hk_api_shader *shader = cmd->state.cs.shader;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   if (shader && unlikely(shader->min_lod_source) &&
+       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
+      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+      if (twin) {
+         cmd->state.cs.shader = twin;
+         shader = twin;
+      } else {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
    if (shader && unlikely(shader->border_source) &&
        p_atomic_read(&hk_device_physical(dev)->border_emulation)) {
       struct hk_api_shader *twin = hk_border_twin(dev, shader);
