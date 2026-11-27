@@ -23,6 +23,12 @@ bool hk_pack_native_texture(unsigned generation,
                             struct hk_native_texture_descriptor *out,
                             const struct AGX_TEXTURE *legacy);
 
+/* Keep a 2D view's level-zero extent in the Gen10 descriptor's software word
+ * (AGX_GEN10_IMAGE_EXTENT_OFFSET), for AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT.
+ * Only for chips where agx_chip_texture_descriptor_spare_word() holds. */
+void hk_native_texture_set_level_zero_extent(
+   struct hk_native_texture_descriptor *out, uint32_t width, uint32_t height);
+
 /* Translate a multisample count only when the native sampled-texture format is
  * recovered for the descriptor generation.  There is no one-sample field in
  * the descriptor, so samples == 1 deliberately returns false.

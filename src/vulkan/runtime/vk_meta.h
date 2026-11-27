@@ -132,6 +132,8 @@ struct vk_meta_device {
     */
    bool use_combined_blit_descriptors;
    bool use_masked_rgba8_buffer_unpack;
+   /* Match fixed-function RGBA8 4x average resolves that round half up. */
+   bool resolve_rgba8_4x_half_up;
    /* A driver without layered rendering may split a 3D graphics copy into
     * one attachment view per destination Z slice.  The fragment Layer value
     * is then relative to that view, so it must not be rebased by the absolute
@@ -222,6 +224,7 @@ enum vk_meta_object_key_type {
    /* BVH build pipelines */
    VK_META_OBJECT_KEY_BVH_PIPELINE_LAYOUT,
    VK_META_OBJECT_KEY_LEAF,
+   VK_META_OBJECT_KEY_LEAF_MORTON,
    VK_META_OBJECT_KEY_MORTON,
    VK_META_OBJECT_KEY_PAIR_TRIANGLES,
    VK_META_OBJECT_KEY_ID_PREFIX_SCAN,

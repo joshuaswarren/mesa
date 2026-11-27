@@ -93,3 +93,68 @@ TEST(AGX3CubeScratch, ScratchSourceValidates)
    agx_validate(b->shader, "cube-array scratch");
    ralloc_free(mem);
 }
+
+/* On AGX3C, cube sampling reserves halves 8..15 for the low CEM scratch bank.
+ * Linked shaders may preload ABI inputs in halves 8..15 and keep them live
+ * across a cube sample; RA must evict those preloads out of 8..15 at entry so
+ * CEM cannot clobber them. */
+TEST(AGX3CubeScratch, Agx3cEvictsPreloadsOutOfLowCemBank)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_shader_info out = {};
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->out = &out;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+   agx_index p4 = agx_preload(b, agx_register(8, AGX_SIZE_32));
+   agx_index p6 = agx_preload(b, agx_register(12, AGX_SIZE_32));
+
+   agx_index c_vals[3];
+   for (unsigned c = 0; c < 3; ++c)
+      c_vals[c] = agx_mov_imm(b, 32, 0x3f800000);
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 3);
+   agx_instr *collect = agx_collect_to(b, coords, 3);
+   for (unsigned c = 0; c < 3; ++c)
+      collect->src[c] = c_vals[c];
+
+   agx_index sampled = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_texture_sample_to(b, sampled, coords, agx_immediate(0),
+                         agx_immediate(0), agx_uniform(0, AGX_SIZE_64),
+                         agx_immediate(0), agx_null(), AGX_DIM_CUBE,
+                         AGX_LOD_MODE_LOD_MIN, 0xf, false, false, false,
+                         AGX_GATHER_NONE, false);
+   agx_instr *split = agx_split(b, 4, sampled);
+   for (unsigned c = 0; c < 4; ++c)
+      split->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   agx_index sum = agx_iadd(b, p4, p6, 0);
+   agx_instr *final_add = agx_iadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                      sum, split->dest[0], 0);
+   agx_export(b, final_add->dest[0], 16);
+   agx_stop(b);
+
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   ASSERT_TRUE(b->shader->agx3_cem_low_scratch);
+   agx_validate(b->shader, "agx3c cem preload eviction");
+
+   /* After the entry eviction moves, the live operands consumed after the cube
+    * sample must not sit in halves 8..15. */
+   bool saw_sum = false;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_IADD && I->src[0].type == AGX_INDEX_REGISTER &&
+          I->src[1].type == AGX_INDEX_REGISTER) {
+         saw_sum = true;
+         EXPECT_GE(I->src[0].value, 16u);
+         EXPECT_GE(I->src[1].value, 16u);
+      }
+   }
+   EXPECT_TRUE(saw_sum);
+   ralloc_free(mem);
+}

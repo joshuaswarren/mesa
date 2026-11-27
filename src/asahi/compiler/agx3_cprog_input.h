@@ -44,12 +44,6 @@ bool agx3_cprog_input_publish(const struct agx3_cprog_inputs *inputs,
                              unsigned uniform_half, unsigned source_half,
                              void *output, size_t capacity, size_t *written);
 
-/* Scheduled loader form: selected halves of one source word, at the compact
- * TPS position previously resolved from the immutable input layout. */
-bool agx3_cprog_input_publish_at(unsigned mask, unsigned tps_half,
-                                unsigned source_half, void *output,
-                                size_t capacity, size_t *written);
-
 /* Chip-aware forms preserve the classic ABI and encode M5's native TPS
  * COPY/RLD forms. M5 capture uses slot6 and compact8B extended COPY. */
 bool agx3_cprog_input_publish_at_encoding(

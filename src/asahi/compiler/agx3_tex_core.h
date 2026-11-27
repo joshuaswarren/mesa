@@ -424,6 +424,16 @@ bool agx3_tex_stage_typed_lod_g18g(uint16_t bank, uint16_t src, uint8_t slot,
                                    uint8_t out[AGX3_TEX_MAX_LENGTH],
                                    uint8_t *len);
 
+/* Publish the layer and per-lane half-float LOD together into operand bank
+ * bank + 6. */
+bool agx3_tex_stage_array_lod_at(enum agx_isa_encoding enc, uint16_t bank,
+                                 uint16_t layer, uint16_t lod, uint8_t slot,
+                                 uint16_t wait_mask, bool layer_cache,
+                                 bool layer_discard, bool lod_cache,
+                                 bool lod_discard,
+                                 uint8_t out[AGX3_TEX_MAX_LENGTH],
+                                 uint8_t *len);
+
 /* Publish the layer and per-lane half-float LOD together into operand bank 6. */
 bool agx3_tex_stage_array_lod(enum agx_isa_encoding enc, uint16_t layer,
                               uint16_t lod, uint8_t slot, uint16_t wait_mask,

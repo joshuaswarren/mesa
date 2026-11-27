@@ -25,19 +25,8 @@ struct agx_vdm_stream_terminate_core {
    uint8_t length;
 };
 
-/*
- * Pack/unpack the exact four-byte type-6 VDM Stream Terminate copied by the
- * inspected G15G/G15X, G16G/G16X, G17P, and G17G/G17X Apple Metal render
- * contexts.  Each matching context constructor copies the same constant pair
- * {0, 0xc0000000}; emitEndCommandStream advances four bytes and writes its
- * second word.
- *
- * The allowlist contains only identities directly served by those plugins,
- * plus G18G, whose J873 native VDM streams all end in 0xc0000000; G16P and
- * G17A remain closed.  The unlocated type-7 Stream Return form also
- * remains closed.  This helper does not allocate or emit a live command,
- * submit work, or admit a device.
- */
+/* Pack/unpack the 4-byte type-6 VDM Stream Terminate record (0xc0000000);
+ * type-7 Stream Return is not accepted. */
 bool agx_vdm_stream_terminate_core_supported(enum agx_chip chip);
 
 bool

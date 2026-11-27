@@ -65,7 +65,8 @@ lower_for_agx_passes(nir_shader *s, struct hk_descriptor_set_layout *layout)
 {
    struct vk_descriptor_set_layout *layouts[1] = {&layout->vk};
    CHECK(hk_nir_lower_descriptors(s, &vk_robustness_disabled, 1, layouts, false,
-                                  false, 0, false, false, false, false, false));
+                                  false, 0, false, false, false, false, false,
+                                  false));
    NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(
                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT, false,
@@ -189,7 +190,7 @@ check_binding_accepted(VkDescriptorType type, bool is_ssbo, bool complex)
       nir_store_global(&b, sum, nir_imm_int64(&b, 0x100000), .align_mul = 4);
       lower_for_agx_passes(b.shader, layout);
       NIR_PASS(_, b.shader, nir_lower_pack);
-      CHECK(agx_nir_fold_m5_offsets(b.shader));
+      CHECK(agx_nir_fold_m5_offsets(b.shader, false));
       nir_validate_shader(b.shader, "after hk binding fold");
       ralloc_free(b.shader);
    }
@@ -261,17 +262,38 @@ check_packed_uvec4_refused(bool from_ubo)
       nir_store_global(&b, sum, nir_imm_int64(&b, 0x100000), .align_mul = 4);
       lower_for_agx_passes(b.shader, layout);
       NIR_PASS(_, b.shader, nir_lower_pack);
-      CHECK(!agx_nir_fold_m5_offsets(b.shader));
+      CHECK(!agx_nir_fold_m5_offsets(b.shader, false));
       ralloc_free(b.shader);
    }
 
    free(layout);
 }
 
+static void
+check_ssbo_addr_format_matches_descriptor_gen(void)
+{
+   /* Gen10 parts (M5 and G18G) all use the 5-component SSBO address format
+    * with the map slot, matching hk_nir_lower_descriptors(). */
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17G));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17S));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17C));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G18G));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G17P));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G16G));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G13G));
+
+   const nir_address_format g18_fmt = hk_buffer_addr_format(
+      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT, false,
+      hk_ssbo_addr_has_map(AGX_CHIP_G18G));
+   CHECK(g18_fmt == nir_address_format_64bit_global_32bit_offset_map);
+   CHECK(nir_address_format_num_components(g18_fmt) == 5);
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
+   check_ssbo_addr_format_matches_descriptor_gen();
    check_binding_accepted(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true, false);
    check_binding_accepted(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, false, false);
    check_binding_accepted(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, true, false);

@@ -8,6 +8,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_pbe_agx3_core.h"
 #include "util/macros.h"
+#include <assert.h>
 #include "util/u_atomic.h"
 
 #include <string.h>
@@ -165,6 +166,8 @@ hk_pack_native_texture(unsigned generation,
    }
 
    if (generation == 10) {
+      if (legacy->layout == AGX_LAYOUT_INTERCHANGE)
+         return false;
       if (!legacy->width || legacy->width > 32768 || !legacy->height ||
           legacy->height > 32768)
          return false;
@@ -217,6 +220,15 @@ hk_pack_native_texture(unsigned generation,
    return false;
 }
 
+void
+hk_native_texture_set_level_zero_extent(
+   struct hk_native_texture_descriptor *out, uint32_t width, uint32_t height)
+{
+   /* Width and height are each at most 32768 (hk_pack_native_texture). */
+   assert(width <= 0xffff && height <= 0xffff);
+   out->opaque[AGX_GEN10_IMAGE_EXTENT_OFFSET / 4] = width | (height << 16);
+}
+
 bool
 hk_pack_native_pbe(unsigned generation,
                    struct hk_native_pbe_descriptor *out,
@@ -262,8 +274,9 @@ hk_pack_native_pbe(unsigned generation,
    const bool compressed_2d = legacy->compressed &&
       (generation == 9 || generation == 10) &&
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D ||
-       (generation == 10 && array && legacy->layers == 1 &&
-        legacy->level == 0 && legacy->levels == 1)) &&
+       (generation == 10 && array) ||
+       (generation == 10 && three_d && legacy->level == 0 &&
+        legacy->levels == 1)) &&
       (legacy->layout == AGX_LAYOUT_GPU || (generation == 9 && interchange)) &&
       !multisample;
    /* Private destination capability for raw D32 copy views. The independently
@@ -312,7 +325,7 @@ hk_pack_native_pbe(unsigned generation,
         legacy->layout != AGX_LAYOUT_TWIDDLED &&
         legacy->layout != AGX_LAYOUT_GPU &&
         !(interchange && generation == 9 && !layered && !multisample &&
-          legacy->level == 0 && legacy->levels == 1)) ||
+          legacy->compressed && legacy->level == 0 && legacy->levels == 1)) ||
        legacy->unk_52 || legacy->rotate_90 || legacy->flip_vertical ||
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
                        legacy->samples != AGX_SAMPLE_COUNT_4 &&

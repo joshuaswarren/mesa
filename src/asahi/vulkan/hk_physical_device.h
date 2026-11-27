@@ -8,8 +8,10 @@
 #pragma once
 
 #include "asahi/lib/agx_device.h"
+#include <float.h>
 #include <sys/types.h>
 #include "hk_private.h"
+#include "util/os_misc.h"
 #include "vk_physical_device.h"
 #include "vk_sync.h"
 #include "wsi_common.h"
@@ -71,9 +73,14 @@ struct hk_physical_device {
    uint8_t mem_heap_count;
    uint8_t mem_type_count;
    uint64_t sysmem;
+   float sysmem_heap_percent;
 
    struct hk_queue_family queue_families[3];
    uint8_t queue_family_count;
+
+   /* Kernel queue limits with DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES, zero
+    * when the kernel does not report them. */
+   struct drm_asahi_queue_limits queue_limits;
 
    struct vk_sync_type syncobj_sync_type;
    const struct vk_sync_type *sync_types[2];
@@ -111,8 +118,83 @@ void hk_physical_device_destroy(struct vk_physical_device *vk_device);
 
 uint64_t hk_codegen_env_hash(void);
 
+/* optimalTilingLayoutUUID: the device's generation contract only. */
+void hk_layout_identity(const struct agx_device *dev,
+                        uint8_t uuid[VK_UUID_SIZE]);
+
+/* pipelineCacheUUID (and shaderBinaryUUID) and the disk cache's driver flags:
+ * the build, the generation contract, the compiler flags, the codegen
+ * environment and the kernel's feature bits. */
+void hk_cache_identity(const uint8_t build_sha[32],
+                       const struct agx_device *dev, uint64_t compiler_flags,
+                       uint64_t env_hash, uint8_t uuid[VK_UUID_SIZE],
+                       uint64_t *disk_cache_id);
+
 void hk_border_emulation_recall(struct hk_physical_device *pdev);
 void hk_border_emulation_remember(struct hk_physical_device *pdev);
+
+uint64_t hk_get_sysmem_heap_size(struct hk_physical_device *pdev);
+
+/* Size Borealis's UMA system-memory heap from the kernel's exported memacct
+ * admission capacities (drm_asahi_params_global::memory_limit and
+ * client_memory_limit, where 0 means no driver limit when has_memory_limits is
+ * true) so VkMemoryHeap::size matches what GEM_CREATE will admit:
+ *
+ * - When has_memory_limits is true, kernel_limit_B is the smaller non-zero
+ *   limit of client_memory_limit_B and memory_limit_B, or 0 if both driver
+ *   limits are disabled.
+ * - An explicit driconf heap_memory_percent (> 0) scales total_ram_B up to
+ *   total_aligned_B, clamped to kernel_limit_B when non-zero so the advertised
+ *   heap never exceeds kernel admission (and able to raise the heap above 50%
+ *   when driver limits are disabled).
+ * - With OS_GPU_HEAP_SIZE_HEURISTIC (0.0f), use kernel_limit_B when non-zero,
+ *   or cap at 50% of total_ram_B when kernel_limit_B is 0 (both driver limits
+ *   disabled, legacy 600-byte kernels, and virtio) to avoid swapping.
+ */
+static inline uint64_t
+hk_resolve_uma_sysmem_heap(uint64_t total_ram_B, float driconf_pct,
+                           bool has_memory_limits, uint64_t memory_limit_B,
+                           uint64_t client_memory_limit_B, float *percent_out)
+{
+   if (total_ram_B == 0)
+      return 0;
+
+   uint64_t kernel_limit_B = 0;
+   if (has_memory_limits) {
+      if (client_memory_limit_B > 0 && memory_limit_B > 0)
+         kernel_limit_B = MIN2(client_memory_limit_B, memory_limit_B);
+      else
+         kernel_limit_B = client_memory_limit_B ? client_memory_limit_B
+                                                : memory_limit_B;
+   }
+
+   const uint64_t total_aligned_B = ROUND_DOWN_TO(total_ram_B, 1ull << 20);
+   uint64_t heap_B;
+
+   if (driconf_pct > OS_GPU_HEAP_SIZE_HEURISTIC) {
+      double scaled = (double)total_ram_B * (double)driconf_pct;
+      uint64_t requested_B = scaled >= (double)total_aligned_B
+                                ? total_aligned_B
+                                : ROUND_DOWN_TO((uint64_t)scaled, 1ull << 20);
+      heap_B = MIN2(requested_B, total_aligned_B);
+      if (kernel_limit_B > 0)
+         heap_B = MIN2(heap_B, ROUND_DOWN_TO(kernel_limit_B, 1ull << 20));
+   } else if (kernel_limit_B > 0) {
+      heap_B = ROUND_DOWN_TO(MIN2(kernel_limit_B, total_ram_B), 1ull << 20);
+   } else {
+      heap_B = ROUND_DOWN_TO(total_ram_B / 2, 1ull << 20);
+   }
+
+   if (percent_out) {
+      float pct = (float)((double)heap_B / (double)total_ram_B);
+      pct = CLAMP(pct, 0.0f, 1.0f);
+      if (heap_B > 0 && pct == 0.0f)
+         pct = FLT_MIN;
+      *percent_out = pct;
+   }
+
+   return heap_B;
+}
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) ||                                    \
    defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||    \

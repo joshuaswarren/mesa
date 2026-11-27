@@ -58,6 +58,54 @@ driver_asahi = declare_dependency(
   link_with : [libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib, libasahi_layout, libasahi_decode]
 )
 
+if with_tests
+  asahi_zero_lod_bias_test = executable(
+    'asahi-zero-lod-bias',
+    files('tests/test-agx-zero-lod-bias.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  test(
+    'asahi-zero-lod-bias-nir',
+    asahi_zero_lod_bias_test,
+    args : ['--nir-only'],
+    suite : ['asahi'],
+  )
+
+  asahi_reload_elision_test = executable(
+    'asahi-reload-elision',
+    files('tests/test-agx-reload-elision.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  test(
+    'asahi-reload-elision-nir',
+    asahi_reload_elision_test,
+    args : ['--nir-only'],
+    suite : ['asahi'],
+  )
+endif
+
 if with_tests and with_tools.contains('drm-shim')
   asahi_g17g_raster_state_test = executable(
     'asahi-g17g-raster-state',
@@ -85,6 +133,39 @@ if with_tests and with_tools.contains('drm-shim')
     suite : ['asahi'],
   )
 
+  asahi_m5_mrt_resident_test = executable(
+    'asahi-m5-mrt-resident',
+    files('tests/test-agx-m5-mrt-resident.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  # g17s-kernel passes every submission through the M5 kernel's checks and
+  # fails the run on a refused one.
+  foreach chip : ['g17s', 'g17s-kernel']
+    test(
+      'asahi-' + chip + '-m5-mrt-resident',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'), libasahi_noop_drm_shim,
+        asahi_m5_mrt_resident_test,
+      ],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'ASAHI_SHIM_M5_EXPECT_VALID=1',
+             'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
   asahi_zs_merge_test = executable(
     'asahi-zs-merge',
     files('tests/test-agx-zs-merge.c'),
@@ -108,6 +189,103 @@ if with_tests and with_tools.contains('drm-shim')
       prog_python,
       args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_zs_merge_test],
       env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  asahi_m5_layer_transfer_test = executable(
+    'asahi-m5-layer-transfer',
+    files('tests/test-agx-m5-layer-transfer.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  foreach chip : ['g13g', 'g17p', 'g17s']
+    test(
+      'asahi-' + chip + '-m5-layer-transfer',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'), libasahi_noop_drm_shim,
+        asahi_m5_layer_transfer_test,
+      ],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  asahi_m5_pbo_draw_test = executable(
+    'asahi-m5-pbo-draw',
+    files('tests/test-agx-m5-pbo-draw.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  # g17s-kernel passes every submission through the M5 kernel's checks and
+  # fails the run on a refused one.
+  foreach chip : ['g17s', 'g17s-kernel']
+    test(
+      'asahi-' + chip + '-m5-pbo-draw',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'), libasahi_noop_drm_shim,
+        asahi_m5_pbo_draw_test,
+      ],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'ASAHI_SHIM_M5_EXPECT_VALID=1',
+             'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  asahi_m5_compression_test = executable(
+    'asahi-m5-compression',
+    files('tests/test-agx-m5-compression.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  # Every submission passes the M5 kernel's checks, with and without the
+  # compressed multisample ZLS feature bits, and a refused one fails the run.
+  foreach msaa_zls : ['on', 'off']
+    test(
+      'asahi-g17s-kernel-m5-compression-msaa-zls-' + msaa_zls,
+      prog_python,
+      args : [
+        files('tests/run-shim.py'), libasahi_noop_drm_shim,
+        asahi_m5_compression_test,
+      ],
+      env : ['ASAHI_SHIM_CHIP=g17s-kernel', 'ASAHI_SHIM_M5_EXPECT_VALID=1',
+             'MESA_SHADER_CACHE_DISABLE=true'] +
+            (msaa_zls == 'off' ? ['ASAHI_SHIM_NO_M5_MSAA_ZLS_COMPRESSION=1'] : []),
       suite : ['asahi'],
     )
   endforeach
@@ -208,7 +386,6 @@ if with_tests and with_tools.contains('drm-shim')
       libasahi_layout, libasahi_decode, libagx3b_disasm, libgallium,
       libgalliumvl_stub,
     ],
-    build_by_default : false,
   )
 
   asahi_priority_test = executable(
@@ -323,12 +500,63 @@ if with_tests and with_tools.contains('drm-shim')
     )
   endforeach
 
+  asahi_async_fence_test = executable(
+    'asahi-async-fence',
+    files('tests/test-agx-async-fence.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig, dep_dl,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  test(
+    'asahi-g17p-async-fence',
+    prog_python,
+    args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_async_fence_test],
+    env : ['ASAHI_SHIM_CHIP=g17p'],
+    suite : ['asahi'],
+  )
+
   foreach chip : ['g13g', 'g17p', 't6041']
     test(
       'asahi-' + chip + '-gallium-submit',
       prog_python,
       args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_submit_test],
       env : ['ASAHI_SHIM_CHIP=' + chip],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  asahi_threaded_context_test = executable(
+    'asahi-threaded-context',
+    files('tests/test-agx-threaded-context.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  foreach chip : ['g13g', 'g16g', 'g17p']
+    test(
+      'asahi-' + chip + '-threaded-context',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_threaded_context_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
       suite : ['asahi'],
     )
   endforeach
@@ -369,6 +597,31 @@ if with_tests and with_tools.contains('drm-shim')
     )
   endforeach
 
+  foreach chip : ['g13g', 'g15g', 'g16g', 'g17p', 't6041']
+    test(
+      'asahi-' + chip + '-gallium-interchange-shared-bo',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        asahi_g17p_blit_test,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'AGX_TEST_INTERCHANGE_SHARED_BO=1',
+      ],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  test(
+    'asahi-g17s-gallium-mipmap',
+    prog_python,
+    args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_g17p_blit_test],
+    env : ['ASAHI_SHIM_CHIP=g17s', 'AGX_TEST_MIPMAP_HW=1'],
+    suite : ['asahi'],
+  )
+
   foreach chip : ['g17p', 't6041']
     test(
       'asahi-' + chip + '-gallium-blit',
@@ -388,6 +641,23 @@ if with_tests and with_tools.contains('drm-shim')
     )
   endforeach
 
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'asahi-' + chip + '-gallium-fast-clear',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        asahi_g17p_blit_test,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'AGX_TEST_FAST_CLEAR_HW=1',
+      ],
+      suite : ['asahi'],
+    )
+  endforeach
+
   test(
     'asahi-g17p-gallium-blit-encode',
     prog_python,
@@ -402,4 +672,24 @@ if with_tests and with_tools.contains('drm-shim')
     ],
     suite : ['asahi'],
   )
+
+  foreach chip : ['g14g', 'g17p']
+    test(
+      'asahi-' + chip + '-zero-lod-bias',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_zero_lod_bias_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'asahi-' + chip + '-reload-elision',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_reload_elision_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
 endif

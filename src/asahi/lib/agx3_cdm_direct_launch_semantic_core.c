@@ -9,17 +9,13 @@
 
 #include <string.h>
 
-/* The G15G, G15X, G16G, G16X, G17P, G17G and G17X families all use this
- * direct 40-byte launch record with the AGX3 compute encoding.  G16P and
- * G17A have no corresponding direct witness and deliberately remain
- * closed. */
 bool
 agx3_cdm_direct_launch_target_grounded(enum agx_chip chip)
 {
    return agx3_cdm_launch_target_grounded(chip);
 }
 
-bool
+static bool
 agx3_cdm_direct_template_build(
    const struct agx3_cdm_direct_template_fields *fields,
    struct agx3_cdm_direct_template *result)
@@ -151,8 +147,7 @@ agx3_cdm_direct_dimension_word(uint8_t dimensions, uint32_t *word)
 static bool
 agx3_cdm_direct_g15x_bit31_allowed(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G15G || chip == AGX_CHIP_G15S ||
-          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G15D;
+   return agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
 }
 
 bool

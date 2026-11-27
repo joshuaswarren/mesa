@@ -37,9 +37,16 @@ main()
    uint id = gl_GlobalInvocationID.x;
    if (id >= args.primitive_count)
       return;
-   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
-   uint64_t slots = refit.retained +
-                    uint64_t(HK_AGX3_RETAINED_SLOTS(refit.job_count, args.leaf_bound));
+   libagx_gen1_as_metadata live =
+      DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
+   if (live.retained_bytes == 0ul)
+      return;
+   uint64_t source = live.native_base + live.retained_offset;
+   uint jobs = DEREF(REF(hk_agx3_retained_state)(source)).job_count;
+   if (jobs == 0u)
+      return;
+   uint64_t slots = source +
+                    uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
    uint slot = DEREF(INDEX(uint32_t, slots, args.geometry.first_id + id));
    if (slot == ~0u)
       return;

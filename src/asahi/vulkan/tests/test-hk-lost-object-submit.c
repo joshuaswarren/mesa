@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: MIT
  * Exercise real object teardown against a paused host submission. No GPU used.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <xf86drm.h>
 #include "c11/threads.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
@@ -180,7 +182,7 @@ cleanup(void *data)
    return 0;
 }
 static void
-run(unsigned kind, bool wait)
+run(enum agx_chip chip, unsigned kind, bool wait)
 {
    struct fixture f = {.kind = kind};
    f.dev = calloc(1, sizeof(*f.dev));
@@ -194,7 +196,7 @@ run(unsigned kind, bool wait)
    dev->submit_mode = VK_QUEUE_SUBMIT_MODE_THREADED;
    dev->timeline_mode = VK_DEVICE_TIMELINE_MODE_NATIVE;
    list_inithead(&dev->queues);
-   f.dev->dev.chip = AGX_CHIP_G17C;
+   f.dev->dev.chip = chip;
    uint64_t used = 4096;
    pdev->mem_heaps[0].used = &used;
    struct agx_bo bo = {.size = 4096, .refcnt = 2};
@@ -276,16 +278,194 @@ run(unsigned kind, bool wait)
    vk_object_base_finish(&dev->base);
    free(f.dev);
    free(pdev);
-   printf("object=%u pending_wait=%u: PASS\n", kind, wait);
+   printf("chip=%u object=%u pending_wait=%u: PASS\n", chip, kind, wait);
 }
+
+static unsigned mock_query_calls, mock_wait_calls;
+static unsigned mock_eintr_remaining;
+static int64_t mock_last_timeout;
+static uint32_t mock_waited_handles[4];
+static uint64_t mock_waited_points[4];
+static unsigned mock_waited_count;
+
+int
+drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
+                 uint32_t handle_count, uint32_t flags)
+{
+   (void)fd;
+   CHECK(handle_count == 1);
+   CHECK(flags == DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED);
+   ++mock_query_calls;
+   switch (handles[0]) {
+   case 10:
+      return -EOPNOTSUPP;
+   case 20:
+      points[0] = 0;
+      return 0;
+   case 30:
+      points[0] = 7;
+      return 0;
+   case 40:
+      points[0] = 9;
+      return 0;
+   default:
+      abort();
+   }
+}
+
+int
+drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
+                       unsigned num_handles, int64_t timeout_nsec,
+                       unsigned flags, uint32_t *first_signaled)
+{
+   (void)fd;
+   (void)first_signaled;
+   CHECK(num_handles == 1);
+   CHECK(timeout_nsec > 0);
+   if (handles[0] == 50 || handles[0] == 60) {
+      CHECK(flags == DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+      CHECK(timeout_nsec == INT64_MAX);
+      ++mock_wait_calls;
+      if (handles[0] == 50) {
+         if (mock_eintr_remaining > 0) {
+            --mock_eintr_remaining;
+            return -EINTR;
+         }
+         CHECK(mock_waited_count < ARRAY_SIZE(mock_waited_handles));
+         mock_waited_handles[mock_waited_count] = handles[0];
+         mock_waited_points[mock_waited_count++] = points[0];
+         return 0;
+      }
+      errno = EIO;
+      return -EIO;
+   }
+   CHECK(flags == 0);
+   if (mock_wait_calls == 0)
+      mock_last_timeout = timeout_nsec;
+   else
+      CHECK(timeout_nsec == mock_last_timeout);
+   ++mock_wait_calls;
+   if (handles[0] == 30) {
+      if (mock_eintr_remaining > 0) {
+         --mock_eintr_remaining;
+         return -EINTR;
+      }
+      CHECK(mock_waited_count < ARRAY_SIZE(mock_waited_handles));
+      mock_waited_handles[mock_waited_count] = handles[0];
+      mock_waited_points[mock_waited_count++] = points[0];
+      return 0;
+   }
+   if (handles[0] == 40) {
+      CHECK(mock_waited_count < ARRAY_SIZE(mock_waited_handles));
+      mock_waited_handles[mock_waited_count] = handles[0];
+      mock_waited_points[mock_waited_count++] = points[0];
+      return -ETIME;
+   }
+   abort();
+}
+
+static void
+test_wait_submitted(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   CHECK(dev);
+   dev->dev.fd = -1;
+   list_inithead(&dev->vk.queues);
+
+   struct hk_queue queues[5] = {0};
+   const uint32_t syncobjs[5] = {0, 10, 20, 30, 40};
+   for (unsigned i = 0; i < ARRAY_SIZE(queues); ++i) {
+      queues[i].drm.syncobj = syncobjs[i];
+      list_addtail(&queues[i].vk.link, &dev->vk.queues);
+   }
+
+   mock_query_calls = 0;
+   mock_wait_calls = 0;
+   mock_eintr_remaining = 2;
+   mock_last_timeout = 0;
+   mock_waited_count = 0;
+
+   hk_device_wait_submitted(dev, 5ull * 1000000000ull);
+
+   /* syncobj=0 skipped before query; 10/20/30/40 queried; 30 retried twice on
+    * -EINTR then succeeded; 40 timed out with -ETIME without hanging. */
+   CHECK(mock_query_calls == 4);
+   CHECK(mock_wait_calls == 4);
+   CHECK(mock_eintr_remaining == 0);
+   CHECK(mock_waited_count == 2);
+   CHECK(mock_waited_handles[0] == 30 && mock_waited_points[0] == 7);
+   CHECK(mock_waited_handles[1] == 40 && mock_waited_points[1] == 9);
+
+   free(dev);
+   printf("wait_submitted: PASS\n");
+}
+
+static void
+test_queue_wait_idle(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
+   CHECK(dev && pdev);
+   dev->dev.fd = -1;
+   vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
+   dev->vk.physical = &pdev->vk;
+   dev->vk._lost.reported = true;
+
+   struct hk_queue queue = {0};
+   vk_object_base_init(&dev->vk, &queue.vk.base, VK_OBJECT_TYPE_QUEUE);
+   queue.vk.submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
+   queue.drm.syncobj = 50;
+   queue.drm.timeline_value = 1;
+   queue.drm.signalled_value = 1;
+
+   mock_wait_calls = 0;
+   mock_eintr_remaining = 2;
+   mock_waited_count = 0;
+
+   /* Already-signalled idle queue takes zero wait ioctls. */
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 0);
+
+   /* Pending timeline point waits once (retrying -EINTR) and advances
+    * signalled_value so a subsequent wait needs zero ioctls. */
+   queue.drm.timeline_value = 5;
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 3);
+   CHECK(mock_eintr_remaining == 0);
+   CHECK(mock_waited_count == 1 && mock_waited_handles[0] == 50 &&
+         mock_waited_points[0] == 5);
+   CHECK(p_atomic_read(&queue.drm.signalled_value) == 5);
+
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 3);
+
+   /* Wait failure loses the device, and later calls short-circuit. */
+   queue.drm.syncobj = 60;
+   queue.drm.timeline_value = 6;
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_ERROR_DEVICE_LOST);
+   CHECK(mock_wait_calls == 4);
+   CHECK(vk_device_is_lost(&dev->vk));
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_ERROR_DEVICE_LOST);
+   CHECK(mock_wait_calls == 4);
+
+   free(pdev);
+   free(dev);
+   printf("queue_wait_idle: PASS\n");
+}
+
 int
 main(void)
 {
    CHECK(mtx_init(&lock, mtx_plain) == thrd_success);
    CHECK(cnd_init(&cond) == thrd_success);
-   for (unsigned kind = 0; kind < 5; kind++)
-      run(kind, false);
-   run(3, true);
+   const enum agx_chip chips[] = {AGX_CHIP_G13G, AGX_CHIP_G17P, AGX_CHIP_G17C};
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); c++) {
+      for (unsigned kind = 0; kind < 5; kind++)
+         run(chips[c], kind, false);
+      run(chips[c], 3, true);
+   }
+   test_wait_submitted();
+   test_queue_wait_idle();
    cnd_destroy(&cond);
    mtx_destroy(&lock);
    return 0;

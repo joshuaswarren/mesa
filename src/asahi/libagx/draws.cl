@@ -29,6 +29,37 @@ libagx_predicate_indirect(global uint32_t *out, constant uint32_t *in,
    }
 }
 
+/*
+ * Build a GPU-authored AGX3 VDM sub-stream (and per-draw Ioto vertex programs
+ * when the vertex shader reads base parameters or draw ID) for multi-draw
+ * indirect and indirect-count draws. Four consecutive lanes cooperate on each
+ * draw record using 128-bit coalesced transfers with in-register patching; draw
+ * `count` writes the returning VDM Stream Link so culled slots above `count`
+ * are never parsed by the VDM.
+ */
+KERNEL(128)
+libagx_build_indirect_vdm(constant struct libagx_indirect_vdm_desc *desc)
+{
+   libagx_build_indirect_vdm_sublane(desc, cl_global_id.x);
+}
+
+/*
+ * Fast path for drawIndirectCount: instead of copying and predicating every
+ * indirect command and letting VDM execute all maxDrawCount records, patch a
+ * non-returning VDM_STREAM_LINK over draw `*draw_count`'s first 8 bytes so VDM
+ * jumps straight past the remaining records.
+ */
+KERNEL(1)
+libagx_patch_vdm_indirect_count(
+   global struct libagx_vdm_truncate_state *state,
+   constant struct libagx_vdm_draw_span *spans, constant uint32_t *draw_count,
+   uint32_t num_spans, uint32_t max_draw_count, uint32_t link_w0,
+   uint32_t link_w1)
+{
+   libagx_vdm_patch_indirect_count_impl(state, spans, draw_count, num_spans,
+                                        max_draw_count, link_w0, link_w1);
+}
+
 /* VK_EXT_transform_feedback exposes the byte count written by streamout as a
  * draw source.  Generate the complete VkDrawIndirectCommand on the GPU so a
  * producer earlier in this command buffer never needs CPU readback. */
@@ -270,7 +301,7 @@ libagx_draw_robust_index_impl(
    global uint32_t *vdm, global struct poly_heap *heap,
    global uint32_t *printf_buffer,
    constant VkDrawIndexedIndirectCommand *cmd, uint64_t in_buf_ptr,
-   uint32_t in_buf_range_B, ushort restart, uint32_t restart_index,
+   uint64_t in_buf_range_B, ushort restart, uint32_t restart_index,
    enum agx_chip chip, enum agx_primitive topology,
    uint32_t draw_state_context_offset,
    uint32_t render_state_emitted, uint64_t empty_draw_jump,
@@ -295,10 +326,9 @@ libagx_draw_robust_index_impl(
       draw.index_buffer_range_B = 4;
       draw.start = 0;
    } else if (cmd->instanceCount != 0 && cmd->indexCount > in_size_el) {
-      uint start_B = agx_indices_to_B(draw.start, draw.index_size);
+      uint64_t start_B = (uint64_t)draw.start << draw.index_size;
       constant void *in_buf =
          (constant void *)(draw.index_buffer + start_B);
-      uint in_size_B = agx_indices_to_B(in_size_el, index_size);
 
       /* After a small number of zeroes at the end, extra zeroes cannot change
        * triangle/line rendering: they duplicate degenerate primitives. Clamp
@@ -350,6 +380,7 @@ libagx_draw_robust_index_impl(
          draw.index_buffer_range_B = 4;
          draw.start = 0;
       } else {
+         uint in_size_B = agx_indices_to_B(in_size_el, index_size);
          global uchar *padded = heap->base + padded_offs;
          draw.index_buffer = (uintptr_t)padded;
          draw.index_buffer_range_B = out_size_B;
@@ -371,7 +402,7 @@ KERNEL(32)
 libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
                          global uint32_t *printf_buffer,
                          constant VkDrawIndexedIndirectCommand *cmd,
-                         uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                         uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                          ushort restart, uint32_t restart_index,
                          enum agx_chip chip, enum agx_primitive topology,
                          uint32_t draw_state_context_offset,
@@ -389,7 +420,7 @@ KERNEL(32)
 libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                global struct poly_heap *heap,
                                global uint32_t *printf_buffer,
-                               uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                               uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                                ushort restart, uint32_t restart_index,
                                enum agx_chip chip, enum agx_primitive topology,
                                enum agx_index_size index_size__3)
@@ -436,6 +467,25 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
  * be copied to for the kernels to read, or zero when the record already holds
  * them.  `handles` lists each kernel's raygen handle index.
  */
+/* Same non-wrapping round-up as hk_rt_launch_group_count: 8x4 tiles for 2D/3D
+ * launches (height > 1) with 32-lane workgroups, 32x1 strips for 1D launches. */
+static inline uint2
+libagx_trace_rays_group_count(uint32_t width, uint32_t height,
+                              uint32_t local_size_x_log2)
+{
+   if (local_size_x_log2 == 5u && height > 1u) {
+      return (uint2)(
+         (width >> 3u) + ((width & 7u) ? 1u : 0u),
+         (height >> 2u) + ((height & 3u) ? 1u : 0u)
+      );
+   }
+   const uint32_t mask = (1u << local_size_x_log2) - 1u;
+   return (uint2)(
+      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u),
+      height
+   );
+}
+
 KERNEL(1)
 libagx_trace_rays_select_setup(constant uint64_t *record,
                                global uint32_t *out_record_dims,
@@ -455,11 +505,8 @@ libagx_trace_rays_select_setup(constant uint64_t *record,
       out_record_dims[2] = depth;
    }
 
-   /* Same non-wrapping round-up as libagx_trace_rays_indirect_setup and
-    * hk_rt_launch_group_count. */
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
-   const uint32_t groups_x =
-      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u);
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
 
    constant uint32_t *raygen_handle = (constant uint32_t *)(uintptr_t)record[0];
    const uint32_t selected = *raygen_handle;
@@ -467,8 +514,8 @@ libagx_trace_rays_select_setup(constant uint64_t *record,
    for (uint32_t k = 0; k < kernel_count; ++k) {
       const bool run = handles[k] == selected;
       out_groups[k] = (VkDispatchIndirectCommand){
-         .x = run ? groups_x : 0u,
-         .y = run ? height : 0u,
+         .x = run ? groups_xy.x : 0u,
+         .y = run ? groups_xy.y : 0u,
          .z = run ? depth : 0u,
       };
    }
@@ -509,9 +556,10 @@ libagx_trace_rays_select_launch(constant uint64_t *record,
       out_record_dims[2] = depth;
    }
 
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
-   const uint32_t groups_x =
-      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u);
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
+   const uint32_t groups_x = groups_xy.x;
+   const uint32_t groups_y = groups_xy.y;
 
    constant uint32_t *raygen_handle = (constant uint32_t *)(uintptr_t)record[0];
    const uint32_t selected = *raygen_handle;
@@ -522,23 +570,23 @@ libagx_trace_rays_select_launch(constant uint64_t *record,
          chosen = k;
    }
 
-   const bool run = chosen < kernel_count && groups_x && height && depth;
+   const bool run = chosen < kernel_count && groups_x && groups_y && depth;
    *out_groups = (VkDispatchIndirectCommand){
       .x = run ? groups_x : 0u,
-      .y = run ? height : 0u,
+      .y = run ? groups_y : 0u,
       .z = run ? depth : 0u,
    };
 
    constant uint32_t *t = templates + 11u * (run ? chosen : 0u);
    uint32_t word0 = t[0];
-   if (!run || (height < 2u && depth < 2u))
+   if (!run || (groups_y < 2u && depth < 2u))
       word0 &= 0xfff1ffffu;
    slot[1] = word0;
    slot[2] = t[1];
    slot[3] = t[2];
    slot[4] = t[3];
    slot[5] = run ? (groups_x << local_size_x_log2) : 0u;
-   slot[6] = run ? height : 0u;
+   slot[6] = run ? groups_y : 0u;
    slot[7] = run ? depth : 0u;
    slot[8] = run ? t[7] : 0u;
    slot[9] = run ? t[8] : 0u;
@@ -578,10 +626,73 @@ libagx_trace_rays_indirect_setup(global uint32_t *out_record_dims,
     * test-hk-ray-tracing-core pins the two together at the top of the range;
     * the first version of this kernel used the wrapping form and that test is
     * what caught it. */
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
    *out_groups = (VkDispatchIndirectCommand){
-      .x = (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u),
-      .y = height,
+      .x = groups_xy.x,
+      .y = groups_xy.y,
       .z = depth,
    };
+}
+
+/* Minimal 1-thread no-op helper used as the zero-grid fallback launch on G18G
+ * so an indirect compute stream never submits an empty or zero-sized launch. */
+KERNEL(1)
+libagx_g18_noop(global uint32_t *scratch)
+{
+   *scratch = 0u;
+}
+
+/* Materialize a 48-byte sealed G18G direct CDM stream (40-byte direct launch +
+ * 4-byte strong barrier + 4-byte terminate) from an indirect grid buffer.
+ * mode_local == 0 (INDIRECT_GLOBAL): in_grid[0..2] are group counts, local size
+ * comes from local_{x,y,z}; in_grid[3..5] are not read.
+ * mode_local != 0 (INDIRECT_LOCAL): in_grid[0..2] are global thread counts and
+ * in_grid[3..5] are local sizes.
+ * If any dimension is zero, emit the pre-built 1-thread no-op launch instead. */
+KERNEL(1)
+libagx_g18_indirect_launch(constant uint32_t *in_grid,
+                           constant uint32_t *tmpl,
+                           constant uint32_t *noop_tmpl,
+                           global uint32_t *out_stream,
+                           uint32_t local_x,
+                           uint32_t local_y,
+                           uint32_t local_z,
+                           uint32_t mode_local)
+{
+   uint32_t gx = in_grid[0];
+   uint32_t gy = in_grid[1];
+   uint32_t gz = in_grid[2];
+   uint32_t lx = local_x;
+   uint32_t ly = local_y;
+   uint32_t lz = local_z;
+   if (mode_local) {
+      lx = in_grid[3];
+      ly = in_grid[4];
+      lz = in_grid[5];
+   }
+
+   uint32_t tx = mode_local ? gx : (gx * lx);
+   uint32_t ty = mode_local ? gy : (gy * ly);
+   uint32_t tz = mode_local ? gz : (gz * lz);
+   bool run = (gx != 0u) && (gy != 0u) && (gz != 0u) &&
+              (lx != 0u) && (ly != 0u) && (lz != 0u);
+
+   constant uint32_t *src = run ? tmpl : noop_tmpl;
+   uint32_t word0 = src[0];
+   if (run && ty < 2u && tz < 2u)
+      word0 &= 0xfff1ffffu;
+
+   out_stream[0] = word0;
+   out_stream[1] = src[1];
+   out_stream[2] = src[2];
+   out_stream[3] = src[3];
+   out_stream[4] = run ? tx : src[4];
+   out_stream[5] = run ? ty : src[5];
+   out_stream[6] = run ? tz : src[6];
+   out_stream[7] = run ? lx : src[7];
+   out_stream[8] = run ? ly : src[8];
+   out_stream[9] = run ? lz : src[9];
+   out_stream[10] = src[10];
+   out_stream[11] = src[11];
 }

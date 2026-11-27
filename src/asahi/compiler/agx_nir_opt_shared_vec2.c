@@ -5,9 +5,108 @@
 
 #include "agx_nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_instr_set.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 
 #define SHARED_PAIR_WINDOW 64
+
+/* The boundary is a workgroup-wide rendezvous and shared-memory fence.
+ * Divergence is an additional refusal; correctness uses the barrier's
+ * workgroup execution scope on a valid shader. */
+bool
+agx_nir_is_shared_phase_barrier(nir_instr *instr)
+{
+   if (!instr || instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *barrier = nir_instr_as_intrinsic(instr);
+   return barrier->intrinsic == nir_intrinsic_barrier &&
+          nir_intrinsic_execution_scope(barrier) == SCOPE_WORKGROUP &&
+          (nir_intrinsic_memory_scope(barrier) == SCOPE_WORKGROUP ||
+           nir_intrinsic_memory_scope(barrier) == SCOPE_DEVICE) &&
+          nir_intrinsic_memory_modes(barrier) == nir_var_mem_shared &&
+          nir_intrinsic_memory_semantics(barrier) == NIR_MEMORY_ACQ_REL;
+}
+
+static bool
+shared_phase_load(const nir_intrinsic_instr *intrin, UNUSED const void *data)
+{
+   return intrin->intrinsic == nir_intrinsic_load_shared &&
+          nir_intrinsic_access(intrin) == 0 && intrin->def.bit_size == 32 &&
+          intrin->def.num_components == 1;
+}
+
+static bool
+reuse_flat_shared_phase(nir_instr *begin, nir_instr *end)
+{
+   struct set loads = {0};
+   bool progress = false;
+
+   for (nir_instr *instr = nir_instr_next(begin); instr != end;) {
+      nir_instr *next = nir_instr_next(instr);
+      if (instr->type == nir_instr_type_intrinsic) {
+         if (!loads.table)
+            nir_instr_set_init(&loads, NULL);
+         if (nir_instr_set_add_or_rewrite(&loads, instr,
+                                          shared_phase_load, NULL, NULL)) {
+            nir_instr_remove(instr);
+            progress = true;
+         }
+      }
+      instr = next;
+   }
+   if (loads.table)
+      nir_instr_set_fini(&loads);
+   return progress;
+}
+
+static bool
+cse_flat_shared_phases(nir_block *block)
+{
+   if (block->divergent)
+      return false;
+
+   bool progress = false;
+   nir_instr *begin = NULL;
+   nir_foreach_instr(instr, block) {
+      if (agx_nir_is_shared_phase_barrier(instr)) {
+         if (begin)
+            progress |= reuse_flat_shared_phase(begin, instr);
+         begin = instr;
+      } else if (begin && instr->type != nir_instr_type_alu &&
+                 instr->type != nir_instr_type_load_const &&
+                 (instr->type != nir_instr_type_intrinsic ||
+                  !shared_phase_load(nir_instr_as_intrinsic(instr), NULL))) {
+         begin = NULL;
+      }
+   }
+   return progress;
+}
+
+/* Within one convergent block between two such barriers that holds only ALU,
+ * constants and plain scalar 32-bit shared loads, identical shared loads read
+ * the same value: no invocation of the workgroup stores to shared memory
+ * between the two rendezvous. Keep the first of each and use it for the
+ * others. */
+bool
+agx_nir_opt_shared_flat_phase_cse(nir_shader *nir)
+{
+   bool any = false;
+   nir_divergence_analysis(nir);
+   nir_foreach_function_impl(impl, nir) {
+      if (impl->function->is_preamble) {
+         nir_no_progress(impl);
+         continue;
+      }
+
+      bool progress = false;
+      nir_foreach_block(block, impl)
+         progress |= cse_flat_shared_phases(block);
+      any |= nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return any;
+}
 
 struct shared_address {
    nir_scalar index;
