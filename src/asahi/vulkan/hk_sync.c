@@ -1124,9 +1124,22 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* The geometry heap is one device-wide bump allocator (hk_cmd_draw.c,
-    * hk_heap): a pass that uses it must not overlap any earlier stream. */
+    * hk_heap): a pass that uses it must not overlap any earlier stream.
+    * With multi-slot heap rings (pass_heap_slot > 0), only wait on the
+    * previous pass that used the same slot. */
    if (st->heap_pass && (!compute || pre_gfx || post_gfx))
       hk_sync_stream_wait_all(cmd, cs);
+   if (st->pass_heap_slot && (!compute || pre_gfx || post_gfx)) {
+      const uint8_t slot = st->pass_heap_slot - 1;
+      cs->sync.heap_slot = st->pass_heap_slot;
+      struct hk_sync_dep hdep[HK_SYNC_NUM_SQ] = {
+         {.cut = st->last_heap_slot[slot][HK_SYNC_VDM]},
+         {.cut = st->last_heap_slot[slot][HK_SYNC_CDM]},
+      };
+      hk_sync_stream_wait(cs, hdep);
+      const unsigned sq = hk_sync_sq(cs);
+      st->pass_heap_last[sq] = hk_sync_later(st->pass_heap_last[sq], cs);
+   }
 
    note_last(cmd, cs);
    if (st->brl_transition_active) {
@@ -2112,12 +2125,28 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    hk_cmd_buffer_end_compute(cmd);
 }
 
+static void
+flush_pass_heap_slot(struct hk_sync_state *st)
+{
+   if (!st->pass_heap_slot)
+      return;
+   const uint8_t slot = st->pass_heap_slot - 1;
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if (st->pass_heap_last[sq])
+         st->last_heap_slot[slot][sq] =
+            hk_sync_later(st->last_heap_slot[slot][sq], st->pass_heap_last[sq]);
+      st->pass_heap_last[sq] = NULL;
+   }
+   st->pass_heap_slot = 0;
+}
+
 void
 hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
 {
    struct hk_sync_state *st = &cmd->sync;
    if (resuming && st->pending_start_ts_unordered)
       hk_sync_flush_pending_timestamp(cmd);
+   flush_pass_heap_slot(st);
    st->epoch++;
    st->in_pass = true;
    st->pass_start_seq = st->next_seq;
@@ -2152,6 +2181,7 @@ void
 hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending)
 {
    struct hk_sync_state *st = &cmd->sync;
+   flush_pass_heap_slot(st);
    st->epoch++;
    st->suspended_last = suspending ? st->pass_tile_last : NULL;
    pass_footprints_commit(cmd);
@@ -2200,6 +2230,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->pass_vdm = cs;
    st->resume_pending = false;
    st->heap_pass = false;
+   flush_pass_heap_slot(st);
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = cs;
@@ -2223,6 +2254,37 @@ hk_sync_heap_used(struct hk_cmd_buffer *cmd)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.pre_gfx);
    if (cmd->current_cs.post_gfx)
       hk_sync_stream_wait_all(cmd, cmd->current_cs.post_gfx);
+}
+
+void
+hk_sync_heap_slot_used(struct hk_cmd_buffer *cmd, uint8_t slot)
+{
+   assert(slot < HK_HEAP_SLOTS);
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
+   struct hk_sync_state *st = &cmd->sync;
+   flush_pass_heap_slot(st);
+   st->pass_heap_slot = slot + 1;
+   st->epoch++;
+
+   struct hk_sync_dep hdep[HK_SYNC_NUM_SQ] = {
+      {.cut = st->last_heap_slot[slot][HK_SYNC_VDM]},
+      {.cut = st->last_heap_slot[slot][HK_SYNC_CDM]},
+   };
+   struct hk_cs *streams[3] = {
+      cmd->current_cs.pre_gfx,
+      cmd->current_cs.gfx,
+      cmd->current_cs.post_gfx,
+   };
+   for (unsigned i = 0; i < 3; ++i) {
+      struct hk_cs *s = streams[i];
+      if (!s)
+         continue;
+      s->sync.heap_slot = slot + 1;
+      hk_sync_stream_wait(s, hdep);
+      const unsigned sq = hk_sync_sq(s);
+      st->pass_heap_last[sq] = hk_sync_later(st->pass_heap_last[sq], s);
+   }
 }
 
 void
@@ -2284,6 +2346,7 @@ struct submit_state {
    /* Global index of the last stream of each kind on each subqueue among the
     * command buffers already processed. */
    hk_sync_value last[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+   hk_sync_value last_heap_slot[HK_HEAP_SLOTS][HK_SYNC_NUM_SQ];
    /* Requirement every later stream of each kind carries. */
    hk_sync_value carry[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t carry_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
@@ -2641,6 +2704,10 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
          ss.carry_absolute[k][sq] = queue->sync.tail[k][sq];
       }
    }
+   for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs) {
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+         ss.last_heap_slot[hs][sq] = HK_SYNC_NONE;
+   }
 
    if (first_cdm_is_flush) {
       /* A sparse-binding flush opens the payload; it is a compute command
@@ -2721,6 +2788,33 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
             } else {
                resolve_one(&ss, sq, t, ta_carry, &cs->sync.barrier_ta[sq],
                            &cs->sync.prior_ta[sq]);
+            }
+            if (cs->sync.heap_slot > 0) {
+               const unsigned hs = cs->sync.heap_slot - 1;
+               if (ss.last_heap_slot[hs][sq] > 0) {
+                  const hk_sync_value hv = ss.last_heap_slot[hs][sq];
+                  barrier_at_least(queue, sq, &cs->sync.barrier[sq],
+                                   &cs->sync.prior[sq], hv);
+                  if (cs->sync.barrier[sq] != DRM_ASAHI_BARRIER_NONE)
+                     cs->sync.prior[sq] = 0;
+                  barrier_at_least(queue, sq, &cs->sync.barrier_ta[sq],
+                                   &cs->sync.prior_ta[sq], hv);
+                  if (cs->sync.barrier_ta[sq] != DRM_ASAHI_BARRIER_NONE)
+                     cs->sync.prior_ta[sq] = 0;
+               } else if (queue->sync.exact_prior &&
+                          queue->sync.last_heap_slot[hs][sq]) {
+                  const uint64_t prev = queue->sync.last_heap_slot[hs][sq];
+                  if (cs->sync.barrier[sq] == DRM_ASAHI_BARRIER_NONE)
+                     cs->sync.prior[sq] = MAX2(cs->sync.prior[sq], prev);
+                  if (cs->sync.barrier_ta[sq] == DRM_ASAHI_BARRIER_NONE)
+                     cs->sync.prior_ta[sq] = MAX2(cs->sync.prior_ta[sq], prev);
+               } else if (!queue->sync.exact_prior &&
+                          (queue->sync.heap_slot_ever[sq] & BITFIELD_BIT(hs))) {
+                  barrier_at_least(queue, sq, &cs->sync.barrier[sq],
+                                   &cs->sync.prior[sq], 0);
+                  barrier_at_least(queue, sq, &cs->sync.barrier_ta[sq],
+                                   &cs->sync.prior_ta[sq], 0);
+               }
             }
          }
       }
@@ -2816,6 +2910,14 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
             struct hk_cs *last = cmd->sync.last[k][sq];
             if (last)
                ss.last[k][sq] = value_max(ss.last[k][sq], last->sync.index);
+         }
+      }
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+         if (cs->sync.heap_slot > 0) {
+            const unsigned hs = cs->sync.heap_slot - 1;
+            const unsigned sq = hk_sync_sq(cs);
+            ss.last_heap_slot[hs][sq] =
+               value_max(ss.last_heap_slot[hs][sq], cs->sync.index);
          }
       }
 
@@ -2918,10 +3020,23 @@ hk_sync_resolve_submit_ex(struct hk_queue *queue,
                   queue->sync.submitted[sq] + ss.last[k][sq];
          }
       }
+      for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            if (ss.last_heap_slot[hs][sq] > 0)
+               queue->sync.last_heap_slot[hs][sq] =
+                  queue->sync.submitted[sq] + ss.last_heap_slot[hs][sq];
+         }
+      }
       if (tail_raised_out)
          *tail_raised_out = tail_raised;
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
          queue->sync.submitted[sq] += ss.count[sq];
+   }
+   for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs) {
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (ss.last_heap_slot[hs][sq] > 0)
+            queue->sync.heap_slot_ever[sq] |= BITFIELD_BIT(hs);
+      }
    }
 
    /* This queue has now run these kinds. */

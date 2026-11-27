@@ -1643,6 +1643,18 @@ struct hk_cs {
     * (hk_render_pack_streams_match()). */
    uint8_t render_pack_elided;
 
+   /* Full (unelided) tile programs saved before hk_g17p_elide_untouched_color()
+    * rewrites cr.{bg,eot}, so submit-time render packing can combine members
+    * whose untouched-attachment elision masks differ. */
+   bool render_pack_has_full_programs;
+   struct hk_bg_eot render_pack_full_bg_main;
+   struct hk_bg_eot render_pack_full_eot_main;
+   struct hk_bg_eot render_pack_full_eot_partial;
+
+   /* Depth/stencil aspects whose store hk_g17p_zls_elide_store() dropped from
+    * cr.zls_control, so render packing can union z_store/s_store across members. */
+   uint8_t render_pack_zls_elided_store;
+
    /* Scratch requirements */
    struct {
       union {
@@ -2498,6 +2510,7 @@ struct hk_cmd_buffer {
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
+   uint8_t heap_slot;
 
    /* The push descriptor sets hk_meta_begin() saves, each only as long as
     * its layout, stacked in the order nested meta operations begin. */

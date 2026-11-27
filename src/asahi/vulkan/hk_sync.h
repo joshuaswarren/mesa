@@ -325,7 +325,11 @@ struct hk_sync_stream {
     * what earlier dependencies ask of later transfer work. */
    bool brl_transition;
    uint8_t brl_carry;
+   /* 1..HK_HEAP_SLOTS when this stream belongs to a geometry-heap slot pass. */
+   uint8_t heap_slot;
 };
+
+#define HK_HEAP_SLOTS 8u
 
 /* The resolved fields of one occurrence of a stream in a submission. */
 struct hk_sync_resolved {
@@ -469,12 +473,18 @@ struct hk_sync_state {
    /* The event wait being recorded (brl_sync_event_poll()): its latest poll
     * stream. */
    struct hk_cs *brl_event_poll;
+
+   /* Per-slot geometry heap tracking (1..HK_HEAP_SLOTS, 0 = none). */
+   uint8_t pass_heap_slot;
+   struct hk_cs *pass_heap_last[HK_SYNC_NUM_SQ];
+   struct hk_cs *last_heap_slot[HK_HEAP_SLOTS][HK_SYNC_NUM_SQ];
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
  * dependency on earlier submits of a kind that never ran is no dependency. */
 struct hk_sync_queue {
    uint8_t ever[HK_SYNC_NUM_SQ];
+   uint8_t heap_slot_ever[HK_SYNC_NUM_SQ];
    bool exact_prior;
    /* G13/G14 retain upstream's order after both preceding engine prefixes. */
    bool serialize;
@@ -485,6 +495,7 @@ struct hk_sync_queue {
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+   uint64_t last_heap_slot[HK_HEAP_SLOTS][HK_SYNC_NUM_SQ];
    /* G17P: the largest whole render prefix of a render submitted without
     * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS (hk_drm_g17p_tiling_ordered()). */
    uint64_t ta_cover;
@@ -707,6 +718,7 @@ void hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending);
  * caller guarantees cs is the latest stream of the command buffer. */
 void hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_heap_used(struct hk_cmd_buffer *cmd);
+void hk_sync_heap_slot_used(struct hk_cmd_buffer *cmd, uint8_t slot);
 
 /* Tile hazards: a written attachment of the pass instance being begun, then
  * the end of the list, before the instance creates its first stream. */

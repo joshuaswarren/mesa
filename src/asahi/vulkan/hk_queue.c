@@ -6843,9 +6843,13 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 /* Submit-time render packing (hk_render_pack.h): a submission-owned
  * command buffer that runs a packed run of render command buffers as one
  * render command. */
+#define HK_RENDER_PACK_MAX_PRE 16
+
 struct hk_render_packet {
    struct hk_cmd_buffer cmd;
    struct hk_cs cs;
+   struct hk_cs pre_cs[HK_RENDER_PACK_MAX_PRE];
+   struct hk_cs post_cs[HK_HEAP_SLOTS];
 };
 
 struct hk_render_pack_run {
@@ -6974,12 +6978,20 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    }
 
    for (unsigned i = 0; targets && runs && i < n;) {
-      const struct hk_cs *first = hk_render_pack_member(cmds[i]);
+      const struct hk_cs *first_pre = NULL, *first_post = NULL;
+      const struct hk_cs *first =
+         hk_render_pack_member_streams(cmds[i], &first_pre, &first_post);
       struct hk_render_pack_run run = {
          .first = i, .count = 1, .scissor = first, .zbias = first,
       };
       enum u_tristate dbias = first ? first->cr.dbias_is_int : U_TRISTATE_UNSET;
       size_t resources = first ? first->render_resources.size : 0;
+      uint8_t used_heap_slots =
+         first && first->sync.heap_slot
+            ? BITFIELD_BIT(first->sync.heap_slot - 1)
+            : 0;
+      unsigned run_pre = first_pre ? 1 : 0;
+      unsigned run_post = first_post ? 1 : 0;
       struct hk_render_pack_run_state state;
       if (first)
          hk_render_pack_run_start(&state, cmds[i], first);
@@ -6990,7 +7002,9 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
       while (first && i + run.count < n) {
          const unsigned a = i + run.count - 1, b = a + 1;
-         const struct hk_cs *bs = hk_render_pack_member(cmds[b]);
+         const struct hk_cs *bs_pre = NULL, *bs_post = NULL;
+         const struct hk_cs *bs =
+            hk_render_pack_member_streams(cmds[b], &bs_pre, &bs_post);
          if (unlikely(dev->frame_anatomy))
             cmds[b]->render_pack.next_why = NULL;
          if (!bs) {
@@ -7000,6 +7014,13 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
          const char *why =
             hk_render_pack_boundary(&state, cmds[a], cmds[b], bs, first);
+         if (!why && bs->sync.heap_slot &&
+             (used_heap_slots & BITFIELD_BIT(bs->sync.heap_slot - 1)))
+            why = "heap slot";
+         if (!why && bs_pre && run_pre >= HK_RENDER_PACK_MAX_PRE)
+            why = "pre-graphics count";
+         if (!why && bs_post && run_post >= HK_HEAP_SLOTS)
+            why = "post-graphics count";
          const struct util_dynarray *scissor = NULL, *zbias = NULL;
          if (!why &&
              (!hk_render_pack_array_prefix(&run.scissor->scissor,
@@ -7030,6 +7051,12 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             run.zbias = bs;
          if (dbias == U_TRISTATE_UNSET)
             dbias = bs->cr.dbias_is_int;
+         if (bs->sync.heap_slot)
+            used_heap_slots |= BITFIELD_BIT(bs->sync.heap_slot - 1);
+         if (bs_pre)
+            run_pre++;
+         if (bs_post)
+            run_post++;
          resources += bs->render_resources.size;
          hk_render_pack_run_join(&state, cmds[a], cmds[b], bs);
          run.count++;
@@ -7065,13 +7092,64 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       p->cmd.vk.base.device = &dev->vk;
       hk_render_pack_init(&p->cmd, &p->cs, cmds + run->first, run->count);
       uint8_t preceding = 0;
+      uint8_t cdm_preceding = 0;
+      uint8_t carried_req[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ] = {0};
+      bool cdm_req_cut[HK_SYNC_NUM_KINDS] = {false};
+      unsigned n_pre = 0, n_post = 0;
       bool ok = true;
       for (unsigned m = 0; ok && m < run->count; ++m) {
          const struct hk_cmd_buffer *source = cmds[run->first + m];
-         const struct hk_cs *item =
-            list_first_entry(&source->control_streams, struct hk_cs, node);
+         const struct hk_cs *pre = NULL, *post = NULL;
+         const struct hk_cs *item = hk_render_pack_find_vdm(source, &pre, &post);
+         if (!item)
+            item = list_first_entry(&source->control_streams, struct hk_cs, node);
+         if (pre) {
+            assert(n_pre < HK_RENDER_PACK_MAX_PRE);
+            struct hk_cs *dst = &p->pre_cs[n_pre++];
+            *dst = *pre;
+            list_inithead(&dst->node);
+            dst->cmd = &p->cmd;
+            dst->stream_owner = pre->cmd;
+            memset(&dst->sync, 0, sizeof(dst->sync));
+            dst->sync.kind = pre->sync.kind;
+            dst->sync.heap_slot = pre->sync.heap_slot;
+            dst->sync.vtx_images = pre->sync.vtx_images;
+            const uint8_t pre_carry = hk_sync_full_kinds(dst->sync.kind);
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               dst->sync.dep[sq].prior = pre->sync.dep[sq].prior;
+               dst->sync.dep_ta[sq].prior = pre->sync.dep_ta[sq].prior;
+               u_foreach_bit(k, pre_carry) {
+                  dst->sync.dep[sq].prior |= carried_req[k][sq];
+                  dst->sync.dep_ta[sq].prior |= carried_req[k][sq];
+               }
+            }
+            cdm_preceding |= pre->sync.kind;
+         }
+         if (post) {
+            assert(n_post < HK_HEAP_SLOTS);
+            struct hk_cs *dst = &p->post_cs[n_post++];
+            *dst = *post;
+            list_inithead(&dst->node);
+            dst->cmd = &p->cmd;
+            dst->stream_owner = post->cmd;
+            memset(&dst->sync, 0, sizeof(dst->sync));
+            dst->sync.kind = post->sync.kind;
+            dst->sync.heap_slot = post->sync.heap_slot;
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               dst->sync.dep[sq].prior = post->sync.dep[sq].prior;
+               dst->sync.dep_ta[sq].prior = post->sync.dep_ta[sq].prior;
+            }
+            cdm_preceding |= post->sync.kind;
+         }
          ok = hk_render_pack_add(&p->cmd, &p->cs, source, item, m == 0,
                                  m + 1 == run->count, &preceding);
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+            const struct hk_sync_dep *creq = &source->sync.req[k][HK_SYNC_CDM];
+            if (creq->cut || (creq->prior & cdm_preceding))
+               cdm_req_cut[k] = true;
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+               carried_req[k][sq] |= source->sync.req[k][sq].prior;
+         }
       }
       if (!ok) {
          run_count = 0;
@@ -7080,6 +7158,39 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       p->cs.uploaded_scissor = run->scissor->uploaded_scissor;
       p->cs.uploaded_zbias = run->zbias->uploaded_zbias;
       hk_render_pack_finish(&p->cmd, &p->cs);
+      if (n_pre || n_post) {
+         list_inithead(&p->cmd.control_streams);
+         uint32_t seq = 0;
+         for (unsigned j = 0; j < n_pre; ++j) {
+            p->pre_cs[j].sync.seq = ++seq;
+            list_addtail(&p->pre_cs[j].node, &p->cmd.control_streams);
+            u_foreach_bit(k, p->pre_cs[j].sync.kind)
+               p->cmd.sync.last[k][HK_SYNC_CDM] = &p->pre_cs[j];
+            p->cmd.sync.last_any[HK_SYNC_CDM] = &p->pre_cs[j];
+         }
+         p->cs.sync.seq = ++seq;
+         p->cs.sync.heap_slot = 0;
+         if (n_pre) {
+            p->cs.sync.dep[HK_SYNC_CDM].cut = &p->pre_cs[n_pre - 1];
+            p->cs.sync.dep_ta[HK_SYNC_CDM].cut = &p->pre_cs[n_pre - 1];
+         }
+         list_addtail(&p->cs.node, &p->cmd.control_streams);
+         for (unsigned j = 0; j < n_post; ++j) {
+            p->post_cs[j].sync.seq = ++seq;
+            p->post_cs[j].sync.dep[HK_SYNC_VDM].cut = &p->cs;
+            p->post_cs[j].sync.dep_ta[HK_SYNC_VDM].cut = &p->cs;
+            list_addtail(&p->post_cs[j].node, &p->cmd.control_streams);
+            u_foreach_bit(k, p->post_cs[j].sync.kind)
+               p->cmd.sync.last[k][HK_SYNC_CDM] = &p->post_cs[j];
+            p->cmd.sync.last_any[HK_SYNC_CDM] = &p->post_cs[j];
+         }
+         struct hk_cs *last_cdm =
+            n_post ? &p->post_cs[n_post - 1] : &p->pre_cs[n_pre - 1];
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+            if (cdm_req_cut[k] || p->cmd.sync.req[k][HK_SYNC_CDM].cut)
+               p->cmd.sync.req[k][HK_SYNC_CDM].cut = last_cdm;
+         }
+      }
 
       perf_debug_dev(&dev->dev,
                      "Packing %u render command buffers (%u draws) into one "

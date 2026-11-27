@@ -185,15 +185,16 @@ hk_upload_rodata(struct hk_device *dev)
     * own buffer object so the sampler table next to the texel-fetch sampler
     * never changes after device creation.
     */
-   dev->rodata.heap_bo = agx_bo_create(&dev->dev, sizeof(struct poly_heap), 0,
-                                       0, "Geometry heap descriptor");
+   dev->rodata.heap_bo = agx_bo_create(&dev->dev,
+                                       HK_HEAP_SLOTS * sizeof(struct poly_heap),
+                                       0, 0, "Geometry heap descriptor");
    if (!dev->rodata.heap_bo)
       goto fail;
 
    void *heap_map = agx_bo_map(dev->rodata.heap_bo);
    if (!heap_map)
       goto fail;
-   memset(heap_map, 0, sizeof(struct poly_heap));
+   memset(heap_map, 0, HK_HEAP_SLOTS * sizeof(struct poly_heap));
    dev->rodata.heap = dev->rodata.heap_bo->va->addr;
 
    return VK_SUCCESS;

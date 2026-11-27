@@ -841,6 +841,110 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+static void
+test_pregfx_and_union_elision(void)
+{
+   /* 1. Driver-only [pre_gfx, VDM, post_gfx] CB on a ring heap slot. */
+   struct hk_cmd_buffer *c = split(4);
+   struct hk_cs *vdm = first_cs(c);
+   struct hk_cs *pre = test_alloc(sizeof(*pre));
+   struct hk_cs *post = test_alloc(sizeof(*post));
+   pre->type = HK_CS_CDM;
+   pre->stats.cmds = 1;
+   pre->stats.calls = 0;
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->sync.heap_slot = 2;
+   vdm->sync.heap_slot = 2;
+   vdm->sync.dep[HK_SYNC_CDM].cut = pre;
+   vdm->sync.dep_ta[HK_SYNC_CDM].cut = pre;
+   post->type = HK_CS_CDM;
+   post->stats.cmds = 1;
+   post->stats.calls = 0;
+   post->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   post->sync.heap_slot = 2;
+   post->sync.dep[HK_SYNC_VDM].cut = vdm;
+   post->sync.dep_ta[HK_SYNC_VDM].cut = vdm;
+   list_inithead(&c->control_streams);
+   list_addtail(&pre->node, &c->control_streams);
+   list_addtail(&vdm->node, &c->control_streams);
+   list_addtail(&post->node, &c->control_streams);
+
+   const struct hk_cs *got_pre = NULL, *got_post = NULL;
+   const struct hk_cs *got_vdm =
+      hk_render_pack_member_streams(c, &got_pre, &got_post);
+   T("driver-only [pre, VDM, post] with matching ring slot is a member",
+     got_vdm == vdm && got_pre == pre && got_post == post);
+
+   pre->stats.calls = 1;
+   T("API compute dispatch before VDM is refused",
+     hk_render_pack_member(c) == NULL);
+   pre->stats.calls = 0;
+
+   post->sync.heap_slot = 3;
+   T("post-graphics with mismatched heap slot is refused",
+     hk_render_pack_member(c) == NULL);
+   post->sync.heap_slot = 2;
+
+   /* 2. Union untouched-RT elision + union ZLS store elision. */
+   struct hk_cmd_buffer *a = split(2), *b = split(3);
+   struct hk_cs *as = first_cs(a), *bs = first_cs(b);
+   as->cr.bg.main.rsrc_spec = 0x111;
+   as->cr.eot.main.rsrc_spec = 0x222;
+   as->cr.eot.partial.rsrc_spec = 0x333;
+   bs->cr.bg.main.rsrc_spec = 0x444; /* elided program */
+   bs->cr.eot.main.rsrc_spec = 0x555; /* elided program */
+   bs->cr.eot.partial.rsrc_spec = 0x666;
+   bs->render_pack_elided = 0x2;
+   bs->render_pack_has_full_programs = true;
+   bs->render_pack_full_bg_main = as->cr.bg.main;
+   bs->render_pack_full_eot_main = as->cr.eot.main;
+   bs->render_pack_full_eot_partial = as->cr.eot.partial;
+
+   agx_pack(&as->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_store = true;
+   }
+   agx_pack(&bs->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_store = false;
+   }
+   bs->render_pack_zls_elided_store = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+   T("differing elision with preserved full programs and elided z_store matches",
+     !hk_render_pack_streams_match(as, bs));
+
+   struct hk_cmd_buffer pkt = {0};
+   struct hk_cs pcs = {0};
+   struct hk_cmd_buffer *members[2] = {b, a};
+   hk_render_pack_init(&pkt, &pcs, members, 2);
+   uint8_t preceding = 0;
+   T("packet add b then a succeeds",
+     hk_render_pack_add(&pkt, &pcs, b, bs, true, false, &preceding) &&
+        hk_render_pack_add(&pkt, &pcs, a, as, false, true, &preceding));
+   hk_render_pack_finish(&pkt, &pcs);
+   agx_unpack(NULL, &pcs.cr.zls_control, ZLS_CONTROL, zout);
+   T("packet restores full bg/eot and unions z_store across members",
+     pcs.render_pack_elided == 0 && pcs.cr.bg.main.rsrc_spec == 0x111 &&
+        pcs.cr.eot.partial.rsrc_spec == 0x333 &&
+        pcs.cr.eot.main.rsrc_spec == 0x222 && zout.z_store);
+
+   /* Reverse order: last member is the elided one -> must restore full eot.main. */
+   struct hk_cmd_buffer *rev[2] = {a, b};
+   hk_render_pack_init(&pkt, &pcs, rev, 2);
+   preceding = 0;
+   T("packet add a then b succeeds",
+     hk_render_pack_add(&pkt, &pcs, a, as, true, false, &preceding) &&
+        hk_render_pack_add(&pkt, &pcs, b, bs, false, true, &preceding));
+   hk_render_pack_finish(&pkt, &pcs);
+   agx_unpack(NULL, &pcs.cr.zls_control, ZLS_CONTROL, zout2);
+   T("packet restores last member's full eot.main and preserves z_store",
+     pcs.render_pack_elided == 0 && pcs.cr.eot.main.rsrc_spec == 0x222 &&
+        zout2.z_store);
+
+   util_dynarray_fini(&pcs.render_resources);
+   util_dynarray_fini(&pkt.sync_pass_records);
+}
+
 int
 main(void)
 {
@@ -861,6 +965,7 @@ main(void)
       test_tails();
       test_fold(false);
       test_fold(true);
+      test_pregfx_and_union_elision();
    }
 
    ralloc_free(test_context);

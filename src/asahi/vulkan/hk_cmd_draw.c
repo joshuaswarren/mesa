@@ -3383,6 +3383,7 @@ hk_g17p_zls_elide(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
       agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
          cfg = control;
       }
+      cs->render_pack_zls_elided_store |= (uint8_t)aspects;
    }
 }
 
@@ -3535,6 +3536,11 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area, NULL);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
+
+   cs->render_pack_full_bg_main = cs->cr.bg.main;
+   cs->render_pack_full_eot_main = cs->cr.eot.main;
+   cs->render_pack_full_eot_partial = cs->cr.eot.partial;
+   cs->render_pack_has_full_programs = true;
 
    cs->cr.bg.main = bg_main;
    cs->cr.eot.main = eot_main;
@@ -4100,7 +4106,8 @@ hk_xfer_check_draw(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
  * (hk_m5_pass_merge_begin()).
  */
 static const char *
-hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+hk_m5_pass_merge_refusal_ex(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                            bool allow_pregfx_heap)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -4119,14 +4126,18 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
                      : cmd->in_meta                          ? "meta"
                      : cs->stats.cmds == 0                   ? "no draws"
                      : cmd->sync.pass_vdm != cs              ? "split pass"
-                     : cmd->current_cs.pre_gfx               ? "pre-graphics"
-                     : cmd->current_cs.post_gfx              ? "post-graphics"
+                     : (!allow_pregfx_heap && cmd->current_cs.pre_gfx)
+                                                             ? "pre-graphics"
+                     : (!allow_pregfx_heap && cmd->current_cs.post_gfx)
+                                                             ? "post-graphics"
                      : cmd->state.oq_pending_render          ? "occlusion query"
-                     : cmd->uses_heap                        ? "heap"
+                     : (cmd->uses_heap &&
+                        (!allow_pregfx_heap || cs->sync.heap_slot == 0))
+                                                             ? "heap"
                      : cs->timestamp.start.handle            ? "start timestamp"
                                                              : NULL;
    if (why) {
-      if (msaa_enabled)
+      if (msaa_enabled && !allow_pregfx_heap)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
@@ -4174,6 +4185,12 @@ hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    attachments += render->depth_att.iview != NULL;
    attachments += render->stencil_att.iview != NULL;
    return attachments > 0 ? NULL : "no attachments";
+}
+
+static const char *
+hk_m5_pass_merge_refusal(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   return hk_m5_pass_merge_refusal_ex(cmd, cs, false);
 }
 
 static bool
@@ -5058,15 +5075,13 @@ hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd)
    e->linked = 0;
 
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
-       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
-       !list_is_singular(&cmd->control_streams)) {
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       e->head = false;
       return;
    }
 
-   struct hk_cs *cs =
-      list_first_entry(&cmd->control_streams, struct hk_cs, node);
-   if (cs->type != HK_CS_VDM) {
+   const struct hk_cs *cs = hk_render_pack_find_vdm(cmd, NULL, NULL);
+   if (!cs) {
       e->head = false;
       return;
    }
@@ -6211,6 +6226,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    merge->valid = false;
    const char *refusal = cs ? hk_m5_pass_merge_refusal(cmd, cs) : "no stream";
    const bool continuable = !refusal;
+   const char *rpack_refusal =
+      continuable || !cs ? refusal
+                         : hk_m5_pass_merge_refusal_ex(cmd, cs, true);
 
    /* The stream the command buffer's first instance began, for submit-time
     * render packing (hk_render_pack_end_cmd()). */
@@ -6296,7 +6314,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
 
-   if (continuable)
+   if (continuable || !rpack_refusal)
       merge->render = *render;
 
    bool need_resolve = false;
@@ -6407,7 +6425,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
    /* The render state is cleared by now; the candidate kept a copy. */
    hk_render_pack_end(cmd, cs, &merge->render,
-                      !continuable                  ? refusal
+                      rpack_refusal                 ? rpack_refusal
                       : need_resolve                ? "resolve"
                       : cs->end != end_before ||
                             vk_command_buffer_has_error(&cmd->vk)
@@ -6489,6 +6507,26 @@ hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
    p->cs = NULL;
 }
 
+static bool
+hk_heap_ring_enabled(const struct hk_device *dev)
+{
+   return agx_chip_native_or_m5(dev->dev.chip);
+}
+
+static size_t
+hk_heap_slot_size(const struct hk_device *dev)
+{
+   return hk_heap_ring_enabled(dev) ? (dev->heap->size / HK_HEAP_SLOTS)
+                                    : dev->heap->size;
+}
+
+static uint64_t
+hk_heap_base(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return dev->heap->va->addr + (uint64_t)cmd->heap_slot * hk_heap_slot_size(dev);
+}
+
 static void
 hk_init_heap(const void *data)
 {
@@ -6511,10 +6549,20 @@ hk_init_heap(const void *data)
       return;
    }
 
-   *map = (struct poly_heap){
-      .base = heap->va->addr,
-      .size = size,
-   };
+   if (hk_heap_ring_enabled(dev)) {
+      const size_t slot_size = size / HK_HEAP_SLOTS;
+      for (unsigned s = 0; s < HK_HEAP_SLOTS; ++s) {
+         map[s] = (struct poly_heap){
+            .base = heap->va->addr + (uint64_t)s * slot_size,
+            .size = slot_size,
+         };
+      }
+   } else {
+      map[0] = (struct poly_heap){
+         .base = heap->va->addr,
+         .size = size,
+      };
+   }
    dev->heap = heap;
 }
 
@@ -6559,20 +6607,33 @@ hk_heap(struct hk_cmd_buffer *cmd)
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
       perf_debug(cmd, "Freeing heap");
-      uint64_t addr = dev->rodata.heap;
+      if (hk_heap_ring_enabled(dev)) {
+         const uint8_t slot =
+            (uint8_t)(p_atomic_fetch_add(&dev->heap_next_slot, 1) %
+                      HK_HEAP_SLOTS);
+         cmd->heap_slot = slot;
+         const uint64_t addr =
+            dev->rodata.heap + (uint64_t)slot * sizeof(struct poly_heap);
+         hk_sync_heap_slot_used(cmd, slot);
+         hk_queue_write(cmd, addr + offsetof(struct poly_heap, bottom), 0,
+                        true /* after gfx */);
+      } else {
+         cmd->heap_slot = 0;
+         uint64_t addr = dev->rodata.heap;
 
-      /* One device-wide bump allocator: every pass that uses it runs after
-       * every earlier stream and its free runs after the pass. */
-      hk_sync_heap_used(cmd);
+         /* One device-wide bump allocator: every pass that uses it runs after
+          * every earlier stream and its free runs after the pass. */
+         hk_sync_heap_used(cmd);
 
-      /* Zeroing the allocated index frees everything */
-      hk_queue_write(cmd, addr + offsetof(struct poly_heap, bottom), 0,
-                     true /* after gfx */);
+         /* Zeroing the allocated index frees everything */
+         hk_queue_write(cmd, addr + offsetof(struct poly_heap, bottom), 0,
+                        true /* after gfx */);
+      }
 
       cmd->uses_heap = true;
    }
 
-   return dev->rodata.heap;
+   return dev->rodata.heap + (uint64_t)cmd->heap_slot * sizeof(struct poly_heap);
 }
 
 static uint64_t
@@ -6755,8 +6816,8 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
          /* Need to allocate heap if we haven't yet */
          hk_heap(cmd);
 
-         cmd->geom_index_buffer = dev->heap->va->addr;
-         cmd->geom_index_count = dev->heap->size;
+         cmd->geom_index_buffer = hk_heap_base(cmd);
+         cmd->geom_index_count = hk_heap_slot_size(dev);
       } else {
          cmd->geom_index_count =
             poly_gs_rast_vertices(gsi->shape, gsi->max_indices, 1, 0);
@@ -6827,7 +6888,7 @@ hk_init_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out)
    }
 
    /* heap is allocated by hk_heap */
-   out->patch_coord_buffer = dev->heap->va->addr;
+   out->patch_coord_buffer = hk_heap_base(cmd);
 }
 
 static void
@@ -7002,8 +7063,8 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                                 AGX_BARRIER_ALL | AGX_PREGFX, ia,
                                 poly_compact_prim(prim));
 
-   return agx_draw_indexed_indirect(ia.out_draw, dev->heap->va->addr,
-                                    dev->heap->size, draw.index_size,
+   return agx_draw_indexed_indirect(ia.out_draw, hk_heap_base(cmd),
+                                    hk_heap_slot_size(dev), draw.index_size,
                                     false /* restart */);
 }
 
@@ -7316,8 +7377,9 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                         info.mode, POLY_TESS_MODE_WITH_COUNTS, state);
    }
 
-   return agx_draw_indexed_indirect(gfx->tess.out_draws, dev->heap->va->addr,
-                                    dev->heap->size, AGX_INDEX_SIZE_U32, false);
+   return agx_draw_indexed_indirect(gfx->tess.out_draws, hk_heap_base(cmd),
+                                    hk_heap_slot_size(dev), AGX_INDEX_SIZE_U32,
+                                    false);
 }
 
 __attribute__((hot)) void
@@ -16288,8 +16350,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                   draw.indexed ? agx_index_size_to_B(draw.index_size) : 0,
                   prim);
 
-               draw = agx_draw_indexed_indirect(out_draw, dev->heap->va->addr,
-                                                dev->heap->size,
+               draw = agx_draw_indexed_indirect(out_draw, hk_heap_base(cmd),
+                                                hk_heap_slot_size(dev),
                                                 AGX_INDEX_SIZE_U32, false);
             } else {
                struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;

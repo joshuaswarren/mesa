@@ -328,6 +328,8 @@ struct hk_device {
       uint64_t heap;
    } rodata;
 
+   uint32_t heap_next_slot;
+
    struct hk_internal_shaders prolog_epilog;
    struct hk_internal_shaders kernels;
    struct hk_api_shader *null_fs;
