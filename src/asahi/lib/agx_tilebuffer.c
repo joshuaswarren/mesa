@@ -889,12 +889,33 @@ agx_tilebuffer_compact(const struct agx_tilebuffer_layout *src,
    if (!src || !dst)
       return 0;
 
+   /* Fast path for already-compact layouts (e.g. RT0 only or RT0..k-1
+    * contiguous): avoid copying the struct twice and zeroing arrays. */
+   unsigned count = 0;
+   bool compact = true;
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
+      if (src->logical_format[rt] != PIPE_FORMAT_NONE) {
+         if (rt != count) {
+            compact = false;
+            break;
+         }
+         if (map)
+            map[count] = rt;
+         ++count;
+      }
+   }
+   if (compact) {
+      if (dst != src)
+         *dst = *src;
+      return count;
+   }
+
    const struct agx_tilebuffer_layout original = *src;
    *dst = original;
    memset(dst->logical_format, 0, sizeof(dst->logical_format));
    memset(dst->spilled, 0, sizeof(dst->spilled));
    memset(dst->_offset_B, 0, sizeof(dst->_offset_B));
-   unsigned count = 0;
+   count = 0;
    for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
       if (original.logical_format[rt] == PIPE_FORMAT_NONE)
          continue;

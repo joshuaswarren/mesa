@@ -141,15 +141,44 @@ correctness(struct fixture *f)
    CHECK(cmd->state.cs.descriptors.root.dynamic_buffers[0].base_addr == 0x400010);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    CHECK(memcmp(old, f->root_map, sizeof(old)) == 0);
+   /* Pure dynamic-offset rebind marks only HK_ROOT_DIRTY_DYNBUF and keeps
+    * non_dynbuf_generation stable; changing set/layout advances it. */
+   {
+      struct hk_descriptor_state *gd = &cmd->state.gfx.descriptors;
+      hk_root_mark_clean(gd);
+      const uint64_t g0 = gd->generation;
+      const uint64_t np0 = gd->non_push_generation;
+      const uint64_t nd0 = gd->non_dynbuf_generation;
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->generation == g0 + 1);
+      CHECK(gd->non_push_generation == np0 + 1);
+      CHECK(gd->non_dynbuf_generation == nd0);
+      CHECK(hk_root_bypass_dirty(gd));
+      CHECK(gd->root_change.dynbuf_dirty_mask == BITFIELD64_BIT(0));
+      /* Identical rebind is a no-op and preserves state. */
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->generation == g0 + 1 && gd->non_dynbuf_generation == nd0);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->non_dynbuf_generation == nd0);
+   }
    /* Switching from push descriptors back to the same set is a real bind. */
    cmd->state.gfx.descriptors.push_active = 1;
    cmd->state.gfx.descriptors.root.sets[0] = 0x500000;
-   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   {
+      const uint64_t nd_before = cmd->state.gfx.descriptors.non_dynbuf_generation;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(cmd->state.gfx.descriptors.non_dynbuf_generation == nd_before + 1);
+      CHECK(!hk_root_bypass_dirty(&cmd->state.gfx.descriptors));
+   }
    CHECK(!cmd->state.gfx.descriptors.push_active);
    CHECK(cmd->state.gfx.descriptors.root.sets[0] == f->set->addr);
    /* An identical set with changed dynamic-layout indexing is a real change. */
    f->layout.dynamic_descriptor_offset[0] = 1;
-   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   {
+      const uint64_t nd_before = cmd->state.gfx.descriptors.non_dynbuf_generation;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(cmd->state.gfx.descriptors.non_dynbuf_generation == nd_before + 1);
+   }
    CHECK(cmd->state.gfx.descriptors.root.set_dynamic_buffer_start[0] == 1);
    CHECK(cmd->state.gfx.descriptors.root.dynamic_buffers[1].base_addr == 0x400020);
    f->layout.dynamic_descriptor_offset[0] = 0;

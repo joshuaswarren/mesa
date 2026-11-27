@@ -1951,21 +1951,11 @@ hk_native_mesh_object(struct hk_graphics_state *gfx, bool *task)
       ? HK_MESH_VARIANT_PREDICATED_OBJECT : HK_MESH_VARIANT_RAST];
 }
 
-static void
-hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+static ATTRIBUTE_NOINLINE void
+hk_m5_note_render_resources_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   /* G17P publishes no render resources. hk_flush_gfx_state() has already
-    * added the memory writes of every bound program to the stream. */
-   if (dev->dev.chip == AGX_CHIP_G17P) {
-      if (cs->m5_shader_writes_memory || gfx->xfb_enabled ||
-          gfx->render.m5_attachments_reach_memory)
-         hk_sync_note_memory_write(cmd, cs);
-      return;
-   }
-   if (!agx_chip_g17_m5(dev->dev.chip))
-      return;
    struct hk_shader *vs = hk_bound_hw_vs(gfx);
    struct hk_linked_shader *linked_vs = vs && vs->only_linked
       ? vs->only_linked : gfx->linked[MESA_SHADER_VERTEX];
@@ -2056,6 +2046,24 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
          return;
    }
    util_dynarray_append_array(&cs->render_resources, uint8_t, values, bytes);
+}
+
+static inline void
+hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   /* G17P publishes no render resources. hk_flush_gfx_state() has already
+    * added the memory writes of every bound program to the stream. */
+   if (likely(dev->dev.chip == AGX_CHIP_G17P)) {
+      if (unlikely(cs->m5_shader_writes_memory || gfx->xfb_enabled ||
+                   gfx->render.m5_attachments_reach_memory))
+         hk_sync_note_memory_write(cmd, cs);
+      return;
+   }
+   if (!agx_chip_g17_m5(dev->dev.chip))
+      return;
+   hk_m5_note_render_resources_slow(cmd, cs);
 }
 
 static bool
@@ -10453,11 +10461,13 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       gfx->g17p_bind_tail_dyn.front_face = dyn->rs.front_face;
       prepared->cull_word = memo_cull_word;
       prepared->descriptor_generation =
-         hk_root_push_only_dirty(&gfx->descriptors)
+         hk_root_dirty(&gfx->descriptors)
             ? gfx->descriptors.uploaded_root_generation
             : gfx->descriptors.generation;
       prepared->non_push_descriptor_generation =
          gfx->descriptors.non_push_generation;
+      prepared->non_dynbuf_descriptor_generation =
+         gfx->descriptors.non_dynbuf_generation;
       prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
       prepared->root = gfx->root;
       prepared->fragment_shader = fs;
@@ -11020,11 +11030,13 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    cmd->g17p_gfx_caches_used = true;
    prepared->dynamic_generation = dyn->generation;
    prepared->descriptor_generation =
-      hk_root_push_only_dirty(&gfx->descriptors)
+      hk_root_dirty(&gfx->descriptors)
          ? gfx->descriptors.uploaded_root_generation
          : gfx->descriptors.generation;
    prepared->non_push_descriptor_generation =
       gfx->descriptors.non_push_generation;
+   prepared->non_dynbuf_descriptor_generation =
+      gfx->descriptors.non_dynbuf_generation;
    prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
    prepared->root = gfx->root;
    prepared->fragment_shader = fs;
@@ -11136,7 +11148,7 @@ hk_g17p_bind_tail_state_matches_impl(
 static bool
 hk_g17p_prepared_bind_tail_matches_impl(
    const struct hk_cmd_buffer *cmd,
-   const struct hk_g17p_prepared_bind_tail *prepared, bool check_push)
+   const struct hk_g17p_prepared_bind_tail *prepared, bool strict_root)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
 
@@ -11155,13 +11167,20 @@ hk_g17p_prepared_bind_tail_matches_impl(
     * fragment_dma_set_base directly also guards against any cached-root or
     * descriptor-buffer set-base mismatch. */
    const bool desc_gen_match =
-      check_push
+      strict_root
          ? prepared->descriptor_generation == gfx->descriptors.generation
-         : prepared->non_push_descriptor_generation ==
-              gfx->descriptors.non_push_generation;
-   return desc_gen_match &&
-          prepared->vertex_buffer_generation ==
-             gfx->vertex_buffer_generation &&
+         : (prepared->non_dynbuf_descriptor_generation ==
+               gfx->descriptors.non_dynbuf_generation &&
+            hk_root_reads_ignore_dirty(
+               prepared->fragment_shader->info.agx3_root_reads,
+               prepared->fragment_shader->info.agx3_dynbuf_reads,
+               &gfx->descriptors));
+   const bool vb_gen_match =
+      prepared->vertex_buffer_generation == gfx->vertex_buffer_generation ||
+      (!strict_root &&
+       !(prepared->fragment_shader->info.agx3_root_reads &
+         (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT)));
+   return desc_gen_match && vb_gen_match &&
           prepared->root == gfx->root &&
           prepared->fragment_dma_set_base ==
              hk_g17p_dma_set_base_from_index(cmd,
@@ -11401,20 +11420,25 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                   : hk_g17p_dma_set_index(fs);
             const uint64_t dma_set_base =
                hk_g17p_dma_set_base_from_index(cmd, dma_set_index);
-            const bool push_only_dirty =
-               hk_root_push_only_dirty(&gfx->descriptors);
+            const bool bypass_dirty =
+               hk_root_bypass_dirty(&gfx->descriptors) &&
+               hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
+                                          fs->info.agx3_dynbuf_reads,
+                                          &gfx->descriptors);
             const bool desc_gen_ok =
                prepared->descriptor_generation ==
                   gfx->descriptors.generation ||
-               (push_only_dirty &&
+               (bypass_dirty &&
+                prepared->non_dynbuf_descriptor_generation ==
+                   gfx->descriptors.non_dynbuf_generation);
+            const bool vb_gen_ok =
+               prepared->vertex_buffer_generation ==
+                  gfx->vertex_buffer_generation ||
+               (bypass_dirty &&
                 !(fs->info.agx3_root_reads &
-                  (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
-                prepared->non_push_descriptor_generation ==
-                   gfx->descriptors.non_push_generation);
+                  (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT)));
             uint64_t fragment_program;
-            if (prepared->valid && desc_gen_ok &&
-                prepared->vertex_buffer_generation ==
-                   gfx->vertex_buffer_generation &&
+            if (prepared->valid && desc_gen_ok && vb_gen_ok &&
                 prepared->root == gfx->root &&
                 prepared->fragment_shader == fs &&
                 prepared->fragment_dma_set_base == dma_set_base) {
@@ -11432,8 +11456,9 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             const bool cull_emit =
                new_cull_word != cs->g17p_bind_tail.cull_word;
             const uint64_t new_desc_gen =
-               push_only_dirty ? gfx->descriptors.uploaded_root_generation
-                               : gfx->descriptors.generation;
+               hk_root_dirty(&gfx->descriptors)
+                  ? gfx->descriptors.uploaded_root_generation
+                  : gfx->descriptors.generation;
 
             if (likely(!fs_changed && !cull_emit &&
                        prepared->fragment_program == fragment_program &&
@@ -11453,6 +11478,8 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                prepared->descriptor_generation = new_desc_gen;
                prepared->non_push_descriptor_generation =
                   gfx->descriptors.non_push_generation;
+               prepared->non_dynbuf_descriptor_generation =
+                  gfx->descriptors.non_dynbuf_generation;
                prepared->vertex_buffer_generation =
                   gfx->root_vertex_buffer_generation;
                prepared->root = gfx->root;
@@ -11491,6 +11518,8 @@ hk_g17p_emit_native_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                prepared->descriptor_generation = new_desc_gen;
                prepared->non_push_descriptor_generation =
                   gfx->descriptors.non_push_generation;
+               prepared->non_dynbuf_descriptor_generation =
+                  gfx->descriptors.non_dynbuf_generation;
                prepared->vertex_buffer_generation =
                   gfx->root_vertex_buffer_generation;
                prepared->root = gfx->root;
@@ -13809,7 +13838,9 @@ hk_flush_vertex_attribs_root(struct hk_cmd_buffer *cmd,
       &cmd->vk.dynamic_graphics_state;
 
    unsigned slot = 0;
-   bool vertex_root_changed = false;
+   bool base_changed = false;
+   bool clamp_changed = false;
+   bool stride_changed = false;
    u_foreach_bit(a, sw_vs->info.vs.attribs_read) {
       uint64_t base;
       uint32_t clamp;
@@ -13835,17 +13866,19 @@ hk_flush_vertex_attribs_root(struct hk_cmd_buffer *cmd,
          stride = 0;
       }
 
-      vertex_root_changed |= desc->root.draw.attrib_base[slot] != base ||
-                             desc->root.draw.attrib_clamps[slot] != clamp ||
-                             desc->root.draw.attrib_strides[slot] != stride;
+      base_changed |= desc->root.draw.attrib_base[slot] != base;
+      clamp_changed |= desc->root.draw.attrib_clamps[slot] != clamp;
+      stride_changed |= desc->root.draw.attrib_strides[slot] != stride;
       desc->root.draw.attrib_base[slot] = base;
       desc->root.draw.attrib_clamps[slot] = clamp;
       desc->root.draw.attrib_strides[slot] = stride;
       ++slot;
    }
 
-   if (vertex_root_changed)
+   if (stride_changed)
       hk_root_mark_dirty(desc);
+   else if (base_changed || clamp_changed)
+      hk_root_mark_vb_dirty(desc, base_changed, clamp_changed);
    gfx->root_vertex_buffer_generation = gfx->vertex_buffer_generation;
 }
 
@@ -14818,11 +14851,16 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   const size_t gfx_root_size = hk_gfx_root_size_from_stages(
+      hw_vs->root_descriptor_size, true, hk_bound_fs(cmd)->root_descriptor_size,
+      sizeof(struct hk_root_descriptor_table));
+   const bool root_needs_growth =
+      hk_root_upload_needs_growth(desc->uploaded_root_size, gfx_root_size);
+
    if (!hk_root_dirty(desc) &&
        (agx_chip_native_hal200(dev->dev.chip) ||
         agx_chip_g17_m5(dev->dev.chip)) &&
-       hk_root_upload_needs_growth(desc->uploaded_root_size,
-                                   hk_gfx_root_descriptor_size(cmd)))
+       root_needs_growth)
       return false;
 
    if (hk_fast_link_vs_uvs_stale(cmd, sw_vs))
@@ -14830,25 +14868,26 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    *g17p_native_bind_tail_emitted_out = false;
 
-   /* Only push constants changed since the root was uploaded, and the
-    * fragment program, which keeps following the uploaded root
-    * (hk_agx3_fragment_root()), cannot read them: the vertex program can be
-    * launched over a copy of the push constants it reads, keeping the
-    * uploaded root (hk_agx3_try_push_only_vs_program()). Once it has been,
-    * a draw that changes nothing keeps that launch as a clean root would
-    * keep its own. */
-   const bool push_launch_fits =
-      hk_root_push_only_dirty(desc) && !agx_is_indirect(draw.b) &&
-      !hw_vs->b.info.has_preamble &&
-      !(fs->info.agx3_root_reads &
-        (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
-      !hk_root_upload_needs_growth(desc->uploaded_root_size,
-                                   hk_gfx_root_descriptor_size(cmd));
+   /* When only push constants, dynamic buffer offsets, and/or VB attrib
+    * bases/clamps changed since the root was uploaded, and the fragment
+    * program (which keeps following the uploaded root) cannot observe any of
+    * those dirty bytes, the vertex program can be launched over narrow copies
+    * or patched buffer VAs while keeping gfx->root and the HAL200 bind tail
+    * intact (hk_agx3_try_push_only_vs_program()). Once it has been, a draw
+    * that changes nothing keeps that launch as a clean root would keep its
+    * own. */
+   const bool bypass_draw_ok = !agx_is_indirect(draw.b) &&
+                               !hw_vs->b.info.has_preamble &&
+                               !root_needs_growth;
+   const bool bypass_launch_fits =
+      bypass_draw_ok && hk_root_bypass_dirty(desc) &&
+      hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
+                                 fs->info.agx3_dynbuf_reads, desc);
 
    const bool republishes_base_param =
       sw_vs->b.info.uses_base_param || linked_vs->b.uses_base_param;
    const bool uses_draw_id = sw_vs->b.info.uses_draw_id;
-   if (!gfx->dirty && hk_root_launch_current(desc, push_launch_fits) &&
+   if (!gfx->dirty && hk_root_launch_current(desc, bypass_launch_fits) &&
        !republishes_base_param && !uses_draw_id) {
       if (unlikely(cull_changed)) {
          assert(cs->current + 0x1000 < cs->end && "already ensured space");
@@ -14884,17 +14923,21 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    hk_flush_draw_params_and_id(cmd, sw_vs, linked_vs, draw_id, draw);
 
-   /* hk_flush_vertex_attribs_root() may have changed more of the root since
-    * push_launch_fits was decided. The root stays dirty after a push-only
-    * launch, so the next draw that needs all of it, through any path,
-    * uploads it. */
+   /* hk_flush_vertex_attribs_root() may have marked VB base/clamp dirty (or
+    * HK_ROOT_DIRTY_OTHER if strides changed) since bypass_launch_fits was
+    * decided. The root stays dirty after a bypassed launch, so the next draw
+    * that needs all of it, through any path, uploads it. */
+   const bool try_bypass =
+      bypass_draw_ok && hk_root_bypass_dirty(desc) &&
+      hk_root_reads_ignore_dirty(fs->info.agx3_root_reads,
+                                 fs->info.agx3_dynbuf_reads, desc);
    uint64_t pipeline_program = 0;
-   if (push_launch_fits && hk_root_push_only_dirty(desc))
+   if (try_bypass)
       pipeline_program =
          hk_agx3_try_push_only_vs_program(cmd, hw_vs, linked_vs);
-   const bool push_only = pipeline_program != 0;
+   const bool root_bypass = pipeline_program != 0;
 
-   if (!push_only && hk_root_dirty(desc)) {
+   if (!root_bypass && hk_root_dirty(desc)) {
       gfx->root =
          hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    }
@@ -14903,23 +14946,27 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t *out = cs->current;
 
    hk_reserve_scratch(cmd, cs, hw_vs);
-   if (!push_only)
+   if (!root_bypass)
       pipeline_program = hk_upload_usc_words(cmd, hw_vs, linked_vs);
 
    const bool desc_gen_match =
-      push_only
-         ? prepared->non_push_descriptor_generation ==
-              desc->non_push_generation
+      root_bypass
+         ? prepared->non_dynbuf_descriptor_generation ==
+              desc->non_dynbuf_generation
          : prepared->descriptor_generation == desc->generation;
+   const bool vb_gen_match =
+      prepared->vertex_buffer_generation == gfx->vertex_buffer_generation ||
+      (root_bypass &&
+       !(fs->info.agx3_root_reads &
+         (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT)));
    const bool tail_known_match =
       cull_matches_prepared && prepared->valid && desc_gen_match &&
-      prepared->vertex_buffer_generation == gfx->vertex_buffer_generation &&
-      prepared->root == gfx->root &&
+      vb_gen_match && prepared->root == gfx->root &&
       prepared->fragment_dma_set_base ==
          hk_g17p_dma_set_base_from_index(cmd, prepared->fragment_dma_set_index);
 #if defined(MESA_DEBUG) && MESA_DEBUG
    assert(!tail_known_match ||
-          hk_g17p_prepared_bind_tail_matches_impl(cmd, prepared, !push_only));
+          hk_g17p_prepared_bind_tail_matches_impl(cmd, prepared, !root_bypass));
 #endif
    const enum hk_g17p_bind_tail_match tail_match =
       (tail_known_match &&
@@ -14943,8 +14990,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (unlikely(any_dyn_dirty))
       vk_dynamic_graphics_state_clear_dirty(dyn);
    gfx->dirty = 0;
-   if (push_only)
-      hk_root_mark_push_launched(desc);
+   if (root_bypass)
+      hk_root_mark_bypass_launched(desc);
    else
       hk_root_mark_clean(desc);
    return true;
@@ -15062,15 +15109,18 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) ==
              gfx->fast_link_fs.key.prolog.statistics) {
          struct hk_descriptor_state *desc = &gfx->descriptors;
-         const bool push_launch_fits =
-            hk_root_push_only_dirty(desc) && !agx_is_indirect(draw.b) &&
+         const bool bypass_launch_fits =
+            hk_root_bypass_dirty(desc) && !agx_is_indirect(draw.b) &&
             !hw_vs->b.info.has_preamble &&
-            !(fs_src->info.agx3_root_reads &
-              (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
-            !hk_root_upload_needs_growth(desc->uploaded_root_size,
-                                         hk_gfx_root_descriptor_size(cmd));
+            hk_root_reads_ignore_dirty(fs_src->info.agx3_root_reads,
+                                       fs_src->info.agx3_dynbuf_reads, desc) &&
+            !hk_root_upload_needs_growth(
+               desc->uploaded_root_size,
+               hk_gfx_root_size_from_stages(
+                  hw_vs->root_descriptor_size, true, fs->root_descriptor_size,
+                  sizeof(struct hk_root_descriptor_table)));
 
-         if (hk_root_launch_current(desc, push_launch_fits) &&
+         if (hk_root_launch_current(desc, bypass_launch_fits) &&
              !hw_vs->b.info.uses_draw_id && !linked_vs->b.uses_base_param)
             return;
 
@@ -15085,13 +15135,13 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
 
             uint64_t pipeline_program = 0;
-            if (push_launch_fits && hk_root_push_only_dirty(desc))
+            if (bypass_launch_fits)
                pipeline_program =
                   hk_agx3_try_push_only_vs_program(cmd, hw_vs, linked_vs);
-            const bool push_only = pipeline_program != 0;
+            const bool root_bypass = pipeline_program != 0;
 
             const uint64_t prev_fs_root = gfx->fs_root;
-            if (!push_only) {
+            if (!root_bypass) {
                gfx->root =
                   hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
                if (unlikely(!gfx->root))
@@ -15113,7 +15163,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out =
                hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
 
-            if (!push_only) {
+            if (!root_bypass) {
                const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
                const bool use_shadow =
                   verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
@@ -15138,8 +15188,8 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             }
 
             cs->current = out;
-            if (push_only)
-               hk_root_mark_push_launched(desc);
+            if (root_bypass)
+               hk_root_mark_bypass_launched(desc);
             else
                hk_root_mark_clean(desc);
             return;
@@ -15570,20 +15620,24 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
 
    /* TODO: Try to reduce draw overhead of this */
-   if (!gfx->shaders[MESA_SHADER_MESH])
+   if (unlikely(gfx->shaders_dirty) && !gfx->shaders[MESA_SHADER_MESH])
       hk_handle_passthrough_gs(cmd, *draw);
    if (vk_command_buffer_has_error(&cmd->vk))
       return NULL;
 
-   hk_flush_shaders(cmd);
+   if (unlikely(gfx->shaders_dirty || vk_dynamic_graphics_state_any_dirty(dyn)))
+      hk_flush_shaders(cmd);
 
    const bool geom = gfx->shaders[MESA_SHADER_GEOMETRY];
    const bool tess = gfx->shaders[MESA_SHADER_TESS_EVAL];
-   bool adj = mesa_prim_has_adjacency(
-      vk_topology_to_mesa(dyn->ia.primitive_topology));
+   bool adj =
+      dyn->ia.primitive_topology >= VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY &&
+      dyn->ia.primitive_topology <=
+         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
    adj &= !geom;
    *needs_idx_robust =
-      hk_needs_index_robustness(cmd, draw, conditional_direct);
+      draw->indexed ? hk_needs_index_robustness(cmd, draw, conditional_direct)
+                    : false;
    const bool needs_heap = geom || tess || (*needs_idx_robust && !adj) ||
       (adj && (draw->restart ||
                (agx_chip_agx3_path(dev->dev.chip) &&
@@ -15679,14 +15733,6 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if ((draw->restart || geom) && !agx_chip_agx3_path(dev->dev.chip))
       hk_flush_index(cmd, cs);
 
-   /* Everything that can dirty render state for this draw has now run, so
-    * this is the first point at which "does this draw republish state?" is
-    * answerable, and -- because hk_flush_index() is not on the G17P path --
-    * the last point at which nothing of this draw has been written to the
-    * stream yet.  Both halves are required: the republication is the hazard,
-    * and a split has to happen before the record it protects. */
-   const bool republishes = hk_gfx_republishes_render_state(cmd);
-
    /* The HAL200 draw-state selector holds 16-bit scissor and
     * depth-bias indices. A stream whose arrays are about to exceed that
     * (only reachable with >65k distinct scissor/depth-bias states) is ended
@@ -15697,7 +15743,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       (cs->scissor.size / AGX_SCISSOR_LENGTH + ppp_margin > UINT16_MAX ||
        cs->depth_bias.size / AGX_DEPTH_BIAS_LENGTH + ppp_margin > UINT16_MAX);
 
-   if (republishes && cs->stats.cmds > 0 && ppp_index_limit) {
+   if (unlikely(ppp_index_limit) && cs->stats.cmds > 0 &&
+       hk_gfx_republishes_render_state(cmd)) {
       hk_cmd_buffer_end_graphics(cmd);
       cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
       if (!cs)
@@ -16382,25 +16429,28 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                  : agx_draw_indirect(patched);
    }
 
-   uint64_t stat_ia_verts = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT);
-
-   uint64_t stat_ia_prims = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT);
-
-   uint64_t stat_vs_inv = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT);
-
-   uint64_t stat_c_inv = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT);
-
-   uint64_t stat_c_prims = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT);
-
-   bool ia_stats = hk_stat_enabled(stat_ia_verts) ||
-                   hk_stat_enabled(stat_ia_prims) ||
-                   hk_stat_enabled(stat_vs_inv) ||
-                   hk_stat_enabled(stat_c_inv) || hk_stat_enabled(stat_c_prims);
+   uint64_t stat_ia_verts = AGX_SCRATCH_PAGE_ADDRESS;
+   uint64_t stat_ia_prims = AGX_SCRATCH_PAGE_ADDRESS;
+   uint64_t stat_vs_inv = AGX_SCRATCH_PAGE_ADDRESS;
+   uint64_t stat_c_inv = AGX_SCRATCH_PAGE_ADDRESS;
+   uint64_t stat_c_prims = AGX_SCRATCH_PAGE_ADDRESS;
+   bool ia_stats = false;
+   if (unlikely(cmd->state.gfx.descriptors.root.draw.pipeline_stats_flags)) {
+      stat_ia_verts = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT);
+      stat_ia_prims = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT);
+      stat_vs_inv = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT);
+      stat_c_inv = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT);
+      stat_c_prims = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT);
+      ia_stats = hk_stat_enabled(stat_ia_verts) ||
+                 hk_stat_enabled(stat_ia_prims) ||
+                 hk_stat_enabled(stat_vs_inv) ||
+                 hk_stat_enabled(stat_c_inv) || hk_stat_enabled(stat_c_prims);
+   }
    /* Validate the native index domain before robustness or geometry lowering
     * can introduce a pre-render compute dispatch.  Robust draws keep their
     * application range for the ordered GPU-side bounds pass, which shadows the
@@ -16477,8 +16527,11 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
       bool geom = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
       bool tess = cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
-      bool adj = mesa_prim_has_adjacency(
-         vk_topology_to_mesa(dyn->ia.primitive_topology));
+      bool adj =
+         dyn->ia.primitive_topology >=
+            VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY &&
+         dyn->ia.primitive_topology <=
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
       adj &= !geom;
       needs_idx_robust &= !adj;
 
@@ -16707,7 +16760,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          }
       }
 
-      hk_note_attachmentless_draw(cmd, cs);
+      if (unlikely(hk_attachmentless_render(cs)))
+         hk_note_attachmentless_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
       if (unlikely(dev->frame_anatomy)) {
@@ -17711,9 +17765,11 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
       const bool rasterization_enabled = hk_native_vertex_template_enabled(
          hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
          hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
+      const bool hoisted_preamble = gfx->g17p_hoisted_preamble_va != 0;
       const struct hk_g17p_vdm_update_key *memo = &gfx->g17p_vdm_update_memo.key;
       vdm_raw_template =
-         hw_vs->agx3_vdm_state_update.template_info.raw_state_load_count_18 << 3;
+         hk_hw_vs_vdm_state_update(hw_vs, hoisted_preamble)
+            ->template_info.raw_state_load_count_18 << 3;
       if (!gfx->g17p_vdm_update_memo.valid ||
           !agx_vdm_state_vertex_pipeline_pair_supported(chip) ||
           (vdm_raw_template & ~AGX_VDM_STATE_VERTEX_PIPELINE_TEMPLATE_MASK) !=
@@ -17723,6 +17779,7 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
           memo->draw_path != draw_path || memo->provoking != gfx->provoking ||
           memo->rasterization_enabled != rasterization_enabled ||
           memo->primitive_id != gfx->generate_primitive_id || !memo->ordinary ||
+          memo->hoisted_preamble != hoisted_preamble ||
           memo->selector_valid != cs->agx3_active_context_selector_valid)
          return start;
       vdm_tpl = gfx->g17p_vdm_update_memo.encoded;
@@ -18058,7 +18115,8 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
       cs->stats.calls += emitted;
       cs->stats.cmds += emitted;
       hk_upload_stat(cmd, draws, emitted);
-      hk_note_attachmentless_draw(cmd, cs);
+      if (unlikely(hk_attachmentless_render(cs)))
+         hk_note_attachmentless_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
    }

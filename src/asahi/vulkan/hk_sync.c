@@ -196,6 +196,11 @@ void
 hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (!cmd->sync_pass_records.size) {
+      memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+      st->pass_tile_wait_frag = NULL;
+      return;
+   }
    const bool frag_ok = hk_sync_load_hazard_frag(hk_cmd_buffer_device(cmd));
    struct hk_cs *wait[HK_SYNC_NUM_SQ] = {0};
    struct hk_cs *frag = NULL;
