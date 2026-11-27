@@ -85,7 +85,8 @@ bool hk_compute_opt_validate_dispatch_core(
    bool alias_free, const struct hk_descriptor_state *desc,
    const struct hk_compute_opt_plan *plan, uint32_t base_x, uint32_t base_y,
    uint32_t base_z, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-   uint32_t *out_groups_x, uint32_t *out_groups_y);
+   uint32_t max_groups_x, uint32_t max_groups_y, uint32_t *out_groups_x,
+   uint32_t *out_groups_y);
 
 bool hk_compute_opt_validate_dispatch(
    const struct hk_device *dev, const struct hk_descriptor_state *desc,

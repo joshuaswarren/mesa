@@ -20,6 +20,8 @@
 #include <string.h>
 
 #define test_nir_options agx_nir_options
+#define TEST_MAX_WG_X 0x7fffffffu
+#define TEST_MAX_WG_Y 65535u
 
 static struct hk_descriptor_set_layout *
 make_test_layout(unsigned count, bool uab)
@@ -161,17 +163,21 @@ test_rgba8_to_gray(void)
    set_push_i32(&desc, 12, 516);
 
    uint32_t gx = 0, gy = 0;
-   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                1, 64, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    assert(gx == 3 && gy == 16);
    /* Reject alias_free == false, non-zero base, and overlapping VA ranges. */
-   assert(!hk_compute_opt_validate_dispatch_core(false, &desc, &plan, 0, 0, 0,
-                                                 1, 64, 1, &gx, &gy));
-   assert(!hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 1, 0, 0,
-                                                 1, 64, 1, &gx, &gy));
+   assert(!hk_compute_opt_validate_dispatch_core(
+      false, &desc, &plan, 0, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 1, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    addrs[1].base_addr = 0x100100;
-   assert(!hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                 1, 64, 1, &gx, &gy));
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    ralloc_free(s);
 
    nir_shader *bad = build_test_rgba8_to_gray(true);
@@ -401,13 +407,15 @@ test_canny_hysteresis(void)
    set_push_i32(&desc, 4, 17);
 
    uint32_t gx = 0, gy = 0;
-   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                3, 17, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 3, 17, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    assert(gx == 2 && gy == 5);
    /* Reject in-place aliasing (src == dst). */
    addrs[1].base_addr = addrs[0].base_addr;
-   assert(!hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                 3, 17, 1, &gx, &gy));
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 3, 17, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    ralloc_free(s);
 
    nir_shader *bad = build_test_canny_hysteresis(true);
@@ -514,8 +522,9 @@ test_canny_nms(void)
    set_push_i32(&desc, 4, 480);
 
    uint32_t gx = 0, gy = 0;
-   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                1, 480, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 480, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    assert(gx == 3 && gy == 120);
    ralloc_free(s);
 
@@ -605,8 +614,9 @@ test_canny_finalize(void)
    set_push_i32(&desc, 8, 320);
 
    uint32_t gx = 0, gy = 0;
-   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                1, 200, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 200, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    assert(gx == 2 && gy == 50);
    ralloc_free(s);
 
@@ -868,15 +878,103 @@ test_bilinear_resize_border(void)
    set_push_i32(&desc, 24, 16);
 
    uint32_t gx = 0, gy = 0;
-   assert(hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                4, 4, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 4, 4, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
    assert(gx == 7 && gy == 75);
 
-   /* Reject border=0 with width < 2 (guards against dst_w - 2 - border underflow). */
-   set_push_i32(&desc, 12, 1);
+   /* Enforce device workgroup count limits on rewritten grid dimensions:
+    * tall narrow buffer with ceil(height / 8) == 65535 fits; 65536 must be
+    * rejected so the original grid-stride dispatch is retained. */
+   struct hk_buffer_address tall_addrs[2] = {
+      {.base_addr = 0x1000000, .size = 16u * 1024u * 1024u},
+      {.base_addr = 0x3000000, .size = 16u * 1024u * 1024u},
+   };
+   setup_desc_state(&desc, &ds, layout, tall_addrs, 2);
+   set_push_i32(&desc, 0, 16);
+   set_push_i32(&desc, 4, 65535 * 8);
+   set_push_i32(&desc, 8, 16);
+   set_push_i32(&desc, 12, 16);
+   set_push_i32(&desc, 16, 65535 * 8);
+   set_push_i32(&desc, 20, 16);
    set_push_i32(&desc, 24, 0);
-   assert(!hk_compute_opt_validate_dispatch_core(true, &desc, &plan, 0, 0, 0,
-                                                 1, 1, 1, &gx, &gy));
+   assert(hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
+   assert(gx == 1 && gy == 65535);
+
+   set_push_i32(&desc, 4, 65535 * 8 + 1);
+   set_push_i32(&desc, 16, 65535 * 8 + 1);
+   gx = 0xdeadbeefu;
+   gy = 0xbeefdeadu;
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 64, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
+   assert(gx == 0xdeadbeefu && gy == 0xbeefdeadu);
+
+   /* Also reject rewritten X group count exceeding max_groups_x. */
+   set_push_i32(&desc, 0, 256);
+   set_push_i32(&desc, 4, 64);
+   set_push_i32(&desc, 8, 256);
+   set_push_i32(&desc, 12, 256);
+   set_push_i32(&desc, 16, 64);
+   set_push_i32(&desc, 20, 256);
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 8, 1, 1, TEST_MAX_WG_Y, &gx, &gy));
+
+   /* Reject border=0 with width < 2 (guards against dst_w - 2 - border underflow). */
+   setup_desc_state(&desc, &ds, layout, addrs, 2);
+   set_push_i32(&desc, 0, 1024);
+   set_push_i32(&desc, 4, 768);
+   set_push_i32(&desc, 8, 1024);
+   set_push_i32(&desc, 12, 1);
+   set_push_i32(&desc, 16, 600);
+   set_push_i32(&desc, 20, 832);
+   set_push_i32(&desc, 24, 0);
+   assert(!hk_compute_opt_validate_dispatch_core(
+      true, &desc, &plan, 0, 0, 0, 1, 1, 1, TEST_MAX_WG_X, TEST_MAX_WG_Y, &gx,
+      &gy));
+
+   /* Non-default float execution controls must be preserved on replacement NIR. */
+   const uint32_t fc_modes[] = {
+      FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP32 |
+         FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32,
+      FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32 |
+         FLOAT_CONTROLS_DENORM_PRESERVE_FP32,
+   };
+   for (unsigned fi = 0; fi < ARRAY_SIZE(fc_modes); fi++) {
+      s->info.float_controls_execution_mode = fc_modes[fi];
+      struct hk_compute_opt_plan fc_plan = {0};
+      assert(hk_nir_match_compute_opt(s, 1, layouts, &fc_plan));
+      nir_shader *fc_opt = hk_nir_build_compute_opt(
+         NULL, s, &fc_plan, nir_address_format_64bit_bounded_global);
+      assert(fc_opt != NULL);
+      assert(fc_opt->info.float_controls_execution_mode == fc_modes[fi]);
+      ralloc_free(fc_opt);
+   }
+   s->info.float_controls_execution_mode = 0;
+
+   /* Per-ALU float math control flags that the builder does not emit must be refused. */
+   {
+      nir_shader *fp_mod = build_test_bilinear_resize_border(false);
+      bool marked = false;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(fp_mod)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type == nir_instr_type_alu &&
+                nir_instr_as_alu(ins)->op == nir_op_fmin) {
+               nir_instr_as_alu(ins)->fp_math_ctrl = nir_fp_preserve_nan;
+               marked = true;
+               break;
+            }
+         }
+         if (marked)
+            break;
+      }
+      assert(marked);
+      struct hk_compute_opt_plan fp_plan = {0};
+      assert(!hk_nir_match_compute_opt(fp_mod, 1, layouts, &fp_plan));
+      ralloc_free(fp_mod);
+   }
    ralloc_free(s);
 
    nir_shader *bad = build_test_bilinear_resize_border(true);

@@ -8,6 +8,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
+#include "hk_physical_device.h"
 
 #include "compiler/glsl_types.h"
 #include "nir_builder.h"
@@ -3413,6 +3414,8 @@ match_ftrunc_frac(nir_def *def, nir_def *s_def)
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   if (alu->fp_math_ctrl != 0)
+      return false;
    if (alu->op == nir_op_ffract && strip_mov(alu->src[0].src.ssa) == s_def)
       return true;
    if (alu->op == nir_op_fsub && strip_mov(alu->src[0].src.ssa) == s_def)
@@ -3519,6 +3522,8 @@ match_one_minus_f32(nir_def *def, nir_def **t_out)
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *a = nir_instr_as_alu(nir_def_instr(def));
+   if (a->fp_math_ctrl != 0)
+      return false;
    uint32_t bits = 0;
    if (a->op == nir_op_fsub && match_const_f32_bits(a->src[0].src.ssa, &bits) &&
        bits == 0x3f800000u) {
@@ -4041,13 +4046,15 @@ match_bilinear_resize_border_inloop_u8(
    if (!fi_d || nir_def_instr(fi_d)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *fia = nir_instr_as_alu(nir_def_instr(fi_d));
-   if (fia->op != nir_op_f2i32 && fia->op != nir_op_f2u32)
+   if ((fia->op != nir_op_f2i32 && fia->op != nir_op_f2u32) ||
+       fia->fp_math_ctrl != 0)
       return false;
    nir_def *cl_hi = strip_mov(fia->src[0].src.ssa);
    if (!cl_hi || nir_def_instr(cl_hi)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *mina = nir_instr_as_alu(nir_def_instr(cl_hi));
-   if (mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx)
+   if ((mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx) ||
+       mina->fp_math_ctrl != 0)
       return false;
    uint32_t bits_hi = 0, bits_lo = 0;
    nir_def *cl_lo = NULL;
@@ -4062,7 +4069,8 @@ match_bilinear_resize_border_inloop_u8(
    if (!cl_lo || nir_def_instr(cl_lo)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *maxa = nir_instr_as_alu(nir_def_instr(cl_lo));
-   if (maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx)
+   if ((maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx) ||
+       maxa->fp_math_ctrl != 0)
       return false;
    nir_def *bilerp_val = NULL;
    if (match_const_f32_bits(maxa->src[1].src.ssa, &bits_lo) && bits_lo == 0)
@@ -4506,13 +4514,15 @@ match_bilinear_resize_border_u8(
    if (!fi_d || nir_def_instr(fi_d)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *fia = nir_instr_as_alu(nir_def_instr(fi_d));
-   if (fia->op != nir_op_f2i32 && fia->op != nir_op_f2u32)
+   if ((fia->op != nir_op_f2i32 && fia->op != nir_op_f2u32) ||
+       fia->fp_math_ctrl != 0)
       return false;
    nir_def *cl_hi = strip_mov(fia->src[0].src.ssa);
    if (!cl_hi || nir_def_instr(cl_hi)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *mina = nir_instr_as_alu(nir_def_instr(cl_hi));
-   if (mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx)
+   if ((mina->op != nir_op_fmin && mina->op != nir_op_fmin_agx) ||
+       mina->fp_math_ctrl != 0)
       return false;
    uint32_t bits_hi = 0, bits_lo = 0;
    nir_def *cl_lo = NULL;
@@ -4527,7 +4537,8 @@ match_bilinear_resize_border_u8(
    if (!cl_lo || nir_def_instr(cl_lo)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *maxa = nir_instr_as_alu(nir_def_instr(cl_lo));
-   if (maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx)
+   if ((maxa->op != nir_op_fmax && maxa->op != nir_op_fmax_agx) ||
+       maxa->fp_math_ctrl != 0)
       return false;
    nir_def *bilerp_val = NULL;
    if (match_const_f32_bits(maxa->src[1].src.ssa, &bits_lo) && bits_lo == 0)
@@ -5945,6 +5956,8 @@ hk_nir_build_compute_opt(void *mem_ctx, const nir_shader *orig_nir,
    ralloc_steal(mem_ctx, b.shader);
    b.shader->info.zero_initialize_shared_memory =
       orig_nir->info.zero_initialize_shared_memory;
+   b.shader->info.float_controls_execution_mode =
+      orig_nir->info.float_controls_execution_mode;
 
    switch ((enum hk_compute_opt_kind)plan->kind) {
    case HK_COMPUTE_OPT_RGBA8_TO_GRAY_U8:
@@ -6052,7 +6065,8 @@ hk_compute_opt_validate_dispatch_core(
    bool alias_free, const struct hk_descriptor_state *desc,
    const struct hk_compute_opt_plan *plan, uint32_t base_x, uint32_t base_y,
    uint32_t base_z, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-   uint32_t *out_groups_x, uint32_t *out_groups_y)
+   uint32_t max_groups_x, uint32_t max_groups_y, uint32_t *out_groups_x,
+   uint32_t *out_groups_y)
 {
    if (!alias_free || !desc || !plan || !out_groups_x || !out_groups_y)
       return false;
@@ -6215,8 +6229,16 @@ hk_compute_opt_validate_dispatch_core(
       return false;
    }
 
-   *out_groups_x = DIV_ROUND_UP((uint32_t)width, (uint32_t)plan->tile_w);
-   *out_groups_y = DIV_ROUND_UP((uint32_t)height, (uint32_t)plan->tile_h);
+   const uint32_t new_groups_x =
+      DIV_ROUND_UP((uint32_t)width, (uint32_t)plan->tile_w);
+   const uint32_t new_groups_y =
+      DIV_ROUND_UP((uint32_t)height, (uint32_t)plan->tile_h);
+   if (new_groups_x == 0 || new_groups_y == 0 ||
+       new_groups_x > max_groups_x || new_groups_y > max_groups_y)
+      return false;
+
+   *out_groups_x = new_groups_x;
+   *out_groups_y = new_groups_y;
    return true;
 }
 
@@ -6229,8 +6251,11 @@ hk_compute_opt_validate_dispatch(const struct hk_device *dev,
                                  uint32_t groups_y, uint32_t groups_z,
                                  uint32_t *out_groups_x, uint32_t *out_groups_y)
 {
-   if (!dev)
+   if (!dev || !dev->vk.physical)
       return false;
+
+   const uint32_t *max_wg =
+      dev->vk.physical->properties.maxComputeWorkGroupCount;
 
    const bool alias_free = p_atomic_read(&dev->va_alias_resources) == 0 &&
                            p_atomic_read(&dev->alias_live) == 0 &&
@@ -6238,5 +6263,5 @@ hk_compute_opt_validate_dispatch(const struct hk_device *dev,
 
    return hk_compute_opt_validate_dispatch_core(
       alias_free, desc, plan, base_x, base_y, base_z, groups_x, groups_y,
-      groups_z, out_groups_x, out_groups_y);
+      groups_z, max_wg[0], max_wg[1], out_groups_x, out_groups_y);
 }
