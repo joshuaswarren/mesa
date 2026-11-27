@@ -412,7 +412,20 @@ test_member(void)
 
    c = split(4);
    first_cs(c)->timestamp.end.handle = 1;
-   T("a render with an end stamp is not", !hk_render_pack_member(c));
+   T("a render with an end stamp is a member", hk_render_pack_member(c));
+   T("taking the fragment end",
+     hk_render_pack_stamp_slots(first_cs(c)) == 2);
+
+   c = split(4);
+   first_cs(c)->timestamp.vtx_end.handle = 1;
+   T("a render with a vertex-end stamp is a member",
+     hk_render_pack_member(c) && hk_render_pack_stamp_slots(first_cs(c)) == 1);
+
+   c = split(4);
+   first_cs(c)->timestamp.start.handle = 1;
+   T("a render with a start stamp is not", !hk_render_pack_member(c));
+   T("and says so",
+     !strcmp(hk_render_pack_member_refusal(c) ?: "", "timestamp"));
 
    c = split(4);
    first_cs(c)->oq_stamp[3].handle = 1;
@@ -740,6 +753,19 @@ test_fold(bool exact)
    T(N("a later member's image reads carry an earlier tail to the vertex half"),
      cs->sync.vtx_images &&
         (cs->sync.dep_ta[HK_SYNC_CDM].prior & HK_SYNC_COMPUTE));
+
+   /* A leading top-of-pipe stamp on the first member's vertex end and an
+    * end stamp on the last member's fragment end ride on the packet. */
+   struct hk_cmd_buffer *a5 = split(10), *b5 = split(10);
+   first_cs(a5)->timestamp.vtx_end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 8};
+   first_cs(b5)->timestamp.end =
+      (struct agx_timestamp_req){.handle = 7, .offset_B = 16};
+   struct hk_cmd_buffer *ab5[] = {a5, b5};
+   packet = pack(ab5, 2, &cs);
+   T(N("the packet carries the members' vertex-end and fragment-end stamps"),
+     cs->timestamp.vtx_end.offset_B == 8 && cs->timestamp.end.offset_B == 16 &&
+        !cs->timestamp.start.handle);
 #undef N
 }
 
@@ -841,6 +867,59 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+static void
+test_vtx_img_bloom(void)
+{
+   struct hk_cmd_buffer *m0 = split(10), *m1 = split(20);
+   struct hk_cs *c0 = first_cs(m0), *c1 = first_cs(m1);
+   const uint64_t b_a = hk_sync_image_bloom(0x100000);
+   uint64_t k_b = 0x200000;
+   while (hk_sync_image_bloom(k_b) == b_a)
+      k_b += 0x10000;
+   const uint64_t b_b = hk_sync_image_bloom(k_b);
+
+   c0->sync.att_bloom = b_a;
+   c1->sync.att_bloom = b_b;
+   c0->sync.vtx_images = true;
+   c0->sync.vtx_img_bloom = b_a;
+   c0->sync.dep_ta_img_prior = HK_SYNC_GFX;
+   c1->sync.vtx_images = true;
+   c1->sync.vtx_img_bloom = b_b;
+   m0->sync.req[util_logbase2(HK_SYNC_GFX_IMG)][HK_SYNC_VDM].prior = HK_SYNC_XFER;
+
+   struct hk_cmd_buffer *packet = new_cmd();
+   struct hk_cs *pcs = test_alloc(sizeof(*pcs));
+   struct hk_cmd_buffer *members[] = {m0, m1};
+   hk_render_pack_init(packet, pcs, members, 2);
+   uint8_t preceding = 0;
+   T("bloom pack add m0",
+     hk_render_pack_add(packet, pcs, m0, c0, true, false, &preceding));
+   T("bloom pack add m1",
+     hk_render_pack_add(packet, pcs, m1, c1, false, true, &preceding));
+   hk_render_pack_finish(packet, pcs);
+
+   T("packed stream unions att_bloom and vtx_img_bloom safely",
+     pcs->sync.vtx_images && !pcs->sync.vtx_img_unsafe &&
+     pcs->sync.att_bloom == (b_a | b_b) &&
+     pcs->sync.vtx_img_bloom == (b_a | b_b) &&
+     (pcs->sync.dep_ta_img_prior & (HK_SYNC_GFX | HK_SYNC_XFER)) ==
+        (HK_SYNC_GFX | HK_SYNC_XFER) &&
+     !(pcs->sync.dep_ta[HK_SYNC_VDM].prior & HK_SYNC_XFER));
+
+   /* One unsafe member upgrades the packet to conservative vtx_img_unsafe. */
+   c1->sync.vtx_img_unsafe = true;
+   hk_render_pack_init(packet, pcs, members, 2);
+   preceding = 0;
+   T("unsafe bloom pack add m0",
+     hk_render_pack_add(packet, pcs, m0, c0, true, false, &preceding));
+   T("unsafe bloom pack add m1",
+     hk_render_pack_add(packet, pcs, m1, c1, false, true, &preceding));
+   hk_render_pack_finish(packet, pcs);
+   T("unsafe member routes image req into dep_ta[VDM]",
+     pcs->sync.vtx_img_unsafe &&
+     (pcs->sync.dep_ta[HK_SYNC_VDM].prior & HK_SYNC_XFER));
+}
+
 int
 main(void)
 {
@@ -861,6 +940,7 @@ main(void)
       test_tails();
       test_fold(false);
       test_fold(true);
+      test_vtx_img_bloom();
    }
 
    ralloc_free(test_context);

@@ -29,6 +29,7 @@ static const enum agx_chip gpu1_targets[] = {
    AGX_CHIP_G17G,
    AGX_CHIP_G17S,
    AGX_CHIP_G17C,
+   AGX_CHIP_G17D,
 };
 
 struct fixture {

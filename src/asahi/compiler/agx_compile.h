@@ -793,8 +793,13 @@ void agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip);
 /* Access private (scratch) memory in whole 32-bit words, the only width the
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
 bool agx3_nir_lower_scratch_words(nir_shader *nir);
+/* Single-die M5 (G17G) convenience entry points for unit tests without a
+ * device; runtime callers must use the _chip variants below. */
 void agx_preprocess_nir_m5(nir_shader *nir);
 void agx_preprocess_nir_m5_defer_idiv(nir_shader *nir);
+/* For any M5 chip (agx_chip_g17_m5); per-chip capabilities check chip. */
+void agx_preprocess_nir_m5_chip(nir_shader *nir, enum agx_chip chip);
+void agx_preprocess_nir_m5_defer_idiv_chip(nir_shader *nir, enum agx_chip chip);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 /* TARGET/LIVE retain their normal semantics. This flag records the proof that

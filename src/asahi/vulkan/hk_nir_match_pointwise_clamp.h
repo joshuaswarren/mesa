@@ -268,6 +268,24 @@ struct hk_dual_gemm_dw_push {
    uint32_t _pad;
 };
 
+#define HK_GEMM_DW_PROJ_FLAG_HAS_BIAS  (1u << 0)
+#define HK_GEMM_DW_PROJ_FLAG_HAS_COPY  (1u << 1)
+#define HK_GEMM_DW_PROJ_FLAG_SKIP_C    (1u << 2)
+#define HK_GEMM_DW_PROJ_FLAG_SKIP_COPY (1u << 3)
+
+struct hk_dual_gemm_dw_proj_push {
+   uint32_t proj_b_va_lo;
+   uint32_t proj_b_va_hi;
+   uint32_t proj_bias_va_lo;
+   uint32_t proj_bias_va_hi;
+   uint32_t proj_c_va_lo;
+   uint32_t proj_c_va_hi;
+   uint32_t proj_copy_va_lo;
+   uint32_t proj_copy_va_hi;
+   uint32_t proj_n;
+   uint32_t proj_flags;
+};
+
 #define HK_IM2COL_A_FLAG_VEC4    (1u << 0)
 #define HK_IM2COL_A_FLAG_COPY1X1 (1u << 1)
 
@@ -340,12 +358,45 @@ struct hk_dw_a_push {
    uint32_t _pad;
 };
 
+#define HK_EXP_DW_A_FLAG_HAS_BIAS     (1u << 0)
+#define HK_EXP_DW_A_FLAG_SKIP_EXP_C   (1u << 1)
+#define HK_EXP_DW_A_FLAG_SKIP_IM2_DST (1u << 2)
+
+struct hk_exp_dw_a_push {
+   uint32_t exp_a_va_lo;
+   uint32_t exp_a_va_hi;
+   uint32_t exp_b_va_lo;
+   uint32_t exp_b_va_hi;
+   uint32_t exp_bias_va_lo;
+   uint32_t exp_bias_va_hi;
+   uint32_t im2_dst_va_lo;
+   uint32_t im2_dst_va_hi;
+   uint32_t exp_k;            /* K_in of expand GEMM (% 4 == 0 for 1x1; kw*kh for im2col) */
+   uint32_t tiles_x_m_prime;  /* fast udiv for tiles_x = in_w >> 3 */
+   uint32_t tiles_x_udiv_sh;  /* b0: sh1, b1..5: sh2 for tiles_x; b8: kw_sh1, b9..13: kw_sh2 */
+   uint32_t flags;
+   uint32_t im2_iw_ih;        /* lo16: iw, hi16: ih */
+   uint32_t im2_kw_kh;        /* lo16: kw, hi16: kh */
+   uint32_t im2_step_sh;      /* lo16: step_x, hi16: sh */
+   uint32_t im2_pad_xy;       /* lo16: pad_x, hi16: pad_y */
+   uint32_t im2_kw_m_prime;   /* fast udiv for im2_kw */
+   uint32_t _pad;
+};
+
 struct hk_nir_dw_a_cfg {
    uint32_t fmul_fp_ctrl;
    uint32_t fadd_fp_ctrl;
    uint32_t bias_fadd_fp_ctrl;
    bool has_epilogue;
    struct hk_nir_clamp_epilogue epilogue;
+   bool has_expand;
+   bool has_exp_im2col;
+   bool has_exp_epilogue;
+   struct hk_nir_clamp_epilogue exp_epilogue;
+   bool has_proj;
+   uint8_t proj_tile_n; /* 16, 24, 32, or 64 */
+   bool has_proj_epilogue;
+   struct hk_nir_clamp_epilogue proj_epilogue;
 };
 
 static inline bool
@@ -359,7 +410,29 @@ hk_nir_dw_a_cfg_equal(const struct hk_nir_dw_a_cfg *a,
           a->bias_fadd_fp_ctrl == b->bias_fadd_fp_ctrl &&
           a->has_epilogue == b->has_epilogue &&
           (!a->has_epilogue ||
-           hk_nir_clamp_epilogue_equal(&a->epilogue, &b->epilogue));
+           hk_nir_clamp_epilogue_equal(&a->epilogue, &b->epilogue)) &&
+          a->has_expand == b->has_expand &&
+          a->has_exp_im2col == b->has_exp_im2col &&
+          a->has_exp_epilogue == b->has_exp_epilogue &&
+          (!a->has_exp_epilogue ||
+           hk_nir_clamp_epilogue_equal(&a->exp_epilogue, &b->exp_epilogue)) &&
+          a->has_proj == b->has_proj &&
+          (!a->has_proj ||
+           (a->proj_tile_n == b->proj_tile_n &&
+            a->has_proj_epilogue == b->has_proj_epilogue &&
+            (!a->has_proj_epilogue ||
+             hk_nir_clamp_epilogue_equal(&a->proj_epilogue, &b->proj_epilogue))));
+}
+
+static inline void
+hk_exp_dw_a_push_init_udiv(struct hk_exp_dw_a_push *ep, uint32_t tiles_x)
+{
+   uint32_t sh1 = 0, sh2 = 0, kw_sh1 = 0, kw_sh2 = 0;
+   hk_im2col_a_fast_udiv_params(tiles_x, &ep->tiles_x_m_prime, &sh1, &sh2);
+   const uint32_t kw = ep->im2_kw_kh & 0xffffu;
+   if (kw > 0u)
+      hk_im2col_a_fast_udiv_params(kw, &ep->im2_kw_m_prime, &kw_sh1, &kw_sh2);
+   ep->tiles_x_udiv_sh = sh1 | (sh2 << 1) | (kw_sh1 << 8) | (kw_sh2 << 9);
 }
 
 static inline void
@@ -416,6 +489,23 @@ hk_dw_a_push_offset(uint32_t push_bytes,
                     enum hk_compute_pair_dual_write dual_write)
 {
    return hk_im2col_a_push_offset(push_bytes, dual_write);
+}
+
+static inline uint32_t
+hk_exp_dw_a_push_offset(uint32_t push_bytes,
+                        enum hk_compute_pair_dual_write dual_write)
+{
+   return ALIGN_POT(hk_dw_a_push_offset(push_bytes, dual_write) +
+                       sizeof(struct hk_dw_a_push),
+                    8u);
+}
+
+static inline uint32_t
+hk_dual_gemm_dw_proj_push_offset(uint32_t push_bytes)
+{
+   return ALIGN_POT(hk_dual_write_push_offset(push_bytes) +
+                       sizeof(struct hk_dual_gemm_dw_push),
+                    8u);
 }
 
 #define HK_COMPUTE_PAIR_INFO_VERSION 5u

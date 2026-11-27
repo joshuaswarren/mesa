@@ -366,7 +366,8 @@ TEST(OptLicm, HoistsUniformUsedByBranchCompare)
       EXPECT_EQ(licm(b->shader, 64), !uniforms_written);
       EXPECT_EQ(count(l.body, AGX_OPCODE_MOV), uniforms_written ? 2u : 0u);
       EXPECT_EQ(count(l.entry, AGX_OPCODE_MOV), uniforms_written ? 0u : 1u);
-      if (!uniforms_written)
+      if (!uniforms_written) {
          EXPECT_EQ(br->src[1].value, alu->src[1].value);
+      }
    }
 }

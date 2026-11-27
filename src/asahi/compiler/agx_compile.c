@@ -896,7 +896,9 @@ agx_emit_load_vary(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 static void
 agx_wait_pixel_mask(agx_builder *b, uint32_t mask)
 {
-   /* Background programs do not need to wait as they are the eldest pixels */
+   /* Background programs are the eldest pixels and need no wait to read the
+    * tile. A multisample reload still acquires the colour class before its
+    * stores, see agx_background_holds_colour(). */
    if (b->shader->key->fs.ignore_tib_dependencies) {
       assert(b->shader->nir->info.internal);
       return;
@@ -1407,13 +1409,55 @@ agx_pack_integer_8_word_agx3(agx_builder *b, nir_intrinsic_instr *instr,
    return 0;
 }
 
+/*
+ * An AGX3B background that reloads a multisampled attachment holds the colour
+ * class across its per-sample tile stores: pixwait 12 before the first store,
+ * pixrel 12 after the last, then the program's final release. The per-sample
+ * reload is slow (one multisample fetch per sample), and without the
+ * transaction the fragments blended on top of the reloaded tile and the
+ * end-of-tile program are not ordered behind its stores, so they see a
+ * partly reloaded tile (mesa#1197). Single-store backgrounds keep the
+ * transaction-free form.
+ */
+static bool
+agx_background_holds_colour(agx_context *ctx)
+{
+   if (ctx->stage != MESA_SHADER_FRAGMENT ||
+       !ctx->key->fs.ignore_tib_dependencies ||
+       ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       !ctx->nir->info.fs.uses_sample_shading)
+      return false;
+
+   if (ctx->background_stores_left == 0) {
+      int stores = 0;
+      nir_foreach_function_impl(impl, ctx->nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               stores += instr->type == nir_instr_type_intrinsic &&
+                         nir_instr_as_intrinsic(instr)->intrinsic ==
+                            nir_intrinsic_store_local_pixel_agx;
+            }
+         }
+      }
+      ctx->background_stores_left = stores > 1 ? stores : -1;
+   }
+
+   return ctx->background_stores_left > 0;
+}
+
 static agx_instr *
 agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
 {
    bool explicit = nir_intrinsic_explicit_coord(instr);
+   const bool hold_colour = agx_background_holds_colour(b->shader);
 
    /* TODO: Reverse-engineer interactions with MRT */
-   if (b->shader->stage == MESA_SHADER_FRAGMENT) {
+   if (hold_colour) {
+      if (!(b->shader->already_pixel_waited & 0xC)) {
+         agx_wait_pix(b, 0xC);
+         b->shader->already_pixel_waited |= 0xC;
+      }
+   } else if (b->shader->stage == MESA_SHADER_FRAGMENT) {
       agx_wait_pixel_mask(b, 0xC);
    }
 
@@ -1510,6 +1554,9 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
        !b->shader->key->fs.ignore_tib_dependencies &&
        agx_is_g18g(&b->shader->key->dev) &&
        (b->shader->key->fs.nr_samples == 2 || b->shader->key->fs.nr_samples == 4))
+      agx_signal_pix(b, 0xC);
+
+   if (hold_colour && --b->shader->background_stores_left == 0)
       agx_signal_pix(b, 0xC);
 
    return st;
@@ -20459,23 +20506,33 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
                                           preamble_newly_enabled, 4, NULL);
 }
 
-/* The M5 helpers serve G17G, G17S and G17C, which share one row of the
- * capability table. */
-#define AGX_M5_SIGNED_ZERO_SELECT                                              \
-   ((AGX_CAPS_M5 & AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) != 0)
+void
+agx_preprocess_nir_m5_chip(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(
+      nir, false, true, false, true,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT), true, false,
+      false, false);
+}
 
+void
+agx_preprocess_nir_m5_defer_idiv_chip(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(
+      nir, false, true, false, true,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT), true, false,
+      true, false);
+}
+
+/* Single-die M5 convenience entry points (for callers without a device). */
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true,
-                               AGX_M5_SIGNED_ZERO_SELECT, true, false, false,
-                               false);
+   agx_preprocess_nir_m5_chip(nir, AGX_CHIP_G17G);
 }
 
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true,
-                               AGX_M5_SIGNED_ZERO_SELECT, true, false, true,
-                               false);
+   agx_preprocess_nir_m5_defer_idiv_chip(nir, AGX_CHIP_G17G);
 }

@@ -144,6 +144,32 @@ hk_m5_loader_list_free(void **head)
    *head = NULL;
 }
 
+static void
+hk_m5_compute_program_desc_set_device(
+   const struct hk_device *dev,
+   struct agx3_g17p_graphics_program_desc *desc)
+{
+   desc->usc_clusters = dev->dev.params.num_clusters_total;
+}
+
+static bool
+hk_m5_compute_program_generate(const struct hk_device *dev,
+                               struct agx3_g17p_graphics_program_desc *desc,
+                               struct agx3_g17p_graphics_program *program)
+{
+   hk_m5_compute_program_desc_set_device(dev, desc);
+   return agx3_g17g_compute_program_generate(dev->dev.chip, desc, program);
+}
+
+static bool
+hk_m5_compute_launch_bind(const struct hk_device *dev,
+                          struct agx3_g17p_native_compute_program_desc *desc,
+                          struct agx3_compute_program *launch)
+{
+   desc->ordering_memory_scope = agx_cdm_ordering_memory_scope(&dev->dev);
+   return agx3_m5_native_compute_program_bind(dev->dev.chip, desc, launch);
+}
+
 static bool
 hk_m5_loader_matches(const struct hk_m5_compute_loader *l,
                       const struct agx3_g17p_graphics_program_desc *d)
@@ -179,23 +205,25 @@ hk_m5_loader_create(struct hk_device *dev,
    struct agx3_g17p_graphics_program_template *t = calloc(1, sizeof(*t));
    if (!t)
       return NULL;
+   struct agx3_g17p_graphics_program_desc desc = *d;
+   hk_m5_compute_program_desc_set_device(dev, &desc);
    struct hk_m5_compute_loader *l = NULL;
-   if (!agx3_g17g_compute_program_template_generate(dev->dev.chip, d, t))
+   if (!agx3_g17g_compute_program_template_generate(dev->dev.chip, &desc, t))
       goto out;
    l = calloc(1, sizeof(*l) + t->program.length);
    if (!l)
       goto out;
-   if (!hk_g17p_patch_plan_init(&l->plan, d->uniform_ranges,
-                                d->uniform_range_count, t->relocations,
+   if (!hk_g17p_patch_plan_init(&l->plan, desc.uniform_ranges,
+                                desc.uniform_range_count, t->relocations,
                                 t->relocation_count, t->program.length, false)) {
       free(l);
       l = NULL;
       goto out;
    }
-   l->desc = *d;
+   l->desc = desc;
    l->desc.uniform_ranges = l->ranges;
-   memcpy(l->ranges, d->uniform_ranges,
-          d->uniform_range_count * sizeof(l->ranges[0]));
+   memcpy(l->ranges, desc.uniform_ranges,
+          desc.uniform_range_count * sizeof(l->ranges[0]));
    l->length = t->program.length;
    memcpy(l->bytes, t->program.bytes, l->length);
 out:
@@ -1906,7 +1934,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 precompiled", &reservation))
       return;
    const uint64_t shader_va = prog->ptr + prog->entry_offset;
-   const struct agx3_g17p_graphics_program_desc desc = {
+   struct agx3_g17p_graphics_program_desc desc = {
       .program_va = reservation.va, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
       .shader_binary_size = prog->info.main_size,
@@ -1922,10 +1950,10 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       .program_va = reservation.va, .shader_va = shader_va,
    };
    struct agx3_compute_program launch;
-   if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
+   if (!hk_m5_compute_program_generate(dev, &desc, &program) ||
        !agx3_cdm_direct_template_sources_compute(
           false, false, false, &launch_desc.launch_sources) ||
-       !agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc, &launch)) {
+       !hk_m5_compute_launch_bind(dev, &launch_desc, &launch)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -2094,7 +2122,7 @@ hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
                                     &reservation))
       return false;
 
-   const struct agx3_g17p_graphics_program_desc desc = {
+   struct agx3_g17p_graphics_program_desc desc = {
       .program_va = reservation.va,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -2113,9 +2141,8 @@ hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
       .launch_sources = launch_sources,
    };
    struct agx3_compute_program launch;
-   if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
-       !agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc,
-                                            &launch))
+   if (!hk_m5_compute_program_generate(dev, &desc, &program) ||
+       !hk_m5_compute_launch_bind(dev, &launch_desc, &launch))
       return false;
 
    memcpy(reservation.map, program.bytes, program.length);
@@ -2240,6 +2267,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       if (s->b.info.agx3_preamble_tps_inputs)
          desc.cprog_inputs = &s->b.info.agx3_preamble_inputs;
    }
+   hk_m5_compute_program_desc_set_device(dev, &desc);
    struct agx3_g17p_graphics_program program;
    const struct hk_m5_compute_loader *loader =
       hk_m5_loader_get(dev, linked, &desc);
@@ -2253,14 +2281,14 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_g17p_patch_plan_apply(&loader->plan, ranges, program.bytes);
       if (dev->dev.debug & AGX_DBG_VERIFY) {
          struct agx3_g17p_graphics_program fresh;
-         if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &fresh) ||
+         if (!hk_m5_compute_program_generate(dev, &desc, &fresh) ||
              fresh.length != program.length ||
              memcmp(fresh.bytes, program.bytes, program.length)) {
             mesa_loge("M5 cached compute launch differs from fresh composition");
             goto refused;
          }
       }
-   } else if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program)) {
+   } else if (!hk_m5_compute_program_generate(dev, &desc, &program)) {
       goto refused;
    }
    if (!agx3_cdm_direct_template_sources_compute(s->b.info.uses_resource_info_query,
@@ -2281,7 +2309,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       launch_desc.launch_sources.ti_spill_bytes =
          MAX2(launch_desc.launch_sources.ti_spill_bytes, cprog_frame);
    }
-   if (!agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc, &launch))
+   if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch))
       goto refused;
    memcpy(reservation.map, program.bytes, program.length);
    if (!hk_cmd_publish_ioto_program(cmd, &reservation, program.length))
@@ -3137,7 +3165,7 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       s->b.info.local_size
          ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
          : 0;
-   const struct agx3_g17p_graphics_program_desc desc = {
+   struct agx3_g17p_graphics_program_desc desc = {
       .program_va = program_t.gpu, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
       .shader_binary_size = linked->b.size,
@@ -3155,9 +3183,13 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .program_va = program_t.gpu, .shader_va = shader_va,
    };
    struct agx3_compute_program launch;
-   const bool generated = g18
-      ? agx3_g18g_compute_program_generate(&desc, &program)
-      : agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program);
+   bool generated;
+   if (g18) {
+      hk_m5_compute_program_desc_set_device(dev, &desc);
+      generated = agx3_g18g_compute_program_generate(&desc, &program);
+   } else {
+      generated = hk_m5_compute_program_generate(dev, &desc, &program);
+   }
    if (!generated ||
        !agx3_cdm_direct_template_sources_compute(s->b.info.uses_resource_info_query,
                                                  false, false, &launch_desc.launch_sources) ||
@@ -3691,8 +3723,7 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
          if (ml->length > ioto_cap)
             return false;
          struct agx3_compute_program launch;
-         if (!agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc,
-                                                  &launch) ||
+         if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch) ||
              !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
             return false;
          memcpy(ioto_map, ml->bytes, ml->length);
@@ -3700,12 +3731,11 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
          ioto_used = ml->length;
       } else {
          struct agx3_g17p_graphics_program program;
-         if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
+         if (!hk_m5_compute_program_generate(dev, &desc, &program) ||
              program.length > ioto_cap)
             return false;
          struct agx3_compute_program launch;
-         if (!agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc,
-                                                  &launch) ||
+         if (!hk_m5_compute_launch_bind(dev, &launch_desc, &launch) ||
              !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
             return false;
          memcpy(ioto_map, program.bytes, program.length);

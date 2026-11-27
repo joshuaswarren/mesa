@@ -327,6 +327,7 @@ hk_agx3_g17p_shared_graphics_desc(
       .patchable = desc->patchable,
       .constant_program = desc->constant_program,
       .cprog_inputs = desc->cprog_inputs,
+      .usc_clusters = desc->usc_clusters,
    };
 }
 

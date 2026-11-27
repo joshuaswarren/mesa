@@ -2160,21 +2160,26 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       return false;
    }
 
-   /* The driver renders each exact 2x2 reduction whose destination is at or
-    * above the chip's crossover, then generates the rest with compute. On
-    * G17P that is levels 1 and 2 of this chain; the classic submission
-    * model's crossover is above 1280x720, so it renders none. */
+   /* On HAL200/AGX3B (G16G, G17P), exact 2x2 compressed levels stay in
+    * compute via compressed block-mip (32x32 workgroups storing through the
+    * compressed PBE) with zero render passes; chips without block-mip fall
+    * back to rendering levels at or above the raw-compute crossover. */
+   const bool block_mip =
+      chain_compresses && hk_g17p_block_mip_supported(mdev->chip);
    unsigned expected_levels = 0;
    for (unsigned l = 0; l < big_tmpl.last_level; ++l) {
       const unsigned w = u_minify(big_tmpl.width0, l);
       const unsigned h = u_minify(big_tmpl.height0, l);
-      if ((w | h) & 1 || !hk_mip_level_through_pbe(mdev->chip, w / 2, h / 2))
+      if ((w | h) & 1 ||
+          !(block_mip
+               ? hk_compressed_mip_level_through_pbe(mdev->chip, w, h, w / 2,
+                                                     h / 2)
+               : hk_mip_level_through_pbe(mdev->chip, w / 2, h / 2)))
          break;
       expected_levels |= BITFIELD_BIT(l + 1);
    }
-   if (mdev->chip == AGX_CHIP_G17P &&
-       expected_levels != (BITFIELD_BIT(1) | BITFIELD_BIT(2))) {
-      fprintf(stderr, "G17P mip crossover no longer renders levels 1 and 2\n");
+   if (block_mip && expected_levels != 0) {
+      fprintf(stderr, "HAL200/AGX3B block-mip should render 0 exact-2x2 levels\n");
       pipe_resource_reference(&big_tex, NULL);
       return false;
    }
@@ -2193,13 +2198,11 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       pipe_resource_reference(&big_tex, NULL);
       return false;
    }
-   /* The compute tail starts after the last rendered level; its small levels
-    * still share fused launches. */
    if (chain_compresses) {
       const uint8_t *cdm_base = agx_bo_map(mctx->batch->cdm.bo);
       const size_t cdm_len = (size_t)(mctx->batch->cdm.current - cdm_base);
       size_t off = 0;
-      unsigned launches = 0, fused_launches = 0;
+      unsigned launches = 0, block_launches = 0, fused_launches = 0;
       while (off < cdm_len) {
          struct agx3_cdm_decoded_record rec;
          if (!agx3_cdm_decode_one(mdev->chip, cdm_base + off, cdm_len - off,
@@ -2212,6 +2215,10 @@ check_compressed_mip_chain(struct pipe_screen *screen,
          }
          if (rec.kind == AGX3_CDM_RECORD_LAUNCH) {
             ++launches;
+            if (rec.data.launch.local_size[0] == 32 &&
+                rec.data.launch.local_size[1] == 32 &&
+                rec.data.launch.local_size[2] == 1)
+               ++block_launches;
             if (rec.data.launch.local_size[0] == 16 &&
                 rec.data.launch.local_size[1] == 8 &&
                 rec.data.launch.local_size[2] == 1)
@@ -2219,7 +2226,18 @@ check_compressed_mip_chain(struct pipe_screen *screen,
          }
          off += rec.length;
       }
-      if (!fused_launches || launches >= 11) {
+      if (block_mip) {
+         /* Levels 1..5 (1280x720..80x45) are exact 2x2 compressed block-mip
+          * (32x32), followed by odd level 6 (40x22) and tail levels 7..11. */
+         if (block_launches != 5 || launches < 11) {
+            fprintf(stderr,
+                    "compressed 2560x1440 mipchain did not take block-mip "
+                    "(block=%u launches=%u)\n",
+                    block_launches, launches);
+            pipe_resource_reference(&big_tex, NULL);
+            return false;
+         }
+      } else if (!fused_launches || launches >= 11) {
          fprintf(stderr,
                  "compressed 2560x1440 mipchain did not take precompiled tail "
                  "(fused=%u launches=%u)\n",

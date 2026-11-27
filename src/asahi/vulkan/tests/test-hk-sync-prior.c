@@ -10,6 +10,7 @@
 #include "hk_device.h"
 #include "hk_drm_prior_core.h"
 #include "hk_queue.h"
+#include "agx_chip_caps.h"
 _Static_assert(sizeof(struct drm_asahi_cmd_render) == 320, "legacy render");
 _Static_assert(sizeof(struct drm_asahi_cmd_compute) == 128,
                "legacy Mesa compute");
@@ -145,7 +146,7 @@ end_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
 /* Chips whose start stamps latch before a command's waits (hk_sync.c,
  * start_stamps_ordered()): G17P and M5. */
 static const enum agx_chip end_stamp_chips[] = {
-   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D};
 
 /* G17P and M5: ResetQueryPool leaves a reusable compute stream. A TOP_OF_PIPE
  * stamp after it ends that stream's command: start stamps latch before the
@@ -628,7 +629,7 @@ render_pass(struct hk_cmd_buffer *cmd, const void *image, uint32_t layers,
 {
    hk_sync_begin_rendering(cmd, false);
    hk_sync_pass_footprint(cmd, image, 0, 0, layers, 32, 32,
-                         (VkRect2D){{0, 0}, {32, 32}}, preserve_layers);
+                         (VkRect2D){{0, 0}, {32, 32}}, preserve_layers, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *cs = test_alloc(sizeof(*cs));
    cs->type = HK_CS_VDM;
@@ -935,7 +936,7 @@ compute_clear_pass(struct hk_cmd_buffer *cmd, const void *image,
 {
    hk_sync_begin_rendering(cmd, false);
    hk_sync_pass_footprint(cmd, image, 0, base_layer, base_layer + 1, 32, 32,
-                         (VkRect2D){{0, 0}, {32, 32}}, false);
+                         (VkRect2D){{0, 0}, {32, 32}}, false, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *render = test_alloc(sizeof(*render));
    render->type = HK_CS_VDM;
@@ -968,7 +969,7 @@ test_resume_after_compute_clear(void)
    hk_sync_end_rendering(cmd, true);
    hk_sync_begin_rendering(cmd, true);
    hk_sync_pass_footprint(cmd, image, 0, 0, 1, 32, 32,
-                          (VkRect2D){{0, 0}, {32, 32}}, false);
+                          (VkRect2D){{0, 0}, {32, 32}}, false, false);
    hk_sync_pass_footprints_done(cmd);
    struct hk_cs *resumed = add(cmd, false);
    T("resumed instance waits on the suspended instance's compute clear",
@@ -1227,6 +1228,102 @@ test_history_tile_hazard_split(void)
    T("split history tiling within whole", tiling <= whole);
 }
 
+/* A 64x64 pass instance of image over area, loading its attachment or not. */
+static struct hk_cs *
+load_pass(struct hk_cmd_buffer *cmd, const void *image, bool load,
+          VkRect2D area)
+{
+   hk_sync_begin_rendering(cmd, false);
+   hk_sync_pass_footprint(cmd, image, 0, 0, 1, 64, 64, area, false, load);
+   hk_sync_pass_footprints_done(cmd);
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   cs->type = HK_CS_VDM;
+   hk_sync_stream_created(cmd, cs, &cmd->current_cs.gfx, false);
+   list_addtail(&cs->node, &cmd->control_streams);
+   hk_sync_end_rendering(cmd, false);
+   return cs;
+}
+
+/* A pass that only loads whole tiles an earlier render stored waits for that
+ * render in its fragment half alone when the kernel orders fragment work
+ * after the previous render's (hk_sync_queue::load_hazard_frag), in the
+ * command buffer, across command buffers and across submissions. Partly
+ * covered tiles and compute producers keep both halves. */
+static void
+test_load_hazard_frag(void)
+{
+   const VkRect2D full = {{0, 0}, {64, 64}}, part = {{0, 0}, {40, 40}};
+   for (unsigned frag = 0; frag < 2; ++frag) {
+#define N(s) (frag ? s " (fragment-only)" : s " (both halves)")
+      const void *image = (void *)0x7171;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->load_hazard_frag = frag;
+      struct hk_cs *a = load_pass(cmd, image, false, full);
+      struct hk_cs *b = load_pass(cmd, image, true, full);
+      T(N("a loading pass waits for the earlier render"),
+        b->sync.dep[HK_SYNC_VDM].cut == a);
+      T(N("its tiling waits for it unless only whole tiles are loaded"),
+        b->sync.dep_ta[HK_SYNC_VDM].cut == (frag ? NULL : a));
+      struct hk_cs *c = load_pass(cmd, image, true, part);
+      T(N("a partly covered tile keeps both halves"),
+        c->sync.dep[HK_SYNC_VDM].cut == b &&
+           c->sync.dep_ta[HK_SYNC_VDM].cut == b);
+
+      /* A clear the empty-render optimizer runs on compute. */
+      struct hk_cmd_buffer *k = new_cmd();
+      hk_cmd_buffer_device(k)->load_hazard_frag = frag;
+      struct hk_cs *clear = compute_clear_pass(k, image, 0, true);
+      struct hk_cs *after = load_pass(k, image, true, full);
+      T(N("a compute producer keeps both halves"),
+        after->sync.dep[HK_SYNC_CDM].cut == clear &&
+           after->sync.dep_ta[HK_SYNC_CDM].cut == clear);
+
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         /* Across command buffers of one submission. */
+         struct hk_queue *q = new_queue(exact);
+         q->sync.precise_tile_evictions = true;
+         q->sync.load_hazard_frag = frag;
+         struct hk_cmd_buffer *x = new_cmd(), *y = new_cmd();
+         struct hk_cs *xa = load_pass(x, image, false, full);
+         struct hk_cs *yb = load_pass(y, image, true, full);
+         struct hk_cmd_buffer *both[] = {x, y};
+         T(N("two command buffers resolve"),
+           hk_sync_resolve_submit(q, both, 2, false, false, 0, NULL));
+         T(N("the loading pass's whole render waits for the earlier one"),
+           yb->sync.barrier[HK_SYNC_VDM] == xa->sync.index);
+         T(N("and its tiling unless only whole tiles are loaded"),
+           yb->sync.barrier_ta[HK_SYNC_VDM] ==
+              (frag ? DRM_ASAHI_BARRIER_NONE : xa->sync.index));
+
+         /* Across submissions, the earlier one possibly still running. */
+         struct hk_queue *h = new_queue(exact);
+         h->sync.precise_tile_evictions = true;
+         h->sync.load_hazard_frag = frag;
+         struct hk_cmd_buffer *first = new_cmd(), *later = new_cmd();
+         load_pass(first, image, false, full);
+         h->drm.timeline_value = 1;
+         T(N("earlier submission"), submit(h, first));
+         struct hk_cs *lb = load_pass(later, image, true, full);
+         const uint64_t start = h->sync.submitted[HK_SYNC_VDM];
+         h->drm.timeline_value = 2;
+         T(N("later submission"), submit(h, later));
+         if (exact) {
+            T(N("whole render waits for the earlier submission"),
+              lb->sync.prior[HK_SYNC_VDM] == start);
+            T(N("tiling too unless only whole tiles are loaded"),
+              lb->sync.prior_ta[HK_SYNC_VDM] == (frag ? 0 : start));
+         } else {
+            T(N("whole render waits for earlier ioctls"),
+              lb->sync.barrier[HK_SYNC_VDM] == 0);
+            T(N("tiling too unless only whole tiles are loaded"),
+              lb->sync.barrier_ta[HK_SYNC_VDM] ==
+                 (frag ? DRM_ASAHI_BARRIER_NONE : 0));
+         }
+      }
+#undef N
+   }
+}
+
 static void
 test_pass_software_graphics_dependencies(void)
 {
@@ -1375,6 +1472,37 @@ test_g17p_vertex_after_memory_writers(void)
    T("G17P aliasing attachments without a draw count as a memory writer",
      (cleared->sync.kind & HK_SYNC_GFX_MEM) &&
      after_clear->sync.dep_ta[HK_SYNC_VDM].cut == cleared);
+
+   /* An optimal ALIAS_BIT attachment whose memory has no buffer binding is
+    * exempted from HK_SYNC_GFX_MEM while buffer_alias_mem_gen is unchanged,
+    * allowing vertex/fragment overlap; if a buffer is later bound to an
+    * image-bearing memory (advancing buffer_alias_mem_gen), submit-time
+    * resolution upgrades it conservatively and widens intra-CB vertex waits. */
+   for (unsigned stale = 0; stale < 2; ++stale) {
+      struct hk_cmd_buffer *ac = timestamp_cmd(AGX_CHIP_G17P, true);
+      struct hk_device *adev = hk_cmd_buffer_device(ac);
+      ac->sync.has_alias_image_render = true;
+      ac->sync.buffer_alias_mem_gen = adev->buffer_alias_mem_gen;
+      ac->state.gfx.render.m5_attachments_alias_image = true;
+      struct hk_cs *aliased = add(ac, false);
+      ac->state.gfx.render.m5_attachments_alias_image = false;
+      hk_sync_barrier(ac, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *after_alias = add(ac, false);
+      T("alias-image render skips HK_SYNC_GFX_MEM at record time",
+        !(aliased->sync.kind & HK_SYNC_GFX_MEM) &&
+        aliased->sync.alias_image_render &&
+        after_alias->sync.dep_ta[HK_SYNC_VDM].cut == NULL);
+      if (stale)
+         adev->buffer_alias_mem_gen++;
+      struct hk_queue *aq = new_queue(true);
+      T("alias-image render submit", submit(aq, ac));
+      T("alias-image render submit-time gen check",
+        ((aliased->sync.kind & HK_SYNC_GFX_MEM) != 0) == (stale != 0) &&
+        after_alias->sync.barrier[HK_SYNC_VDM] == 1 &&
+        after_alias->sync.barrier_ta[HK_SYNC_VDM] ==
+           (stale ? 1 : DRM_ASAHI_BARRIER_NONE) &&
+        after_alias->sync.ta_split == !stale);
+   }
 
    struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G15S, true);
    struct hk_cs *plain = add(cmd, false);
@@ -1582,6 +1710,155 @@ test_image_barrier_vertex_class(void)
    T("spilling pre-graphics honours image class",
      pre_spill->sync.dep[HK_SYNC_VDM].cut == producer);
    hk_sync_end_rendering(cmd, false);
+}
+
+static void
+test_vertex_image_bloom(void)
+{
+   /* Find three distinct keys with pairwise-disjoint 64-bit bloom bits. */
+   const uint64_t k_a = UINT64_C(0x100000);
+   uint64_t k_b = UINT64_C(0x200000);
+   while (hk_sync_image_bloom(k_b) == hk_sync_image_bloom(k_a))
+      k_b += 0x10000;
+   uint64_t k_c = k_b + 0x10000;
+   while (hk_sync_image_bloom(k_c) == hk_sync_image_bloom(k_a) ||
+          hk_sync_image_bloom(k_c) == hk_sync_image_bloom(k_b))
+      k_c += 0x10000;
+   const uint64_t b_a = hk_sync_image_bloom(k_a);
+   const uint64_t b_b = hk_sync_image_bloom(k_b);
+   const uint64_t b_c = hk_sync_image_bloom(k_c);
+
+   /* In-CB: disjoint attachment vs VS bloom splits TA while fragment waits. */
+   struct hk_cmd_buffer *cmd = new_cmd();
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_a;
+   struct hk_cs *p1 = add(cmd, false);
+   hk_sync_end_rendering(cmd, false);
+
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_b;
+   struct hk_cs *p2 = add(cmd, false);
+   hk_sync_end_rendering(cmd, false);
+
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+
+   /* Disjoint reader (reads C): waits on neither P1 nor P2 in vertex half. */
+   struct hk_cs *r_disjoint = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_disjoint, b_c);
+   T("in-CB disjoint bloom splits vertex half",
+     !r_disjoint->sync.dep_ta[HK_SYNC_VDM].cut &&
+     r_disjoint->sync.dep[HK_SYNC_VDM].cut == p2);
+
+   /* Reader of A: waits on P1, not P2. */
+   struct hk_cs *r_match_a = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_match_a, b_a);
+   T("in-CB bloom waits on matching earlier render only",
+     r_match_a->sync.dep_ta[HK_SYNC_VDM].cut == p1 &&
+     r_match_a->sync.dep[HK_SYNC_VDM].cut == p2);
+
+   /* Adding a second draw reading B upgrades cut to P2. */
+   hk_sync_vertex_images_bloom(cmd, r_match_a, b_b);
+   T("in-CB second draw widens bloom cut to P2",
+     r_match_a->sync.dep_ta[HK_SYNC_VDM].cut == p2);
+
+   /* Upgrading to unsafe forces full conservative HK_SYNC_GFX_IMG wait. */
+   hk_sync_vertex_images(cmd, r_disjoint);
+   T("in-CB unsafe upgrade forces full wait",
+     r_disjoint->sync.vtx_img_unsafe &&
+     r_disjoint->sync.dep_ta[HK_SYNC_VDM].cut == p2);
+
+   /* In-CB HK_SYNC_GFX_MEM producer always orders even disjoint bloom. */
+   cmd = new_cmd();
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.att_bloom = b_a;
+   struct hk_cs *pmem = add(cmd, false);
+   hk_sync_note_memory_write(cmd, pmem);
+   hk_sync_end_rendering(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   struct hk_cs *r_after_mem = add(cmd, false);
+   hk_sync_vertex_images_bloom(cmd, r_after_mem, b_c);
+   T("in-CB memory-writing render orders disjoint bloom reader",
+     r_after_mem->sync.dep_ta[HK_SYNC_VDM].cut == pmem);
+
+   /* Cross-submit with exact_prior: disjoint splits, matching hits exact ordinal. */
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *s1 = new_cmd();
+   hk_sync_begin_rendering(s1, false);
+   s1->state.gfx.render.att_bloom = b_a;
+   add(s1, false); /* ordinal 1: att A */
+   hk_sync_end_rendering(s1, false);
+   hk_sync_begin_rendering(s1, false);
+   s1->state.gfx.render.att_bloom = b_b;
+   add(s1, false); /* ordinal 2: att B */
+   hk_sync_end_rendering(s1, false);
+   hk_sync_barrier(s1, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   T("bloom cross-submit producer", submit(q, s1));
+
+   struct hk_cmd_buffer *s2 = new_cmd();
+   struct hk_cs *c_disjoint = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_disjoint, b_c);
+   struct hk_cs *c_match_a = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_match_a, b_a);
+   struct hk_cs *c_zero = add(s2, false);
+   hk_sync_vertex_images_bloom(s2, c_zero, 0);
+   struct hk_cs *c_unsafe = add(s2, false);
+   hk_sync_vertex_images(s2, c_unsafe);
+   T("bloom cross-submit consumers", submit(q, s2));
+
+   T("cross-submit disjoint bloom skips prior renders on VDM TA",
+     c_disjoint->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_disjoint->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+     c_disjoint->sync.prior[HK_SYNC_VDM] == 2 &&
+     c_disjoint->sync.ta_split);
+   T("cross-submit matching bloom waits on exact matching ordinal 1, not 2",
+     c_match_a->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_match_a->sync.prior_ta[HK_SYNC_VDM] == 1 &&
+     c_match_a->sync.prior[HK_SYNC_VDM] == 2 &&
+     c_match_a->sync.ta_split);
+   T("cross-submit empty bloom (null descriptors) skips prior renders",
+     c_zero->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     c_zero->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+     c_zero->sync.ta_split);
+   T("cross-submit unsafe reader waits on full prior ordinal 2",
+     c_unsafe->sync.prior_ta[HK_SYNC_VDM] == 2 &&
+     !c_unsafe->sync.ta_split);
+
+   /* Cross-submit ring eviction stays conservative at evicted ordinal. */
+   struct hk_queue *qe = new_queue(true);
+   struct hk_cmd_buffer *se = new_cmd();
+   for (unsigned i = 0; i < HK_SYNC_RECENT_VDM_ATT + 4; ++i) {
+      hk_sync_begin_rendering(se, false);
+      se->state.gfx.render.att_bloom = b_a;
+      add(se, false);
+      hk_sync_end_rendering(se, false);
+   }
+   hk_sync_barrier(se, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   T("bloom eviction producer submit", submit(qe, se));
+   struct hk_cmd_buffer *sc = new_cmd();
+   struct hk_cs *c_ev = add(sc, false);
+   hk_sync_vertex_images_bloom(sc, c_ev, b_c);
+   T("bloom eviction consumer submit", submit(qe, sc));
+   T("cross-submit ring eviction waits conservatively on evicted ordinal",
+     c_ev->sync.prior_ta[HK_SYNC_VDM] == 4 &&
+     c_ev->sync.prior[HK_SYNC_VDM] == HK_SYNC_RECENT_VDM_ATT + 4 &&
+     c_ev->sync.ta_split);
+
+   /* Legacy queue (exact_prior == false) falls back conservatively. */
+   struct hk_queue *ql = new_queue(false);
+   struct hk_cmd_buffer *la = new_cmd(), *lb = new_cmd();
+   hk_sync_begin_rendering(la, false);
+   la->state.gfx.render.att_bloom = b_a;
+   add(la, false);
+   hk_sync_end_rendering(la, false);
+   hk_sync_barrier(la, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   struct hk_cs *lr = add(lb, false);
+   hk_sync_vertex_images_bloom(lb, lr, b_c);
+   struct hk_cmd_buffer *lpair[] = {la, lb};
+   T("legacy bloom submit",
+     hk_sync_resolve_submit(ql, lpair, 2, false, false, 0, NULL));
+   T("legacy queue keeps conservative vertex wait",
+     lr->sync.barrier_ta[HK_SYNC_VDM] == lr->sync.barrier[HK_SYNC_VDM] &&
+     lr->sync.barrier_ta[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE);
 }
 
 /* A layout transition the driver performs as work (the metadata clear of a
@@ -2421,8 +2698,12 @@ test_draw_indirect_scope(void)
 static void
 test_cdm_overlap_splits(void)
 {
+   unsigned tested = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(end_stamp_chips); ++i) {
       const enum agx_chip chip = end_stamp_chips[i];
+      if (!agx_chip_has_cap(chip, AGX_CAP_CDM_OVERLAP_SPLIT))
+         continue;
+      tested++;
 
       /* U1 same-CB: R1 -> C1(indep) -> barrier(GFX->COMPUTE) -> C2 */
       {
@@ -2569,8 +2850,10 @@ test_cdm_overlap_splits(void)
       }
    }
 
-   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
-   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
+   T("at least one chip tests CDM overlap splits", tested > 0);
+
+   /* Unmeasured chips (G15, G16G, G17D) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17D};
    for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
       struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
       struct hk_cs *c1 = add(cmd, true);
@@ -2600,6 +2883,7 @@ main(void)
    test_resume_after_compute_clear();
    test_loaded_color_preservation();
    test_history_tile_hazard_split();
+   test_load_hazard_frag();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
    test_discard_transition();
@@ -2947,6 +3231,7 @@ main(void)
       T("signalled_value ignores equal point",
         p_atomic_read(&mq->drm.signalled_value) == 12);
    }
+   test_vertex_image_bloom();
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
