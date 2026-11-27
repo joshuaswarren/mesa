@@ -384,6 +384,54 @@ main(void)
       hk_root_mark_push_dirty(d);
       CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
       CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+
+      /* Generalized bypass tracking: dynbuf slots, VB base/clamp, and
+       * combinations with push constants stay bypassable until HK_ROOT_DIRTY_OTHER,
+       * and hk_root_reads_ignore_dirty() rejects any shader that observes a
+       * dirty category or dynbuf slot. */
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0xff, UINT64_MAX, d));
+
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(0));
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d) &&
+            hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(1), d));
+      CHECK(hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH | HK_ROOT_READS_VERTEX_INPUT,
+                                       BITFIELD64_BIT(1), d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(0), d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_DYNAMIC_BUFFERS, 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_ADDRESS, 0, d));
+
+      hk_root_mark_bypass_launched(d);
+      CHECK(hk_root_launch_current(d, true));
+      CHECK(!hk_root_launch_current(d, false));
+
+      /* Accumulating a second dynbuf slot preserves slot 0 and clears launch. */
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(1));
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(hk_root_bypass_dirty(d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(0), d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(1), d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(2), d));
+
+      /* Adding VB base/clamp and push stays bypassable for non-observing FS. */
+      hk_root_mark_vb_dirty(d, true, false);
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(2), d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_VERTEX_INPUT, 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, d));
+
+      /* Any OTHER mutation disables bypass and cannot be undone by bypass marks. */
+      hk_root_mark_dirty(d);
+      CHECK(!hk_root_bypass_dirty(d));
+      CHECK(!hk_root_reads_ignore_dirty(0, 0, d));
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(0));
+      hk_root_mark_vb_dirty(d, true, true);
+      CHECK(!hk_root_bypass_dirty(d));
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d) && d->root_change.dynbuf_dirty_mask == 0);
       free(d);
    }
 
