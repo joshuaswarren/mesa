@@ -2053,3 +2053,58 @@ TEST(AGX3VisionOpts, FoldAlignedLowMaskAndDisjointMaskSum)
    EXPECT_GE(count_alu_op(b.shader, nir_op_imadshl_agx), 2u);
    ralloc_free(b.shader);
 }
+
+
+TEST(AGX3VisionOpts, FoldAlignedHighMasksAndShiftRoundtrips)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options,
+                                                  "aligned_mask_shift_fold");
+   b.shader->info.workgroup_size[0] = 64;
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .range = 16);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *x = nir_channel(&b, lid, 0);
+   nir_def *y = nir_channel(&b, lid, 1);
+
+   /* Aligned multiples of 32/64/128/256 drop under masks 31/63/127/255. */
+   nir_def *m32 = nir_iand_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, x, 5), y), 31);
+   nir_def *m64 = nir_iand_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, x, 6), y), 63);
+   nir_def *m128 = nir_iand_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, x, 7), y), 127);
+   nir_def *m256 = nir_iand_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, x, 8), y), 255);
+
+   /* Aligned shift roundtrips: ((4*x) >> 2) << 1 -> (4*x) >> 1;
+    * ((4*x) >> 1) & ~1 -> (4*x) >> 1; ((2*x) >> 1) << 1 -> 2*x. */
+   nir_def *x4 = nir_ishl_imm(&b, x, 2);
+   nir_def *x2 = nir_ishl_imm(&b, x, 1);
+   nir_def *s0 = nir_ishl_imm(&b, nir_ushr_imm(&b, x4, 2), 1);
+   nir_def *s1 = nir_iand_imm(&b, nir_ushr_imm(&b, x4, 1), 0xfffffffe);
+   nir_def *s2 = nir_ishl_imm(&b, nir_ushr_imm(&b, x2, 1), 1);
+
+   /* Negative controls: non-multiple of 4 keeps its shift and mask. */
+   nir_def *neg_sh = nir_ishl_imm(&b, nir_ushr_imm(&b, y, 2), 1);
+   nir_def *neg_m = nir_iand_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, x, 4), y), 31);
+
+   nir_def *sum = nir_iadd(&b, nir_iadd(&b, m32, m64), nir_iadd(&b, m128, m256));
+   nir_def *sh_sum = nir_iadd(&b, nir_iadd(&b, s0, s1), s2);
+   nir_store_global(&b, nir_vec4(&b, sum, sh_sum, neg_sh, neg_m), addr, .write_mask = 15);
+   nir_lower_vars_to_ssa(b.shader);
+
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, b.shader, agx_nir_fold_aligned_masks);
+      if (progress) {
+         NIR_PASS(_, b.shader, nir_opt_constant_folding);
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         NIR_PASS(_, b.shader, nir_opt_cse);
+      }
+   } while (progress);
+
+   nir_validate_shader(b.shader, "aligned_mask_shift_fold");
+   /* Aligned addends dropped (only neg_m keeps its iadd with x<<4; plus 5 sum iadds). */
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_iadd), 6u);
+   /* Only the 4 folded low masks (y & 31/63/127/255) and neg_m keep iand; s1 dropped its & ~1. */
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_iand), 5u);
+   /* s0 and s1 share CSEd ushr(x4, 1); neg_sh keeps its ushr(y, 2). */
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_ushr), 2u);
+   ralloc_free(b.shader);
+}

@@ -12928,6 +12928,17 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, agx_nir_fold_aligned_masks);
+      if (progress) {
+         pre_alg_progress = true;
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_dce);
+         NIR_PASS(_, nir, nir_opt_cse);
+      }
+   } while (progress);
+
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |
