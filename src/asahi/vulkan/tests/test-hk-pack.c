@@ -2313,6 +2313,51 @@ main(int argc, char **argv)
       T("two bounded looping members pack into one packet",
         rc == 1 && runs[0].count == 2);
 
+      /* Core-count-scaled static-work budget (1x at <=20, 2x at 40, 4x at >=80). */
+      T("work budget stays 1x for <=20 cores",
+        hk_pack_max_static_work_for_cores(10) == HK_PACK_MAX_STATIC_WORK &&
+        hk_pack_max_static_work_for_cores(16) == HK_PACK_MAX_STATIC_WORK &&
+        hk_pack_max_static_work_for_cores(20) == HK_PACK_MAX_STATIC_WORK);
+      T("work budget scales cleanly on 32/40/80+ cores",
+        hk_pack_max_static_work_for_cores(32) ==
+           (HK_PACK_MAX_STATIC_WORK / 4u) * 32ull / 5u &&
+        hk_pack_max_static_work_for_cores(40) == HK_PACK_MAX_STATIC_WORK * 2ull &&
+        hk_pack_max_static_work_for_cores(80) == HK_PACK_MAX_STATIC_WORK * 4ull &&
+        hk_pack_max_static_work_for_cores(160) == HK_PACK_MAX_STATIC_WORK * 4ull);
+      const uint64_t max40 = hk_pack_max_static_work_for_cores(40);
+      T("scaled limit accepts bounded loop between 1x and 2x budget",
+        hk_pack_account_dispatch_work_eff_limit(
+           1ull << 24, 256, true, 3072, HK_PACK_MAX_STATIC_WORK, &w) &&
+        !hk_pack_account_dispatch_work_eff_limit(
+           1ull << 24, 256, true, 3072, max40, &w) &&
+        w == (1ull << 24) * 3072ull);
+      T("scaled fusion budget accepts run between 1x and 2x budget",
+        !hk_pack_fusion_fits_run_limit(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                       5000, false, HK_PACK_MAX_STATIC_WORK,
+                                       &nw, &nl) &&
+        hk_pack_fusion_fits_run_limit(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                      5000, false, max40, &nw, &nl) &&
+        nw == HK_PACK_MAX_STATIC_WORK + 3500 && nl == 0);
+      /* Two 24G thread-instruction members exceed 2^35 (34.4G) on 20 cores
+       * but pack into one packet under the 40-core 2^36 (68.7G) budget. */
+      struct hk_cmd_buffer *wide_cbs[2] = { plain(1), plain(1) };
+      for (unsigned i = 0; i < 2; ++i)
+         first_cs(wide_cbs[i])->pack_static_work = UINT64_C(24) << 30;
+      struct hk_pack_member wm[2];
+      struct hk_device *d40 = device();
+      struct hk_sync_queue sq0 = {0};
+      hk_pack_describe_submit(wm, d40, &sq0, wide_cbs, 2, terminate, false);
+      struct hk_pack_limits lim20 = { .max_attachments = 64, .overhead = 64 };
+      struct hk_pack_limits lim40 = {
+         .max_attachments = 64, .overhead = 64, .max_static_work = max40,
+      };
+      unsigned pm = 0;
+      size_t tot = 0;
+      T("24G + 24G splits under 20-core 1x budget",
+        hk_pack_plan(wm, 2, &lim20, runs, &pm, &tot) == 0);
+      T("24G + 24G packs under 40-core 2x budget",
+        hk_pack_plan(wm, 2, &lim40, runs, &pm, &tot) == 1 && runs[0].count == 2);
+
       /* Observed-duration looping budget (HK_PACK_MAX_OBS_NS). */
       struct hk_pack_member obs_m[4] = {0};
       struct hk_cmd_buffer *obs_cbs[4] = {

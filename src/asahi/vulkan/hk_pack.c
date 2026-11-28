@@ -341,14 +341,14 @@ hk_pack_tail(const uint8_t tails[HK_SYNC_NUM_KINDS], uint8_t kinds)
 /* Whether `m` may start a run on its own. */
 static bool
 hk_pack_within_bounds(const struct hk_pack_member *m,
-                      const struct hk_pack_limits *limits)
+                      const struct hk_pack_limits *limits, uint64_t max_work)
 {
    const struct hk_cs *cs = m->cs;
    const uint64_t m_threads = hk_pack_member_threads(cs, m->query_reset);
    const uint64_t m_work = hk_pack_member_static_work(cs, m->query_reset);
    return cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
           m_threads <= HK_PACK_MAX_THREADS &&
-          m_work <= HK_PACK_MAX_STATIC_WORK &&
+          m_work <= max_work &&
           (!cs->pack_loops || m->obs_ns <= HK_PACK_MAX_OBS_NS) &&
           m->bytes <= UINT32_MAX - limits->overhead &&
           cs->compute_resources.size <= UINT16_MAX &&
@@ -379,6 +379,9 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    unsigned run_count = 0;
    struct hk_pack_run run = {0};
    uint64_t dispatches = 0, threads = 0, work = 0;
+   const uint64_t max_work =
+      limits->max_static_work ? limits->max_static_work
+                              : HK_PACK_MAX_STATIC_WORK;
    size_t resources = 0;
    uint32_t attachments = 0;
    uint8_t kinds = 0, waits = 0, tails[HK_SYNC_NUM_KINDS] = {0};
@@ -410,7 +413,7 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          m_obs <= HK_PACK_MAX_OBS_NS - obs_ns &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
          m_threads <= HK_PACK_MAX_THREADS - threads &&
-         m_work <= HK_PACK_MAX_STATIC_WORK - work &&
+         m_work <= max_work - work &&
          m->bytes <= UINT32_MAX - limits->overhead - run.bytes &&
          cs->compute_resources.size <= UINT16_MAX - resources &&
          cs->compute_attachments.count <=
@@ -448,7 +451,7 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       obs_ns = 0;
 
       /* Start a new run with this member when it is within the bounds. */
-      if (cs && hk_pack_within_bounds(m, limits)) {
+      if (cs && hk_pack_within_bounds(m, limits, max_work)) {
          run = (struct hk_pack_run){.first = i, .count = 1, .bytes = m->bytes};
          dispatches = cs->stats.cmds;
          threads = m_threads;
@@ -551,10 +554,29 @@ hk_pack_add_bo(struct util_dynarray *bos, struct agx_bo *bo)
    return true;
 }
 
+uint64_t
+hk_pack_max_static_work_for_cores(unsigned cores)
+{
+   /* HK_PACK_MAX_STATIC_WORK (2^35) was calibrated for ~16-20 core GPUs
+    * (~18 ms at M4 ALU rate). Scale linearly with core count between 20 and
+    * 80 cores (1x at <=20, 1.6x at 32, 2x at 40, 4x at >=80) so wall-clock
+    * packet budget stays bounded while larger graphs and fused variants fit. */
+   const unsigned clamped = CLAMP(cores, 20u, 80u);
+   return (HK_PACK_MAX_STATIC_WORK / 4u) * (uint64_t)clamped / 5u;
+}
+
+uint64_t
+hk_pack_max_static_work(const struct hk_device *dev)
+{
+   if (!dev)
+      return HK_PACK_MAX_STATIC_WORK;
+   return hk_pack_max_static_work_for_cores(agx_get_num_cores(&dev->dev));
+}
+
 bool
-hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
-                                  bool has_loops, uint64_t eff_instrs,
-                                  uint64_t *work_out)
+hk_pack_account_dispatch_work_eff_limit(uint64_t threads, uint64_t instrs,
+                                        bool has_loops, uint64_t eff_instrs,
+                                        uint64_t max_work, uint64_t *work_out)
 {
    uint64_t work = 0;
    if (__builtin_mul_overflow(threads, instrs, &work))
@@ -568,7 +590,7 @@ hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
    if (eff_instrs > 0) {
       uint64_t bounded = 0;
       if (!__builtin_mul_overflow(threads, eff_instrs, &bounded) &&
-          bounded <= HK_PACK_MAX_STATIC_WORK) {
+          bounded <= max_work) {
          *work_out = bounded;
          return false;
       }
@@ -581,28 +603,49 @@ hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
 }
 
 bool
-hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
-                              bool has_loops, uint64_t loop_bound,
-                              uint64_t *work_out)
+hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
+                                  bool has_loops, uint64_t eff_instrs,
+                                  uint64_t *work_out)
+{
+   return hk_pack_account_dispatch_work_eff_limit(
+      threads, instrs, has_loops, eff_instrs, HK_PACK_MAX_STATIC_WORK,
+      work_out);
+}
+
+bool
+hk_pack_account_dispatch_work_limit(uint64_t threads, uint64_t instrs,
+                                    bool has_loops, uint64_t loop_bound,
+                                    uint64_t max_work, uint64_t *work_out)
 {
    if (!has_loops || loop_bound == 0)
-      return hk_pack_account_dispatch_work_eff(threads, instrs, has_loops, 0,
-                                               work_out);
+      return hk_pack_account_dispatch_work_eff_limit(
+         threads, instrs, has_loops, 0, max_work, work_out);
 
    uint64_t eff_instrs = 0;
    if (__builtin_mul_overflow(instrs, loop_bound, &eff_instrs)) {
       *work_out = UINT64_MAX;
       return true;
    }
-   return hk_pack_account_dispatch_work_eff(threads, instrs, true, eff_instrs,
-                                            work_out);
+   return hk_pack_account_dispatch_work_eff_limit(
+      threads, instrs, true, eff_instrs, max_work, work_out);
 }
 
 bool
-hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
-                        uint64_t replaced_work, unsigned replaced_loops,
-                        uint64_t fused_work, bool fused_loops,
-                        uint64_t *new_work_out, unsigned *new_loops_out)
+hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
+                              bool has_loops, uint64_t loop_bound,
+                              uint64_t *work_out)
+{
+   return hk_pack_account_dispatch_work_limit(
+      threads, instrs, has_loops, loop_bound, HK_PACK_MAX_STATIC_WORK,
+      work_out);
+}
+
+bool
+hk_pack_fusion_fits_run_limit(uint64_t run_work, unsigned run_loops,
+                              uint64_t replaced_work, unsigned replaced_loops,
+                              uint64_t fused_work, bool fused_loops,
+                              uint64_t max_work, uint64_t *new_work_out,
+                              unsigned *new_loops_out)
 {
    if (replaced_work > run_work || replaced_loops > run_loops)
       return false;
@@ -613,13 +656,25 @@ hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
       return false;
    uint64_t new_work = 0;
    if (__builtin_add_overflow(rem_work, fused_work, &new_work) ||
-       new_work > HK_PACK_MAX_STATIC_WORK)
+       new_work > max_work)
       return false;
    if (new_work_out)
       *new_work_out = new_work;
    if (new_loops_out)
       *new_loops_out = new_loops;
    return true;
+}
+
+bool
+hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
+                        uint64_t replaced_work, unsigned replaced_loops,
+                        uint64_t fused_work, bool fused_loops,
+                        uint64_t *new_work_out, unsigned *new_loops_out)
+{
+   return hk_pack_fusion_fits_run_limit(run_work, run_loops, replaced_work,
+                                        replaced_loops, fused_work, fused_loops,
+                                        HK_PACK_MAX_STATIC_WORK, new_work_out,
+                                        new_loops_out);
 }
 
 static bool
