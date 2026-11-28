@@ -1557,6 +1557,62 @@ test_event_after_render_query(void)
    }
 }
 
+/* vkCmdSetEvent2 is ordered after its whole first scope, earlier submissions
+ * included (Vulkan 1.4, 7.4.2). On an exact-prior queue that dependency on an
+ * earlier submission's compute work reaches the kernel only as the carrier's
+ * prior ordinal, and a primary-queue submission waits for the sibling kernel
+ * queues only when some command names such a prior (hk_drm_sibling_prefix(),
+ * sib_earlier). Submission A's long dispatch ran on a sibling; submission B
+ * records an independent dispatch and sets the event after it. The event rides
+ * on that dispatch's end stamp, which must keep naming A's dispatch: unlike a
+ * timestamp, an event carrier keeps the same-CDM dependency. */
+static void
+test_event_carrier_keeps_prior_submission(void)
+{
+   const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G};
+   const unsigned compute_k = util_logbase2(HK_SYNC_COMPUTE);
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned render = 0; render < 2; ++render) {
+         test_chip = chips[c];
+         struct hk_cmd_buffer *cmd = new_cmd();
+         hk_cmd_buffer_device(cmd)->dev.params.features |=
+            DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS |
+            DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+         struct hk_cs *carrier = add(cmd, !render);
+         if (!render) {
+            carrier->stats.cmds = 1;
+            cmd->current_cs.cs = carrier;
+         }
+
+         uint64_t status = 0;
+         struct agx_va va = {.addr = 0xa0000};
+         struct agx_bo bo = {.va = &va};
+         struct hk_event event = test_event(&status, &bo, 71, 8);
+         set_event(cmd, &event,
+                   render ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                          : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+         const bool stamped =
+            nstreams(cmd) == 1 &&
+            (render ? carrier->oq_stamp[1].handle == 71
+                    : carrier->timestamp.end.handle == 71);
+         T("event rides on the dispatch or render end stamp", stamped);
+
+         /* Submission A: ten compute commands, its dispatch the last. */
+         struct hk_queue q = {0};
+         q.sync.exact_prior = true;
+         q.sync.submitted[HK_SYNC_CDM] = 10;
+         q.sync.last_absolute[compute_k][HK_SYNC_CDM] = 10;
+         struct hk_cmd_buffer *cbs[] = {cmd};
+         T("event carrier submission resolves",
+           hk_sync_resolve_submit(&q, cbs, 1, false, false, 0, NULL));
+         T(render ? "render event carrier names the earlier dispatch"
+                  : "compute event carrier names the earlier dispatch",
+           carrier->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+              carrier->sync.prior[HK_SYNC_CDM] == 10);
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -1583,6 +1639,7 @@ main(void)
    test_event_retirement_stamping();
    test_event_stamp_not_copied();
    test_event_after_render_query();
+   test_event_carrier_keeps_prior_submission();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

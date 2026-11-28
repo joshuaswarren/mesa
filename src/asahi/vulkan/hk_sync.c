@@ -2024,6 +2024,23 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
+/* An event set on a command's end stamp (hk_sync_stamp_event()) orders the
+ * event after its whole first scope, earlier submissions included: unlike a
+ * timestamp, it keeps the same-CDM dependency stamp_wait() drops on
+ * exact-prior queues. A primary-queue submission learns that it must wait for
+ * the sibling kernel queues only from that dependency's prior, so dropping it
+ * would let the event be set before an earlier submission's compute work
+ * running on a sibling has completed. A render carrier orders its fragment
+ * half, after which the kernel writes every retirement slot. */
+static void
+event_stamp_wait(struct hk_cs *cs, const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   if (cs->type == HK_CS_CDM)
+      hk_sync_stream_wait(cs, dep);
+   else
+      stream_wait_frag(cs, dep);
+}
+
 /* G17P latches a command's start stamps when the firmware takes the command,
  * before its barriers resolve: a vkCmdResetQueryPool dispatch followed by a
  * full ALL_COMMANDS barrier still overwrites the next render's vertex start
@@ -2558,7 +2575,7 @@ hk_sync_stamp_event(struct hk_cmd_buffer *cmd, struct agx_timestamp_req req,
 
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), tail, dep);
-      stamp_wait(cmd, tail, dep);
+      event_stamp_wait(tail, dep);
       tail->oq_stamp[slot] = req;
       cmd->pass_merge.valid = false;
       const unsigned stamp_k = util_logbase2(HK_SYNC_STAMP);
@@ -2581,7 +2598,7 @@ hk_sync_stamp_event(struct hk_cmd_buffer *cmd, struct agx_timestamp_req req,
 
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), tail, dep);
-      stamp_wait(cmd, tail, dep);
+      event_stamp_wait(tail, dep);
       tail->timestamp.end = req;
       const unsigned stamp_k = util_logbase2(HK_SYNC_STAMP);
       st->last[stamp_k][HK_SYNC_CDM] =
