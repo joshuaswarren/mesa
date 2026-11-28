@@ -322,6 +322,8 @@ hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    struct libagx_timestamp_copy *pairs = params.cpu;
    for (unsigned i = 0; i < count; ++i) {
+      /* Only timestamp queries are copied (agx_timestamp_req::event). */
+      assert(copies[i].src.addr && !copies[i].src.event && copies[i].dst.addr);
       pairs[i] = (struct libagx_timestamp_copy){
          .dest = copies[i].dst.addr,
          .src = copies[i].src.addr,

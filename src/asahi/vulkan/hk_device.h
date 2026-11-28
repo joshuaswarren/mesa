@@ -403,6 +403,15 @@ struct hk_device {
       size_t prune_threshold;
    } query_stamps;
 
+   /* Device-wide slab allocator for VkEvent status words, bound once per slab
+    * as a kernel timestamp buffer on HAL200/M5 so vkCmdSetEvent2 can ride on
+    * the producing stream's retirement timestamp without a CDM store. */
+   struct {
+      bool ready;
+      simple_mtx_t lock;
+      struct list_head slabs;
+   } events;
+
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
     * runtime grid can reach the main record is for this program to publish
