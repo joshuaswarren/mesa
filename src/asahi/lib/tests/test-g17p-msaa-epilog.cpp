@@ -10,6 +10,10 @@
 extern "C" {
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/compiler/agx_debug.h"
+extern "C" {
+#include "asahi/compiler/agx3_compose/agx3_decode.h"
+#include "asahi/isa/disasm.h"
+}
 }
 
 
@@ -1696,5 +1700,211 @@ TEST(G17PMsaaEpilog, LocalReadEquivNegativeControlsDerivativesAndSideEffects)
       ASSERT_TRUE(agx_nir_lower_to_per_sample(b.shader));
       EXPECT_FALSE(agx_nir_unroll_g17p_samples_equiv(b.shader, 4, &layout));
       ralloc_free(b.shader);
+   }
+}
+
+/* The deferred lighting shape: RGBA8, RGBA16F (read as 16-bit lanes and
+ * widened, as load_tilebuffer() lowers it), RGBA8 and RGBA8 reads, one RGBA8
+ * result. With sample groups the body runs once per group in a loop. */
+static nir_shader *
+build_deferred_local_read(bool sample_id, bool discard, bool quad)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "local-read sample groups");
+   b.shader->info.fs.uses_sample_shading = true;
+   b.shader->info.fs.uses_fbfetch_output = true;
+   b.shader->info.fs.uses_discard = discard;
+
+   nir_def *g0 = nir_load_local_pixel_agx(
+      &b, 4, 32, nir_imm_intN_t(&b, 0xff, 16), .base = 16,
+      .format = PIPE_FORMAT_R8_UNORM, .target = 2);
+   nir_def *g1 = nir_f2f32(&b, nir_load_local_pixel_agx(
+      &b, 4, 16, nir_imm_intN_t(&b, 0xff, 16), .base = 8,
+      .format = PIPE_FORMAT_R16_UINT, .target = 1));
+   nir_def *g2 = nir_load_local_pixel_agx(
+      &b, 4, 32, nir_imm_intN_t(&b, 0xff, 16), .base = 20,
+      .format = PIPE_FORMAT_R8_UNORM, .target = 3);
+   nir_def *g3 = nir_load_local_pixel_agx(
+      &b, 4, 32, nir_imm_intN_t(&b, 0xff, 16), .base = 24,
+      .format = PIPE_FORMAT_R8_UNORM, .target = 4);
+   nir_def *acc = nir_fadd(&b, nir_fadd(&b, g0, g1), nir_fadd(&b, g2, g3));
+   if (sample_id) {
+      nir_def *sid = nir_u2f32(&b, nir_load_sample_id(&b));
+      acc = nir_fadd(&b, acc, nir_vec4(&b, sid, sid, sid, sid));
+   }
+   if (quad)
+      acc = nir_quad_broadcast(&b, acc, nir_imm_int(&b, 1));
+   nir_def *lit = nir_fmul_imm(&b, acc, 0.25f);
+   nir_store_local_pixel_agx(&b, lit, nir_imm_intN_t(&b, 0xff, 16),
+                             nir_undef(&b, 2, 16), .base = 0,
+                             .write_mask = 0xf,
+                             .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+   EXPECT_TRUE(agx_nir_lower_to_per_sample(b.shader));
+   return b.shader;
+}
+
+/* Whether `def` is `target` or an iand tree with `target` as a leaf. */
+static bool
+iand_reaches(nir_def *def, const nir_def *target)
+{
+   if (def == target)
+      return true;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu ||
+       nir_instr_as_alu(instr)->op != nir_op_iand)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   return iand_reaches(alu->src[0].src.ssa, target) ||
+          iand_reaches(alu->src[1].src.ssa, target);
+}
+
+TEST(G17PMsaaEpilog, MonolithicLocalReadSampleGroupsLoop)
+{
+   static const unsigned partition_offsets[] = {0, 8, 16, 20, 24};
+
+   for (enum agx_chip chip : {AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      for (unsigned samples : {2u, 4u}) {
+         SCOPED_TRACE(testing::Message() << "chip " << chip << " samples "
+                                         << samples);
+         nir_shader *s = build_deferred_local_read(false, false, false);
+         ASSERT_TRUE(agx_nir_unroll_g17p_samples_groups(
+            s, samples, AGX_ISA_ENCODING_AGX3B));
+
+         bool progress;
+         do {
+            progress = false;
+            progress |= nir_opt_constant_folding(s);
+            progress |= nir_opt_algebraic(s);
+            progress |= nir_opt_dce(s);
+         } while (progress);
+         agx_nir_hoist_g17p_zs_writes(s);
+         agx_nir_lower_g17p_tile_samples(s, samples);
+         s->info.fs.uses_sample_shading = false;
+         nir_validate_shader(s, "local-read sample groups");
+
+         /* One coverage read and one PIXINFO ahead of one loop; the body is
+          * not cloned and nothing compares samples in software. */
+         nir_function_impl *impl = nir_shader_get_entrypoint(s);
+         unsigned loops = 0;
+         foreach_list_typed(nir_cf_node, node, node, &impl->body)
+            loops += node->type == nir_cf_node_loop;
+         EXPECT_EQ(loops, 1u);
+
+         unsigned groups = 0, active = 0, loads = 0, stores = 0, ballots = 0,
+                  const_masks = 0, xors = 0;
+         nir_def *coverage = NULL, *sample_groups = NULL;
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_alu) {
+                  xors += nir_instr_as_alu(instr)->op == nir_op_ixor;
+                  continue;
+               }
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_sample_groups_agx:
+                  groups++;
+                  sample_groups = &intr->def;
+                  EXPECT_EQ(intr->src[0].ssa, coverage);
+                  EXPECT_EQ(intr->def.bit_size, 16u);
+                  break;
+               case nir_intrinsic_load_active_samples_agx:
+                  active++;
+                  coverage = &intr->def;
+                  break;
+               case nir_intrinsic_load_local_pixel_agx:
+                  loads++;
+                  const_masks += nir_src_is_const(intr->src[0]);
+                  break;
+               case nir_intrinsic_store_local_pixel_agx:
+                  stores++;
+                  const_masks += nir_src_is_const(intr->src[1]);
+                  /* The store mask is the coverage ANDed with the group. */
+                  EXPECT_TRUE(iand_reaches(intr->src[1].ssa, coverage));
+                  break;
+               case nir_intrinsic_ballot:
+                  ballots++;
+                  break;
+               default:
+                  break;
+               }
+            }
+         }
+         EXPECT_EQ(active, 1u);
+         EXPECT_EQ(groups, 1u);
+         EXPECT_NE(sample_groups, nullptr);
+         EXPECT_EQ(loads, 4u);
+         EXPECT_EQ(stores, 1u);
+         EXPECT_EQ(const_masks, 0u);
+         EXPECT_EQ(ballots, 0u);
+         EXPECT_EQ(xors, 0u);
+
+         agx_preprocess_nir(s);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         key.no_preamble = true;
+         key.agx3_local_read = true;
+         key.fs.nr_samples = samples;
+         for (unsigned off : partition_offsets)
+            BITSET_SET(key.g17p_tile_partitions, off);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+            << agx_last_compile_refusal();
+         EXPECT_EQ(part.info.scratch_size, 0u);
+
+         /* One PIXINFO, the four target reads once and the result stored
+          * once, with the sample groups as a register mask. */
+         unsigned pixinfo = 0, lldcol = 0, lstcol = 0;
+         const uint8_t *code = (const uint8_t *)part.binary;
+         for (size_t off = 0; off < part.info.binary_size;) {
+            const signed n = agx3b_instr_length(code + off,
+                                                part.info.binary_size - off,
+                                                NULL);
+            ASSERT_GT(n, 0);
+            uint64_t f[AGX3_MAX_FIELDS];
+            if (agx3_decode(&agx3b_table, code + off, (unsigned)n,
+                            AGX3_MN_pixinfo, f) >= 0) {
+               pixinfo++;
+               EXPECT_EQ(f[51], 2u);
+            }
+            if (agx3_decode(&agx3b_table, code + off, (unsigned)n,
+                            AGX3_MN_lldcol, f) >= 0) {
+               lldcol++;
+               EXPECT_EQ(f[51], 2u);
+            }
+            lstcol += agx3_decode(&agx3b_table, code + off, (unsigned)n,
+                                  AGX3_MN_lstcol, f) >= 0;
+            off += (size_t)n;
+         }
+         EXPECT_EQ(pixinfo, 1u);
+         EXPECT_EQ(lldcol, 4u);
+         EXPECT_EQ(lstcol, 1u);
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+TEST(G17PMsaaEpilog, MonolithicLocalReadSampleGroupsIneligible)
+{
+   /* Only the AGX3B encoding has PIXINFO here, and only up to four groups. */
+   {
+      nir_shader *s = build_deferred_local_read(false, false, false);
+      EXPECT_FALSE(agx_nir_unroll_g17p_samples_groups(
+         s, 4, AGX_ISA_ENCODING_AGX3C));
+      EXPECT_FALSE(agx_nir_unroll_g17p_samples_groups(
+         s, 8, AGX_ISA_ENCODING_AGX3B));
+      ralloc_free(s);
+   }
+   /* The sample index, discard, and quad operations across a divergent group
+    * loop keep the per-sample paths. */
+   for (unsigned i = 0; i < 3; ++i) {
+      SCOPED_TRACE(i);
+      nir_shader *s = build_deferred_local_read(i == 0, i == 1, i == 2);
+      EXPECT_FALSE(agx_nir_unroll_g17p_samples_groups(
+         s, 4, AGX_ISA_ENCODING_AGX3B));
+      ralloc_free(s);
    }
 }
