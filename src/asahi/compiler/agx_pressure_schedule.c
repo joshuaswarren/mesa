@@ -1213,6 +1213,31 @@ ilp_instr_pipe(const agx_instr *I)
    }
 }
 
+/* Mark hoisted loads feeding SSA value v as consumed, walking through any
+ * transitive COLLECT chains (which regroup split/collected channels without
+ * consuming them). */
+static void
+ilp_mark_consumed_ssa(unsigned v, const int *load_node,
+                      agx_instr *const *collect_def, bool *consumed,
+                      unsigned *consumed_loads)
+{
+   const int l = load_node[v];
+   if (l >= 0) {
+      if (!consumed[l]) {
+         consumed[l] = true;
+         (*consumed_loads)++;
+      }
+      return;
+   }
+   const agx_instr *col = collect_def[v];
+   if (!col)
+      return;
+   agx_foreach_ssa_src(col, cj) {
+      ilp_mark_consumed_ssa(col->src[cj].value, load_node, collect_def,
+                            consumed, consumed_loads);
+   }
+}
+
 static bool
 ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool native_uniforms, unsigned alu_latency,
@@ -1330,10 +1355,6 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             dies[nodes[i]->instr->dest[d].value] =
                !u_sparse_bitset_test(&block->live_out,
                                      nodes[i]->instr->dest[d].value);
-            /* Loop-carried PHIs are already live on block entry; do not charge
-             * them against the forward budget for temporaries added here. */
-            if (nodes[i]->instr->op == AGX_OPCODE_PHI)
-               eff_fwd_cap += agx_index_size_16(nodes[i]->instr->dest[d]);
          }
       }
       /* Trailing control flow keeps its operands alive. */
@@ -1342,6 +1363,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             continue;
          agx_foreach_ssa_src(I, si)
             dies[I->src[si].value] = false;
+      }
+      /* Loop-carried PHIs in loop headers are already live on block entry; do
+       * not charge live ones against the forward budget for temporaries added
+       * inside this block. Dead PHIs contribute 0 net live halves, and non-loop
+       * merge PHIs keep the original fwd_cap brake intact. */
+      if (block->loop_header) {
+         for (unsigned i = 0; i < n; ++i) {
+            if (nodes[i]->instr->op != AGX_OPCODE_PHI)
+               continue;
+            agx_foreach_ssa_dest(nodes[i]->instr, d) {
+               const unsigned v = nodes[i]->instr->dest[d].value;
+               if (uses_left[v] > 0 || !dies[v])
+                  eff_fwd_cap += agx_index_size_16(nodes[i]->instr->dest[d]);
+            }
+         }
       }
    }
 
@@ -1369,15 +1405,44 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                load_node[nodes[i]->instr->dest[d].value] = i;
          } else if (nodes[i]->instr->op == AGX_OPCODE_SPLIT &&
                     nodes[i]->instr->src[0].type == AGX_INDEX_NORMAL) {
-            const int l = load_node[nodes[i]->instr->src[0].value];
+            const unsigned sv = nodes[i]->instr->src[0].value;
+            const int l = load_node[sv];
             if (l >= 0) {
                agx_foreach_ssa_dest(nodes[i]->instr, d)
                   load_node[nodes[i]->instr->dest[d].value] = l;
+            } else if (collect_def[sv]) {
+               agx_instr *col = collect_def[sv];
+               bool exact_channels = col->nr_srcs == nodes[i]->instr->nr_dests;
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (agx_index_size_16(col->src[d]) !=
+                         agx_index_size_16(nodes[i]->instr->dest[d])) {
+                        exact_channels = false;
+                        break;
+                     }
+                  }
+               }
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (col->src[d].type != AGX_INDEX_NORMAL)
+                        continue;
+                     const unsigned cv = col->src[d].value;
+                     const unsigned dv = nodes[i]->instr->dest[d].value;
+                     if (load_node[cv] >= 0)
+                        load_node[dv] = load_node[cv];
+                     else if (collect_def[cv])
+                        collect_def[dv] = collect_def[cv];
+                  }
+               } else {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d)
+                     collect_def[nodes[i]->instr->dest[d].value] = col;
+               }
             }
          } else if (nodes[i]->instr->op == AGX_OPCODE_COLLECT) {
             bool from_load = false;
             agx_foreach_ssa_src(nodes[i]->instr, si) {
-               if (load_node[nodes[i]->instr->src[si].value] >= 0) {
+               const unsigned sv = nodes[i]->instr->src[si].value;
+               if (load_node[sv] >= 0 || collect_def[sv]) {
                   from_load = true;
                   break;
                }
@@ -1538,20 +1603,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT &&
           nodes[best]->instr->op != AGX_OPCODE_COLLECT) {
          agx_foreach_ssa_src(nodes[best]->instr, si) {
-            const unsigned v = nodes[best]->instr->src[si].value;
-            const int l = load_node[v];
-            if (l >= 0 && !consumed[l]) {
-               consumed[l] = true;
-               consumed_loads++;
-            } else if (collect_def[v]) {
-               agx_foreach_ssa_src(collect_def[v], cj) {
-                  const int cl = load_node[collect_def[v]->src[cj].value];
-                  if (cl >= 0 && !consumed[cl]) {
-                     consumed[cl] = true;
-                     consumed_loads++;
-                  }
-               }
-            }
+            ilp_mark_consumed_ssa(nodes[best]->instr->src[si].value, load_node,
+                                  collect_def, consumed, &consumed_loads);
          }
       }
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
