@@ -7575,24 +7575,25 @@ build_sobel_3x3_u8_kernel(nir_builder *b,
 
    nir_push_if(b, nir_ilt(b, py, height));
    {
-      /* Load 3 rows x 6 bytes via 6 coalesced u8x4 shared loads. */
+      /* Load 3 rows x 6 bytes via 6 coalesced u8x4 shared loads. Keep samples
+       * in u16/i16 (Sobel sums are in [-1020, 1020], L1 mag in [0, 2040]) to
+       * halve live register footprint across the 4-pixel stencil body. */
       nir_def *p[3][6];
       for (unsigned dy = 0; dy < 3; dy++) {
          nir_def *sh_u4 =
             nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, row, dy), SH_U4), bx);
          nir_def *v0 = load_sh_u8x4(b, sh_src, sh_u4);
          nir_def *v1 = load_sh_u8x4(b, sh_src, nir_iadd_imm(b, sh_u4, 1));
-         p[dy][0] = nir_u2u32(b, nir_channel(b, v0, 0));
-         p[dy][1] = nir_u2u32(b, nir_channel(b, v0, 1));
-         p[dy][2] = nir_u2u32(b, nir_channel(b, v0, 2));
-         p[dy][3] = nir_u2u32(b, nir_channel(b, v0, 3));
-         p[dy][4] = nir_u2u32(b, nir_channel(b, v1, 0));
-         p[dy][5] = nir_u2u32(b, nir_channel(b, v1, 1));
+         p[dy][0] = nir_u2u16(b, nir_channel(b, v0, 0));
+         p[dy][1] = nir_u2u16(b, nir_channel(b, v0, 1));
+         p[dy][2] = nir_u2u16(b, nir_channel(b, v0, 2));
+         p[dy][3] = nir_u2u16(b, nir_channel(b, v0, 3));
+         p[dy][4] = nir_u2u16(b, nir_channel(b, v1, 0));
+         p[dy][5] = nir_u2u16(b, nir_channel(b, v1, 1));
       }
 
       nir_def *c_lo = nir_imm_int(b, 0x3ed413cdu);
       nir_def *c_hi = nir_imm_int(b, 0x401a827au);
-      nir_def *fzero = nir_imm_float(b, 0.0f);
 
       nir_def *dir_out[4];
       nir_def *mag_out[4];
@@ -7610,27 +7611,38 @@ build_sobel_3x3_u8_kernel(nir_builder *b,
             b, nir_iadd(b, p[0][t + 2], p[2][t + 2]),
             nir_ishl_imm(b, p[1][t + 2], 1));
 
-         nir_def *gy = nir_i2f32(b, nir_isub(b, top, bot));
-         nir_def *gx = nir_i2f32(b, nir_isub(b, lft, rgt));
+         nir_def *gy_i = nir_isub(b, top, bot);
+         nir_def *gx_i = nir_isub(b, lft, rgt);
+         nir_def *agy_i = nir_iabs(b, gy_i);
+         nir_def *agx_i = nir_iabs(b, gx_i);
 
-         nir_def *mag = nir_fadd(b, nir_fabs(b, gy), nir_fabs(b, gx));
-         nir_def *ratio = nir_fabs(b, nir_fmul(b, gx, nir_frcp(b, gy)));
+         /* Exact L1 magnitude in i16 ([0, 2040]) -> f32. */
+         mag_out[t] = nir_u2f32(b, nir_iadd(b, agy_i, agx_i));
 
-         nir_def *gx_neg = nir_flt(b, gx, fzero);
-         nir_def *gy_neg = nir_flt(b, gy, fzero);
+         /* Replace SFU frcp(gy) with cross-multiplied threshold comparisons:
+          * |gx / gy| < c_lo  <=>  |gx| < |gy| * c_lo
+          * c_hi < |gx / gy|  <=>  |gy| * c_hi < |gx|
+          * Bit-exact across all (gx, gy) in [-1020, 1020]^2 including gy == 0
+          * (both (0, 0) -> false/false and (gx != 0, 0) -> false/true).
+          * Direction constants include the final (q + 6) & 7 rotation. */
+         nir_def *agx = nir_u2f32(b, agx_i);
+         nir_def *agy = nir_u2f32(b, agy_i);
+         nir_def *lt_lo = nir_flt(b, agx, nir_fmul(b, agy, c_lo));
+         nir_def *gt_hi = nir_flt(b, nir_fmul(b, agy, c_hi), agx);
+
+         nir_def *gx_neg = nir_ilt_imm(b, gx_i, 0);
+         nir_def *gy_neg = nir_ilt_imm(b, gy_i, 0);
          nir_def *d_neg_gy =
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 5), nir_imm_int(b, 3));
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 3), nir_imm_int(b, 1));
          nir_def *d_pos_gy =
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 7), nir_imm_int(b, 1));
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 5), nir_imm_int(b, 7));
          nir_def *diag = nir_bcsel(b, gy_neg, d_neg_gy, d_pos_gy);
          nir_def *q0 = nir_bcsel(
-            b, nir_flt(b, ratio, c_lo),
-            nir_bcsel(b, gy_neg, nir_imm_int(b, 4), nir_imm_int(b, 0)), diag);
-         nir_def *q1 = nir_bcsel(
-            b, nir_flt(b, c_hi, ratio),
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 6), nir_imm_int(b, 2)), q0);
-         dir_out[t] = nir_iand_imm(b, nir_iadd_imm(b, q1, 6), 7);
-         mag_out[t] = mag;
+            b, lt_lo,
+            nir_bcsel(b, gy_neg, nir_imm_int(b, 2), nir_imm_int(b, 6)), diag);
+         dir_out[t] = nir_bcsel(
+            b, gt_hi,
+            nir_bcsel(b, gx_neg, nir_imm_int(b, 4), nir_imm_int(b, 0)), q0);
       }
 
       nir_def *wm1 = nir_iadd_imm(b, width, -1);
