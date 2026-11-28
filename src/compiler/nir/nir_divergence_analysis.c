@@ -1135,6 +1135,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_enter_query_agx:
    case nir_intrinsic_load_exported_agx:
    case nir_intrinsic_load_local_pixel_agx:
+   case nir_intrinsic_load_sample_groups_agx:
    case nir_intrinsic_load_coefficients_agx:
    case nir_intrinsic_load_active_subgroup_invocation_agx:
    case nir_intrinsic_load_sample_mask:

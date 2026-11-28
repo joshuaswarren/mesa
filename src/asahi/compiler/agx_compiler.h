@@ -454,6 +454,12 @@ typedef struct {
    /* TODO: Handle tilebuffer ops more efficient */
    bool explicit_coords : 1;
 
+   /* AGX3B: this ld_tile is PIXINFO (nir_intrinsic_load_sample_groups_agx).
+    * Its source is the coverage word and its 16-bit destination the packed
+    * sample groups. It names no target bytes: the tile protocols give it the
+    * colour transaction of a first read, and nothing else. */
+   bool sample_groups : 1;
+
    /* Logical attachment identity, independent of the physical pixel_offset. */
    uint8_t colour_target;
 

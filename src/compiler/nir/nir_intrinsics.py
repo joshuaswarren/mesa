@@ -2617,6 +2617,18 @@ load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
 # base = byte offset, target = logical colour attachment index
 store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [])
+# AGX3B: the sample groups of the fragment's pixel, as PIXINFO returns them for
+# its W16 SR39 coverage word. The hardware keeps track of which samples of a
+# pixel hold the same tilebuffer contents; nibble k of the result holds the
+# samples of group k, from the lowest nibble, and the nibbles after the last
+# group are zero. A shader that reads the tilebuffer without depending on the
+# sample index can shade one sample per group: load with the remaining group
+# word as the sample mask and store to the coverage ANDed with it.
+#
+# src[] = { coverage word }
+intrinsic("load_sample_groups_agx", src_comp=[1], dest_comp=1, bit_sizes=[16],
+          flags=[CAN_ELIMINATE])
+
 # Decode one raw 32-bit tilebuffer word, as read by load_local_pixel_agx with
 # a 32-bit integer format, into the channels a load_local_pixel_agx of FORMAT
 # at the same offset returns.
