@@ -745,3 +745,62 @@ TEST(SharedByteOffsets, ValueEquivalence16BitElementsAndStoreShared)
       ralloc_free(b.shader);
    }
 }
+
+/* Same-block shared accesses in a <= 32 KiB allocation share greedy 256-byte
+ * windows even when their variable terms have unknown 32-bit upper bounds
+ * (such as preamble uniforms or subgroup IDs). */
+TEST(SharedByteOffsets, SmallSharedGreedyAnchorUnbounded)
+{
+   nir_builder b = workgroup_shader("shared-small-greedy");
+   b.shader->info.shared_size = 14336;
+   nir_def *u = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   nir_def *lane = nir_load_subgroup_invocation(&b);
+   nir_def *row = nir_imul_imm(&b, nir_iand_imm(&b, lane, 12), 40);
+   nir_def *base_var = nir_iadd(&b, u, row);
+
+   /* 2576 + {0, 40, 80, 120} crosses the 2688 multiple-of-128 boundary at
+    * 2696, but fits in one 256-byte window (byte offsets 0, 80, 160, 240)
+    * when anchored at 2576. */
+   nir_intrinsic_instr *intrs[4];
+   nir_def *sum = NULL;
+   for (unsigned t = 0; t < 4; ++t) {
+      nir_def *idx = nir_u2u16(&b, nir_iadd_imm(&b, base_var, 2576u + t * 40u));
+      nir_def *val = nir_load_shared(&b, 2, 16, idx, .align_mul = 4);
+      intrs[t] = nir_def_as_intrinsic(val);
+      nir_def *x = nir_channel(&b, val, 0);
+      sum = sum ? nir_iadd(&b, sum, x) : x;
+   }
+   nir_store_global(&b, nir_u2u32(&b, sum), nir_imm_int64(&b, 0), .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_opt_shared_byte_offsets(b.shader));
+   nir_opt_cse(b.shader);
+   nir_opt_dce(b.shader);
+
+   for (unsigned t = 0; t < 4; ++t) {
+      EXPECT_EQ(nir_intrinsic_base(intrs[t]), (int)(t * 80u));
+      EXPECT_EQ(nir_get_io_offset_src(intrs[t])->ssa,
+                nir_get_io_offset_src(intrs[0])->ssa);
+   }
+
+   nir_validate_shader(b.shader, "shared-small-greedy result");
+   ralloc_free(b.shader);
+}
+
+/* Allocations > 32 KiB must not use the 32 KiB no-wrap assumption. */
+TEST(SharedByteOffsets, LargeSharedRejectsUnbounded)
+{
+   nir_builder b = workgroup_shader("shared-large-unbounded");
+   b.shader->info.shared_size = 36864;
+   nir_def *u = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+
+   nir_def *a = nir_load_shared(&b, 2, 16, nir_u2u16(&b, u), .align_mul = 4);
+   nir_def *c = nir_load_shared(&b, 2, 16, nir_u2u16(&b, nir_iadd_imm(&b, u, 40)),
+                                .align_mul = 4);
+   nir_store_global(&b, nir_u2u32(&b, nir_iadd(&b, nir_channel(&b, a, 0),
+                                               nir_channel(&b, c, 0))),
+                    nir_imm_int64(&b, 0), .align_mul = 4);
+
+   EXPECT_FALSE(agx_nir_opt_shared_byte_offsets(b.shader));
+   nir_validate_shader(b.shader, "shared-large-unbounded result");
+   ralloc_free(b.shader);
+}

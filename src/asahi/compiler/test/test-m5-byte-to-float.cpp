@@ -788,6 +788,120 @@ TEST(M5ByteToFloat, EncodeNarrowDequantF16Chain)
 }
 
 
+/* GLSL unpack8(w) lowers to u2u8/i2i8 of a 32-bit word and its 8/16/24-bit
+ * shifts. On AGX3C (M5, !emit_agx3d), u2f32 and i2f32/i2f16 must extract each
+ * byte directly from the word's 16-bit halves without 0xff masks or 32-bit
+ * shifts, and every target (AGX3B, G17C, G18G) must compile cleanly. */
+TEST(M5ByteToFloat, Unpack8WordToFloat)
+{
+   const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+
+   for (auto t : targets) {
+      for (bool is_signed_conv : {false, true}) {
+         SCOPED_TRACE(t.chip);
+         SCOPED_TRACE(is_signed_conv);
+         nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                        &agx_nir_options,
+                                                        "unpack8-word");
+         nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *w = nir_load_global(&b, 1, 32, addr);
+         nir_def *h = nir_load_global(&b, 1, 16, nir_iadd_imm(&b, addr, 4));
+         nir_def *masked = nir_iand_imm(&b, w, 0x0f0f0f0f);
+
+         nir_def *bytes[6] = {
+            nir_u2u8(&b, masked),
+            nir_u2u8(&b, nir_ushr_imm(&b, masked, 8)),
+            nir_u2u8(&b, nir_unpack_32_2x16_split_y(&b, masked)),
+            nir_u2u8(&b, nir_ushr_imm(&b, masked, 24)),
+            nir_i2i8(&b, nir_ishr_imm(&b, w, 24)),
+            nir_u2u8(&b, nir_ushr_imm(&b, nir_u2u32(&b, h), 8)),
+         };
+         nir_def *f[6];
+         for (unsigned i = 0; i < 6; ++i)
+            f[i] = is_signed_conv ? nir_i2f32(&b, bytes[i])
+                                  : nir_u2f32(&b, bytes[i]);
+
+         nir_def *out0 = nir_vec4(&b, f[0], f[1], f[2], f[3]);
+         nir_def *out1 = nir_vec2(&b, f[4], f[5]);
+         nir_store_global(&b, out0, nir_iadd_imm(&b, addr, 16), .align_mul = 16);
+         nir_store_global(&b, out1, nir_iadd_imm(&b, addr, 32), .align_mul = 8);
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key key = {};
+         key.dev.encoding = t.encoding;
+         key.dev.chip = t.chip;
+         key.dev.emit_agx3d = t.emit_agx3d;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+         EXPECT_GT(part.info.stats.instrs, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(M5ByteToFloat, Unpack8WordNoMaskOnM5)
+{
+   /* Compare instruction counts on M5 (G17C) vs G18G (emit_agx3d) for unpacking
+    * all 4 unsigned bytes of a 32-bit word through u2u8 + u2f32 (the GLSL
+    * unpack8() lowering). M5 must eliminate the 0xff masks and 32-bit shifts,
+    * yielding strictly fewer instructions than the G18G fallback. */
+   auto compile_for = [](agx_chip chip, bool emit_agx3d, bool is_signed_conv) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "unpack8-m5-count");
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *w = nir_load_global(&b, 1, 32, addr);
+      nir_def *b0 = nir_u2u8(&b, w);
+      nir_def *b1 = nir_u2u8(&b, nir_ushr_imm(&b, w, 8));
+      nir_def *b2 = nir_u2u8(&b, nir_unpack_32_2x16_split_y(&b, w));
+      nir_def *b3 = nir_u2u8(&b, nir_ushr_imm(&b, w, 24));
+      nir_def *f0 = is_signed_conv ? nir_i2f32(&b, b0) : nir_u2f32(&b, b0);
+      nir_def *f1 = is_signed_conv ? nir_i2f32(&b, b1) : nir_u2f32(&b, b1);
+      nir_def *f2 = is_signed_conv ? nir_i2f32(&b, b2) : nir_u2f32(&b, b2);
+      nir_def *f3 = is_signed_conv ? nir_i2f32(&b, b3) : nir_u2f32(&b, b3);
+      nir_store_global(&b, nir_vec4(&b, f0, f1, f2, f3),
+                       nir_iadd_imm(&b, addr, 16), .align_mul = 16);
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = chip;
+      key.dev.emit_agx3d = emit_agx3d;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      unsigned instrs = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+      return instrs;
+   };
+
+   for (bool is_signed_conv : {false, true}) {
+      unsigned m5 = compile_for(AGX_CHIP_G17C, false, is_signed_conv);
+      unsigned g18 = compile_for(AGX_CHIP_G18G, true, is_signed_conv);
+      EXPECT_LT(m5, g18) << "is_signed_conv=" << is_signed_conv;
+   }
+}
+
+
 TEST(M5ByteToFloat, NarrowHalfMaskShiftAndUbfeToFloat)
 {
    /* agx_nir_opt_m5_narrow_to_float narrows u2f32/i2f32 of masked, shifted,

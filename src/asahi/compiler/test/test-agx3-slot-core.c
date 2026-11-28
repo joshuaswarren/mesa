@@ -456,6 +456,25 @@ int main(void)
       CHECK(r[6].slot==1 && r[6].wait_mask==0);
    }
 
+   /* A reissuable instruction still takes an already-waited slot before
+    * reissuing a live one, and reissues a live slot once all slots are live. */
+   {
+      struct agx3_slot_instr p[9];
+      for (int i = 0; i < 6; ++i) {
+         p[i] = ld((uint16_t)(i * 2));
+         p[i].reissues_live_slot = true;
+      }
+      p[6] = st(2); /* retire slot 2 while slot 1 stays live */
+      p[7] = ld(20);
+      p[7].reissues_live_slot = true;
+      p[8] = ld(22);
+      p[8].reissues_live_slot = true;
+      CHECK(agx3_slot_assign(p, 9, 6, r));
+      CHECK(r[6].wait_mask == (1u << 1));
+      CHECK(r[7].slot == 2 && r[7].wait_mask == 0);
+      CHECK(r[8].slot == 3 && r[8].wait_mask == 0);
+   }
+
    /* agx3c has 8 slots. */
    {
       struct agx3_slot_instr p[9];

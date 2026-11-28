@@ -19,6 +19,7 @@
 #include "asahi/lib/agx_chip_caps.h"
 #include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
+#include "agx3_matrix_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
@@ -3177,7 +3178,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          continue;
       }
 
-      if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+      if (I->op == AGX_OPCODE_MATMAD16_AGX3 &&
+          !(I->matrix_type & AGX3_MATRIX_ZERO_ACCUM)) {
          if (I->nr_dests != 1 || I->nr_srcs != 3 ||
              I->src[2].type != AGX_INDEX_NORMAL || I->src[2].memory ||
              !I->src[2].kill || rctx->ncomps[I->src[2].value] != 16 ||
@@ -3272,7 +3274,13 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
+      const bool matmad_zero_accum =
+         (I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+          I->op == AGX_OPCODE_MATMAD8_AGX3) &&
+         (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM);
+
       if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) && !I->dest[0].memory &&
+          !matmad_zero_accum &&
           !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
@@ -3873,10 +3881,21 @@ agx_has_static_register_split(const agx_context *ctx)
 static unsigned
 agx_ra_mem_bound(agx_context *ctx)
 {
-   /* AGX2 keeps the original 2048-half (4 KiB) spill-slot bound so
-    * agx_scratch memory sizing stays unchanged. */
-   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
-      return AGX2_MAX_SPILL_SLOTS;
+   /* AGX2 allocates scratch lazily via agx_scratch (up to 512 KiB/thread) and
+    * encodes stack_load/stack_store immediate byte offsets in 16 bits
+    * (< 64 KiB). Default to AGX2_MAX_SPILL_SLOTS (4 KiB) when max_scratch_B
+    * is unset, and allow callers (e.g. Vulkan) to admit up to
+    * AGX_NUM_MODELED_REGS (16 KiB) of spill slots within the 64 KiB immediate
+    * offset ceiling. */
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding)) {
+      const unsigned max_slots =
+         (ctx->key && ctx->key->max_scratch_B)
+            ? MIN2(ctx->key->max_scratch_B / 2, (unsigned)AGX_NUM_MODELED_REGS)
+            : (unsigned)AGX2_MAX_SPILL_SLOTS;
+      if (ctx->spill_base_B >= 0x10000u)
+         return 0;
+      return MIN2((0x10000u - ctx->spill_base_B) / 2, max_slots);
+   }
 
    unsigned avail_B = ctx->key->max_scratch_B ? ctx->key->max_scratch_B
                                               : AGX3_G17P_MAX_SPILL_B;

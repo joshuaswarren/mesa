@@ -370,6 +370,9 @@ bool agx_nir_unroll_g17p_samples_layout(
 bool agx_nir_unroll_g17p_samples_equiv(
    struct nir_shader *shader, unsigned nr_samples,
    const struct agx_g17p_colour_layout *layout);
+bool agx_nir_unroll_g17p_samples_groups(struct nir_shader *shader,
+                                        unsigned nr_samples,
+                                        enum agx_isa_encoding encoding);
 
 bool agx_nir_hoist_g17p_zs_writes(struct nir_shader *shader);
 

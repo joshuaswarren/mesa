@@ -614,6 +614,12 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
 
+      /* AGX3B's immediate-addend FMA forms carry no saturate bit, so keep a
+       * constant addend in its register on a saturated FFMA. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_FFMA && I->saturate && s == 2)
+         continue;
+
       agx_instr *def = defs[src.value];
       if (!def || def->op != AGX_OPCODE_MOV_IMM)
          continue;
@@ -676,6 +682,18 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 4 &&
           ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 && def->imm > 15)
          continue;
+      /* AGX3B/AGX3C immediate ASR only encodes shift counts in [1, width - 1];
+       * a shift count of 0 or >= width has no immediate encoding and causes
+       * agx3_pack_program() to refuse the shader (e.g. cooperative-matrix
+       * dequant decode shaders). Keep out-of-range counts in a register. */
+      if (ctx->key &&
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+          I->op == AGX_OPCODE_ASR && s == 1) {
+         unsigned max_shift = I->src[0].size == AGX_SIZE_16 ? 15 : 31;
+         if (def->imm == 0 || def->imm > max_shift)
+            continue;
+      }
       if ((I->op == AGX_OPCODE_DEVICE_STORE ||
            I->op == AGX_OPCODE_LOCAL_STORE || I->op == AGX_OPCODE_ATOMIC ||
            I->op == AGX_OPCODE_LOCAL_ATOMIC) &&
@@ -827,15 +845,23 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
    if (use->src[0].neg || use->src[0].abs)
       return false;
 
-   /* G17P's native saturate is a standalone f32add.ep2 of the value and -0.
+   /* G17P's standalone saturate is an f32add.ep2 of the value and -0.
     * G18G keeps the same rule for its native narrowing saturate.
     * Pulling that modifier into its producer invents saturated forms for
-    * operations such as fmul and transcendental functions. Keep the exact
-    * Apple sequence intact for every producer. */
+    * operations such as fmul and transcendental functions. AGX3B's 32-bit
+    * FFMA and FADD do have saturated forms (except FFMA with an immediate
+    * addend), so a 32-bit clamp of their result folds into them; every
+    * other producer keeps the separate saturate. */
    if (ctx->key &&
        (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&ctx->key->dev)) &&
-       use->saturate)
+       use->saturate &&
+       !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->dest[0].size == AGX_SIZE_32 &&
+         use->dest[0].size == AGX_SIZE_32 &&
+         (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FADD) &&
+         !(I->op == AGX_OPCODE_FFMA &&
+           I->src[2].type == AGX_INDEX_IMMEDIATE)))
       return false;
 
    /* M5 (AGX3C) encodes reciprocal and reciprocal square root without a

@@ -169,7 +169,11 @@ hk_get_device_extensions(const struct agx_device *dev,
     */
    const bool ray_tracing_pipeline = ray_query;
 
+   const bool has_shader_cores = agx_get_num_cores(dev) > 0;
+
    *ext = (struct vk_device_extension_table){
+      .AMD_shader_core_properties = has_shader_cores,
+      .AMD_shader_core_properties2 = has_shader_cores,
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = ray_query,
@@ -370,9 +374,10 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
-      /* Hardware ASTC HDR decode is supported across AGX2 and native AGX3
-       * (G13-G17P); keep HAL300 off until qualified on M5 hardware. */
-      .EXT_texture_compression_astc_hdr = !agx_chip_hal300_path(dev->chip),
+      /* Hardware ASTC HDR decode is supported across AGX2, native AGX3, and
+       * AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300 encodings such as
+       * AGX3D (G18G) stay off until qualified on their hardware. */
+      .EXT_texture_compression_astc_hdr = agx_chip_has_astc_hdr(dev->chip),
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       
@@ -516,7 +521,7 @@ hk_get_device_features(
 
       /* VK_NV_cooperative_matrix2: each feature is enabled where it is
        * implemented. */
-      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixWorkgroupScope = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixFlexibleDimensions = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
@@ -1179,6 +1184,11 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix
          ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      /* Keep max flexible dimension at 256: AGX3 has 256 16-bit GPRs/thread
+       * (128 32-bit GPRs/thread), and advertising >= 512 causes clients such
+       * as ggml-vulkan to select 128x256 f32 workgroup tiles across 256
+       * threads (128 f32 accumulators/lane = 100% of the register file),
+       * triggering severe register spilling. */
       .cooperativeMatrixFlexibleDimensionsMaxDimension =
          features->cooperativeMatrixFlexibleDimensions ? 256 : 0,
       .apiVersion = hk_get_vk_version(),
@@ -1766,6 +1776,26 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+
+      /* VK_AMD_shader_core_properties */
+      .shaderEngineCount = MAX2(dev->params.num_clusters_total, 1u),
+      .shaderArraysPerEngineCount = 1,
+      .computeUnitsPerShaderArray = MAX2(dev->params.num_cores_per_cluster, 1u),
+      .simdPerComputeUnit = 1,
+      .wavefrontsPerSimd = 1024 / 32,
+      .wavefrontSize = 32,
+      .sgprsPerSimd = 256,
+      .minSgprAllocation = 0,
+      .maxSgprAllocation = 256,
+      .sgprAllocationGranularity = 1,
+      .vgprsPerSimd = 128,
+      .minVgprAllocation = 4,
+      .maxVgprAllocation = 128,
+      .vgprAllocationGranularity = 4,
+
+      /* VK_AMD_shader_core_properties2 */
+      .shaderCoreFeatures = 0,
+      .activeComputeUnitCount = agx_get_num_cores(dev),
    };
 
    /* Strict residency on M5 relies on soft faults; see
@@ -2762,6 +2792,7 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
       VkComponentTypeKHR a, b, c;
    } configs[] = {
       {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
@@ -2781,6 +2812,35 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
             .scope = VK_SCOPE_SUBGROUP_KHR,
             .workgroupInvocations = 0,
          };
+      }
+   }
+   if (pdev->vk.supported_features.cooperativeMatrixWorkgroupScope) {
+      const struct {
+         uint32_t wg_invocations;
+         uint32_t m_gran, n_gran, k_gran;
+      } wg_shapes[] = {
+         {128, 32, 16, 16},
+         {256, 32, 32, 16},
+      };
+      for (unsigned w = 0; w < ARRAY_SIZE(wg_shapes); ++w) {
+         for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
+            if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+                          configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+               continue;
+            vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
+               *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {
+                  .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+                  .MGranularity = wg_shapes[w].m_gran,
+                  .NGranularity = wg_shapes[w].n_gran,
+                  .KGranularity = wg_shapes[w].k_gran,
+                  .AType = configs[i].a, .BType = configs[i].b,
+                  .CType = configs[i].c, .ResultType = configs[i].c,
+                  .saturatingAccumulation = VK_FALSE,
+                  .scope = VK_SCOPE_WORKGROUP_KHR,
+                  .workgroupInvocations = wg_shapes[w].wg_invocations,
+               };
+            }
+         }
       }
    }
    return vk_outarray_status(&out);

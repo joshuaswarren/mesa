@@ -386,8 +386,7 @@ agx_licm_can_speculate(nir_instr *instr)
    case nir_instr_type_intrinsic: {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
-      if (!info->has_dest || !nir_intrinsic_can_reorder(intr) ||
-          (info->flags & (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP)))
+      if (!info->has_dest || !nir_intrinsic_can_reorder(intr))
          return false;
       switch (intr->intrinsic) {
       case nir_intrinsic_load_preamble:
@@ -395,10 +394,14 @@ agx_licm_can_speculate(nir_instr *instr)
       case nir_intrinsic_load_global_invocation_id:
       case nir_intrinsic_load_local_invocation_id:
       case nir_intrinsic_load_local_invocation_index:
+      case nir_intrinsic_load_subgroup_invocation:
+      case nir_intrinsic_load_subgroup_id:
       case nir_intrinsic_load_workgroup_id:
       case nir_intrinsic_load_num_workgroups:
          return true;
       default:
+         if (info->flags & (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP))
+            return false;
          return nir_intrinsic_has_access(intr) &&
                 (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE);
       }

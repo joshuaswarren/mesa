@@ -728,6 +728,7 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
    case AGX_OPCODE_IMAGE_LOAD:
       if (I->nr_srcs < 2 ||
           (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_ARRAY &&
+           I->dim != AGX_DIM_2D_MS && I->dim != AGX_DIM_2D_MS_ARRAY &&
            I->dim != AGX_DIM_3D))
          return false;
 
@@ -905,18 +906,46 @@ ilp_tile_store_bank_overflows(agx_context *ctx, struct sched_node **nodes,
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return false;
 
+   /* A split channel takes its vector's register, and RA places the whole
+    * vector of a stored channel in the bank (see low_gpr in agx_ra()): a
+    * per-sample reload of an R32 target stores channel 0 of each eight-half
+    * 2D_MS texel fetch. Count the vector while it is live, not only the
+    * stored channel. */
    uint8_t *tile_width = NULL;
+   agx_index *split_parent = NULL;
    agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_SPLIT && I->src[0].type == AGX_INDEX_NORMAL &&
+          I->src[0].value < ctx->alloc) {
+         if (!split_parent) {
+            split_parent =
+               rzalloc_array(memctx, agx_index, MAX2(ctx->alloc, 1));
+            if (!split_parent)
+               return true;
+         }
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < ctx->alloc)
+               split_parent[I->dest[d].value] = I->src[0];
+         }
+      }
       if (I->op != AGX_OPCODE_ST_TILE || I->src[0].type != AGX_INDEX_NORMAL ||
           I->src[0].value >= ctx->alloc)
          continue;
       if (!tile_width) {
          tile_width = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
-         if (!tile_width)
+         if (!tile_width) {
+            ralloc_free(split_parent);
             return true;
+         }
       }
       tile_width[I->src[0].value] = agx_index_size_16(I->src[0]);
+      if (split_parent && split_parent[I->src[0].value].type ==
+                             AGX_INDEX_NORMAL) {
+         const agx_index vec = split_parent[I->src[0].value];
+         tile_width[vec.value] =
+            MAX2(tile_width[vec.value], agx_index_size_16(vec));
+      }
    }
+   ralloc_free(split_parent);
    if (!tile_width)
       return false;
 
@@ -1213,6 +1242,31 @@ ilp_instr_pipe(const agx_instr *I)
    }
 }
 
+/* Mark hoisted loads feeding SSA value v as consumed, walking through any
+ * transitive COLLECT chains (which regroup split/collected channels without
+ * consuming them). */
+static void
+ilp_mark_consumed_ssa(unsigned v, const int *load_node,
+                      agx_instr *const *collect_def, bool *consumed,
+                      unsigned *consumed_loads)
+{
+   const int l = load_node[v];
+   if (l >= 0) {
+      if (!consumed[l]) {
+         consumed[l] = true;
+         (*consumed_loads)++;
+      }
+      return;
+   }
+   const agx_instr *col = collect_def[v];
+   if (!col)
+      return;
+   agx_foreach_ssa_src(col, cj) {
+      ilp_mark_consumed_ssa(col->src[cj].value, load_node, collect_def,
+                            consumed, consumed_loads);
+   }
+}
+
 static bool
 ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool native_uniforms, unsigned alu_latency,
@@ -1317,6 +1371,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    unsigned *uses_left = NULL;
    bool *dies = NULL;
    signed live = 0;
+   signed eff_fwd_cap = fwd_cap;
    if (fwd_cap > 0) {
       uses_left = rzalloc_array(memctx, unsigned, ctx->alloc);
       dies = rzalloc_array(memctx, bool, ctx->alloc);
@@ -1338,6 +1393,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          agx_foreach_ssa_src(I, si)
             dies[I->src[si].value] = false;
       }
+      /* Loop-carried PHIs in loop headers are already live on block entry; do
+       * not charge live ones against the forward budget for temporaries added
+       * inside this block. Dead PHIs contribute 0 net live halves, and non-loop
+       * merge PHIs keep the original fwd_cap brake intact. */
+      if (block->loop_header) {
+         for (unsigned i = 0; i < n; ++i) {
+            if (nodes[i]->instr->op != AGX_OPCODE_PHI)
+               continue;
+            agx_foreach_ssa_dest(nodes[i]->instr, d) {
+               const unsigned v = nodes[i]->instr->dest[d].value;
+               if (uses_left[v] > 0 || !dies[v])
+                  eff_fwd_cap += agx_index_size_16(nodes[i]->instr->dest[d]);
+            }
+         }
+      }
    }
 
    /* With loads_in_flight, the window starts at the number of hoisted loads
@@ -1348,11 +1418,13 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    const bool in_flight = hoist_samples && loads_in_flight;
    unsigned consumed_loads = 0;
    int *load_node = NULL;
+   agx_instr **collect_def = NULL;
    bool *consumed = NULL;
    if (in_flight) {
       load_node = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+      collect_def = rzalloc_array(memctx, agx_instr *, MAX2(ctx->alloc, 1));
       consumed = rzalloc_array(memctx, bool, n);
-      if (!load_node || !consumed)
+      if (!load_node || !collect_def || !consumed)
          return false;
       for (unsigned v = 0; v < ctx->alloc; ++v)
          load_node[v] = -1;
@@ -1362,10 +1434,51 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                load_node[nodes[i]->instr->dest[d].value] = i;
          } else if (nodes[i]->instr->op == AGX_OPCODE_SPLIT &&
                     nodes[i]->instr->src[0].type == AGX_INDEX_NORMAL) {
-            const int l = load_node[nodes[i]->instr->src[0].value];
+            const unsigned sv = nodes[i]->instr->src[0].value;
+            const int l = load_node[sv];
             if (l >= 0) {
                agx_foreach_ssa_dest(nodes[i]->instr, d)
                   load_node[nodes[i]->instr->dest[d].value] = l;
+            } else if (collect_def[sv]) {
+               agx_instr *col = collect_def[sv];
+               bool exact_channels = col->nr_srcs == nodes[i]->instr->nr_dests;
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (agx_index_size_16(col->src[d]) !=
+                         agx_index_size_16(nodes[i]->instr->dest[d])) {
+                        exact_channels = false;
+                        break;
+                     }
+                  }
+               }
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (col->src[d].type != AGX_INDEX_NORMAL)
+                        continue;
+                     const unsigned cv = col->src[d].value;
+                     const unsigned dv = nodes[i]->instr->dest[d].value;
+                     if (load_node[cv] >= 0)
+                        load_node[dv] = load_node[cv];
+                     else if (collect_def[cv])
+                        collect_def[dv] = collect_def[cv];
+                  }
+               } else {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d)
+                     collect_def[nodes[i]->instr->dest[d].value] = col;
+               }
+            }
+         } else if (nodes[i]->instr->op == AGX_OPCODE_COLLECT) {
+            bool from_load = false;
+            agx_foreach_ssa_src(nodes[i]->instr, si) {
+               const unsigned sv = nodes[i]->instr->src[si].value;
+               if (load_node[sv] >= 0 || collect_def[sv]) {
+                  from_load = true;
+                  break;
+               }
+            }
+            if (from_load) {
+               agx_foreach_ssa_dest(nodes[i]->instr, d)
+                  collect_def[nodes[i]->instr->dest[d].value] = nodes[i]->instr;
             }
          }
       }
@@ -1389,16 +1502,39 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       int best = -1;
       unsigned best_t = 0;
       signed best_grow = 0;
+      signed best_dest_grow = 0;
       bool best_fits = true;
       unsigned i;
       BITSET_FOREACH_SET(i, ready_bits, n) {
          const unsigned t = MAX2(ready[i], cycle);
+         signed dest_grow = 0;
          signed grow = 0;
          if (fwd_cap > 0) {
-            agx_foreach_ssa_dest(nodes[i]->instr, d)
-               grow += agx_index_size_16(nodes[i]->instr->dest[d]);
+            const agx_instr *I = nodes[i]->instr;
+            agx_foreach_ssa_dest(I, d)
+               dest_grow += agx_index_size_16(I->dest[d]);
+            grow = dest_grow;
+            agx_foreach_ssa_src(I, si) {
+               const unsigned v = I->src[si].value;
+               if (!dies[v])
+                  continue;
+               unsigned occ = 0;
+               bool seen_before = false;
+               agx_foreach_ssa_src(I, sj) {
+                  if (I->src[sj].value == v) {
+                     if (sj < si) {
+                        seen_before = true;
+                        break;
+                     }
+                     occ++;
+                  }
+               }
+               if (!seen_before && uses_left[v] == occ)
+                  grow -= agx_index_size_16(I->src[si]);
+            }
          }
-         const bool fits = fwd_cap <= 0 || grow == 0 || live + grow <= fwd_cap;
+         const bool fits =
+            fwd_cap <= 0 || grow <= 0 || live + grow <= eff_fwd_cap;
          bool better;
          if (best < 0)
             better = true;
@@ -1467,6 +1603,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             best = i;
             best_t = t;
             best_grow = grow;
+            best_dest_grow = dest_grow;
             best_fits = fits;
          }
       }
@@ -1477,7 +1614,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       if (fwd_cap > 0) {
          const agx_instr *B = nodes[best]->instr;
-         live += best_grow;
+         live += best_dest_grow;
          agx_foreach_ssa_src(B, si) {
             const unsigned v = B->src[si].value;
             if (--uses_left[v] == 0 && dies[v])
@@ -1492,13 +1629,11 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       order[step] = nodes[best];
       issued_samples += ilp_is_hoisted(ctx, nodes[best]->instr, hoist_loads);
-      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT) {
+      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT &&
+          nodes[best]->instr->op != AGX_OPCODE_COLLECT) {
          agx_foreach_ssa_src(nodes[best]->instr, si) {
-            const int l = load_node[nodes[best]->instr->src[si].value];
-            if (l >= 0 && !consumed[l]) {
-               consumed[l] = true;
-               consumed_loads++;
-            }
+            ilp_mark_consumed_ssa(nodes[best]->instr->src[si].value, load_node,
+                                  collect_def, consumed, &consumed_loads);
          }
       }
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
@@ -1806,6 +1941,8 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
          break;
       switch (I->op) {
       case AGX_OPCODE_LD_TILE:
+         if (I->sample_groups)
+            return false;
          ++loads;
          load_target = I->colour_target;
          break;
@@ -2275,8 +2412,12 @@ agx_ilp_schedule(agx_context *ctx)
                                        AGX_ILP_FS_SAMPLE_HALVES)
                   : MAX2(load_cap - peak, 0);
                const bool wide_flat =
-                  ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                  device_loads == loads && loads > 4 && device_load_cap > peak;
+                  ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                    device_loads == loads && loads > 4 &&
+                    device_load_cap > peak) ||
+                   (m5_compute && !ctx->key->dev.emit_agx3d &&
+                    in_loop[block->index] && device_loads > 4 &&
+                    device_load_cap > peak));
                const signed step_cap = small_loop_loads || !chained
                                           ? device_load_cap : chained_step_cap;
                /* Each window first tries interleaving independent ALU chains

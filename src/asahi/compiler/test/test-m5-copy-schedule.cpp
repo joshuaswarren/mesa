@@ -642,7 +642,7 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
    const unsigned coord_comps =
       (dim == AGX_DIM_CUBE_ARRAY) ? 4
       : (dim == AGX_DIM_2D_ARRAY || dim == AGX_DIM_3D || dim == AGX_DIM_CUBE ||
-         dim == AGX_DIM_2D_MS)
+         dim == AGX_DIM_2D_MS || dim == AGX_DIM_2D_MS_ARRAY)
          ? 3
          : 2;
    for (unsigned i = 0; i < 5; ++i) {
@@ -755,9 +755,9 @@ TEST(M5CopySchedule, AGX3BFragmentSamplesUseOccupancySlack)
              5u);
 }
 
-/* AGX3B fragment shaders recognize relocatable AGX_OPCODE_IMAGE_LOAD (2D and
- * immediate-LOD 2D_ARRAY) as native SMP samples and hoist them within the
- * occupancy step. */
+/* AGX3B fragment shaders recognize relocatable AGX_OPCODE_IMAGE_LOAD and
+ * AGX_OPCODE_TEXTURE_LOAD (2D, immediate-LOD 2D_ARRAY, 2D_MS, and 2D_MS_ARRAY)
+ * as native SMP samples and hoist them within the occupancy step. */
 TEST(M5CopySchedule, AGX3BFragmentImageLoadsHoist)
 {
    EXPECT_EQ(emit_frag_samples_and_count(
@@ -768,6 +768,21 @@ TEST(M5CopySchedule, AGX3BFragmentImageLoadsHoist)
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, AGX_DIM_2D_ARRAY,
                 FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
+                FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
+                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS_ARRAY,
+                FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
                 false, false, 0),
              5u);
 }
@@ -784,8 +799,8 @@ TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
                 FRAG_SAMPLE_TEX, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD, false,
                 false, 0),
              1u);
-   /* 3D, cube-array, gradient-LOD samples, multisample image loads, and
-    * register-LOD texture loads also keep staging bank 0 on AGX3B. */
+   /* 3D, cube-array, gradient-LOD samples, and register-LOD texture loads
+    * also keep staging bank 0 on AGX3B. */
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_3D,
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
@@ -800,11 +815,6 @@ TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_LOD_GRAD, false,
                 false, 0),
-             1u);
-   EXPECT_EQ(emit_frag_samples_and_count(
-                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
-                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
-                false, false, 0),
              1u);
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
@@ -1121,5 +1131,335 @@ TEST(M5CopySchedule, FragmentDiscardSkipsDeviceLoadIlp)
 
    agx_ilp_schedule(b->shader);
    EXPECT_EQ(loads_before_first_add(s.body), 1u);
+   ralloc_free(s.mem);
+}
+
+/* Loop-carried PHIs (such as cooperative-matrix accumulators) are already live
+ * at block entry and must not consume the forward pressure cap meant for
+ * temporaries added inside the block. With >= 88 halves of loop PHIs, a wide
+ * vec4 device_load should still hoist ahead of independent scalar ALU. */
+TEST(M5CopySchedule, LoopPhisDoNotStarveWideDeviceLoadHoisting)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   agx_builder *b = s.b;
+
+   /* Entry block: initialize 48 32-bit loop-carried PHIs = 96 halves
+    * (> AGX_ILP_FS_SAMPLE_HALVES). */
+   agx_index addr = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index inits[48];
+   for (unsigned i = 0; i < 48; ++i)
+      inits[i] = agx_mov_imm(b, 32, i);
+
+   b->cursor = agx_after_block(s.body);
+   agx_index phis[48];
+   for (unsigned i = 0; i < 48; ++i) {
+      agx_instr *phi = agx_phi_to(b, agx_temp(b->shader, AGX_SIZE_32), 2);
+      phi->src[0] = inits[i];
+      phi->src[1] = phi->dest[0];
+      phis[i] = phi->dest[0];
+   }
+
+   agx_index l0 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_device_load_to(b, l0, addr, agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_index a = agx_iadd(b, l0, agx_immediate(1), 0);
+   for (unsigned k = 0; k < 6; ++k)
+      a = agx_iadd(b, a, agx_immediate(k + 2), 0);
+
+   agx_index l1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l1, addr, agx_immediate(16), AGX_FORMAT_I32, 0xf, 0, false);
+   agx_index l2 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l2, addr, agx_immediate(32), AGX_FORMAT_I32, 0xf, 0, false);
+   agx_index l3 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l3, addr, agx_immediate(48), AGX_FORMAT_I32, 0xf, 0, false);
+
+   agx_instr *s1 = agx_split(b, 4, l1);
+   agx_instr *s2 = agx_split(b, 4, l2);
+   agx_instr *s3 = agx_split(b, 4, l3);
+   for (unsigned c = 0; c < 4; ++c) {
+      s1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s2->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s3->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+   }
+   agx_index sum = agx_iadd(b, s1->dest[0], s2->dest[0], 0);
+   sum = agx_iadd(b, sum, s3->dest[0], 0);
+   sum = agx_iadd(b, sum, phis[0], 0);
+   agx_unit_test(b, a);
+   agx_unit_test(b, sum);
+   for (unsigned i = 1; i < 48; ++i)
+      agx_unit_test(b, phis[i]);
+
+   agx_ilp_schedule(b->shader);
+   EXPECT_GE(loads_before_first_add(s.body), 4u);
+   ralloc_free(s.mem);
+}
+
+/* COLLECT of hoisted local_load splits only regroups channels and must not
+ * advance in-flight load consumption before the real consumer executes. */
+TEST(M5CopySchedule, CollectDoesNotAdvanceInFlightLoadConsumption)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_16));
+   agx_index dst_addr = agx_preload(b, agx_register(4, AGX_SIZE_64));
+
+   for (unsigned g = 0; g < 3; ++g) {
+      agx_index chans[4];
+      for (unsigned j = 0; j < 4; ++j) {
+         agx_index ld = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+         agx_local_load_to(b, ld, agx_immediate((g * 4 + j) * 4), base,
+                           AGX_FORMAT_I16, 0x3);
+         agx_instr *sp = agx_split(b, 2, ld);
+         sp->dest[0] = agx_temp(b->shader, AGX_SIZE_16);
+         sp->dest[1] = agx_temp(b->shader, AGX_SIZE_16);
+         chans[j] = sp->dest[0];
+      }
+      agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_16, 4);
+      agx_instr *col = agx_collect_to(b, vec, 4);
+      for (unsigned j = 0; j < 4; ++j)
+         col->src[j] = chans[j];
+      agx_device_store(b, vec, dst_addr, agx_immediate(g * 8),
+                       AGX_FORMAT_I16, 0xf, 0, false);
+   }
+
+   agx_ilp_schedule(b->shader);
+   unsigned loads_before_first_consumer = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_DEVICE_STORE)
+         break;
+      if (I->op == AGX_OPCODE_LOCAL_LOAD)
+         loads_before_first_consumer++;
+   }
+   EXPECT_EQ(loads_before_first_consumer, 4u);
+   ralloc_free(s.mem);
+}
+
+/* Net register growth (dest halves minus dying SSA sources) lets an
+ * accumulator-updating op with net <= 0 fit under fwd_cap and beat a narrower
+ * growing load once live >= fwd_cap. */
+TEST(M5CopySchedule, NetGrowthPrefersRegisterReleasingOpOverGrowingLoad)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   agx_block *entry = s.body;
+   agx_block *then_blk = agx_test_block(b->shader);
+   agx_block *else_blk = agx_test_block(b->shader);
+   agx_block *merge = agx_test_block(b->shader);
+   agx_block *after = agx_test_block(b->shader);
+   agx_block_add_successor(entry, then_blk);
+   agx_block_add_successor(entry, else_blk);
+   agx_block_add_successor(then_blk, merge);
+   agx_block_add_successor(else_blk, merge);
+   agx_block_add_successor(merge, after);
+
+   b->cursor = agx_after_block(entry);
+   agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_16));
+   agx_index dst_addr = agx_preload(b, agx_register(4, AGX_SIZE_64));
+   agx_index inits[46];
+   for (unsigned i = 0; i < 46; ++i)
+      inits[i] = agx_mov_imm(b, 32, i + 1);
+
+   /* 46 non-loop merge PHIs live-out into after => live = 92 > fwd_cap (88)
+    * right after PHIs at the top of merge. */
+   b->cursor = agx_after_block(merge);
+   agx_index phis[46];
+   for (unsigned i = 0; i < 46; ++i) {
+      agx_instr *phi = agx_phi_to(b, agx_temp(b->shader, AGX_SIZE_32), 2);
+      phi->src[0] = inits[i];
+      phi->src[1] = inits[i];
+      phis[i] = phi->dest[0];
+   }
+
+   /* Two 32-bit loads feeding a 32-bit iadd (dest=+2, dying=-4 => net=-2 <= 0). */
+   agx_index a = agx_temp(b->shader, AGX_SIZE_32);
+   agx_local_load_to(b, a, agx_immediate(0), base, AGX_FORMAT_I32, 0x1);
+   agx_index c = agx_temp(b->shader, AGX_SIZE_32);
+   agx_local_load_to(b, c, agx_immediate(4), base, AGX_FORMAT_I32, 0x1);
+
+   /* Narrower 16-bit loads (dest=+1, net=+1 > 0) that look smaller by dest-only
+    * size than the 32-bit iadd (dest=+2). */
+   agx_index narrow[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      narrow[i] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_local_load_to(b, narrow[i], agx_immediate(16 + i * 2), base,
+                        AGX_FORMAT_I16, 0x1);
+   }
+
+   agx_index sum = agx_iadd(b, a, c, 0);
+   agx_device_store(b, sum, dst_addr, agx_immediate(0), AGX_FORMAT_I32, 0x1, 0,
+                    false);
+   for (unsigned i = 0; i < 4; ++i) {
+      agx_device_store(b, narrow[i], dst_addr, agx_immediate(8 + i * 2),
+                       AGX_FORMAT_I16, 0x1, 0, false);
+   }
+
+   b->cursor = agx_after_block(after);
+   for (unsigned i = 0; i < 46; ++i)
+      agx_unit_test(b, phis[i]);
+
+   agx_ilp_schedule(b->shader);
+   /* With net growth, once a and c have loaded, iadd (net=-2, fits=true) must
+    * run ahead of at least one narrower growing 16-bit load (net=+1, !fits). */
+   unsigned iadd_pos = 0, last_load_pos = 0, pos = 0;
+   agx_foreach_instr_in_block(merge, I) {
+      if (I->op == AGX_OPCODE_IADD)
+         iadd_pos = pos;
+      else if (I->op == AGX_OPCODE_LOCAL_LOAD)
+         last_load_pos = pos;
+      pos++;
+   }
+   EXPECT_LT(iadd_pos, last_load_pos);
+   ralloc_free(s.mem);
+}
+
+/* COLLECT -> SPLIT and nested COLLECT -> COLLECT chains must still mark the
+ * underlying hoisted loads consumed when the real consumer executes, so the
+ * in-flight hoist window does not leak slots and stall later loads. */
+TEST(M5CopySchedule, CollectSplitAndNestedCollectConsumeHoistedLoads)
+{
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      SCOPED_TRACE(mode == 0 ? "collect-to-split" : "nested-collect");
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_16));
+      agx_index dst_addr = agx_preload(b, agx_register(4, AGX_SIZE_64));
+
+      agx_index chans[4];
+      for (unsigned j = 0; j < 4; ++j) {
+         agx_index ld = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+         agx_local_load_to(b, ld, agx_immediate(j * 4), base, AGX_FORMAT_I16,
+                           0x3);
+         agx_instr *sp = agx_split(b, 2, ld);
+         sp->dest[0] = agx_temp(b->shader, AGX_SIZE_16);
+         sp->dest[1] = agx_temp(b->shader, AGX_SIZE_16);
+         chans[j] = sp->dest[0];
+      }
+      if (mode == 0) {
+         agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_16, 4);
+         agx_instr *col = agx_collect_to(b, vec, 4);
+         for (unsigned j = 0; j < 4; ++j)
+            col->src[j] = chans[j];
+         agx_instr *sp2 = agx_split(b, 4, vec);
+         for (unsigned j = 0; j < 4; ++j) {
+            sp2->dest[j] = agx_temp(b->shader, AGX_SIZE_16);
+            agx_device_store(b, sp2->dest[j], dst_addr, agx_immediate(j * 2),
+                             AGX_FORMAT_I16, 0x1, 0, false);
+         }
+      } else {
+         agx_index lo = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+         agx_instr *c0 = agx_collect_to(b, lo, 2);
+         c0->src[0] = chans[0];
+         c0->src[1] = chans[1];
+         agx_index hi = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+         agx_instr *c1 = agx_collect_to(b, hi, 2);
+         c1->src[0] = chans[2];
+         c1->src[1] = chans[3];
+         agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_16, 4);
+         agx_instr *c2 = agx_collect_to(b, vec, 2);
+         c2->src[0] = lo;
+         c2->src[1] = hi;
+         agx_device_store(b, vec, dst_addr, agx_immediate(0), AGX_FORMAT_I16,
+                          0xf, 0, false);
+      }
+
+      agx_index b1_loads[4];
+      for (unsigned j = 0; j < 4; ++j) {
+         b1_loads[j] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_local_load_to(b, b1_loads[j], agx_immediate(32 + j * 4), base,
+                           AGX_FORMAT_I32, 0x1);
+         agx_index v = agx_iadd(b, b1_loads[j], agx_immediate(1), 0);
+         agx_device_store(b, v, dst_addr, agx_immediate(32 + j * 4),
+                          AGX_FORMAT_I32, 0x1, 0, false);
+      }
+
+      agx_ilp_schedule(b->shader);
+      unsigned total_loads_before_b1_iadd = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_IADD)
+            break;
+         if (I->op == AGX_OPCODE_LOCAL_LOAD)
+            total_loads_before_b1_iadd++;
+      }
+      EXPECT_EQ(total_loads_before_b1_iadd, 8u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Non-loop merge PHIs must NOT inflate eff_fwd_cap, preserving the original
+ * forward pressure brake on straight-line if/else merge blocks. */
+TEST(M5CopySchedule, NonLoopMergePhisKeepOriginalFwdCap)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   agx_block *entry = s.body;
+   agx_block *then_blk = agx_test_block(b->shader);
+   agx_block *else_blk = agx_test_block(b->shader);
+   agx_block *merge = agx_test_block(b->shader);
+   agx_block *after = agx_test_block(b->shader);
+   agx_block_add_successor(entry, then_blk);
+   agx_block_add_successor(entry, else_blk);
+   agx_block_add_successor(then_blk, merge);
+   agx_block_add_successor(else_blk, merge);
+   agx_block_add_successor(merge, after);
+   ASSERT_FALSE(merge->loop_header);
+
+   b->cursor = agx_after_block(entry);
+   agx_index addr = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index inits[48];
+   for (unsigned i = 0; i < 48; ++i)
+      inits[i] = agx_mov_imm(b, 32, i);
+
+   b->cursor = agx_after_block(merge);
+   agx_index phis[48];
+   for (unsigned i = 0; i < 48; ++i) {
+      agx_instr *phi = agx_phi_to(b, agx_temp(b->shader, AGX_SIZE_32), 2);
+      phi->src[0] = inits[i];
+      phi->src[1] = inits[i];
+      phis[i] = phi->dest[0];
+   }
+
+   agx_index l0 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_device_load_to(b, l0, addr, agx_immediate(0), AGX_FORMAT_I16, 1, 0,
+                      false);
+   agx_index a = agx_iadd(b, l0, agx_immediate(1), 0);
+   for (unsigned k = 0; k < 6; ++k)
+      a = agx_iadd(b, a, agx_immediate(k + 2), 0);
+
+   agx_index l1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l1, addr, agx_immediate(16), AGX_FORMAT_I32, 0xf, 0,
+                      false);
+   agx_index l2 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l2, addr, agx_immediate(32), AGX_FORMAT_I32, 0xf, 0,
+                      false);
+   agx_index l3 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l3, addr, agx_immediate(48), AGX_FORMAT_I32, 0xf, 0,
+                      false);
+
+   agx_instr *s1 = agx_split(b, 4, l1);
+   agx_instr *s2 = agx_split(b, 4, l2);
+   agx_instr *s3 = agx_split(b, 4, l3);
+   for (unsigned c = 0; c < 4; ++c) {
+      s1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s2->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s3->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+   }
+   agx_index sum = agx_iadd(b, s1->dest[0], s2->dest[0], 0);
+   sum = agx_iadd(b, sum, s3->dest[0], 0);
+   sum = agx_iadd(b, sum, phis[0], 0);
+   agx_unit_test(b, a);
+   agx_unit_test(b, sum);
+
+   b->cursor = agx_after_block(after);
+   for (unsigned i = 1; i < 48; ++i)
+      agx_unit_test(b, phis[i]);
+
+   agx_ilp_schedule(b->shader);
+   EXPECT_EQ(loads_before_first_add(merge), 1u);
    ralloc_free(s.mem);
 }

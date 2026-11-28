@@ -230,6 +230,14 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 uint32_t
 hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage)
 {
+   /* AGX2 allocates helper-backed scratch lazily via agx_scratch (up to
+    * 512 KiB/thread) and encodes 16-bit immediate stack byte offsets. Admit
+    * the register allocator's modeled spill capacity (16 KiB) so
+    * descriptor-heavy GS raster replays do not exhaust 4 KiB.
+    */
+   if (!agx_chip_agx3_path(dev->chip))
+      return 2u * AGX_NUM_MODELED_REGS;
+
    /* HAL300 hardware vertex programs publish their linked TPS footprint in
     * render resources. This includes the vertex replay of a geometry shader.
     */
@@ -494,6 +502,8 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
     * which the rest of the lowering must then see. The pieces of a matrix
     * may pair K 64 deep, which the tensor loads then take. */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
+      unsigned wg_sg_m = 1, wg_sg_n = 1;
+      NIR_PASS(_, nir, agx_nir_lower_cmat_workgroup, &wg_sg_m, &wg_sg_n);
       bool split = false, pairing = false;
       NIR_PASS(split, nir, agx_nir_lower_cmat_flexible, &pairing);
       if (split) {
@@ -502,7 +512,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
          NIR_PASS(_, nir, nir_remove_dead_variables,
                   nir_var_function_temp | nir_var_shader_temp, NULL);
       }
-      NIR_PASS(_, nir, agx_nir_lower_cmat_tensor, pairing);
+      NIR_PASS(_, nir, agx_nir_lower_cmat_tensor, pairing, wg_sg_m, wg_sg_n);
    }
 
    /* Then, before anything else lowers the shader: the functions of matrix
@@ -6549,7 +6559,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nir->info.stage == MESA_SHADER_TESS_CTRL;
    uint32_t max_scratch_B = AGX3_G17P_MAX_SPILL_B;
    if (!nir->info.internal) {
-      if (cdm_stage && agx_chip_native_agx3(dev->dev.chip))
+      if (!agx_chip_agx3_path(dev->dev.chip))
+         max_scratch_B = 2u * AGX_NUM_MODELED_REGS;
+      else if (cdm_stage && agx_chip_native_agx3(dev->dev.chip))
          max_scratch_B = AGX3_G17P_MAX_COMPUTE_SPILL_B;
       else if (cdm_stage && agx_chip_g17_m5(dev->dev.chip))
          max_scratch_B = 1u << 16;

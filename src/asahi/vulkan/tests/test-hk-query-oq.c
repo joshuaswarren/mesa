@@ -837,11 +837,12 @@ test_order_forward(void)
 static void
 test_stamp_chips(void)
 {
-   T("chips: native HAL200 and M5 renders carry availability",
+   T("chips: native HAL200, M5, and G18G renders carry availability",
      hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
-        hk_oq_render_stamps_supported(AGX_CHIP_G17S));
+        hk_oq_render_stamps_supported(AGX_CHIP_G17S) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G18G));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&

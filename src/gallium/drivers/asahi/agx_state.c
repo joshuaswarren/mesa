@@ -6659,6 +6659,20 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
    if (bl->g17p_block_mip_sampler)
       ctx->delete_sampler_state(ctx, bl->g17p_block_mip_sampler);
 
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_block_buf2img_cs); ++i) {
+      for (unsigned j = 0; j < ARRAY_SIZE(bl->g17p_block_buf2img_cs[i]); ++j) {
+         if (bl->g17p_block_buf2img_cs[i][j])
+            ctx->delete_compute_state(ctx, bl->g17p_block_buf2img_cs[i][j]);
+      }
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_tiled_buf2img_cs); ++i) {
+      for (unsigned j = 0; j < ARRAY_SIZE(bl->g17p_tiled_buf2img_cs[i]); ++j) {
+         if (bl->g17p_tiled_buf2img_cs[i][j])
+            ctx->delete_compute_state(ctx, bl->g17p_tiled_buf2img_cs[i][j]);
+      }
+   }
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 
