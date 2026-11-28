@@ -489,21 +489,50 @@ hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
    return render_pack_streams_match(first, bs, eot_changes, resolving);
 }
 
+bool
+hk_render_pack_post_is_heap_reset(const struct hk_cs *post)
+{
+   return post && post->type == HK_CS_CDM && post->stats.calls == 0 &&
+          post->sync.heap_slot != 0 &&
+          post->sync.kind == (HK_SYNC_GFX | HK_SYNC_GFX_MEM) &&
+          !post->query_access && !post->query_access_ranges.size &&
+          !post->imm_write_query_ranges.size && !post->query_reset_pending &&
+          !post->oq_pending_count && !post->oq_stamps.size;
+}
+
 const char *
-hk_render_pack_pre_cs_refusal(const struct hk_render_pack_run_state *state,
-                              const struct hk_cs *bs_pre, unsigned run_post,
-                              uint8_t run_vdm_kinds,
-                              const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS])
+hk_render_pack_pre_cs_refusal(
+   const struct hk_render_pack_run_state *state, const struct hk_cs *bs_pre,
+   unsigned run_post, uint8_t post_heap_slots, bool post_heap_only,
+   uint8_t run_vdm_kinds, const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS],
+   const uint8_t run_post_tail_req[HK_SYNC_NUM_KINDS])
 {
    if (!bs_pre)
       return NULL;
 
    /* Every hoisted pre_cs runs before the packed render stream while every
-    * earlier member's post_cs runs after it, so hoisting any pre_cs past an
-    * earlier post_cs would invert their CDM order. */
-   if (run_post > 0)
-      return bs_pre->stats.calls != 0 ? "api compute after post-graphics"
-                                      : "pre-graphics after post-graphics";
+    * earlier member's post_cs runs after it. Hoisting past an earlier post_cs
+    * is only safe for pure driver pre-graphics when every earlier post_cs in
+    * the run is a geometry heap-slot reset on a strictly disjoint heap slot
+    * and no recorded dependency orders any earlier post_cs before bs_pre. */
+   if (run_post > 0) {
+      if (bs_pre->stats.calls != 0)
+         return "api compute after post-graphics";
+      const uint8_t post_kinds = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+      if (!post_heap_only || bs_pre->sync.kind != post_kinds)
+         return "pre-graphics after post-graphics";
+      if (bs_pre->sync.heap_slot &&
+          (post_heap_slots & BITFIELD_BIT(bs_pre->sync.heap_slot - 1)))
+         return "pre-graphics after post-graphics";
+      if ((bs_pre->sync.dep[HK_SYNC_CDM].prior & post_kinds) ||
+          (bs_pre->sync.dep_ta[HK_SYNC_CDM].prior & post_kinds))
+         return "pre-graphics after post-graphics";
+      const uint8_t pre_full = hk_sync_full_kinds(bs_pre->sync.kind);
+      u_foreach_bit(k, pre_full) {
+         if (run_post_tail_req[k] & post_kinds)
+            return "pre-graphics after post-graphics";
+      }
+   }
 
    if (bs_pre->stats.calls == 0)
       return NULL;
