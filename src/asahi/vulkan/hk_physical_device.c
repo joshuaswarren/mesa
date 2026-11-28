@@ -169,7 +169,11 @@ hk_get_device_extensions(const struct agx_device *dev,
     */
    const bool ray_tracing_pipeline = ray_query;
 
+   const bool has_shader_cores = agx_get_num_cores(dev) > 0;
+
    *ext = (struct vk_device_extension_table){
+      .AMD_shader_core_properties = has_shader_cores,
+      .AMD_shader_core_properties2 = has_shader_cores,
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = ray_query,
@@ -1767,6 +1771,26 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+
+      /* VK_AMD_shader_core_properties */
+      .shaderEngineCount = MAX2(dev->params.num_clusters_total, 1u),
+      .shaderArraysPerEngineCount = 1,
+      .computeUnitsPerShaderArray = MAX2(dev->params.num_cores_per_cluster, 1u),
+      .simdPerComputeUnit = 1,
+      .wavefrontsPerSimd = 1024 / 32,
+      .wavefrontSize = 32,
+      .sgprsPerSimd = 256,
+      .minSgprAllocation = 0,
+      .maxSgprAllocation = 256,
+      .sgprAllocationGranularity = 1,
+      .vgprsPerSimd = 128,
+      .minVgprAllocation = 4,
+      .maxVgprAllocation = 128,
+      .vgprAllocationGranularity = 4,
+
+      /* VK_AMD_shader_core_properties2 */
+      .shaderCoreFeatures = 0,
+      .activeComputeUnitCount = agx_get_num_cores(dev),
    };
 
    /* Strict residency on M5 relies on soft faults; see
