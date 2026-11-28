@@ -728,6 +728,7 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
    case AGX_OPCODE_IMAGE_LOAD:
       if (I->nr_srcs < 2 ||
           (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_ARRAY &&
+           I->dim != AGX_DIM_2D_MS && I->dim != AGX_DIM_2D_MS_ARRAY &&
            I->dim != AGX_DIM_3D))
          return false;
 
@@ -905,18 +906,46 @@ ilp_tile_store_bank_overflows(agx_context *ctx, struct sched_node **nodes,
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return false;
 
+   /* A split channel takes its vector's register, and RA places the whole
+    * vector of a stored channel in the bank (see low_gpr in agx_ra()): a
+    * per-sample reload of an R32 target stores channel 0 of each eight-half
+    * 2D_MS texel fetch. Count the vector while it is live, not only the
+    * stored channel. */
    uint8_t *tile_width = NULL;
+   agx_index *split_parent = NULL;
    agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_SPLIT && I->src[0].type == AGX_INDEX_NORMAL &&
+          I->src[0].value < ctx->alloc) {
+         if (!split_parent) {
+            split_parent =
+               rzalloc_array(memctx, agx_index, MAX2(ctx->alloc, 1));
+            if (!split_parent)
+               return true;
+         }
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < ctx->alloc)
+               split_parent[I->dest[d].value] = I->src[0];
+         }
+      }
       if (I->op != AGX_OPCODE_ST_TILE || I->src[0].type != AGX_INDEX_NORMAL ||
           I->src[0].value >= ctx->alloc)
          continue;
       if (!tile_width) {
          tile_width = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
-         if (!tile_width)
+         if (!tile_width) {
+            ralloc_free(split_parent);
             return true;
+         }
       }
       tile_width[I->src[0].value] = agx_index_size_16(I->src[0]);
+      if (split_parent && split_parent[I->src[0].value].type ==
+                             AGX_INDEX_NORMAL) {
+         const agx_index vec = split_parent[I->src[0].value];
+         tile_width[vec.value] =
+            MAX2(tile_width[vec.value], agx_index_size_16(vec));
+      }
    }
+   ralloc_free(split_parent);
    if (!tile_width)
       return false;
 

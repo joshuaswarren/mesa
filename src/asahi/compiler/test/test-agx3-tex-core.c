@@ -2785,6 +2785,76 @@ test_multisample_sample_stage(void)
                                    false, true, bytes, &len));
    CHECK(!agx3_tex_stage_ms_sample(AGX_ISA_ENCODING_AGX3B, 4, 0,
                                    true, true, bytes, &len));
+
+   /* AGX3B relocatable 2D_MS and 2D_MS_ARRAY sample publishers encode bank + 4
+    * in f5 and scoreboard slot 1..6 in f12, matching the fixed bank-0 slot-1
+    * witnesses at bank == 0, slot == 1. */
+   {
+      uint8_t base_ms[AGX3_TEX_MAX_LENGTH], reloc_ms[AGX3_TEX_MAX_LENGTH];
+      uint8_t base_len = 0, reloc_len = 0;
+      CHECK(agx3_tex_stage_ms_sample(AGX_ISA_ENCODING_AGX3B, 2, 0,
+                                     false, true, base_ms, &base_len));
+      CHECK(agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, 0, 2, 1, 0,
+                                        false, true, reloc_ms, &reloc_len));
+      CHECK(reloc_len == base_len && !memcmp(reloc_ms, base_ms, base_len));
+
+      for (uint16_t bank = 8; bank <= 56; bank += 8) {
+         const uint8_t slot = (uint8_t)(((bank / 8) % 6) + 1);
+         CHECK(agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, bank, 2,
+                                           slot, 0, false, true, reloc_ms,
+                                           &reloc_len));
+         CHECK(reloc_len == base_len && memcmp(reloc_ms, base_ms, base_len) != 0);
+         struct agx3_tex_fetch_desc ms = {
+            .dest = 8, .coord = bank, .width = AGX3_TEX_W32, .mask = 15,
+            .slot = slot, .wait_mask = (uint16_t)(1u << (slot - 1)),
+            .coord_kill = true, .final = true, .multisample = true,
+            .staged_sample = true, .sampler_value = 1,
+         };
+         uint8_t msb[AGX3_TEX_MAX_LENGTH], mslen = 0;
+         CHECK(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3B, &ms, msb, &mslen));
+      }
+      CHECK(!agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, 4, 2, 1, 0,
+                                         false, true, reloc_ms, &reloc_len));
+      CHECK(!agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, 64, 2, 1, 0,
+                                         false, true, reloc_ms, &reloc_len));
+      CHECK(!agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, 8, 2, 7, 0,
+                                         false, true, reloc_ms, &reloc_len));
+      CHECK(!agx3_tex_stage_ms_sample_at(AGX_ISA_ENCODING_AGX3B, 8, 2, 1, 0x40,
+                                         false, true, reloc_ms, &reloc_len));
+
+      uint8_t base_arr[AGX3_TEX_MAX_LENGTH], reloc_arr[AGX3_TEX_MAX_LENGTH];
+      uint8_t arr_base_len = 0, arr_reloc_len = 0;
+      CHECK(agx3_tex_stage_ms_array_sample(AGX_ISA_ENCODING_AGX3B, 20, 22,
+                                           false, true, base_arr, &arr_base_len));
+      CHECK(agx3_tex_stage_ms_array_sample_at(AGX_ISA_ENCODING_AGX3B, 0, 20, 22,
+                                              1, false, true, reloc_arr,
+                                              &arr_reloc_len));
+      CHECK(arr_reloc_len == arr_base_len &&
+            !memcmp(reloc_arr, base_arr, arr_base_len));
+
+      for (uint16_t bank = 8; bank <= 24; bank += 8) {
+         const uint8_t slot = (uint8_t)((bank / 8) + 1);
+         CHECK(agx3_tex_stage_ms_array_sample_at(AGX_ISA_ENCODING_AGX3B, bank,
+                                                 20, 22, slot, false, true,
+                                                 reloc_arr, &arr_reloc_len));
+         CHECK(arr_reloc_len == arr_base_len &&
+               memcmp(reloc_arr, base_arr, arr_base_len) != 0);
+         struct agx3_tex_fetch_desc ms = {
+            .dest = 8, .coord = bank, .width = AGX3_TEX_W32, .mask = 15,
+            .slot = slot, .wait_mask = (uint16_t)(1u << (slot - 1)),
+            .coord_kill = true, .final = true, .array = true,
+            .multisample = true, .staged_sample = true, .sampler_value = 1,
+         };
+         uint8_t msb[AGX3_TEX_MAX_LENGTH], mslen = 0;
+         CHECK(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3B, &ms, msb, &mslen));
+      }
+      CHECK(!agx3_tex_stage_ms_array_sample_at(AGX_ISA_ENCODING_AGX3B, 32, 20,
+                                               22, 1, false, true, reloc_arr,
+                                               &arr_reloc_len));
+      CHECK(!agx3_tex_stage_ms_array_sample_at(AGX_ISA_ENCODING_AGX3B, 8, 20,
+                                               22, 7, false, true, reloc_arr,
+                                               &arr_reloc_len));
+   }
    return 0;
 }
 

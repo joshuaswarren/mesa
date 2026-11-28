@@ -642,7 +642,7 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
    const unsigned coord_comps =
       (dim == AGX_DIM_CUBE_ARRAY) ? 4
       : (dim == AGX_DIM_2D_ARRAY || dim == AGX_DIM_3D || dim == AGX_DIM_CUBE ||
-         dim == AGX_DIM_2D_MS)
+         dim == AGX_DIM_2D_MS || dim == AGX_DIM_2D_MS_ARRAY)
          ? 3
          : 2;
    for (unsigned i = 0; i < 5; ++i) {
@@ -755,9 +755,9 @@ TEST(M5CopySchedule, AGX3BFragmentSamplesUseOccupancySlack)
              5u);
 }
 
-/* AGX3B fragment shaders recognize relocatable AGX_OPCODE_IMAGE_LOAD (2D and
- * immediate-LOD 2D_ARRAY) as native SMP samples and hoist them within the
- * occupancy step. */
+/* AGX3B fragment shaders recognize relocatable AGX_OPCODE_IMAGE_LOAD and
+ * AGX_OPCODE_TEXTURE_LOAD (2D, immediate-LOD 2D_ARRAY, 2D_MS, and 2D_MS_ARRAY)
+ * as native SMP samples and hoist them within the occupancy step. */
 TEST(M5CopySchedule, AGX3BFragmentImageLoadsHoist)
 {
    EXPECT_EQ(emit_frag_samples_and_count(
@@ -768,6 +768,21 @@ TEST(M5CopySchedule, AGX3BFragmentImageLoadsHoist)
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, AGX_DIM_2D_ARRAY,
                 FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
+                FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
+                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS_ARRAY,
+                FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
                 false, false, 0),
              5u);
 }
@@ -784,8 +799,8 @@ TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
                 FRAG_SAMPLE_TEX, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD, false,
                 false, 0),
              1u);
-   /* 3D, cube-array, gradient-LOD samples, multisample image loads, and
-    * register-LOD texture loads also keep staging bank 0 on AGX3B. */
+   /* 3D, cube-array, gradient-LOD samples, and register-LOD texture loads
+    * also keep staging bank 0 on AGX3B. */
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_3D,
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
@@ -800,11 +815,6 @@ TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_LOD_GRAD, false,
                 false, 0),
-             1u);
-   EXPECT_EQ(emit_frag_samples_and_count(
-                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
-                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
-                false, false, 0),
              1u);
    EXPECT_EQ(emit_frag_samples_and_count(
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,

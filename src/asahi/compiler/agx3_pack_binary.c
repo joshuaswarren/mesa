@@ -2320,7 +2320,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
     * staging slot 2, then issues the texture result on slot 1. Keep those two
     * independent scoreboard domains; reusing slot 1 for both is not a native
     * dependency shape. */
-   const uint8_t staging_slot = m5 ? slot : ms_array || combined_array_lod
+   const uint8_t staging_slot = m5 ? slot : combined_array_lod
       ? 1 : register_lod ? 2 : slot;
    /* A sparse read writes one extra register after its masked channels, so
     * agx_emit_texture reserves an eight-channel destination for it (see
@@ -2396,19 +2396,24 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
     * sharing the halves is retired first. */
    const bool plain_bank = !ms_2d && !ms_array && !array && !register_lod;
    const bool array_bank = array && !register_lod;
-   const bool m5_ms_banks = m5 && (ms_2d || ms_array);
-   const bool banked_read = plain_bank || array_bank || m5_ms_banks;
+   const bool agx3_ms_banks =
+      (m5 || enc == AGX_ISA_ENCODING_AGX3B) && (ms_2d || ms_array);
+   const bool banked_read = plain_bank || array_bank || agx3_ms_banks;
    /* Fetch coordinates can name any aligned bank through half 60 (f19).
     * Use independent eight-half banks for all scoreboard slots (6 on AGX3B,
     * 8 on AGX3C) before recycling one. */
    const unsigned plain_banks =
       MIN2(m5 ? AGX3_M5_FETCH_BANKS : 6u, 1 + (60 - staging_base) / 8);
-   /* Keep independent non-array MS publications in separate operand banks. */
+   /* Keep independent multisample publications in separate eight-half banks
+    * (up to 6 on AGX3B 2D_MS, 4 on 2D_MS_ARRAY within bank 24). */
    const unsigned ms_banks =
-      m5_ms_banks && !ms_array ? AGX3_M5_MS_FETCH_BANKS : 4;
+      m5 && !ms_array ? AGX3_M5_MS_FETCH_BANKS :
+      (enc == AGX_ISA_ENCODING_AGX3B && !ms_array)
+         ? (staging_base <= 56 ? MIN2(6u, 1u + (56 - staging_base) / 8) : 1u)
+         : (staging_base <= 24 ? MIN2(4u, 1u + (24 - staging_base) / 8) : 1u);
    const uint16_t bank_span =
-      (m5_ms_banks || array_bank) ? 8 : plain_bank ? 2 * coord_count
-                                                   : staging_base + 8;
+      (agx3_ms_banks || array_bank) ? 8 : plain_bank ? 2 * coord_count
+                                                     : staging_base + 8;
    uint16_t staging_coord = staging_base;
    uint16_t bank_retire = 0;
    const bool reuse = group && group->reuse;
@@ -2430,7 +2435,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       /* Non-banked reads with PACK_SMPIR operands occupy halves 0..bank_span. */
       const uint16_t first = banked_read ? staging_base : 0;
       const unsigned max_banks =
-         m5_ms_banks ? ms_banks :
+         agx3_ms_banks ? ms_banks :
          (plain_bank || array_bank) ? plain_banks : 1u;
       bool placed = false;
       for (unsigned c = 0; c < max_banks && !placed; ++c) {
@@ -14102,14 +14107,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           * the generic round-robin starting point. */
          if (enc == AGX_ISA_ENCODING_AGX3B && I->op == AGX_OPCODE_LD_TILE)
             e->preferred_slot = 6;
-         /* Native multisample reloads keep the texture result on slot 1 and
-          * publish the packed sample/layer coordinate independently on slot
-          * 2. This prevents the fetch from waiting on its own generation. */
-         if (enc == AGX_ISA_ENCODING_AGX3B &&
-             I->op == AGX_OPCODE_TEXTURE_LOAD &&
-             (I->dim == AGX_DIM_2D_MS ||
-              I->dim == AGX_DIM_2D_MS_ARRAY))
-            e->preferred_slot = 1;
          if (g17p_vertex_load_policy && I->op == AGX_OPCODE_DEVICE_LOAD &&
              vertex_loads_scheduled++ == 0)
             e->preferred_slot = 6;
@@ -15961,8 +15958,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             }
             const uint16_t fetch_wait =
                g18_fixed_fetch_record ? 0 :
-               wait | (((enc == AGX_ISA_ENCODING_AGX3B ||
-                         ctx->key->dev.emit_agx3d) &&
+               wait | ((ctx->key->dev.emit_agx3d &&
                         (I->dim == AGX_DIM_2D_MS ||
                          I->dim == AGX_DIM_2D_MS_ARRAY))
                           ? (outstanding_here & 1u)

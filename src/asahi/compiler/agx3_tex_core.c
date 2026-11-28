@@ -78,7 +78,9 @@ fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
          (enc == AGX_ISA_ENCODING_AGX3C
             ? (!d->staged_sample || (d->coord & 7) ||
                d->coord > (d->array ? 24 : 120))
-            : d->coord != (d->array && !d->staged_sample ? 16 : 0)))))
+            : d->staged_sample
+               ? ((d->coord & 7) || d->coord > (d->array ? 24 : 56))
+               : d->coord != (d->array ? 16 : 0)))))
       return false;
 
    /* Own-MSL texture3d::read witnesses use f76=3 with a third integer
@@ -259,7 +261,7 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
       return false;
    }
 
-   if (d->multisample && !d->array) {
+   if (d->multisample && !d->array && !d->staged_sample) {
       /* Own-MSL reads of samples 0..3 isolate this two-bit immediate: byte 5
        * is 00/02/04/06 while the remaining sample-0 instruction is fixed. */
       if (out[5] & 0x06) {
@@ -3076,26 +3078,29 @@ agx3_tex_stage_ms_array_sample_at(
    uint16_t packed_layer, uint8_t slot, bool cache, bool discard,
    uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len)
 {
-   if (enc == AGX_ISA_ENCODING_AGX3B && bank == 0)
-      return agx3_tex_stage_ms_array_sample(enc, sample, packed_layer,
-                                             cache, discard, out, len);
    if (!out || !len)
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (enc != AGX_ISA_ENCODING_AGX3C || (bank & 7) || bank > 24 ||
-       sample >= 128 || (sample & 1) || packed_layer > 254 ||
-       (packed_layer & 1) || slot < 1 || slot > 8 || (cache && discard))
+   const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
+   const unsigned slots = m5 ? 8 : 6;
+   if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) || (bank & 7) || bank > 24 ||
+       sample >= 128 || (sample & 1) ||
+       packed_layer > (m5 ? 254 : 190) || (packed_layer & 1) ||
+       slot < 1 || slot > slots || (cache && discard))
       return false;
    const struct agx3_field_kv fields[] = {
       KV(5, bank + 4), KV(9, 5), KV(10, 2), KV(12, slot),
       KV(16, sample), KV(23, 2), KV(24, 1), KV(25, cache), KV(27, discard),
       KV(37, 1), KV(38, 1), KV(44, packed_layer), KV(51, 2),
-      KV(52, 2), KV(55, 1), KV(56, 1), KV(57, 119),
+      KV(52, 2), KV(55, 1),
       KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
+      KV(56, 1), KV(57, 119),
    };
-   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
-                            sizeof(fields) / sizeof(fields[0]), NULL, 0, out, len);
+   const unsigned nfields =
+      sizeof(fields) / sizeof(fields[0]) - (m5 ? 0 : 2);
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields, nfields,
+                            NULL, 0, out, len);
 }
 
 /* Native texture2d_ms reads publish the sample at fixed staging half4.
@@ -3173,16 +3178,16 @@ agx3_tex_stage_ms_sample_at(enum agx_isa_encoding enc, uint16_t bank,
                             bool src_cache, bool src_discard,
                             uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len)
 {
-   if (enc == AGX_ISA_ENCODING_AGX3B && bank == 0)
-      return agx3_tex_stage_ms_sample(enc, src, wait_mask, src_cache,
-                                       src_discard, out, len);
    if (!out || !len)
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (enc != AGX_ISA_ENCODING_AGX3C || (bank & 7) || bank > 120 ||
-       src >= 256 || (src & 1) || slot < 1 || slot > 8 ||
-       (wait_mask & ~0xffu) || (src_cache && src_discard))
+   const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
+   const unsigned slots = m5 ? 8 : 6;
+   if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) || (bank & 7) ||
+       bank > (m5 ? 120 : 56) || src >= 256 || (src & 1) ||
+       slot < 1 || slot > slots ||
+       (wait_mask & ~((1u << slots) - 1)) || (src_cache && src_discard))
       return false;
 
    const struct agx3_field_kv fields[] = {
@@ -3190,16 +3195,18 @@ agx3_tex_stage_ms_sample_at(enum agx_isa_encoding enc, uint16_t bank,
       KV(16, src), KV(23, 2), KV(24, 1),
       KV(25, src_cache), KV(27, src_discard),
       KV(37, 1), KV(38, 1), KV(51, 1), KV(52, 2),
-      KV(56, 1), KV(57, 119), KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
+      KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
+      KV(56, 1), KV(57, 119),
    };
+   const unsigned nfields =
+      sizeof(fields) / sizeof(fields[0]) - (m5 ? 0 : 2);
    struct agx3_field_kv waits[8];
    unsigned n = 0;
-   for (unsigned i = 0; i < 8; ++i)
+   for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          waits[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
-                            sizeof(fields) / sizeof(fields[0]), waits, n,
-                            out, len);
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields, nfields,
+                            waits, n, out, len);
 }
 
 /* Fresh native G17P LOD fragment witnesses use this 12-byte PACK_SMPIR for a
