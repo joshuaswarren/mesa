@@ -364,12 +364,17 @@ agx_subgroup_options_for_target(const nir_shader *s, bool g17p, bool m5,
    const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
 
    /* The native float reduce treats denormals as zeros of their sign and does
-    * not flush or reliably preserve them, so keep the shuffle tree whenever
-    * the shader requests 32-bit denormal flush-to-zero or denormal preserve.
-    */
+    * not preserve them. Under DenormFlushToZero 32,
+    * agx_nir_flush_subgroup_minmax() flushes every lane's FP32 input to zero
+    * before the reduction, so M5's 1-instruction native simd_reduce produces
+    * exact flushed results while DenormPreserve 32 keeps the shuffle tree.
+    * Both native_shuffle_xor and m5_float_minmax encode identically across
+    * compute and graphics stages on AGX3C. */
+   const bool preserve32 =
+      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
    const bool denorm32_exact =
       nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32) ||
-      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
+      preserve32;
 
    if (g17p) {
       return (struct agx_subgroup_lower_options){
@@ -382,8 +387,8 @@ agx_subgroup_options_for_target(const nir_shader *s, bool g17p, bool m5,
       return (struct agx_subgroup_lower_options){
          .optimize_ballot_count = s->info.stage != MESA_SHADER_FRAGMENT,
          .g17p_clustered_float = false,
-         .native_shuffle_xor = !g18g && compute,
-         .m5_float_minmax = !g18g && compute && !denorm32_exact,
+         .native_shuffle_xor = !g18g,
+         .m5_float_minmax = !g18g && !preserve32,
       };
    } else {
       return (struct agx_subgroup_lower_options){

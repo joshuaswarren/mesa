@@ -16,6 +16,8 @@ enum agx3_matrix_input_type {
 
 /* matrix_type bit of an 8x8 matmad with an f16 accumulator and result */
 #define AGX3_MATRIX_ACCUM_F16 (1u << 8)
+/* matrix_type bit selecting zero-initialized accumulator (null src[2]) */
+#define AGX3_MATRIX_ZERO_ACCUM (1u << 9)
 
 struct agx3_matrix_gemm16_desc {
    uint16_t dest;

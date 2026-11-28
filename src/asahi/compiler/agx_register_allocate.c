@@ -19,6 +19,7 @@
 #include "asahi/lib/agx_chip_caps.h"
 #include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
+#include "agx3_matrix_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
@@ -3177,7 +3178,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          continue;
       }
 
-      if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+      if (I->op == AGX_OPCODE_MATMAD16_AGX3 &&
+          !(I->matrix_type & AGX3_MATRIX_ZERO_ACCUM)) {
          if (I->nr_dests != 1 || I->nr_srcs != 3 ||
              I->src[2].type != AGX_INDEX_NORMAL || I->src[2].memory ||
              !I->src[2].kill || rctx->ncomps[I->src[2].value] != 16 ||
@@ -3272,7 +3274,13 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
+      const bool matmad_zero_accum =
+         (I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+          I->op == AGX_OPCODE_MATMAD8_AGX3) &&
+         (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM);
+
       if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) && !I->dest[0].memory &&
+          !matmad_zero_accum &&
           !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;

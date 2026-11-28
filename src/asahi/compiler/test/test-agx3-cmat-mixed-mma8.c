@@ -14,6 +14,7 @@
  * survives optimization.
  */
 
+#include "agx3_compose/agx3_decode.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
 #include "agx_nir.h"
@@ -389,6 +390,159 @@ compile_mma8_loop_ra(enum agx_isa_encoding encoding, const char *name)
    return ok;
 }
 
+static bool
+compile_zero_accum_case(enum agx_isa_encoding encoding, bool is_gemm16,
+                        bool neg_zero, bool expect_zero_accum,
+                        unsigned *instrs_out, const char *name)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "%s", name);
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.shared_size = 4096;
+
+   nir_def *lane = nir_load_subgroup_invocation(&b);
+   const unsigned ncomp = is_gemm16 ? 8 : 2;
+   const uint32_t zero_bits = neg_zero ? 0x80000000u : 0x00000000u;
+
+   nir_def *a_mat, *b_mat;
+   if (is_gemm16) {
+      nir_def *a_lo = nir_load_shared(&b, 4, 16, nir_ishl_imm(&b, lane, 4),
+                                      .align_mul = 16);
+      nir_def *a_hi = nir_load_shared(
+         &b, 4, 16, nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 4), 8),
+         .align_mul = 8);
+      nir_def *b_lo = nir_load_shared(
+         &b, 4, 16, nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 4), 512),
+         .align_mul = 16);
+      nir_def *b_hi = nir_load_shared(
+         &b, 4, 16, nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 4), 520),
+         .align_mul = 8);
+      nir_def *ac[8] = {
+         nir_channel(&b, a_lo, 0), nir_channel(&b, a_lo, 1),
+         nir_channel(&b, a_lo, 2), nir_channel(&b, a_lo, 3),
+         nir_channel(&b, a_hi, 0), nir_channel(&b, a_hi, 1),
+         nir_channel(&b, a_hi, 2), nir_channel(&b, a_hi, 3),
+      };
+      nir_def *bc[8] = {
+         nir_channel(&b, b_lo, 0), nir_channel(&b, b_lo, 1),
+         nir_channel(&b, b_lo, 2), nir_channel(&b, b_lo, 3),
+         nir_channel(&b, b_hi, 0), nir_channel(&b, b_hi, 1),
+         nir_channel(&b, b_hi, 2), nir_channel(&b, b_hi, 3),
+      };
+      a_mat = nir_vec(&b, ac, 8);
+      b_mat = nir_vec(&b, bc, 8);
+   } else {
+      a_mat = nir_load_shared(&b, 2, 32, nir_ishl_imm(&b, lane, 3),
+                              .align_mul = 8);
+      b_mat = nir_load_shared(
+         &b, 2, 32, nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 3), 256),
+         .align_mul = 8);
+   }
+
+   nir_const_value cv[8] = {0};
+   for (unsigned i = 0; i < ncomp; ++i)
+      cv[i].u32 = zero_bits;
+   nir_def *c_mat = nir_build_imm(&b, ncomp, 32, cv);
+
+   nir_def *res = nir_cmat_muladd_agx(
+      &b, a_mat, b_mat, c_mat,
+      .src_type = is_gemm16 ? nir_type_float16 : nir_type_float32,
+      .src_type2 = is_gemm16 ? nir_type_float16 : nir_type_float32);
+
+   if (is_gemm16) {
+      nir_def *r_lo = nir_vec4(&b, nir_channel(&b, res, 0),
+                               nir_channel(&b, res, 1),
+                               nir_channel(&b, res, 2),
+                               nir_channel(&b, res, 3));
+      nir_def *r_hi = nir_vec4(&b, nir_channel(&b, res, 4),
+                               nir_channel(&b, res, 5),
+                               nir_channel(&b, res, 6),
+                               nir_channel(&b, res, 7));
+      nir_store_shared(&b, r_lo,
+                       nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 5), 1024),
+                       .align_mul = 16, .write_mask = 0xf);
+      nir_store_shared(&b, r_hi,
+                       nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 5), 1040),
+                       .align_mul = 16, .write_mask = 0xf);
+   } else {
+      nir_store_shared(&b, res,
+                       nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 3), 1024),
+                       .align_mul = 8, .write_mask = 0x3);
+   }
+
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = encoding;
+   struct agx_shader_part part = {0};
+   if (!agx_compile_shader_nir(b.shader, &key, &part)) {
+      fprintf(stderr, "%s: AGX3 compile failed\n", name);
+      ralloc_free(b.shader);
+      return false;
+   }
+
+   const agx3_table *tbl =
+      encoding == AGX_ISA_ENCODING_AGX3C ? &agx3c_table : &agx3b_table;
+   const enum agx3_mnemonic target_mn =
+      is_gemm16 ? AGX3_MN_fGeMM16x16x16 : AGX3_MN_f32matmad8x8;
+   unsigned matches = 0;
+   bool field_ok = true;
+   uint64_t f[AGX3_MAX_FIELDS];
+   const uint8_t *bin = (const uint8_t *)part.binary;
+   for (unsigned off = 0; off + 2 <= part.info.binary_size;) {
+      unsigned step = 0;
+      for (unsigned sz = 2; sz <= 14 && off + sz <= part.info.binary_size;
+           sz += 2) {
+         int32_t form = agx3_decode(tbl, bin + off, sz,
+                                    AGX3_MN_NONE, f);
+         if (form >= 0) {
+            step = sz;
+            if (tbl->forms[form].mnemonic == target_mn) {
+               matches++;
+               if (is_gemm16) {
+                  if (f[7] != (uint64_t)expect_zero_accum) {
+                     fprintf(stderr,
+                             "%s: gemm16 zero_accumulator=%" PRIu64
+                             " expected %u\n",
+                             name, f[7], (unsigned)expect_zero_accum);
+                     field_ok = false;
+                  }
+               } else {
+                  const uint64_t exp_c_kind = expect_zero_accum ? 1u : 2u;
+                  if (f[59] != exp_c_kind ||
+                      (expect_zero_accum && f[52] != 0u)) {
+                     fprintf(stderr,
+                             "%s: mma8 c_kind=%" PRIu64 " c=%" PRIu64
+                             " expected kind=%" PRIu64 "\n",
+                             name, f[59], f[52], exp_c_kind);
+                     field_ok = false;
+                  }
+               }
+            }
+            break;
+         }
+      }
+      if (!step)
+         break;
+      off += step;
+   }
+
+   if (instrs_out)
+      *instrs_out = part.info.stats.instrs;
+   const bool ok = part.binary != NULL && part.info.binary_size > 0 &&
+                   matches == 1 && field_ok;
+   fprintf(ok ? stdout : stderr,
+           "%s: instrs=%u binary_size=%u matches=%u zero_accum_ok=%u\n",
+           name, part.info.stats.instrs, part.info.binary_size,
+           matches, (unsigned)field_ok);
+
+   free(part.binary);
+   ralloc_free(b.shader);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -427,6 +581,26 @@ main(void)
    if (!compile_mma8_loop_ra(AGX_ISA_ENCODING_AGX3B, "8-acc mma8 loop on AGX3B") ||
        !compile_mma8_loop_ra(AGX_ISA_ENCODING_AGX3C, "8-acc mma8 loop on AGX3C"))
       pass = false;
+
+   unsigned g16_pos = 0, g16_neg = 0, m8_pos = 0, m8_neg = 0;
+   if (!compile_zero_accum_case(AGX_ISA_ENCODING_AGX3C, true, false, true,
+                                &g16_pos, "gemm16 +0.0 on AGX3C") ||
+       !compile_zero_accum_case(AGX_ISA_ENCODING_AGX3C, true, true, false,
+                                &g16_neg, "gemm16 -0.0 on AGX3C") ||
+       !compile_zero_accum_case(AGX_ISA_ENCODING_AGX3C, false, false, true,
+                                &m8_pos, "mma8 +0.0 on AGX3C") ||
+       !compile_zero_accum_case(AGX_ISA_ENCODING_AGX3C, false, true, false,
+                                &m8_neg, "mma8 -0.0 on AGX3C") ||
+       !compile_zero_accum_case(AGX_ISA_ENCODING_AGX3B, false, false, false,
+                                NULL, "mma8 +0.0 untouched on AGX3B"))
+      pass = false;
+   if (g16_pos >= g16_neg || m8_pos >= m8_neg) {
+      fprintf(stderr,
+              "FAIL zero_accum did not reduce instructions: "
+              "gemm16 %u vs %u, mma8 %u vs %u\n",
+              g16_pos, g16_neg, m8_pos, m8_neg);
+      pass = false;
+   }
 
    glsl_type_singleton_decref();
    return pass ? 0 : 1;

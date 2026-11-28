@@ -98,8 +98,15 @@ TEST(M5FloatMinMaxReduce, FullSubgroupReductionsSurviveOnM5Compute)
             struct op_case c = {nir_intrinsic_reduce, op, 32, comps, cluster};
             EXPECT_TRUE(kept(c, MESA_SHADER_COMPUTE, M5))
                << "op " << op << " cluster " << cluster;
-            /* Flushing another width does not matter. */
+            /* Flushing 32-bit denormals flushes inputs first and keeps the
+             * native M5 reduction; flushing 16-bit also keeps it. */
+            EXPECT_TRUE(kept(c, MESA_SHADER_COMPUTE, M5_FTZ32))
+               << "op " << op << " cluster " << cluster;
             EXPECT_TRUE(kept(c, MESA_SHADER_COMPUTE, M5_FTZ16))
+               << "op " << op << " cluster " << cluster;
+            EXPECT_TRUE(kept(c, MESA_SHADER_FRAGMENT, M5))
+               << "op " << op << " cluster " << cluster;
+            EXPECT_TRUE(kept(c, MESA_SHADER_VERTEX, M5))
                << "op " << op << " cluster " << cluster;
          }
       }
@@ -127,12 +134,8 @@ TEST(M5FloatMinMaxReduce, EverythingElseIsLowered)
          EXPECT_FALSE(kept(c, MESA_SHADER_COMPUTE, M5));
       }
       struct op_case full = {nir_intrinsic_reduce, op, 32, 1, 0};
-      /* 32-bit denormals flushed, other stages, the option off (G18), other
-       * targets. */
-      EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_FTZ32));
+      /* DenormPreserve 32, option off (G18), and other targets. */
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_PRESERVE32));
-      EXPECT_FALSE(kept(full, MESA_SHADER_FRAGMENT, M5));
-      EXPECT_FALSE(kept(full, MESA_SHADER_VERTEX, M5));
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_NO_MINMAX));
       EXPECT_TRUE(kept(full, MESA_SHADER_COMPUTE, G17P));
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, G17P_FTZ32));
@@ -181,14 +184,16 @@ reduces_flushed(nir_op op, unsigned mode, bool *kept_reduce)
    return any && all_flushed;
 }
 
-TEST(M5FloatMinMaxReduce, FlushToZeroKeepsTheFlushedTree)
+TEST(M5FloatMinMaxReduce, FlushToZeroFlushesInputsAndKeepsNativeReduce)
 {
    for (nir_op op : {nir_op_fmin, nir_op_fmax}) {
       bool kept_reduce;
       EXPECT_TRUE(reduces_flushed(op, FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32,
                                   &kept_reduce))
          << "op " << op;
-      EXPECT_FALSE(kept_reduce) << "op " << op;
+      /* Inputs are flushed by agx_nir_flush_subgroup_minmax() before the
+       * reduction, so M5 keeps the native 1-instruction simd_reduce. */
+      EXPECT_TRUE(kept_reduce) << "op " << op;
 
       EXPECT_FALSE(reduces_flushed(op, 0, &kept_reduce)) << "op " << op;
       EXPECT_TRUE(kept_reduce) << "op " << op;
