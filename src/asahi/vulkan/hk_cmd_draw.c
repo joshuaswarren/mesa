@@ -3396,7 +3396,6 @@ hk_g17p_zls_elide(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
       agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
          cfg = control;
       }
-      cs->render_pack_zls_elided_store |= (uint8_t)aspects;
    }
 }
 
@@ -3426,6 +3425,7 @@ hk_g17p_zls_elide_store(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
       agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
          cfg = control;
       }
+      cs->render_pack_zls_elided_store |= (uint8_t)aspects;
    }
 }
 
