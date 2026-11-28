@@ -1317,6 +1317,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    unsigned *uses_left = NULL;
    bool *dies = NULL;
    signed live = 0;
+   signed eff_fwd_cap = fwd_cap;
    if (fwd_cap > 0) {
       uses_left = rzalloc_array(memctx, unsigned, ctx->alloc);
       dies = rzalloc_array(memctx, bool, ctx->alloc);
@@ -1329,6 +1330,10 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             dies[nodes[i]->instr->dest[d].value] =
                !u_sparse_bitset_test(&block->live_out,
                                      nodes[i]->instr->dest[d].value);
+            /* Loop-carried PHIs are already live on block entry; do not charge
+             * them against the forward budget for temporaries added here. */
+            if (nodes[i]->instr->op == AGX_OPCODE_PHI)
+               eff_fwd_cap += agx_index_size_16(nodes[i]->instr->dest[d]);
          }
       }
       /* Trailing control flow keeps its operands alive. */
@@ -1348,11 +1353,13 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    const bool in_flight = hoist_samples && loads_in_flight;
    unsigned consumed_loads = 0;
    int *load_node = NULL;
+   agx_instr **collect_def = NULL;
    bool *consumed = NULL;
    if (in_flight) {
       load_node = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+      collect_def = rzalloc_array(memctx, agx_instr *, MAX2(ctx->alloc, 1));
       consumed = rzalloc_array(memctx, bool, n);
-      if (!load_node || !consumed)
+      if (!load_node || !collect_def || !consumed)
          return false;
       for (unsigned v = 0; v < ctx->alloc; ++v)
          load_node[v] = -1;
@@ -1366,6 +1373,18 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             if (l >= 0) {
                agx_foreach_ssa_dest(nodes[i]->instr, d)
                   load_node[nodes[i]->instr->dest[d].value] = l;
+            }
+         } else if (nodes[i]->instr->op == AGX_OPCODE_COLLECT) {
+            bool from_load = false;
+            agx_foreach_ssa_src(nodes[i]->instr, si) {
+               if (load_node[nodes[i]->instr->src[si].value] >= 0) {
+                  from_load = true;
+                  break;
+               }
+            }
+            if (from_load) {
+               agx_foreach_ssa_dest(nodes[i]->instr, d)
+                  collect_def[nodes[i]->instr->dest[d].value] = nodes[i]->instr;
             }
          }
       }
@@ -1389,16 +1408,39 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       int best = -1;
       unsigned best_t = 0;
       signed best_grow = 0;
+      signed best_dest_grow = 0;
       bool best_fits = true;
       unsigned i;
       BITSET_FOREACH_SET(i, ready_bits, n) {
          const unsigned t = MAX2(ready[i], cycle);
+         signed dest_grow = 0;
          signed grow = 0;
          if (fwd_cap > 0) {
-            agx_foreach_ssa_dest(nodes[i]->instr, d)
-               grow += agx_index_size_16(nodes[i]->instr->dest[d]);
+            const agx_instr *I = nodes[i]->instr;
+            agx_foreach_ssa_dest(I, d)
+               dest_grow += agx_index_size_16(I->dest[d]);
+            grow = dest_grow;
+            agx_foreach_ssa_src(I, si) {
+               const unsigned v = I->src[si].value;
+               if (!dies[v])
+                  continue;
+               unsigned occ = 0;
+               bool seen_before = false;
+               agx_foreach_ssa_src(I, sj) {
+                  if (I->src[sj].value == v) {
+                     if (sj < si) {
+                        seen_before = true;
+                        break;
+                     }
+                     occ++;
+                  }
+               }
+               if (!seen_before && uses_left[v] == occ)
+                  grow -= agx_index_size_16(I->src[si]);
+            }
          }
-         const bool fits = fwd_cap <= 0 || grow == 0 || live + grow <= fwd_cap;
+         const bool fits =
+            fwd_cap <= 0 || grow <= 0 || live + grow <= eff_fwd_cap;
          bool better;
          if (best < 0)
             better = true;
@@ -1467,6 +1509,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             best = i;
             best_t = t;
             best_grow = grow;
+            best_dest_grow = dest_grow;
             best_fits = fits;
          }
       }
@@ -1477,7 +1520,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       if (fwd_cap > 0) {
          const agx_instr *B = nodes[best]->instr;
-         live += best_grow;
+         live += best_dest_grow;
          agx_foreach_ssa_src(B, si) {
             const unsigned v = B->src[si].value;
             if (--uses_left[v] == 0 && dies[v])
@@ -1492,12 +1535,22 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       order[step] = nodes[best];
       issued_samples += ilp_is_hoisted(ctx, nodes[best]->instr, hoist_loads);
-      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT) {
+      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT &&
+          nodes[best]->instr->op != AGX_OPCODE_COLLECT) {
          agx_foreach_ssa_src(nodes[best]->instr, si) {
-            const int l = load_node[nodes[best]->instr->src[si].value];
+            const unsigned v = nodes[best]->instr->src[si].value;
+            const int l = load_node[v];
             if (l >= 0 && !consumed[l]) {
                consumed[l] = true;
                consumed_loads++;
+            } else if (collect_def[v]) {
+               agx_foreach_ssa_src(collect_def[v], cj) {
+                  const int cl = load_node[collect_def[v]->src[cj].value];
+                  if (cl >= 0 && !consumed[cl]) {
+                     consumed[cl] = true;
+                     consumed_loads++;
+                  }
+               }
             }
          }
       }

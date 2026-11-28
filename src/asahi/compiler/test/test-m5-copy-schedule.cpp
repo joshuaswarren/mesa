@@ -1123,3 +1123,105 @@ TEST(M5CopySchedule, FragmentDiscardSkipsDeviceLoadIlp)
    EXPECT_EQ(loads_before_first_add(s.body), 1u);
    ralloc_free(s.mem);
 }
+
+/* Loop-carried PHIs (such as cooperative-matrix accumulators) are already live
+ * at block entry and must not consume the forward pressure cap meant for
+ * temporaries added inside the block. With >= 88 halves of loop PHIs, a wide
+ * vec4 device_load should still hoist ahead of independent scalar ALU. */
+TEST(M5CopySchedule, LoopPhisDoNotStarveWideDeviceLoadHoisting)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   agx_builder *b = s.b;
+
+   /* Entry block: initialize 48 32-bit loop-carried PHIs = 96 halves
+    * (> AGX_ILP_FS_SAMPLE_HALVES). */
+   agx_index addr = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index inits[48];
+   for (unsigned i = 0; i < 48; ++i)
+      inits[i] = agx_mov_imm(b, 32, i);
+
+   b->cursor = agx_after_block(s.body);
+   agx_index phis[48];
+   for (unsigned i = 0; i < 48; ++i) {
+      agx_instr *phi = agx_phi_to(b, agx_temp(b->shader, AGX_SIZE_32), 2);
+      phi->src[0] = inits[i];
+      phi->src[1] = phi->dest[0];
+      phis[i] = phi->dest[0];
+   }
+
+   agx_index l0 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_device_load_to(b, l0, addr, agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_index a = agx_iadd(b, l0, agx_immediate(1), 0);
+   for (unsigned k = 0; k < 6; ++k)
+      a = agx_iadd(b, a, agx_immediate(k + 2), 0);
+
+   agx_index l1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l1, addr, agx_immediate(16), AGX_FORMAT_I32, 0xf, 0, false);
+   agx_index l2 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l2, addr, agx_immediate(32), AGX_FORMAT_I32, 0xf, 0, false);
+   agx_index l3 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_device_load_to(b, l3, addr, agx_immediate(48), AGX_FORMAT_I32, 0xf, 0, false);
+
+   agx_instr *s1 = agx_split(b, 4, l1);
+   agx_instr *s2 = agx_split(b, 4, l2);
+   agx_instr *s3 = agx_split(b, 4, l3);
+   for (unsigned c = 0; c < 4; ++c) {
+      s1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s2->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      s3->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+   }
+   agx_index sum = agx_iadd(b, s1->dest[0], s2->dest[0], 0);
+   sum = agx_iadd(b, sum, s3->dest[0], 0);
+   sum = agx_iadd(b, sum, phis[0], 0);
+   agx_unit_test(b, a);
+   agx_unit_test(b, sum);
+   for (unsigned i = 1; i < 48; ++i)
+      agx_unit_test(b, phis[i]);
+
+   agx_ilp_schedule(b->shader);
+   EXPECT_GE(loads_before_first_add(s.body), 4u);
+   ralloc_free(s.mem);
+}
+
+/* COLLECT of hoisted local_load splits only regroups channels and must not
+ * advance in-flight load consumption before the real consumer executes. */
+TEST(M5CopySchedule, CollectDoesNotAdvanceInFlightLoadConsumption)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_16));
+   agx_index dst_addr = agx_preload(b, agx_register(4, AGX_SIZE_64));
+
+   for (unsigned g = 0; g < 3; ++g) {
+      agx_index chans[4];
+      for (unsigned j = 0; j < 4; ++j) {
+         agx_index ld = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+         agx_local_load_to(b, ld, agx_immediate((g * 4 + j) * 4), base,
+                           AGX_FORMAT_I16, 0x3);
+         agx_instr *sp = agx_split(b, 2, ld);
+         sp->dest[0] = agx_temp(b->shader, AGX_SIZE_16);
+         sp->dest[1] = agx_temp(b->shader, AGX_SIZE_16);
+         chans[j] = sp->dest[0];
+      }
+      agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_16, 4);
+      agx_instr *col = agx_collect_to(b, vec, 4);
+      for (unsigned j = 0; j < 4; ++j)
+         col->src[j] = chans[j];
+      agx_device_store(b, vec, dst_addr, agx_immediate(g * 8),
+                       AGX_FORMAT_I16, 0xf, 0, false);
+   }
+
+   agx_ilp_schedule(b->shader);
+   unsigned loads_before_first_consumer = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_DEVICE_STORE)
+         break;
+      if (I->op == AGX_OPCODE_LOCAL_LOAD)
+         loads_before_first_consumer++;
+   }
+   EXPECT_EQ(loads_before_first_consumer, 4u);
+   ralloc_free(s.mem);
+}
