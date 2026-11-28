@@ -2412,8 +2412,12 @@ agx_ilp_schedule(agx_context *ctx)
                                        AGX_ILP_FS_SAMPLE_HALVES)
                   : MAX2(load_cap - peak, 0);
                const bool wide_flat =
-                  ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                  device_loads == loads && loads > 4 && device_load_cap > peak;
+                  ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                    device_loads == loads && loads > 4 &&
+                    device_load_cap > peak) ||
+                   (m5_compute && !ctx->key->dev.emit_agx3d &&
+                    in_loop[block->index] && device_loads > 4 &&
+                    device_load_cap > peak));
                const signed step_cap = small_loop_loads || !chained
                                           ? device_load_cap : chained_step_cap;
                /* Each window first tries interleaving independent ALU chains
