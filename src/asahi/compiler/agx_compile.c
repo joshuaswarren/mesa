@@ -3825,6 +3825,21 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       agx_emit_unpack_local_pixel(b, dst, instr);
       return NULL;
 
+   case nir_intrinsic_load_sample_groups_agx: {
+      /* PIXINFO reads the pixel's tile state, so it takes the read wait of a
+       * tile load. It carries no target: offset and target stay zero and the
+       * sample_groups flag keeps every tile protocol from treating it as an
+       * access of attachment zero. */
+      assert(stage == MESA_SHADER_FRAGMENT);
+      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+      agx_wait_pixel_mask(b, 0x8);
+      agx_instr *I = agx_ld_tile_to(b, dst, agx_src_index(&instr->src[0]),
+                                    agx_null(), AGX_FORMAT_I16, 1, 0, false,
+                                    0);
+      I->sample_groups = true;
+      return I;
+   }
+
    case nir_intrinsic_load_pixel_coord:
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2) {
          return agx_emit_collect_to(
@@ -7358,6 +7373,21 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                            ? agx_mov_imm(&b, 16, _mesa_float_to_half(value))
                            : agx_mov_imm(&b, 32, fui(value));
          }
+      }
+
+      /* AGX3B's immediate-addend FMA forms carry no saturate bit. Materialize
+       * any immediate addend that reaches a saturated FFMA so the register or
+       * immediate-multiplier saturate forms encode it cleanly. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_FFMA && I->saturate && I->nr_dests == 1 &&
+          I->nr_srcs == 3 && I->dest[0].size == AGX_SIZE_32 &&
+          I->src[2].type == AGX_INDEX_IMMEDIATE) {
+         float value = agx_minifloat_decode(I->src[2].value);
+         if (I->src[2].abs)
+            value = fabsf(value);
+         if (I->src[2].neg)
+            value = -value;
+         I->src[2] = agx_mov_imm(&b, 32, fui(value));
       }
 
       /* AGX3's integer compare-select names an immediate comparand in eight
@@ -14923,6 +14953,17 @@ agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
                return false;
             break;
          case AGX_OPCODE_LD_TILE:
+            /* PIXINFO opens the colour transaction like a first read but
+             * names no partition. Only the multisample register form exists. */
+            if (I->sample_groups) {
+               if (!multisample || I->nr_dests != 1 || I->nr_srcs != 2 ||
+                   I->explicit_coords || I->src[0].type != AGX_INDEX_NORMAL ||
+                   I->src[0].size != AGX_SIZE_16 || !agx_is_null(I->src[1]) ||
+                   saw_store)
+                  return false;
+               tile_started = true;
+               break;
+            }
             if (I->nr_dests != 1 || I->nr_srcs != 2 || I->explicit_coords ||
                 I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE ||
                 I->pixel_offset > UINT8_MAX ||
@@ -14993,7 +15034,7 @@ agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
    if (!multisample && all_loads_before_cf_and_stores && load_count > 1) {
       agx_instr *anchor = NULL;
       agx_foreach_instr_in_block_safe(first_block, I) {
-         if (I->op != AGX_OPCODE_LD_TILE)
+         if (I->op != AGX_OPCODE_LD_TILE || I->sample_groups)
             continue;
          if (!anchor) {
             anchor = I;
@@ -15023,7 +15064,7 @@ agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
              I->op == AGX_OPCODE_STOP || agx3_is_local_read_cf_op(I->op))
             break;
 
-         if (I->op == AGX_OPCODE_LD_TILE) {
+         if (I->op == AGX_OPCODE_LD_TILE && !I->sample_groups) {
             const unsigned halves =
                agx_size_align_16(I->dest[0].size) * agx_channels(I->dest[0]);
             const unsigned mask_val = I->src[0].value;
