@@ -268,6 +268,8 @@ struct agx_push_range {
    uint8_t length;
 };
 
+struct agx_g17p_compute_template;
+
 struct agx_compiled_shader {
    /* Base struct */
    struct agx_shader_part b;
@@ -281,6 +283,10 @@ struct agx_compiled_shader {
    /* Persistent AGX3 compute code container for non-linked native dispatches */
    struct agx_bo *agx3_compute_bo;
    uint64_t agx3_compute_va;
+
+   /* Cached HAL200 compute Ioto loader templates (freed with the variant). */
+   struct agx_g17p_compute_template *g17p_compute_templates;
+   unsigned g17p_compute_templates_generated;
 
    /* The backend refused to encode this variant. agx_compile_shader_nir() is
     * fail-closed: it returns false and leaves a zeroed agx_shader_part, so
@@ -320,6 +326,12 @@ struct agx_compiled_shader {
    /* Uniforms the driver must push */
    unsigned push_range_count;
    struct agx_push_range push[AGX_MAX_PUSH_RANGES];
+
+   /* Precomputed byte prefixes of agx_stage_uniforms and agx_draw_uniforms
+    * read through push[]. UINT16_MAX means indirect access requires the full
+    * table. */
+   uint16_t stage_uniforms_upload_size;
+   uint16_t root_uniforms_upload_size;
 
    /* UVS layout for the last vertex stage */
    struct agx_unlinked_uvs_layout uvs;
@@ -412,10 +424,10 @@ struct agx_uncompiled_shader {
       bool fullscreen_tri_z_in_01;
       bool fullscreen_tri_z_in_m11;
 
-      /* Fragment shader static opaque overwrite analysis: bit i is set iff
-       * colour attachment i is unconditionally written in all four channels
+      /* Fragment shader static opaque overwrite analysis: entry i holds the
+       * 4-bit RGBA channel mask unconditionally written to colour attachment i
        * on every non-discarded execution path. */
-      uint8_t fs_unconditional_color_outputs;
+      uint8_t fs_unconditional_color_masks[PIPE_MAX_COLOR_BUFS];
       bool fs_uses_discard;
 
       /* Some image intrinsic other than a read or a size/sample query:
@@ -448,6 +460,8 @@ struct agx_uncompiled_shader {
    } info;
 
    struct hash_table *variants;
+   /* Fast-path cache for compute variants indexed by custom_borders (0/1). */
+   struct agx_compiled_shader *cached_cs[2];
    struct agx_uncompiled_shader *passthrough_progs[MESA_PRIM_COUNT][3][2];
    struct agx_uncompiled_shader *passthrough_tcs[32];
 
@@ -711,6 +725,7 @@ struct agx_batch {
    /* CPU snapshot: never read back the write-combined GPU root upload. */
    struct agx_draw_uniforms vs_root;
    bool vs_root_valid;
+   unsigned uploaded_attribs;
    struct agx_stage_uniforms stage_uniforms[MESA_SHADER_STAGES];
 
    /* Heap descriptor if dynamic allocation is required */
@@ -735,6 +750,11 @@ struct agx_batch {
        * entry here counts as accessed in full. */
       struct hash_table *ranges; /* agx_bo * -> index + 1 into range_list */
       struct util_dynarray range_list; /* struct agx_bo_range */
+      struct agx_bo *recent_bos[4];
+      uint8_t recent_bo_next;
+      struct agx_bo *recent_range_bos[4];
+      uint32_t recent_range_idx[4];
+      uint8_t recent_range_next;
    } bo_list;
 
    /* If true, this batch contains a shader with a potentially incoherent write
@@ -846,9 +866,9 @@ struct agx_blend {
    /* PIPE_CLEAR_* bitmask corresponding to this blend state */
    uint32_t store;
 
-   /* PIPE_CLEAR_COLOR* mask of render targets whose blend state writes all
-    * four channels without reading the destination tilebuffer. */
-   uint32_t opaque_overwrite;
+   /* Per-RT 4-bit RGBA channel mask written without reading the destination
+    * tilebuffer (no blending, logicop, or alpha-to-coverage). */
+   uint8_t opaque_overwrite_mask[PIPE_MAX_COLOR_BUFS];
 };
 
 struct asahi_vs_shader_key {
@@ -991,6 +1011,11 @@ struct asahi_blitter {
 
    /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
    void *g17p_mip_cs[32];
+
+   /* HAL200/AGX3B compressed block-mip compute shader and unnormalized linear
+    * sampler for exact 2x2 compressed mip levels. */
+   void *g17p_block_mip_cs;
+   void *g17p_block_mip_sampler;
 
    /* [filter] */
    void *sampler[2];
@@ -1178,6 +1203,7 @@ struct agx_context {
     * waits for these before the draw reads the shaders, then clears them.
     */
    uint32_t stages_compiling;
+   uint8_t stages_with_textures;
 
    struct agx_vertex_elements *attributes;
    struct agx_rasterizer *rast;
@@ -1240,6 +1266,10 @@ struct agx_context {
 
    struct hash_table *generic_meta;
    struct agx_bg_eot_cache bg_eot;
+
+   /* Cached HAL200 compute Ioto loader templates for precompiled libagx kernels. */
+   struct agx_g17p_compute_template *g17p_precomp_templates[LIBAGX_NUM_PROGRAMS];
+   unsigned g17p_precomp_templates_generated;
 
    bool any_faults;
    bool submit_quarantined;
@@ -1853,10 +1883,66 @@ agx_batch_uses_bo(struct agx_batch *batch, struct agx_bo *bo)
 }
 
 static inline void
+agx_compute_shader_upload_sizes(struct agx_compiled_shader *cs)
+{
+   const unsigned stage_table = AGX_SYSVAL_STAGE(cs->stage);
+   const size_t stage_ptr_off =
+      offsetof(struct agx_draw_uniforms, tables[stage_table]);
+   const size_t stage_ptr_end = stage_ptr_off + sizeof(uint64_t);
+   const size_t root_ptr_end = sizeof(uint64_t);
+
+   bool indirect_stage = false;
+   bool indirect_root = false;
+   size_t stage_end = 0;
+   size_t root_end = 0;
+
+   for (unsigned i = 0; i < cs->push_range_count; ++i) {
+      const struct agx_push_range *push = &cs->push[i];
+      if (push->table == AGX_SYSVAL_TABLE_ROOT) {
+         const size_t start = push->offset;
+         const size_t end = start + (size_t)ALIGN_POT(push->length, 2) * 2;
+         if (start < root_ptr_end && end > 0)
+            indirect_root = true;
+         if (start < stage_ptr_end && end > stage_ptr_off)
+            indirect_stage = true;
+         root_end = MAX2(root_end, end);
+      } else if (push->table == stage_table) {
+         /* Native Ioto loaders move uniform dwords, so an odd 16-bit range
+          * reads one more half (agx_build_g17p_graphics_program). */
+         const size_t end =
+            (size_t)push->offset + (size_t)ALIGN_POT(push->length, 2) * 2;
+         stage_end = MAX2(stage_end, end);
+      }
+   }
+
+   if (indirect_root) {
+      if (cs->stage != MESA_SHADER_FRAGMENT)
+         indirect_stage = true;
+      cs->root_uniforms_upload_size = UINT16_MAX;
+   } else {
+      cs->root_uniforms_upload_size = (uint16_t)MIN2(
+         ALIGN_POT(root_end, 16), sizeof(struct agx_draw_uniforms));
+   }
+
+   if (indirect_stage) {
+      cs->stage_uniforms_upload_size = UINT16_MAX;
+   } else {
+      cs->stage_uniforms_upload_size = (uint16_t)MIN2(
+         ALIGN_POT(stage_end, 16), sizeof(struct agx_stage_uniforms));
+   }
+}
+
+static inline void
 agx_batch_add_bo_internal(struct agx_batch *batch, struct agx_bo *bo)
 {
+   for (unsigned i = 0; i < ARRAY_SIZE(batch->bo_list.recent_bos); ++i) {
+      if (batch->bo_list.recent_bos[i] == bo)
+         return;
+   }
+
    bool found;
    _mesa_set_search_or_add(batch->bo_list.set, bo, &found);
+   batch->bo_list.recent_bos[batch->bo_list.recent_bo_next++ & 3u] = bo;
    if (found)
       return;
 
@@ -2025,6 +2111,10 @@ uint8_t agx_nir_analyze_fullscreen_tri(nir_shader *nir,
                                        bool *out_z_in_m11);
 uint8_t agx_nir_analyze_fs_color_outputs(nir_shader *nir,
                                          bool *out_uses_discard);
+void agx_nir_analyze_fs_color_output_masks(
+   nir_shader *nir, uint8_t out_masks[PIPE_MAX_COLOR_BUFS],
+   bool *out_uses_discard);
+void agx_g17p_compute_templates_free(struct agx_g17p_compute_template **head);
 
 struct asahi_bg_eot {
    uint64_t usc;

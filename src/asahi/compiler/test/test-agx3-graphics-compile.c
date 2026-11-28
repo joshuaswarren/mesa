@@ -5911,6 +5911,80 @@ test_indexed_compute_sample(void)
    return ok;
 }
 
+/* dEQP-VK.glsl.texture_functions.texture.samplercubearrayshadow_compute: a
+ * compute shader with a derivative group, whose texture() on a cube-array
+ * comparison sampler agx_nir_lower_compute_derivatives() turns into a txl with
+ * a per-lane level. The indexed lowering must give it native texture and
+ * sampler state on AGX3B as well: kept as a software heap handle, the sample
+ * has no AGX3B encoding and the pipeline fails. */
+static bool
+test_indexed_compute_cube_array_shadow_level(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options,
+      "AGX3 indexed compute cube-array shadow level");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *element = nir_channel(&b, gid, 0);
+   nir_def *set = nir_load_descriptor_set_agx(&b, 4);
+   nir_def *sampler_index = nir_load_global_constant(
+      &b, 1, 16, nir_iadd_imm(&b, set, 40), .align_mul = 2);
+   nir_def *image = nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 4);
+   nir_def *sampler = nir_bindless_sampler_agx(
+      &b, nir_imm_int(&b, 32), sampler_index, .desc_set = 4);
+
+   nir_def *x = nir_u2f32(&b, element);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 5);
+   tex->op = nir_texop_txl;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+   tex->is_array = true;
+   tex->is_shadow = true;
+   tex->is_new_style_shadow = true;
+   tex->dest_type = nir_type_float32;
+   tex->coord_components = 4;
+   tex->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
+   tex->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord,
+      nir_vec4(&b, x, nir_imm_float(&b, 0.5f), nir_imm_float(&b, 1.0f),
+               nir_imm_float(&b, 1.0f)));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                     nir_fmul_imm(&b, x, 0.125f));
+   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod,
+                                     nir_fmul_imm(&b, x, 0.25f));
+   tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, image);
+   tex->src[4] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+   nir_def_init(&tex->instr, &tex->def, 1, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_export_agx(&b, &tex->def, .base = 0);
+
+   NIR_PASS(_, b.shader, agx_nir_lower_texture_for_generation,
+            AGX_DESCRIPTOR_GENERATION_9);
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
+   ok &= nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) < 0 &&
+         nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 &&
+         nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) >= 0;
+
+   NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,
+            lower_test_descriptor_set, nir_metadata_control_flow, NULL);
+   agx_preprocess_nir(b.shader);
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 32;
+   struct agx_shader_part part = {0};
+   const bool compiled = ok && agx_compile_shader_nir(b.shader, &key, &part) &&
+                         part.binary != NULL;
+   if (!compiled)
+      fprintf(stderr, "indexed compute cube-array shadow level: lowered=%u compiled=%u\n",
+              ok, compiled);
+   free(part.binary);
+   ralloc_free(b.shader);
+   return compiled;
+}
+
 static bool
 test_indexed_compute_storage(void)
 {
@@ -9904,6 +9978,10 @@ main(int argc, char **argv)
 
    if (!test_indexed_compute_sample()) {
       fputs("indexed compute sampler lowering mismatch\n", stderr);
+      all_ok = false;
+   }
+   if (!test_indexed_compute_cube_array_shadow_level()) {
+      fputs("indexed compute cube-array shadow level refused\n", stderr);
       all_ok = false;
    }
 

@@ -239,13 +239,29 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
         num_components == 5));
    const unsigned load_components = map_address ? 4 : num_components;
 
-   if (ctx->clamp_desc_array_bounds)
-      index =
-         nir_umin(b, index, nir_imm_int(b, binding_layout->array_size - 1));
+   if (ctx->clamp_desc_array_bounds) {
+      if (nir_def_is_const(index)) {
+         index = nir_imm_int(b, MIN2(nir_src_as_uint(nir_src_for_ssa(index)),
+                                     binding_layout->array_size - 1));
+      } else {
+         index =
+            nir_umin(b, index, nir_imm_int(b, binding_layout->array_size - 1));
+      }
+   }
 
    switch (binding_layout->type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+      /* Statically indexed non-partially-bound dynamic descriptors are valid
+       * (or null with size == 0) on every path, matching static buffers below.
+       */
+      const bool always_valid =
+         ctx->descriptor_generation == AGX_DESCRIPTOR_GENERATION_9 &&
+         nir_def_is_const(index) &&
+         !(binding_layout->flags &
+           (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT));
+
       /* Get the index in the root descriptor table dynamic_buffers array. */
       nir_def *dynamic_buffer_start = load_dynamic_buffer_start(b, set, ctx);
 
@@ -259,10 +275,12 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
 
       assert(num_components == (map_address ? 5 : 4) && bit_size == 32);
       nir_def *desc = load_root(b, 4, 32, root_desc_offset, 16);
-      if (buffer_binding) {
+      if (buffer_binding || always_valid) {
          nir_intrinsic_instr *desc_intr = nir_def_as_intrinsic(desc);
-         nir_intrinsic_set_access(desc_intr, nir_intrinsic_access(desc_intr) |
-                                                ACCESS_BUFFER_BINDING_AGX);
+         nir_intrinsic_set_access(
+            desc_intr, nir_intrinsic_access(desc_intr) |
+                          (always_valid ? ACCESS_BUFFER_DESCRIPTOR_AGX : 0) |
+                          (buffer_binding ? ACCESS_BUFFER_BINDING_AGX : 0));
       }
 
       if (map_address)
@@ -503,9 +521,15 @@ load_image_handle(nir_builder *b, const struct lower_descriptors_ctx *ctx,
    const struct hk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
 
-   if (ctx->clamp_desc_array_bounds)
-      index =
-         nir_umin(b, index, nir_imm_int(b, binding_layout->array_size - 1));
+   if (ctx->clamp_desc_array_bounds) {
+      if (nir_def_is_const(index)) {
+         index = nir_imm_int(b, MIN2(nir_src_as_uint(nir_src_for_ssa(index)),
+                                     binding_layout->array_size - 1));
+      } else {
+         index =
+            nir_umin(b, index, nir_imm_int(b, binding_layout->array_size - 1));
+      }
+   }
 
    assert(binding_layout->stride > 0);
    nir_def *desc_offs_B =

@@ -30,6 +30,22 @@ void agx3_build_container_constant_program(
 bool agx3_build_m5_container_lead(void *image, size_t capacity,
                                   unsigned clusters);
 
+/* The byte offset, from the USC window base, of the helper-table group an M5
+ * stage calls in the lead agx3_build_m5_container_lead() builds for this many
+ * clusters: one 0x100-byte table per cluster in each of two groups, every
+ * stage but vertex at clusters * 0x100 and vertex at twice that. The
+ * profile loader of every M5 program (agx_ioto_m5_resource_program_compose_
+ * classes()) points there, so the lead and the loaders take the cluster
+ * count the kernel reports from one place. 0 for a count the lead refuses.
+ */
+static inline uint32_t
+agx3_m5_container_group_offset(unsigned clusters, bool vertex)
+{
+   if (!clusters || clusters > (UINT32_MAX - 0x40u) / 0x300u)
+      return 0;
+   return (vertex ? 2u : 1u) * clusters * 0x100u;
+}
+
 size_t agx3_code_block_size(size_t main_span);
 /* The fragment stop constant program in the G18G (agx3d) encoding. */
 void agx3_build_container_stop_program_agx3d(

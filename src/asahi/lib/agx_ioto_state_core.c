@@ -395,12 +395,15 @@ agx_ioto_g17p_fragment_speclm_build(
        (sample_size_B &&
         ((samples != 1 && samples != 2 && samples != 4) ||
          (sample_size_B & 7) || (sample_size_B >> 3) > 31 ||
-         sample_size_B * samples * imageblock->tile_size_px > 32768u)))
+         sample_size_B * samples * imageblock->tile_size_px >
+            AGX_NATIVE_TILE_BUFFER_48K_BYTES)))
       return false;
 
    /* SPECLM encodes the sample stride in 8-byte units (5-bit field at bit 35,
     * max 248 B/sample) and log2(samples) in word 1 bits 7..8. The tile cannot
-    * exceed 32 KiB. Patch only those fields onto the per-tile-geometry seeds,
+    * exceed the largest tile buffer a kernel admits (48 KiB); the render's
+    * tilebuffer layout keeps it within what this kernel admits. Patch only
+    * those fields onto the per-tile-geometry seeds,
     * preserving the opaque geometry bits in word 2[5:0]. */
    static const uint8_t imageblock_32x32[AGX_IOTO_SPECLM_SIZE] = {
       0x77, 0x00, 0x2a, 0x43, 0x4b, 0x00, 0x00, 0x00,

@@ -279,3 +279,66 @@ TEST(NarrowBarriers, Subgroup0RefusesUnsafeShapes)
       ralloc_free(b.shader);
    }
 }
+
+TEST(NarrowBarriers, Subgroup0Linearized2DAnd3DLocalId)
+{
+   /* 2D 16x16x1 reduction using imadshl_agx(lid.x, 1, lid.y, 4) (lowered form
+    * of gl_LocalInvocationIndex / HLSL SV_GroupIndex). Barriers after tid < 32
+    * and tid < 16 must narrow while the initial full-workgroup barrier stays
+    * SCOPE_WORKGROUP. */
+   for (unsigned mode = 0; mode < 5; ++mode) {
+      const bool is_3d = mode == 2;
+      nir_builder b = is_3d ? compute_shader("linear-3d", 8, 8, 4)
+                            : compute_shader("linear-2d", 16, 16, 1);
+      b.shader->info.shared_size = 1024;
+      nir_def *lid = nir_load_local_invocation_id(&b);
+      nir_def *lx = nir_channel(&b, lid, 0);
+      nir_def *ly = nir_channel(&b, lid, 1);
+      nir_def *lz = nir_channel(&b, lid, 2);
+      nir_def *t = NULL;
+      if (mode == 0) {
+         t = nir_imadshl_agx(&b, lx, nir_imm_int(&b, 1), ly, nir_imm_int(&b, 4));
+      } else if (mode == 1) {
+         t = nir_ior(&b, lx, nir_ishl_imm(&b, ly, 4));
+      } else if (mode == 2) {
+         nir_def *yz = nir_imadshl_agx(&b, ly, nir_imm_int(&b, 1), lz,
+                                       nir_imm_int(&b, 3));
+         t = nir_imadshl_agx(&b, lx, nir_imm_int(&b, 1), yz, nir_imm_int(&b, 3));
+      } else if (mode == 3) {
+         /* Wrong stride (8 instead of 16): tid < 32 reaches y=2..3 (subgroup 1)! */
+         t = nir_imadshl_agx(&b, lx, nir_imm_int(&b, 1), ly, nir_imm_int(&b, 3));
+      } else {
+         /* Transposed (ly + lx * 16): tid < 32 covers x=0..1 across all y=0..15! */
+         t = nir_imadshl_agx(&b, ly, nir_imm_int(&b, 1), lx, nir_imm_int(&b, 4));
+      }
+      nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
+      store_shared_word(&b, t, addr);
+      emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
+      for (unsigned off : {32u, 16u}) {
+         nir_push_if(&b, nir_ult_imm(&b, t, off));
+         nir_def *other = load_shared_word(
+            &b, nir_u2u16(&b, nir_ishl_imm(&b, nir_iadd_imm(&b, t, off), 2)));
+         nir_def *mine = load_shared_word(&b, addr);
+         store_shared_word(&b, nir_iadd(&b, mine, other), addr);
+         nir_pop_if(&b, NULL);
+         emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
+      }
+      nir_push_if(&b, nir_ieq_imm(&b, t, 0));
+      nir_def *sum = load_shared_word(&b, nir_imm_intN_t(&b, 0, 16));
+      store_global_word(&b, sum, nir_imm_int64(&b, 0));
+      nir_pop_if(&b, NULL);
+
+      const bool expect_narrow = mode < 3;
+      EXPECT_EQ(agx_nir_narrow_subgroup0_barriers(b.shader), expect_narrow)
+         << "mode=" << mode;
+      nir_validate_shader(b.shader, "linear-local-id");
+      mesa_scope scopes[3];
+      collect_barrier_exec_scopes(b.shader, scopes, 3);
+      EXPECT_EQ(scopes[0], SCOPE_WORKGROUP) << "mode=" << mode;
+      EXPECT_EQ(scopes[1], expect_narrow ? SCOPE_SUBGROUP : SCOPE_WORKGROUP)
+         << "mode=" << mode;
+      EXPECT_EQ(scopes[2], expect_narrow ? SCOPE_SUBGROUP : SCOPE_WORKGROUP)
+         << "mode=" << mode;
+      ralloc_free(b.shader);
+   }
+}

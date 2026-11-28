@@ -190,6 +190,9 @@ struct hk_shader_info {
    /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
     * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
    uint64_t agx3_dynbuf_reads;
+   /* Bitmask of 32-bit root.push[] dwords read by this shader (UINT64_MAX on
+    * non-constant push indexing). Only meaningful when HK_ROOT_READS_PUSH is set. */
+   uint64_t agx3_push_read_dwords;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -261,6 +264,7 @@ struct hk_local_read_shader_meta {
    uint8_t set_count;
    uint8_t agx3_root_reads;
    uint64_t agx3_dynbuf_reads;
+   uint64_t agx3_push_read_dwords;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
@@ -383,6 +387,7 @@ struct hk_shader {
     * draw's colour epilog inlined. NULL when the shape is not eligible. */
    void *g17p_mono_nir;
    size_t g17p_mono_nir_size;
+   struct nir_shader *g17p_mono_postopt_nir;
    struct agx_shader_key g17p_mono_key;
    bool g17p_mono_preoptimized;
 
@@ -588,6 +593,16 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
+   /* Non-NULL for a shader compiled without image-view minLod emulation
+    * because the device had created no view with minLod > baseMipLevel: what
+    * its emulating twin compiles from, and the twin once built
+    * (hk_min_lod_twin). */
+   struct hk_border_source *min_lod_source;
+
+   /* Compiled with image-view minLod emulation that a device without a
+    * non-zero minLod view would have left out (serialized; refused there). */
+   bool min_lod_emulating;
+
    /* Compiled with agx_nir_lower_clip_m1_1 where it rasterizes; a mesh shader
     * sets it when its device enabled depthClipControl (serialized: a binary
     * without it is refused by a device that enabled the feature). */
@@ -637,6 +652,11 @@ nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
+
+/* The image-view-minLod-emulating twin of a shader with a min_lod source,
+ * built on first use. Thread-safe; NULL if it cannot be built. */
+struct hk_api_shader *hk_min_lod_twin(struct hk_device *dev,
+                                      struct hk_api_shader *obj);
 
 /* The twin of a fragment shader with a feedback-loop source, compiled for a
  * depth/stencil feedback loop and built on first use. Thread-safe; NULL if it
@@ -735,6 +755,8 @@ void hk_prelink_pipeline_fragment(struct hk_device *dev,
 void hk_prelink_object_fragment(struct hk_device *dev,
                                 struct hk_api_shader *fs);
 void hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs,
+                       const struct hk_api_shader *fs,
+                       const struct vk_graphics_pipeline_state *state,
                        bool hw_program, bool sw_program);
 
 static inline struct hk_shader *

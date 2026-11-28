@@ -36,7 +36,7 @@ g17g_graphics_program_generate(
    size_t bound;
    const bool mesh = stage == AGX_IOTO_G17G_PROGRAM_MESH ||
                      stage == AGX_IOTO_G17G_PROGRAM_OBJECT;
-   if (!agx_chip_g17_m5(chip) || (mesh && chip != AGX_CHIP_G17S) ||
+   if (!agx_chip_g17_m5(chip) ||
        !desc || !program || (mesh && desc->fragment) ||
        !desc->shader_binary_size ||
        desc->preloaded_root ||
@@ -177,7 +177,7 @@ g17g_graphics_program_generate(
    if (!agx3_ioto_uniform_program_body_generate(
           chip, &load_desc, workspace, &body_size, &copy_offset) ||
        !agx_ioto_m5_resource_program_compose_classes(
-          chip, desc->program_va, body, body_size, &tail,
+          chip, desc->usc_clusters, desc->program_va, body, body_size, &tail,
           stage, MAX2(desc->colour_classes, 1),
           staged.bytes, sizeof(staged.bytes), &written) ||
        written > bound || written > UINT16_MAX)
@@ -304,6 +304,19 @@ agx3_g17g_tile_program_generate(
    return desc && desc->fragment && g17g_graphics_program_generate(
       chip, desc, store ? AGX_IOTO_G17G_PROGRAM_EOT
                        : AGX_IOTO_G17G_PROGRAM_BACKGROUND, program, NULL);
+}
+
+bool
+agx3_g18g_general_tile_program_generate(
+   const struct agx3_g17p_graphics_program_desc *desc, bool store,
+   struct agx3_g17p_graphics_program *program)
+{
+   if (!desc)
+      return false;
+   struct agx3_g17p_graphics_program_desc g18_desc = *desc;
+   g18_desc.usc_clusters = 1;
+   return agx3_g17g_tile_program_generate(AGX_CHIP_G17G, &g18_desc, store,
+                                          program);
 }
 
 bool

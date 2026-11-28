@@ -134,6 +134,167 @@ TEST_F(AvailabilityVisibility, opstore_avail)
    EXPECT_EQ(nir_intrinsic_execution_scope(intrinsic), SCOPE_NONE);
 }
 
+/* Position of the first intrinsic of the given op in the entry point, or -1. */
+static int
+intrinsic_position(nir_shader *shader, nir_intrinsic_op op)
+{
+   int pos = 0;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == op)
+            return pos;
+         pos++;
+      }
+   }
+   return -1;
+}
+
+TEST_F(AvailabilityVisibility, opimageread_vis)
+{
+   /*
+               OpCapability Shader
+               OpCapability VulkanMemoryModel
+               OpCapability VulkanMemoryModelDeviceScope
+               OpMemoryModel Logical Vulkan
+               OpEntryPoint GLCompute %main "main" %img
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %v2int = OpTypeVector %int 2
+     %v4uint = OpTypeVector %uint 4
+     %imgtype = OpTypeImage %uint 2D 0 0 0 2 R32ui
+        %ptr = OpTypePointer UniformConstant %imgtype
+        %img = OpVariable %ptr UniformConstant
+      %int_0 = OpConstant %int 0
+      %coord = OpConstantComposite %v2int %int_0 %int_0
+     %device = OpConstant %int 1
+      %zero = OpConstantNull %v4uint
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %im = OpLoad %imgtype %img
+          %v = OpImageRead %v4uint %im %coord MakeTexelVisible|NonPrivateTexel %device
+               OpImageWrite %im %coord %v
+               OpReturn
+               OpFunctionEnd
+   */
+   static const uint32_t words[] = {
+      0x07230203, 0x00010500, 0x00070000, 0x00000012, 0x00000000, 0x00020011,
+      0x00000001, 0x00020011, 0x000014e1, 0x00020011, 0x000014e2, 0x0003000e,
+      0x00000000, 0x00000003, 0x0006000f, 0x00000005, 0x00000001, 0x6e69616d,
+      0x00000000, 0x00000002, 0x00060010, 0x00000001, 0x00000011, 0x00000001,
+      0x00000001, 0x00000001, 0x00040047, 0x00000002, 0x00000022, 0x00000000,
+      0x00040047, 0x00000002, 0x00000021, 0x00000000, 0x00020013, 0x00000003,
+      0x00030021, 0x00000004, 0x00000003, 0x00040015, 0x00000005, 0x00000020,
+      0x00000000, 0x00040015, 0x00000006, 0x00000020, 0x00000001, 0x00040017,
+      0x00000007, 0x00000006, 0x00000002, 0x00040017, 0x00000008, 0x00000005,
+      0x00000004, 0x00090019, 0x00000009, 0x00000005, 0x00000001, 0x00000000,
+      0x00000000, 0x00000000, 0x00000002, 0x00000021, 0x00040020, 0x0000000a,
+      0x00000000, 0x00000009, 0x0004003b, 0x0000000a, 0x00000002, 0x00000000,
+      0x0004002b, 0x00000006, 0x0000000b, 0x00000000, 0x0005002c, 0x00000007,
+      0x0000000c, 0x0000000b, 0x0000000b, 0x0004002b, 0x00000006, 0x0000000d,
+      0x00000001, 0x0003002e, 0x00000008, 0x0000000e, 0x00050036, 0x00000003,
+      0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000f, 0x0004003d,
+      0x00000009, 0x00000010, 0x00000002, 0x00070062, 0x00000008, 0x00000011,
+      0x00000010, 0x0000000c, 0x00000600, 0x0000000d, 0x00040063, 0x00000010,
+      0x0000000c, 0x00000011, 0x000100fd, 0x00010038,
+   };
+
+   get_nir(sizeof(words) / sizeof(words[0]), words);
+
+   nir_intrinsic_instr *intrinsic = find_intrinsic(nir_intrinsic_barrier, 0);
+   ASSERT_NE(intrinsic, nullptr);
+
+   EXPECT_EQ(nir_intrinsic_memory_semantics(intrinsic), NIR_MEMORY_MAKE_VISIBLE);
+   EXPECT_NE(nir_intrinsic_memory_modes(intrinsic) & nir_var_image, 0);
+   EXPECT_EQ(nir_intrinsic_memory_scope(intrinsic), SCOPE_DEVICE);
+   EXPECT_EQ(nir_intrinsic_execution_scope(intrinsic), SCOPE_NONE);
+
+   /* MakeTexelVisible makes the texel visible before it is read. */
+   int barrier = intrinsic_position(shader, nir_intrinsic_barrier);
+   int load = intrinsic_position(shader, nir_intrinsic_image_deref_load);
+   ASSERT_GE(barrier, 0);
+   ASSERT_GE(load, 0);
+   EXPECT_LT(barrier, load);
+}
+
+TEST_F(AvailabilityVisibility, opimagewrite_avail)
+{
+   /*
+               OpCapability Shader
+               OpCapability VulkanMemoryModel
+               OpCapability VulkanMemoryModelDeviceScope
+               OpMemoryModel Logical Vulkan
+               OpEntryPoint GLCompute %main "main" %img
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %v2int = OpTypeVector %int 2
+     %v4uint = OpTypeVector %uint 4
+     %imgtype = OpTypeImage %uint 2D 0 0 0 2 R32ui
+        %ptr = OpTypePointer UniformConstant %imgtype
+        %img = OpVariable %ptr UniformConstant
+      %int_0 = OpConstant %int 0
+      %coord = OpConstantComposite %v2int %int_0 %int_0
+     %device = OpConstant %int 1
+      %zero = OpConstantNull %v4uint
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %im = OpLoad %imgtype %img
+          %v = OpImageRead %v4uint %im %coord
+               OpImageWrite %im %coord %v MakeTexelAvailable|NonPrivateTexel %device
+               OpReturn
+               OpFunctionEnd
+   */
+   static const uint32_t words[] = {
+      0x07230203, 0x00010500, 0x00070000, 0x00000012, 0x00000000, 0x00020011,
+      0x00000001, 0x00020011, 0x000014e1, 0x00020011, 0x000014e2, 0x0003000e,
+      0x00000000, 0x00000003, 0x0006000f, 0x00000005, 0x00000001, 0x6e69616d,
+      0x00000000, 0x00000002, 0x00060010, 0x00000001, 0x00000011, 0x00000001,
+      0x00000001, 0x00000001, 0x00040047, 0x00000002, 0x00000022, 0x00000000,
+      0x00040047, 0x00000002, 0x00000021, 0x00000000, 0x00020013, 0x00000003,
+      0x00030021, 0x00000004, 0x00000003, 0x00040015, 0x00000005, 0x00000020,
+      0x00000000, 0x00040015, 0x00000006, 0x00000020, 0x00000001, 0x00040017,
+      0x00000007, 0x00000006, 0x00000002, 0x00040017, 0x00000008, 0x00000005,
+      0x00000004, 0x00090019, 0x00000009, 0x00000005, 0x00000001, 0x00000000,
+      0x00000000, 0x00000000, 0x00000002, 0x00000021, 0x00040020, 0x0000000a,
+      0x00000000, 0x00000009, 0x0004003b, 0x0000000a, 0x00000002, 0x00000000,
+      0x0004002b, 0x00000006, 0x0000000b, 0x00000000, 0x0005002c, 0x00000007,
+      0x0000000c, 0x0000000b, 0x0000000b, 0x0004002b, 0x00000006, 0x0000000d,
+      0x00000001, 0x0003002e, 0x00000008, 0x0000000e, 0x00050036, 0x00000003,
+      0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000f, 0x0004003d,
+      0x00000009, 0x00000010, 0x00000002, 0x00050062, 0x00000008, 0x00000011,
+      0x00000010, 0x0000000c, 0x00060063, 0x00000010, 0x0000000c, 0x00000011,
+      0x00000500, 0x0000000d, 0x000100fd, 0x00010038,
+   };
+
+   get_nir(sizeof(words) / sizeof(words[0]), words);
+
+   nir_intrinsic_instr *intrinsic = find_intrinsic(nir_intrinsic_barrier, 0);
+   ASSERT_NE(intrinsic, nullptr);
+
+   EXPECT_EQ(nir_intrinsic_memory_semantics(intrinsic), NIR_MEMORY_MAKE_AVAILABLE);
+   EXPECT_NE(nir_intrinsic_memory_modes(intrinsic) & nir_var_image, 0);
+   EXPECT_EQ(nir_intrinsic_memory_scope(intrinsic), SCOPE_DEVICE);
+   EXPECT_EQ(nir_intrinsic_execution_scope(intrinsic), SCOPE_NONE);
+
+   /* MakeTexelAvailable makes the texel available after it is written. */
+   int barrier = intrinsic_position(shader, nir_intrinsic_barrier);
+   int store = intrinsic_position(shader, nir_intrinsic_image_deref_store);
+   ASSERT_GE(barrier, 0);
+   ASSERT_GE(store, 0);
+   EXPECT_GT(barrier, store);
+}
+
 TEST_F(AvailabilityVisibility, opcopymemory_visavail_both_combined)
 {
    /*

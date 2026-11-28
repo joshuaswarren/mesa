@@ -47,15 +47,24 @@ struct hk_device_memory {
    /* Residency preference the kernel accepted (memory priority 1.0). */
    bool keep_resident;
 
-   /* An import the GPU may write that another import can map at a second
-    * address too: counted in hk_device::va_alias_resources while it lives. */
+   /* An untracked import the GPU may write that another import can map at a
+    * second address too (fd/dma-buf, or a writable host import under the
+    * static M5 rule): counted in hk_device::va_alias_resources while it lives. */
    bool alias_import;
 
-   /* A host import in hk_device::host_alias.imports (M5, host_alias.dynamic). */
+   /* A host import tracked in hk_device::host_alias.imports; counts in
+    * hk_device::va_alias_resources (and hk_device::alias_live on M5 with
+    * host_alias.dynamic) only while it may alias. */
    bool host_alias_tracked;
    /* An fd or dma-buf import, counted in hk_device::alias_live for its
     * lifetime (hk_device_alias_get()). */
    bool alias_fd;
+
+   /* Atomic flags tracking whether an image or buffer has ever been bound to
+    * this memory object. Used by exact-alias dependency tracking so optimal
+    * placed images in image-only heaps do not force HK_SYNC_GFX_MEM. */
+   bool has_image_binding;
+   bool has_buffer_binding;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,

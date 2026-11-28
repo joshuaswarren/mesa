@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include "hk_pack.h"
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "vk_queue.h"
 
@@ -60,6 +62,12 @@ struct hk_queue {
        * signalled, updated monotonically via hk_queue_note_signalled(). Every
        * value at or below it is complete. */
       uint64_t signalled_value;
+      /* Monotonic timestamp (ns) and highest timeline point covered by it,
+       * advanced monotonically by hk_queue_note_signalled() before publishing
+       * signalled_value so observed-duration retirement never uses a stale
+       * timestamp from an earlier point. */
+      uint64_t signalled_ns;
+      uint64_t signalled_ns_point;
 
       /* Latest timeline point that received the waits of a submission
        * without control streams (queue_submit_empty()), 0 once it is known
@@ -135,6 +143,12 @@ struct hk_queue {
       struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
+      /* Observed completion durations for repeated multi-CB looping
+       * submissions, used to budget packets safely below firmware timeouts. */
+      struct hk_pack_obs_entry obs[HK_PACK_OBS_SLOTS];
+      uint32_t obs_pending;
+      uint64_t obs_epoch;
+      uint64_t obs_tick;
    } pack;
 
    /* Reusable scratch and packets for submit-time render packing
@@ -198,9 +212,31 @@ hk_queue_device(struct hk_queue *queue)
 }
 
 static inline void
-hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+hk_queue_note_signalled_at(struct hk_queue *queue, uint64_t point,
+                           uint64_t now_ns)
 {
    uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   if (seen >= point)
+      return;
+
+   uint64_t seen_ns = p_atomic_read(&queue->drm.signalled_ns);
+   while (seen_ns < now_ns) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns, seen_ns, now_ns);
+      if (prev == seen_ns)
+         break;
+      seen_ns = prev;
+   }
+
+   uint64_t seen_pt = p_atomic_read(&queue->drm.signalled_ns_point);
+   while (seen_pt < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns_point, seen_pt, point);
+      if (prev == seen_pt)
+         break;
+      seen_pt = prev;
+   }
+
    while (seen < point) {
       const uint64_t prev =
          p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
@@ -208,6 +244,14 @@ hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
          break;
       seen = prev;
    }
+}
+
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   if (p_atomic_read(&queue->drm.signalled_value) >= point)
+      return;
+   hk_queue_note_signalled_at(queue, point, (uint64_t)os_time_get_nano());
 }
 
 

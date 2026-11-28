@@ -384,6 +384,91 @@ main(void)
       hk_root_mark_push_dirty(d);
       CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
       CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+
+      /* Generalized bypass tracking: dynbuf slots, VB base/clamp, push dword
+       * ranges, and combinations stay bypassable until HK_ROOT_DIRTY_OTHER,
+       * and hk_root_reads_ignore_dirty() rejects any shader that observes a
+       * dirty category, dynbuf slot, or push constant dword. */
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0xff, UINT64_MAX, UINT64_MAX, d));
+
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(0));
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d) &&
+            hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(1), 0, d));
+      CHECK(hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH | HK_ROOT_READS_VERTEX_INPUT,
+                                       BITFIELD64_BIT(1), UINT64_MAX, d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(0), 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_DYNAMIC_BUFFERS, 0, 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_ADDRESS, 0, 0, d));
+
+      hk_root_mark_bypass_launched(d);
+      CHECK(hk_root_launch_current(d, true));
+      CHECK(!hk_root_launch_current(d, false));
+
+      /* Accumulating a second dynbuf slot preserves slot 0 and clears launch. */
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(1));
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(hk_root_bypass_dirty(d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(0), 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(1), 0, d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(2), 0, d));
+
+      /* Fine-grained push constant dword ranges: a push at [0, 8) (dwords 0..1)
+       * does not disturb a shader reading only dword 2, while overlapping
+       * dwords or an unknown push mask (0) are rejected. */
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty_range(d, 0, 8);
+      CHECK(hk_root_bypass_dirty(d));
+      CHECK(d->root_change.push_dirty_dwords == (BITFIELD64_BIT(0) | BITFIELD64_BIT(1)));
+      CHECK(hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(2), d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(0), d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(1), d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, 0, d));
+      hk_root_mark_push_dirty_range(d, 8, 4);
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(2), d));
+      CHECK(hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(3), d));
+
+      /* Adding VB base/clamp and push stays bypassable for non-observing FS. */
+      hk_root_mark_vb_dirty(d, true, false);
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_bypass_dirty(d));
+      CHECK(hk_root_reads_ignore_dirty(0, BITFIELD64_BIT(2), 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_VERTEX_INPUT, 0, 0, d));
+      CHECK(!hk_root_reads_ignore_dirty(HK_ROOT_READS_PUSH, 0, BITFIELD64_BIT(3), d));
+
+      /* Any OTHER mutation disables bypass and cannot be undone by bypass marks. */
+      hk_root_mark_dirty(d);
+      CHECK(!hk_root_bypass_dirty(d));
+      CHECK(!hk_root_reads_ignore_dirty(0, 0, 0, d));
+      hk_root_mark_dynbuf_dirty(d, BITFIELD64_BIT(0));
+      hk_root_mark_vb_dirty(d, true, true);
+      CHECK(!hk_root_bypass_dirty(d));
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d) && d->root_change.dynbuf_dirty_mask == 0 &&
+            d->root_change.push_dirty_dwords == 0);
+
+      /* Non-bypassable root DMA spans (e.g. draw.attrib_strides[], sets[]) are
+       * disjoint from the four bypass-dirtyable regions, while spans touching
+       * push[], dynamic_buffers[], attrib_base[], or attrib_clamps[] overlap. */
+      const uint64_t stride_off = hk_root_descriptor_offset(draw.attrib_strides);
+      CHECK(!hk_root_span_overlaps_bypassable(stride_off, stride_off + 4));
+      CHECK(!hk_root_span_overlaps_bypassable(
+         hk_root_descriptor_offset(sets),
+         hk_root_descriptor_offset(sets) + 64));
+      CHECK(hk_root_span_overlaps_bypassable(
+         hk_root_descriptor_offset(push),
+         hk_root_descriptor_offset(push) + 8));
+      CHECK(hk_root_span_overlaps_bypassable(
+         hk_root_descriptor_offset(dynamic_buffers),
+         hk_root_descriptor_offset(dynamic_buffers) + 16));
+      CHECK(hk_root_span_overlaps_bypassable(
+         hk_root_descriptor_offset(draw.attrib_base),
+         hk_root_descriptor_offset(draw.attrib_base) + 8));
+      CHECK(hk_root_span_overlaps_bypassable(
+         hk_root_descriptor_offset(draw.attrib_clamps),
+         hk_root_descriptor_offset(draw.attrib_clamps) + 4));
       free(d);
    }
 

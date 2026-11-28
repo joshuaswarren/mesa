@@ -429,6 +429,24 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     endforeach
   endforeach
 
+  # The M5 Ultra (G17D) profile: two dies, eight clusters. Admission, device
+  # creation and a queue at each priority, on the shim.
+  test(
+    'hk-g17d-global-priority-allow',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_global_priority,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17d',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # A sparse image bind as a queue's first submission, with no command buffer.
   test(
     'hk-g17p-sparse-bind-first-submit',

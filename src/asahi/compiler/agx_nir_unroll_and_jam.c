@@ -7,6 +7,7 @@
 #include "nir.h"
 #include "nir_builder.h"
 #include "util/bitset.h"
+#include "util/format/u_formats.h"
 #include "util/hash_table.h"
 #include "util/set.h"
 #include "util/u_dynarray.h"
@@ -221,9 +222,16 @@ instr_is_pure_alu(nir_instr *instr)
       return true;
    case nir_instr_type_intrinsic: {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-      return (intr->intrinsic == nir_intrinsic_load_preamble ||
-              intr->intrinsic == nir_intrinsic_load_push_constant) &&
-             nir_intrinsic_infos[intr->intrinsic].has_dest;
+      if (!nir_intrinsic_infos[intr->intrinsic].has_dest)
+         return false;
+      if (intr->intrinsic == nir_intrinsic_load_preamble ||
+          intr->intrinsic == nir_intrinsic_load_push_constant)
+         return true;
+      if (intr->intrinsic == nir_intrinsic_load_global_constant &&
+          nir_intrinsic_can_reorder(intr) &&
+          !(nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT)))
+         return true;
+      return false;
    }
    default:
       return false;
@@ -611,6 +619,188 @@ validate_simple_loop(nir_loop *loop, bool allow_child, nir_loop **child_out)
    return true;
 }
 
+/* Match an invariant expression as `base + const_off` (with const_off == 0 when
+ * there is no constant addend). */
+static void
+split_const_addend(nir_scalar s, nir_def **base_out, int64_t *off_out)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
+      nir_scalar s0 = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar s1 = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(s1)) {
+         *base_out = s0.def;
+         *off_out = nir_scalar_as_int(s1);
+         return;
+      }
+      if (nir_scalar_is_const(s0)) {
+         *base_out = s1.def;
+         *off_out = nir_scalar_as_int(s0);
+         return;
+      }
+   }
+   *base_out = s.def;
+   *off_out = 0;
+}
+
+/* Match `iv` or `ineg(iv)` (possibly with an invariant constant offset). */
+static bool
+match_iv_term(nir_scalar s, nir_def *iv, int *sign_out)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def == iv) {
+      *sign_out = 1;
+      return true;
+   }
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_ineg) {
+      nir_scalar inner = nir_scalar_chase_alu_src(s, 0);
+      if (inner.def == iv) {
+         *sign_out = -1;
+         return true;
+      }
+   }
+   return false;
+}
+
+/* Trace a variant load's address expression back through single-variant-input
+ * address/clamp ops to a sliding-window affine form `(base + off) +/- iv`. */
+static bool
+extract_iv_sliding_key(nir_def *def, nir_def *iv, const BITSET_WORD *variant,
+                       unsigned depth, nir_def **base_out, int64_t *off_out,
+                       int *sign_out)
+{
+   if (!def || depth == 0 || !BITSET_TEST(variant, def->index))
+      return false;
+
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   nir_scalar s = nir_get_scalar(def, 0);
+
+   if (alu->op == nir_op_iadd || alu->op == nir_op_isub) {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(s, 1);
+      int sign = 0;
+      if (!BITSET_TEST(variant, a.def->index) && match_iv_term(b, iv, &sign)) {
+         split_const_addend(a, base_out, off_out);
+         *sign_out = alu->op == nir_op_isub ? -sign : sign;
+         return true;
+      }
+      if (alu->op == nir_op_iadd && !BITSET_TEST(variant, b.def->index) &&
+          match_iv_term(a, iv, &sign)) {
+         split_const_addend(b, base_out, off_out);
+         *sign_out = sign;
+         return true;
+      }
+   }
+
+   switch (alu->op) {
+   case nir_op_mov:
+   case nir_op_u2u64:
+   case nir_op_i2i64:
+   case nir_op_u2u32:
+   case nir_op_i2i32:
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_amul:
+   case nir_op_imul:
+   case nir_op_ishl:
+   case nir_op_ushr:
+   case nir_op_ishr:
+   case nir_op_iand:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_umin:
+   case nir_op_umax: {
+      nir_def *var_src = NULL;
+      unsigned n_inputs = nir_op_infos[alu->op].num_inputs;
+      for (unsigned i = 0; i < n_inputs; ++i) {
+         nir_def *src = alu->src[i].src.ssa;
+         if (BITSET_TEST(variant, src->index)) {
+            if (var_src && var_src != src)
+               return false;
+            var_src = src;
+         }
+      }
+      if (!var_src)
+         return false;
+      return extract_iv_sliding_key(var_src, iv, variant, depth - 1, base_out,
+                                    off_out, sign_out);
+   }
+   default:
+      return false;
+   }
+}
+
+/* Check whether an already-unrolled 1D inner loop's variant loads form a
+ * sliding window along the outer IV so jamming by J reuses loads across
+ * adjacent outer iterations via diagonal CSE instead of multiplying load
+ * traffic by J. */
+static bool
+has_sliding_window_var_loads(nir_loop *inner_leaf, nir_def *iv, int64_t step,
+                             const BITSET_WORD *variant, unsigned var_loads)
+{
+   struct tap_key {
+      nir_def *base;
+      int64_t off;
+      int sign;
+   };
+   struct tap_key keys[16];
+   unsigned n_keys = 0;
+
+   if (var_loads < 2 || var_loads > ARRAY_SIZE(keys))
+      return false;
+
+   nir_foreach_block_in_cf_node(blk, &inner_leaf->cf_node) {
+      nir_foreach_instr(instr, blk) {
+         if (!instr_is_readonly_load(instr) || !instr_uses_bitset(instr, variant))
+            continue;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         nir_def *addr = NULL;
+         for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs;
+              ++i) {
+            if (BITSET_TEST(variant, intr->src[i].ssa->index)) {
+               addr = intr->src[i].ssa;
+               break;
+            }
+         }
+         if (!addr || n_keys >= ARRAY_SIZE(keys))
+            continue;
+         nir_def *base = NULL;
+         int64_t off = 0;
+         int sign = 0;
+         if (extract_iv_sliding_key(addr, iv, variant, 12, &base, &off, &sign))
+            keys[n_keys++] = (struct tap_key){base, off, sign};
+      }
+   }
+
+   if (n_keys < 2)
+      return false;
+
+   unsigned overlap = 0;
+   for (unsigned i = 0; i < n_keys; ++i) {
+      bool adj = false;
+      for (unsigned j = 0; j < n_keys; ++j) {
+         if (i == j)
+            continue;
+         if (keys[i].base == keys[j].base && keys[i].sign == keys[j].sign &&
+             (keys[j].off == keys[i].off + step ||
+              keys[j].off == keys[i].off - step)) {
+            adj = true;
+            break;
+         }
+      }
+      if (adj)
+         overlap++;
+   }
+
+   return overlap * 2 >= var_loads;
+}
+
 static bool
 match_unroll_and_jam(nir_function_impl *impl, nir_loop *outer,
                      struct uaj_match *m)
@@ -935,7 +1125,16 @@ match_unroll_and_jam(nir_function_impl *impl, nir_loop *outer,
    }
 
    /* Every variant value defined inside inner_top used outside inner_top must
-    * be a header phi of inner_top. */
+    * be a header phi of inner_top, or defined in inner_top's header block when
+    * inner_top is a bottom-tested single-body loop (so its header block
+    * dominates the exit). */
+   nir_block *itop_hdr = nir_loop_first_block(inner_top);
+   nir_cf_node *itop_after_hdr = nir_cf_node_next(&itop_hdr->cf_node);
+   bool itop_bottom_body =
+      itop_after_hdr && itop_after_hdr->type == nir_cf_node_if &&
+      nir_cf_node_next(itop_after_hdr) == &nir_loop_last_block(inner_top)->cf_node &&
+      block_is_empty(nir_loop_last_block(inner_top));
+
    nir_foreach_block_in_cf_node(blk, &inner_top->cf_node) {
       nir_foreach_instr(instr, blk) {
          nir_def *def = nir_instr_def(instr);
@@ -943,8 +1142,9 @@ match_unroll_and_jam(nir_function_impl *impl, nir_loop *outer,
             continue;
          nir_foreach_use_including_if(src, def) {
             if (!block_in_loop(use_block(src), inner_top)) {
-               if (instr->type != nir_instr_type_phi ||
-                   blk != nir_loop_first_block(inner_top)) {
+               bool ok_phi = (instr->type == nir_instr_type_phi && blk == itop_hdr);
+               bool ok_body = (itop_bottom_body && blk == itop_hdr);
+               if (!ok_phi && !ok_body) {
                   free(variant);
                   return false;
                }
@@ -957,7 +1157,11 @@ match_unroll_and_jam(nir_function_impl *impl, nir_loop *outer,
     * loads, <= 2 inner accumulators above, paired with J=4 for 2D / J=2 for 1D):
     * empirically sized so a jammed leaf fits within the 64-GPR / 1024-thread
     * occupancy tier on AGX3; the retry loop in agx_compile_shader_nir falls
-    * back to half-factor if register allocation exceeds the tier. */
+    * back to half-factor if register allocation exceeds the tier.
+    *
+    * Also admit an already-unrolled 1D sliding-window stencil inner loop
+    * (inner_top == inner_leaf) when variant loads overlap across adjacent
+    * outer-IV steps so diagonal CSE collapses J * W loads to W + J - 1. */
    unsigned inv_loads = 0, var_loads = 0, leaf_instrs = 0;
    nir_foreach_block_in_cf_node(blk, &inner_leaf->cf_node) {
       nir_foreach_instr(instr, blk) {
@@ -971,17 +1175,24 @@ match_unroll_and_jam(nir_function_impl *impl, nir_loop *outer,
          }
       }
    }
-   if (inv_loads == 0 || var_loads == 0 ||
-       inv_loads + var_loads > 4 || leaf_instrs > 32) {
+   bool small_leaf = (inv_loads + var_loads <= 4 && leaf_instrs <= 32);
+   bool sliding_leaf =
+      !small_leaf && inner_top == inner_leaf && inv_loads <= 24 &&
+      var_loads >= 2 && var_loads <= 16 && leaf_instrs <= 400 &&
+      has_sliding_window_var_loads(inner_leaf, &m->outer_phis[m->iv_idx]->def,
+                                   m->cl.step, variant, var_loads);
+   if (inv_loads == 0 || var_loads == 0 || (!small_leaf && !sliding_leaf)) {
       free(variant);
       return false;
    }
 
-   struct live_out outs[16];
-   unsigned nouts = 0;
-   if (!back_edge_live_outs(outer, outs, &nouts)) {
-      free(variant);
-      return false;
+   if (m->cl.bottom) {
+      struct live_out outs[16];
+      unsigned nouts = 0;
+      if (!back_edge_live_outs(outer, outs, &nouts)) {
+         free(variant);
+         return false;
+      }
    }
 
    m->outer_guard = guard;
@@ -1164,8 +1375,10 @@ unroll_and_jam_loop(nir_function_impl *impl, struct uaj_match *m, unsigned J)
    /* Collect live-outs and check exact_tail before lowering phis. */
    struct live_out outs[16];
    unsigned nouts = 0;
-   bool have_outs = back_edge_live_outs(outer, outs, &nouts);
-   assert(have_outs);
+   if (cl->bottom) {
+      bool have_outs = back_edge_live_outs(outer, outs, &nouts);
+      assert(have_outs);
+   }
    nir_phi_src *iv_init_src = nir_phi_get_src_from_block(cl->iv, pre);
    nir_phi_src *iv_back_src = nir_phi_get_src_from_block(cl->iv, latch);
    const bool exact_tail = cl->bottom && cl->offset == cl->step && iv_init_src &&
@@ -1515,10 +1728,25 @@ match_u2u32_u8(nir_scalar s, nir_def **u8_out)
    if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_u2u32)
       return false;
    nir_scalar src = nir_scalar_chase_alu_src(s, 0);
-   if (src.def->bit_size != 8 || src.def->num_components != 1)
+   if (src.def->num_components != 1)
       return false;
-   *u8_out = src.def;
-   return true;
+   if (src.def->bit_size == 8) {
+      *u8_out = src.def;
+      return true;
+   }
+   if (src.def->bit_size == 16 &&
+       nir_def_instr(src.def)->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr =
+         nir_instr_as_intrinsic(nir_def_instr(src.def));
+      if ((intr->intrinsic == nir_intrinsic_load_agx ||
+           intr->intrinsic == nir_intrinsic_load_constant_agx) &&
+          nir_intrinsic_format(intr) == PIPE_FORMAT_R8_UINT &&
+          !nir_intrinsic_sign_extend(intr)) {
+         *u8_out = src.def;
+         return true;
+      }
+   }
+   return false;
 }
 
 static bool

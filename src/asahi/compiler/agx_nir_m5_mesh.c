@@ -1338,6 +1338,30 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    }
    nir_allocate_mesh_uvb_agx(&b,p,v);
    nir_def *lane=nir_load_subgroup_invocation(&b);
+   if (varyings->clip_m1_1) {
+      /* As agx_nir_lower_clip_m1_1, on the exported z and w. */
+      const unsigned z_plane = first_plane(varyings, VARYING_SLOT_POS) + 2;
+      const uint32_t fp = b.fp_math_ctrl;
+      b.fp_math_ctrl = nir_fp_no_reassoc | nir_fp_no_transform;
+      nir_def *c = nir_load_clip_z_coeff(&b);
+      for (unsigned vertex = 0; vertex < layout.export_vertices; vertex += 32) {
+         nir_def *index = nir_iadd_imm(&b, lane, vertex);
+         nir_push_if(&b, nir_ult(&b, index, nir_u2u32(&b, v)));
+         nir_def *addr = nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
+                                      layout.position + layout.plane_stride * z_plane);
+         nir_def *z = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *w = nir_load_shared(&b, 1, 32,
+            nir_iadd_imm(&b, addr, layout.plane_stride), .align_mul = 4);
+         nir_def *lerp = nir_ffma(&b, z, nir_fsub(&b, nir_imm_float(&b, 1.0f), c),
+                                  nir_fmul(&b, w, c));
+         nir_store_shared(&b, nir_bcsel(&b, nir_fneu(&b, c, nir_imm_float(&b, 0.0f)), lerp, z),
+                          addr, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+      b.fp_math_ctrl = fp;
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   }
    nir_def *primitive_words=nir_udiv_imm(&b,
       nir_iadd_imm(&b,nir_imul_imm(&b,nir_u2u32(&b,p),prim_vertices(s)),3),4);
    for (unsigned word=0;word<DIV_ROUND_UP(prim_vertices(s)*s->info.mesh.max_primitives_out,4);word+=32) {

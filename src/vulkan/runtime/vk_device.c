@@ -798,9 +798,18 @@ vk_device_copy_semaphore_payloads(struct vk_device *device,
       if (result != VK_SUCCESS)
          goto fail;
 
+      STACK_ARRAY(uint64_t, tokens, signal_count);
+      for (uint32_t i = 0; i < signal_count; i++)
+         tokens[i] = vk_sync_pending_begin(signals[i].sync);
+
       /* Now do the copy */
       result = device->copy_sync_payloads(device, wait_count, waits,
                                           signal_count, signals);
+      for (uint32_t i = 0; i < signal_count; i++) {
+         vk_sync_pending_end(signals[i].sync, result == VK_SUCCESS,
+                             signals[i].signal_value, tokens[i]);
+      }
+      STACK_ARRAY_FINISH(tokens);
       if (result != VK_SUCCESS)
          goto fail;
    }

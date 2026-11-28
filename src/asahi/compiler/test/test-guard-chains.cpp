@@ -898,8 +898,119 @@ TEST(GuardChains, CoalesceFloatThreshTreeVariantsAndRefusals)
       nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
       EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 3u);
       EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fadd), 0u);
+      /* Only the original hoisted neg_thr fneg remains; no double-fneg emitted. */
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fneg), 1u);
       ralloc_free(b.shader);
    }
+}
+
+/* Eight adjacent guarded ifs coalesce into one outer fast-path guard with a
+ * 7-bcsel balanced float-threshold tree, and a compact-prefix guarded loop
+ * unrolls by 8 (while >2 unconditional dwords/iter or unguarded bodies stay 4). */
+TEST(GuardChains, CoalescesEightGuardedIfsAndCompactPrefixLoopUnrollsByEight)
+{
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "coalesce-8");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *thr = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *neg_thr = nir_fneg(&b, thr);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+
+      nir_def *vals[8];
+      nir_def *conds[8];
+      for (unsigned k = 0; k < 8; ++k) {
+         nir_def *idx = nir_iadd_imm(&b, tid, 32 * k);
+         nir_def *addr =
+            nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         nir_def *diff = nir_fadd(&b, vals[k], neg_thr);
+         conds[k] = nir_inot(&b, nir_fge(&b, diff, zero));
+      }
+
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < 8; ++k) {
+         nir_push_if(&b, conds[k]);
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, r, acc);
+      }
+      make_store_global(
+         &b, acc, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)),
+         4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after coalesce-8");
+      EXPECT_EQ(count_ifs(b.shader), 9u);
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 7u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fadd), 0u);
+      ralloc_free(b.shader);
+   }
+
+   auto run_loop_unroll = [](bool nested_if, unsigned top_load_comps) -> unsigned {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "guarded-unroll8");
+      b.shader->info.workgroup_size[0] = 32;
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *base2 = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *n = agx_test_load_preamble(&b, 1, 32, 8);
+      nir_def *thr = agx_test_load_preamble(&b, 1, 32, 10);
+      nir_def *one = nir_imm_float(&b, 1.0f);
+
+      nir_variable *iv_var =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "iv");
+      nir_variable *acc_var =
+         nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+      nir_store_var(&b, iv_var, tid, 1);
+      nir_store_var(&b, acc_var, nir_imm_float(&b, 0.0f), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *iv = nir_load_var(&b, iv_var);
+      nir_break_if(&b, nir_uge(&b, iv, n));
+      nir_def *addr =
+         nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, iv), 4));
+      nir_def *v = make_load_global(&b, top_load_comps, 32, addr, 4,
+                                    (gl_access_qualifier)0);
+      nir_def *x = nir_channel(&b, v, 0);
+      if (nested_if)
+         nir_push_if(&b, nir_flt(&b, x, thr));
+      nir_def *addr2 =
+         nir_iadd(&b, base2, nir_ishl_imm(&b, nir_u2u64(&b, iv), 3));
+      nir_def *v2 =
+         make_load_global(&b, 2, 32, addr2, 8, (gl_access_qualifier)0);
+      nir_def *v2x = nir_channel(&b, v2, 0);
+      nir_def *v2y = nir_channel(&b, v2, 1);
+      nir_def *t = nir_frsq(&b, x);
+      for (unsigned i = 0; i < 32; ++i)
+         t = nir_ffma(&b, t, (i & 1) ? v2y : v2x, one);
+      nir_store_var(&b, acc_var, nir_fadd(&b, nir_load_var(&b, acc_var), t), 1);
+      if (nested_if)
+         nir_pop_if(&b, NULL);
+      nir_store_var(&b, iv_var, nir_iadd_imm(&b, iv, 32), 1);
+      nir_pop_loop(&b, loop);
+
+      make_store_global(
+         &b, nir_load_var(&b, acc_var),
+         nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+      nir_lower_vars_to_ssa(b.shader);
+      unsigned widest = 0;
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, &widest));
+      nir_validate_shader(b.shader, "after guarded-unroll8");
+      ralloc_free(b.shader);
+      return widest;
+   };
+
+   /* Positive: compact guarded prefix (2 top-level dwords, ~48 total instrs) -> 8x. */
+   EXPECT_EQ(run_loop_unroll(true, 2), 8u);
+   /* Negative control: >2 unconditional top-level loaded dwords/iter stays at 4x. */
+   EXPECT_EQ(run_loop_unroll(true, 3), 4u);
+   /* Negative control: same size without a nested if stays at 4x. */
+   EXPECT_EQ(run_loop_unroll(false, 2), 4u);
 }
 
 } // namespace

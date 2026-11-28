@@ -54,6 +54,8 @@
 #include "util/u_debug.h"
 #include "git_sha1.h"
 
+#include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_drm_names.h"
 #include "drm-uapi/nouveau_drm.h"
 
 #define MAX_DRM_DEVICES 64
@@ -208,6 +210,42 @@ nouveau_zink_predicate(int fd, const char *driver)
 #endif
 }
 
+/* GL on the GPUs whose chip table row says so (agx_chip_gl_through_zink(),
+ * the M5 Ultra today) runs through zink over Borealis; the asahi Gallium
+ * screen refuses them by the same bit. Such a GPU is one whose device tree
+ * node has a compatible naming that chip ("apple,agx-g17d",
+ * agx_chip_from_compatible()). libdrm reads the compatibles from sysfs
+ * without opening the device, so a GL stack (EGL, GBM, the DRI frontends) on
+ * the GPU's render node needs no MESA_LOADER_DRIVER_OVERRIDE. The display
+ * controller's fd needs nothing here: kmsro tries the asahi screen, which
+ * refuses such a GPU, and falls back to zink. Every other device, the other
+ * M5 members included, keeps its driver.
+ */
+static bool
+asahi_zink_predicate(int fd, const char *kernel_driver)
+{
+#ifndef HAVE_LIBDRM
+   return false;
+#else
+   if (!agx_is_native_drm_driver(kernel_driver))
+      return false;
+
+   drmDevicePtr dev;
+   if (drmGetDevice2(fd, 0, &dev) != 0)
+      return false;
+
+   bool zink = false;
+   if (dev->bustype == DRM_BUS_PLATFORM &&
+       (dev->available_nodes & (1 << DRM_NODE_RENDER)) &&
+       dev->deviceinfo.platform && dev->deviceinfo.platform->compatible) {
+      for (char **c = dev->deviceinfo.platform->compatible; *c && !zink; c++)
+         zink = agx_chip_gl_through_zink(agx_chip_from_compatible(*c));
+   }
+
+   drmFreeDevice(&dev);
+   return zink;
+#endif
+}
 
 /**
  * Goes through all the platform devices whose driver is on the given list and
@@ -801,6 +839,11 @@ loader_get_driver_for_fd(int fd)
    driver = loader_get_pci_driver(fd);
    if (!driver)
       driver = loader_get_kernel_driver_name(fd);
+
+   if (driver && asahi_zink_predicate(fd, driver)) {
+      free(driver);
+      driver = strdup("zink");
+   }
 
    return driver;
 }

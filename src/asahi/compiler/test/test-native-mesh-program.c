@@ -26,12 +26,19 @@ int main(void)
       d.shader_binary_size=c.binary_size;d.scratch_size=c.scratch;
       d.nr_gprs=32;d.compiler_d_valid=true;d.compiler_d=c.compiler_d;
       d.threadgroup_memory_size_B=c.shared;
+      d.usc_clusters=2; /* the M5 Pro's lead */
       struct agx3_g17p_graphics_program p = {0};
-      assert(agx3_g17g_mesh_program_generate(AGX_CHIP_G17S,&d,c.object,&p));
-      assert(p.length>=28);assert(memcmp(p.bytes,c.tail,28)==0);
+      const enum agx_chip m5_chips[] = {
+         AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
+      };
+      for (unsigned ci = 0; ci < sizeof(m5_chips)/sizeof(m5_chips[0]); ci++) {
+         assert(agx3_g17g_mesh_program_generate(m5_chips[ci],&d,c.object,&p));
+         assert(p.length>=28);assert(memcmp(p.bytes,c.tail,28)==0);
+      }
       assert(!agx3_g17g_mesh_program_generate(AGX_CHIP_G17P,&d,c.object,&p));
       d.fragment=true;
-      assert(!agx3_g17g_mesh_program_generate(AGX_CHIP_G17S,&d,c.object,&p));
+      for (unsigned ci = 0; ci < sizeof(m5_chips)/sizeof(m5_chips[0]); ci++)
+         assert(!agx3_g17g_mesh_program_generate(m5_chips[ci],&d,c.object,&p));
    }
    puts("Native mesh/object IOTO tails: 3/3 exact captured matches");
    return 0;

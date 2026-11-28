@@ -6159,7 +6159,9 @@ hk_nir_match_2d_stencil(const nir_shader *orig_nir, uint32_t set_layout_count,
        orig_nir->info.workgroup_size[0] == 0 ||
        orig_nir->info.workgroup_size[1] == 0 ||
        orig_nir->info.workgroup_size[2] != 1 ||
-       orig_nir->info.ray_queries > 0)
+       orig_nir->info.ray_queries > 0 ||
+       orig_nir->info.num_images > 0 || orig_nir->info.num_textures > 0 ||
+       orig_nir->info.num_ubos > 0)
       return false;
 
    nir_foreach_variable_in_shader(var, orig_nir) {
@@ -6704,6 +6706,20 @@ build_box_blur_u8_kernel(nir_builder *b, const struct hk_2d_stencil_plan *plan,
  *   chunk, then for each disparity runs an O(1)-amortized 2-pass separable
  *   vertical + horizontal sliding-window SAD in shared memory, bit-exact on
  *   interior and all border pixels. */
+static nir_def *
+load_stereo_absdiff(nir_builder *b, nir_deref_instr *sh_left,
+                    nir_deref_instr *sh_right, nir_def *sy, nir_def *cx,
+                    nir_def *rx, unsigned sh_l_b, unsigned sh_r_b)
+{
+   nir_def *la = nir_u2u32(
+      b, load_sh_u8x4_byte(b, sh_left,
+                           nir_iadd(b, nir_imul_imm(b, sy, sh_l_b), cx)));
+   nir_def *ra = nir_u2u32(
+      b, load_sh_u8x4_byte(b, sh_right,
+                           nir_iadd(b, nir_imul_imm(b, sy, sh_r_b), rx)));
+   return nir_iabs(b, nir_isub(b, la, ra));
+}
+
 static void
 build_stereo_sad_u8_kernel(nir_builder *b,
                            const struct hk_2d_stencil_plan *plan,
@@ -7083,6 +7099,12 @@ build_stereo_sad_u8_kernel(nir_builder *b,
 
             emit_shared_barrier(b);
 
+            /* Interior threads have all 4 pixels in bounds for every `d` in
+             * `[d0..d1]` because `px_lo` and `px_hi` are monotonic in `t`. */
+            nir_def *chunk_all_valid = nir_iand(
+               b, nir_ige(b, px_lo[0], d1),
+               nir_ilt(b, nir_isub(b, px_hi[3], d0), width));
+
             /* Inner disparity loop: `for (d = d0; d <= d1; d++)`. */
             nir_variable *d_var =
                nir_local_variable_create(b->impl, glsl_int_type(), "d");
@@ -7110,80 +7132,127 @@ build_stereo_sad_u8_kernel(nir_builder *b,
 
                   nir_push_if(b, col_in);
                   {
-                     nir_variable *acc_v = nir_local_variable_create(
-                        b->impl, glsl_int_type(), "vacc");
-                     nir_variable *k_v = nir_local_variable_create(
-                        b->impl, glsl_int_type(), "vk");
-                     nir_store_var(b, acc_v, nir_imm_int(b, 0), 0x1);
-                     nir_store_var(b, k_v, nir_imm_int(b, 0), 0x1);
-                     nir_loop *vl = nir_push_loop(b);
-                     vl->control = nir_loop_control_dont_unroll;
+                     nir_push_if(b, nir_ige_imm(b, diam, 7));
                      {
-                        nir_def *k = nir_load_var(b, k_v);
-                        nir_push_if(b, nir_ige(b, k, diam));
-                        nir_jump(b, nir_jump_break);
-                        nir_pop_if(b, NULL);
+                        /* Cache the first 7 vertical absolute differences and
+                         * reuse them as the outgoing rows for `j = 1..7`,
+                         * eliminating 14 shared loads and 7 absdiffs per
+                         * disparity. `diam` is odd, so `diam - 7` is even. */
+                        nir_def *ad_top[7];
+                        nir_def *init_acc = nir_imm_int(b, 0);
+                        for (unsigned k = 0; k < 7; k++) {
+                           nir_def *ad = load_stereo_absdiff(
+                              b, sh_left, sh_right, nir_iadd_imm(b, row0, k),
+                              cx, rx, SH_L_B, SH_R_B);
+                           ad_top[k] = nir_u2u16(b, ad);
+                           init_acc = nir_iadd(b, init_acc, ad);
+                        }
 
-                        nir_def *sy = nir_iadd(b, row0, k);
-                        nir_def *la = nir_u2u32(
-                           b,
-                           load_sh_u8x4_byte(
-                              b, sh_left,
-                              nir_iadd(b, nir_imul_imm(b, sy, SH_L_B), cx)));
-                        nir_def *ra = nir_u2u32(
-                           b,
-                           load_sh_u8x4_byte(
-                              b, sh_right,
-                              nir_iadd(b, nir_imul_imm(b, sy, SH_R_B), rx)));
-                        nir_def *ad = nir_iabs(b, nir_isub(b, la, ra));
-                        nir_store_var(b, acc_v,
-                                      nir_iadd(b, nir_load_var(b, acc_v), ad),
-                                      0x1);
-                        nir_store_var(b, k_v, nir_iadd_imm(b, k, 1), 0x1);
-                     }
-                     nir_pop_loop(b, NULL);
+                        nir_variable *acc_v = nir_local_variable_create(
+                           b->impl, glsl_int_type(), "vacc");
+                        nir_variable *k_v = nir_local_variable_create(
+                           b->impl, glsl_int_type(), "vk");
+                        nir_store_var(b, acc_v, init_acc, 0x1);
+                        nir_store_var(b, k_v, nir_imm_int(b, 7), 0x1);
+                        nir_loop *vl = nir_push_loop(b);
+                        vl->control = nir_loop_control_dont_unroll;
+                        {
+                           nir_def *k = nir_load_var(b, k_v);
+                           nir_push_if(b, nir_ige(b, k, diam));
+                           nir_jump(b, nir_jump_break);
+                           nir_pop_if(b, NULL);
 
-                     nir_def *acc = nir_load_var(b, acc_v);
-                     store_sh_u16(
-                        b, sh_col,
-                        nir_iadd(b, nir_imul_imm(b, row0, SH_COL_STRIDE), cx),
-                        nir_u2u16(b, acc));
+                           nir_def *sy0 = nir_iadd(b, row0, k);
+                           nir_def *ad0 = load_stereo_absdiff(
+                              b, sh_left, sh_right, sy0, cx, rx, SH_L_B,
+                              SH_R_B);
+                           nir_def *ad1 = load_stereo_absdiff(
+                              b, sh_left, sh_right, nir_iadd_imm(b, sy0, 1), cx,
+                              rx, SH_L_B, SH_R_B);
+                           nir_def *acc_next = nir_iadd(
+                              b, nir_load_var(b, acc_v),
+                              nir_iadd(b, ad0, ad1));
+                           nir_store_var(b, acc_v, acc_next, 0x1);
+                           nir_store_var(b, k_v, nir_iadd_imm(b, k, 2), 0x1);
+                        }
+                        nir_pop_loop(b, NULL);
 
-                     for (unsigned j = 1; j < 8; j++) {
-                        nir_def *sy_add =
-                           nir_iadd_imm(b, nir_iadd(b, row0, two_r), j);
-                        nir_def *sy_sub = nir_iadd_imm(b, row0, j - 1);
-                        nir_def *l_add = nir_u2u32(
-                           b, load_sh_u8x4_byte(
-                                 b, sh_left,
-                                 nir_iadd(b, nir_imul_imm(b, sy_add, SH_L_B),
-                                          cx)));
-                        nir_def *r_add = nir_u2u32(
-                           b, load_sh_u8x4_byte(
-                                 b, sh_right,
-                                 nir_iadd(b, nir_imul_imm(b, sy_add, SH_R_B),
-                                          rx)));
-                        nir_def *l_sub = nir_u2u32(
-                           b, load_sh_u8x4_byte(
-                                 b, sh_left,
-                                 nir_iadd(b, nir_imul_imm(b, sy_sub, SH_L_B),
-                                          cx)));
-                        nir_def *r_sub = nir_u2u32(
-                           b, load_sh_u8x4_byte(
-                                 b, sh_right,
-                                 nir_iadd(b, nir_imul_imm(b, sy_sub, SH_R_B),
-                                          rx)));
-                        nir_def *ad_add = nir_iabs(b, nir_isub(b, l_add, r_add));
-                        nir_def *ad_sub = nir_iabs(b, nir_isub(b, l_sub, r_sub));
-                        acc = nir_isub(b, nir_iadd(b, acc, ad_add), ad_sub);
+                        nir_def *acc = nir_load_var(b, acc_v);
                         store_sh_u16(
                            b, sh_col,
-                           nir_iadd(b,
-                                    nir_imul_imm(b, nir_iadd_imm(b, row0, j),
-                                                 SH_COL_STRIDE),
-                                    cx),
+                           nir_iadd(b, nir_imul_imm(b, row0, SH_COL_STRIDE), cx),
                            nir_u2u16(b, acc));
+
+                        for (unsigned j = 1; j < 8; j++) {
+                           nir_def *sy_add =
+                              nir_iadd_imm(b, nir_iadd(b, row0, two_r), j);
+                           nir_def *ad_add = load_stereo_absdiff(
+                              b, sh_left, sh_right, sy_add, cx, rx, SH_L_B,
+                              SH_R_B);
+                           acc = nir_isub(b, nir_iadd(b, acc, ad_add),
+                                          nir_u2u32(b, ad_top[j - 1]));
+                           store_sh_u16(
+                              b, sh_col,
+                              nir_iadd(b,
+                                       nir_imul_imm(b, nir_iadd_imm(b, row0, j),
+                                                    SH_COL_STRIDE),
+                                       cx),
+                              nir_u2u16(b, acc));
+                        }
                      }
+                     nir_push_else(b, NULL);
+                     {
+                        nir_variable *acc_v = nir_local_variable_create(
+                           b->impl, glsl_int_type(), "vacc_s");
+                        nir_variable *k_v = nir_local_variable_create(
+                           b->impl, glsl_int_type(), "vk_s");
+                        nir_store_var(b, acc_v, nir_imm_int(b, 0), 0x1);
+                        nir_store_var(b, k_v, nir_imm_int(b, 0), 0x1);
+                        nir_loop *vl = nir_push_loop(b);
+                        vl->control = nir_loop_control_dont_unroll;
+                        {
+                           nir_def *k = nir_load_var(b, k_v);
+                           nir_push_if(b, nir_ige(b, k, diam));
+                           nir_jump(b, nir_jump_break);
+                           nir_pop_if(b, NULL);
+
+                           nir_def *sy = nir_iadd(b, row0, k);
+                           nir_def *ad = load_stereo_absdiff(
+                              b, sh_left, sh_right, sy, cx, rx, SH_L_B, SH_R_B);
+                           nir_store_var(b, acc_v,
+                                         nir_iadd(b, nir_load_var(b, acc_v), ad),
+                                         0x1);
+                           nir_store_var(b, k_v, nir_iadd_imm(b, k, 1), 0x1);
+                        }
+                        nir_pop_loop(b, NULL);
+
+                        nir_def *acc = nir_load_var(b, acc_v);
+                        store_sh_u16(
+                           b, sh_col,
+                           nir_iadd(b, nir_imul_imm(b, row0, SH_COL_STRIDE), cx),
+                           nir_u2u16(b, acc));
+
+                        for (unsigned j = 1; j < 8; j++) {
+                           nir_def *sy_add =
+                              nir_iadd_imm(b, nir_iadd(b, row0, two_r), j);
+                           nir_def *sy_sub = nir_iadd_imm(b, row0, j - 1);
+                           nir_def *ad_add = load_stereo_absdiff(
+                              b, sh_left, sh_right, sy_add, cx, rx, SH_L_B,
+                              SH_R_B);
+                           nir_def *ad_sub = load_stereo_absdiff(
+                              b, sh_left, sh_right, sy_sub, cx, rx, SH_L_B,
+                              SH_R_B);
+                           acc = nir_isub(b, nir_iadd(b, acc, ad_add), ad_sub);
+                           store_sh_u16(
+                              b, sh_col,
+                              nir_iadd(b,
+                                       nir_imul_imm(b, nir_iadd_imm(b, row0, j),
+                                                    SH_COL_STRIDE),
+                                       cx),
+                              nir_u2u16(b, acc));
+                        }
+                     }
+                     nir_pop_if(b, NULL);
                   }
                   nir_push_else(b, NULL);
                   {
@@ -7207,58 +7276,101 @@ build_stereo_sad_u8_kernel(nir_builder *b,
                nir_push_if(b, nir_ilt(b, py, height));
                {
                   nir_def *col_row = nir_imul_imm(b, row, SH_COL_STRIDE);
+                  nir_def *col_base = nir_iadd(b, col_row, lx0);
+                  nir_def *n4 = nir_ishr_imm(b, diam, 2);
                   nir_variable *hsum_v = nir_local_variable_create(
                      b->impl, glsl_int_type(), "hsum");
-                  nir_variable *hk_v = nir_local_variable_create(
-                     b->impl, glsl_int_type(), "hk");
+                  nir_variable *hk4_v = nir_local_variable_create(
+                     b->impl, glsl_int_type(), "hk4");
                   nir_store_var(b, hsum_v, nir_imm_int(b, 0), 0x1);
-                  nir_store_var(b, hk_v, nir_imm_int(b, 0), 0x1);
+                  nir_store_var(b, hk4_v, nir_imm_int(b, 0), 0x1);
+                  /* 4 adjacent u16 column sums per iteration vectorize into a
+                   * single 8-byte shared load. */
                   nir_loop *hl = nir_push_loop(b);
                   hl->control = nir_loop_control_dont_unroll;
                   {
-                     nir_def *k = nir_load_var(b, hk_v);
-                     nir_push_if(b, nir_ige(b, k, diam));
+                     nir_def *k4 = nir_load_var(b, hk4_v);
+                     nir_push_if(b, nir_ige(b, k4, n4));
                      nir_jump(b, nir_jump_break);
                      nir_pop_if(b, NULL);
 
-                     nir_def *c = load_sh_u16(
-                        b, sh_col, nir_iadd(b, col_row, nir_iadd(b, lx0, k)));
-                     nir_store_var(b, hsum_v,
-                                   nir_iadd(b, nir_load_var(b, hsum_v),
-                                            nir_u2u32(b, c)),
-                                   0x1);
-                     nir_store_var(b, hk_v, nir_iadd_imm(b, k, 1), 0x1);
+                     nir_def *off =
+                        nir_iadd(b, col_base, nir_ishl_imm(b, k4, 2));
+                     nir_def *s = nir_load_var(b, hsum_v);
+                     for (unsigned lane = 0; lane < 4; lane++) {
+                        nir_def *c = load_sh_u16(
+                           b, sh_col, nir_iadd_imm(b, off, lane));
+                        s = nir_iadd(b, s, nir_u2u32(b, c));
+                     }
+                     nir_store_var(b, hsum_v, s, 0x1);
+                     nir_store_var(b, hk4_v, nir_iadd_imm(b, k4, 1), 0x1);
                   }
                   nir_pop_loop(b, NULL);
 
-                  nir_def *hsum = nir_load_var(b, hsum_v);
-                  for (unsigned t = 0; t < 4; t++) {
-                     if (t > 0) {
-                        nir_def *c_add = load_sh_u16(
-                           b, sh_col,
-                           nir_iadd(b, col_row,
-                                    nir_iadd_imm(b, nir_iadd(b, lx0, two_r),
-                                                 t)));
-                        nir_def *c_sub = load_sh_u16(
-                           b, sh_col,
-                           nir_iadd(b, col_row, nir_iadd_imm(b, lx0, t - 1)));
-                        hsum = nir_isub(b,
-                                        nir_iadd(b, hsum, nir_u2u32(b, c_add)),
-                                        nir_u2u32(b, c_sub));
-                     }
-
-                     nir_def *valid_d = nir_iand(
-                        b, nir_ige_imm(b, nir_isub(b, px_lo[t], d), 0),
-                        nir_ilt(b, nir_isub(b, px_hi[t], d), width));
-                     nir_def *cur_bc = nir_load_var(b, bc_var[t]);
-                     nir_def *cur_bd = nir_load_var(b, bd_var[t]);
-                     nir_def *better =
-                        nir_iand(b, valid_d, nir_ilt(b, hsum, cur_bc));
-                     nir_store_var(b, bc_var[t],
-                                   nir_bcsel(b, better, hsum, cur_bc), 0x1);
-                     nir_store_var(b, bd_var[t], nir_bcsel(b, better, d, cur_bd),
-                                   0x1);
+                  /* `diam = 2*radius + 1` is always odd, leaving 1 or 3 taps. */
+                  nir_def *last = nir_iand_imm(b, diam, ~3);
+                  nir_def *tail_off = nir_iadd(b, col_base, last);
+                  nir_def *hsum = nir_iadd(
+                     b, nir_load_var(b, hsum_v),
+                     nir_u2u32(b, load_sh_u16(b, sh_col, tail_off)));
+                  nir_store_var(b, hsum_v, hsum, 0x1);
+                  nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, diam, 2), 0));
+                  {
+                     nir_def *c1 = load_sh_u16(
+                        b, sh_col, nir_iadd_imm(b, tail_off, 1));
+                     nir_def *c2 = load_sh_u16(
+                        b, sh_col, nir_iadd_imm(b, tail_off, 2));
+                     nir_def *s = nir_iadd(
+                        b, nir_load_var(b, hsum_v),
+                        nir_iadd(b, nir_u2u32(b, c1), nir_u2u32(b, c2)));
+                     nir_store_var(b, hsum_v, s, 0x1);
                   }
+                  nir_pop_if(b, NULL);
+
+                  nir_def *hsums[4];
+                  hsums[0] = nir_load_var(b, hsum_v);
+                  for (unsigned t = 1; t < 4; t++) {
+                     nir_def *c_add = load_sh_u16(
+                        b, sh_col,
+                        nir_iadd_imm(b, nir_iadd(b, col_base, two_r), t));
+                     nir_def *c_sub = load_sh_u16(
+                        b, sh_col, nir_iadd_imm(b, col_base, t - 1));
+                     hsums[t] = nir_isub(
+                        b, nir_iadd(b, hsums[t - 1], nir_u2u32(b, c_add)),
+                        nir_u2u32(b, c_sub));
+                  }
+
+                  nir_push_if(b, chunk_all_valid);
+                  {
+                     for (unsigned t = 0; t < 4; t++) {
+                        nir_def *cur_bc = nir_load_var(b, bc_var[t]);
+                        nir_def *cur_bd = nir_load_var(b, bd_var[t]);
+                        nir_def *better = nir_ilt(b, hsums[t], cur_bc);
+                        nir_store_var(b, bc_var[t],
+                                      nir_bcsel(b, better, hsums[t], cur_bc),
+                                      0x1);
+                        nir_store_var(b, bd_var[t],
+                                      nir_bcsel(b, better, d, cur_bd), 0x1);
+                     }
+                  }
+                  nir_push_else(b, NULL);
+                  {
+                     for (unsigned t = 0; t < 4; t++) {
+                        nir_def *valid_d = nir_iand(
+                           b, nir_ige(b, px_lo[t], d),
+                           nir_ilt(b, nir_isub(b, px_hi[t], d), width));
+                        nir_def *cur_bc = nir_load_var(b, bc_var[t]);
+                        nir_def *cur_bd = nir_load_var(b, bd_var[t]);
+                        nir_def *better =
+                           nir_iand(b, valid_d, nir_ilt(b, hsums[t], cur_bc));
+                        nir_store_var(b, bc_var[t],
+                                      nir_bcsel(b, better, hsums[t], cur_bc),
+                                      0x1);
+                        nir_store_var(b, bd_var[t],
+                                      nir_bcsel(b, better, d, cur_bd), 0x1);
+                     }
+                  }
+                  nir_pop_if(b, NULL);
                }
                nir_pop_if(b, NULL);
 

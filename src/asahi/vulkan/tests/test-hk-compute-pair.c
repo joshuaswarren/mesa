@@ -3777,6 +3777,22 @@ test_g17p_compile_occupancy(void)
       .has_epilogue = true,
       .epilogue = relu6,
    };
+   const struct hk_nir_dw_a_cfg im2expdwa_relu6 = {
+      .has_epilogue = true,
+      .epilogue = relu6,
+      .has_expand = true,
+      .has_exp_im2col = true,
+      .has_exp_epilogue = true,
+      .exp_epilogue = relu6,
+   };
+   const struct hk_nir_dw_a_cfg exp1x1dwa_relu6 = {
+      .has_epilogue = true,
+      .epilogue = relu6,
+      .has_expand = true,
+      .has_exp_im2col = false,
+      .has_exp_epilogue = true,
+      .exp_epilogue = relu6,
+   };
    const struct hk_nir_fadd_epilogue fadd_ok = {0};
    const struct {
       const char *name;
@@ -3787,6 +3803,9 @@ test_g17p_compile_occupancy(void)
       enum hk_compute_pair_dual_write dual;
       bool im2col_a;
       bool dw_a;
+      bool im2_exp_dw_a;
+      uint8_t gemm_dw_proj_n;
+      bool exp1x1_dw_a;
    } cases[] = {
       { "cmat16_ug",               false, 64, 16, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
       { "cmat32_ug",               false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
@@ -3822,6 +3841,8 @@ test_g17p_compile_occupancy(void)
       { "cmat48_ug_dwa_dfaddcopy", false, 64, 48, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
       { "cmat64x64_ug_dwa_dfaddcopy", false, 64, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true },
       { "cmat64_ug_dwa_dfaddcopy", false, 32, 64, false, HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY, false, true  },
+      { "cmat16_ug_im2expdwa_dcopy", false, 64, 16, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, false, true },
+      { "cmat24_ug_exp1x1dwa_dcopy", false, 64, 24, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, false, false, 0, true },
       { "cmat32x32_ug",            false, 32, 32, true,  HK_COMPUTE_PAIR_DUAL_NONE,      false, false },
       { "cmat32x32_ug_im2a_dcopy", false, 32, 32, true,  HK_COMPUTE_PAIR_DUAL_COPY,      true,  false },
       { "cmat32x32_ug_dwa_dcopy",  false, 32, 32, false, HK_COMPUTE_PAIR_DUAL_COPY,      false, true  },
@@ -3836,6 +3857,9 @@ test_g17p_compile_occupancy(void)
       { "cmat24_ug_gemm_dw",       false, 64, 24, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
       { "cmat32_ug_gemm_dw",       false, 64, 32, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
       { "cmat48_ug_gemm_dw",       false, 64, 48, true,  HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false },
+      { "cmat48_ug_gemm_dw_proj24", false, 64, 48, true, HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false, false, 24 },
+      { "cmat24_ug_gemm_dw_proj32", false, 64, 24, true, HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false, false, 32 },
+      { "cmat32_ug_gemm_dw_proj64", false, 64, 32, true, HK_COMPUTE_PAIR_DUAL_GEMM_DW,   false, false, false, 64 },
    };
    bool all_ok = true;
    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
@@ -3851,12 +3875,20 @@ test_g17p_compile_occupancy(void)
       struct hk_pack_loop_bound lb = {0};
       const struct hk_nir_fadd_epilogue *fe =
          hk_compute_pair_dual_is_fadd_ep(cases[i].dual) ? &fadd_ok : NULL;
+      struct hk_nir_dw_a_cfg gdw_cfg = dwa_relu6;
+      if (cases[i].gemm_dw_proj_n) {
+         gdw_cfg.has_proj = true;
+         gdw_cfg.proj_tile_n = cases[i].gemm_dw_proj_n;
+      }
       const struct hk_nir_dw_a_cfg *gdw =
-         cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ? &dwa_relu6 : NULL;
+         cases[i].dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ? &gdw_cfg : NULL;
+      const struct hk_nir_dw_a_cfg *dwa =
+         cases[i].im2_exp_dw_a ? &im2expdwa_relu6 :
+         (cases[i].exp1x1_dw_a ? &exp1x1dwa_relu6 :
+          (cases[i].dw_a ? &dwa_relu6 : NULL));
       nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
          orig, &m, cases[i].tile_m, cases[i].tile_n, cases[i].clamp ? &relu6 : NULL,
-         cases[i].dual, fe, cases[i].im2col_a,
-         cases[i].dw_a ? &dwa_relu6 : NULL, gdw, &lb);
+         cases[i].dual, fe, cases[i].im2col_a, dwa, gdw, &lb);
       HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
       /* With Dynamic Caching ILP headroom on AGX3B, 0-scratch heavy variants
        * trade small GPR increases for higher ILP and tile reuse:
@@ -3864,6 +3896,10 @@ test_g17p_compile_occupancy(void)
        *  - im2col_a / dw_a / gemm_dw / cmat48: <= 128 GPRs (832t)
        *  - 64x64 (16 accs/SG): <= 136 GPRs (768t = 6 WGs/core; 144 for dw_a) */
       const unsigned max_gprs =
+         cases[i].gemm_dw_proj_n
+            ? (cases[i].tile_n == 48 ? 160u : 152u) :
+         cases[i].exp1x1_dw_a ? 160u :
+         cases[i].im2_exp_dw_a ? 136u :
          (cases[i].tile_m == 64 && cases[i].tile_n == 64)
             ? (cases[i].dw_a ? 144u : 136u) :
          cases[i].dw_a
@@ -5189,6 +5225,714 @@ test_gemm_cmat_k32_small_tiles(void)
    ralloc_free(ref_orig);
 }
 
+static void
+test_gemm_exp_dw_a_fusion(void)
+{
+   /* Bit-exact NIR-eval verification of fused im2col + Expand -> 3x3 s=1 DW ->
+    * 1x1 Project (im2_exp_dw_a), plus refusal checks for non-im2col expand,
+    * guarded, tile_m != 64, and DUAL_PAD4. */
+   const struct hk_nir_clamp_epilogue relu6 = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = hk_eval_f2u(0.0f), .upper_bits = hk_eval_f2u(6.0f),
+   };
+   const struct gemm_test_opts ref_opts = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   const struct gemm_test_opts ug_opts = {
+      .guarded = false, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   nir_shader *ref_orig = build_tiled_gemm_nir_opts(&ref_opts);
+   nir_shader *grd_pre = build_tiled_gemm_nir_opts(&ref_opts);
+   nir_shader *ug_pre = build_tiled_gemm_nir_opts(&ug_opts);
+   run_hk_preprocess_for_test(grd_pre, false);
+   run_hk_preprocess_for_test(ug_pre, false);
+   struct hk_nir_gemm_output grd_m = {0}, ug_m = {0};
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      grd_pre, nir_address_format_64bit_global_32bit_offset, &grd_m));
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      ug_pre, nir_address_format_64bit_global_32bit_offset, &ug_m));
+
+   /* Refusal checks: guarded, tile_m != 64, DUAL_PAD4 (both im2col and 1x1 expand). */
+   const struct hk_nir_dw_a_cfg no_im2_cfg = { .has_expand = true };
+   const struct hk_nir_dw_a_cfg bad_cfg = { .has_expand = true, .has_exp_im2col = true };
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      grd_pre, &grd_m, 64, 24, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+      NULL, false, &no_im2_cfg, NULL, NULL) == NULL);
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      ug_pre, &ug_m, 32, 24, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+      NULL, false, &no_im2_cfg, NULL, NULL) == NULL);
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      ug_pre, &ug_m, 64, 24, NULL, HK_COMPUTE_PAIR_DUAL_PAD4,
+      NULL, false, &no_im2_cfg, NULL, NULL) == NULL);
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      grd_pre, &grd_m, 64, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+      NULL, false, &bad_cfg, NULL, NULL) == NULL);
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      ug_pre, &ug_m, 32, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+      NULL, false, &bad_cfg, NULL, NULL) == NULL);
+   HK_EVAL_CHECK(hk_nir_build_gemm_cmat_tiled_with_bound(
+      ug_pre, &ug_m, 64, 32, NULL, HK_COMPUTE_PAIR_DUAL_PAD4,
+      NULL, false, &bad_cfg, NULL, NULL) == NULL);
+
+   /* Also verify im2_exp_dw_a (3x3 s=2 RGB im2col + 27->32 GEMM + clamp -> 3x3 s=1 DW
+    * + clamp + copy4 -> 32->16 Project + copy4) on a 16x16 (2x2 spatial tiles, 32x32x3
+    * input) problem, covering interior + right/bottom im2col border + skip_im2_dst=0/1. */
+   for (unsigned skip_im2 = 0; skip_im2 < 2; ++skip_im2) {
+      const uint32_t in_h = 16, in_w = 16, M = in_h * in_w;
+      const uint32_t src_h = 32, src_w_px = 32, ch = 3, iw = src_w_px * ch;
+      const uint32_t kw = 3 * ch, kh = 3, EK = kw * kh; /* 27 */
+      const uint32_t K = 32, N = 16, tile_n = 16;
+
+      struct hk_nir_dw_a_cfg cfg = {
+         .has_epilogue = true,
+         .epilogue = relu6,
+         .has_expand = true,
+         .has_exp_im2col = true,
+         .has_exp_epilogue = true,
+         .exp_epilogue = relu6,
+      };
+      struct hk_pack_loop_bound lb = {0};
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         ug_pre, &ug_m, 64, tile_n, NULL, HK_COMPUTE_PAIR_DUAL_COPY,
+         NULL, false, &cfg, NULL, &lb);
+      HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
+      nir_validate_shader(alt, "gemm_cmat_im2expdwa");
+
+      const size_t src_elems = (size_t)src_h * iw;
+      const size_t im2_elems = (size_t)M * EK;
+      const size_t eb_elems = (size_t)EK * K;
+      const size_t mid_elems = (size_t)M * K;
+      const size_t wt_elems = 9u * K;
+      const size_t pb_elems = (size_t)K * N;
+      const size_t c_elems = (size_t)M * N;
+      float *src_buf = calloc(src_elems, 4);
+      float *im2_ref = calloc(im2_elems, 4);
+      float *im2_alt = calloc(im2_elems, 4);
+      float *exp_b = calloc(eb_elems, 4);
+      float *exp_bias = calloc(K, 4);
+      float *exp_c_ref = calloc(mid_elems, 4);
+      float *exp_c_alt = calloc(mid_elems, 4);
+      float *wt_buf = calloc(wt_elems, 4);
+      float *dw_bias = calloc(K, 4);
+      float *dw_ref = calloc(mid_elems, 4);
+      float *dw_d1 = calloc(mid_elems, 4);
+      float *dw_d2 = calloc(mid_elems, 4);
+      float *a_dummy = calloc(mid_elems, 4);
+      float *proj_b = calloc(pb_elems, 4);
+      float *proj_bias = calloc(N, 4);
+      float *c_ref = calloc(c_elems, 4);
+      float *c_alt = calloc(c_elems, 4);
+      float *g_dst2 = calloc(c_elems, 4);
+
+      uint32_t rng = 0xa700u + skip_im2 * 53u;
+      for (size_t i = 0; i < src_elems; ++i) src_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < eb_elems; ++i) exp_b[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < K; ++i) exp_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < wt_elems; ++i) wt_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < K; ++i) dw_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < pb_elems; ++i) proj_b[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < N; ++i) proj_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < im2_elems; ++i) im2_alt[i] = -44.5f;
+      for (size_t i = 0; i < mid_elems; ++i) {
+         exp_c_alt[i] = -66.5f; dw_d1[i] = -99.5f; dw_d2[i] = -77.5f; a_dummy[i] = -55.25f;
+      }
+
+      /* CPU reference im2col (sh=2, step_x=6, pad_x=0, pad_y=0, kw=9, kh=3) + Expand + DW. */
+      for (uint32_t oy = 0; oy < in_h; ++oy) {
+         for (uint32_t ox = 0; ox < in_w; ++ox) {
+            const uint32_t p = oy * in_w + ox;
+            for (uint32_t ky = 0; ky < kh; ++ky) {
+               const uint32_t sy = oy * 2u + ky;
+               for (uint32_t kx = 0; kx < kw; ++kx) {
+                  const uint32_t sx = ox * 6u + kx;
+                  im2_ref[(size_t)p * EK + ky * kw + kx] =
+                     (sy < src_h && sx < iw) ? src_buf[(size_t)sy * iw + sx] : 0.0f;
+               }
+            }
+            for (uint32_t c = 0; c < K; ++c) {
+               float acc = 0.0f;
+               for (uint32_t kk = 0; kk < EK; ++kk)
+                  acc = fmaf(im2_ref[(size_t)p * EK + kk], exp_b[(size_t)kk * K + c], acc);
+               acc += exp_bias[c];
+               acc = fminf(fmaxf(acc, 0.0f), 6.0f);
+               exp_c_ref[(size_t)p * K + c] = acc;
+            }
+         }
+      }
+      for (uint32_t oy = 0; oy < in_h; ++oy) {
+         for (uint32_t ox = 0; ox < in_w; ++ox) {
+            for (uint32_t c = 0; c < K; ++c) {
+               float acc = 0.0f;
+               for (int32_t ky = 0; ky < 3; ++ky) {
+                  const int32_t iy = (int32_t)oy - 1 + ky;
+                  for (int32_t kx = 0; kx < 3; ++kx) {
+                     const int32_t ix = (int32_t)ox - 1 + kx;
+                     const float iv = (iy >= 0 && iy < (int32_t)in_h &&
+                                       ix >= 0 && ix < (int32_t)in_w)
+                                         ? exp_c_ref[((size_t)iy * in_w + ix) * K + c]
+                                         : 0.0f;
+                     acc = ref_mul_add_unfused(iv, wt_buf[(size_t)(ky * 3 + kx) * K + c], acc);
+                  }
+               }
+               acc += dw_bias[c];
+               dw_ref[(size_t)(oy * in_w + ox) * K + c] = fminf(fmaxf(acc, 0.0f), 6.0f);
+            }
+         }
+      }
+
+      struct gemm_push_layout push = {
+         .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = 1,
+      };
+      const uint32_t og[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
+      struct hk_eval_ssbo so[4] = {
+         { 0, 0, dw_ref, mid_elems * 4, 0 }, { 0, 1, proj_b, pb_elems * 4, 0 },
+         { 0, 2, proj_bias, (size_t)N * 4, 0 }, { 0, 3, c_ref, c_elems * 4, 0 },
+      };
+      hk_eval_dispatch_wg(ref_orig, og, so, 4, &push, sizeof(push));
+
+      uint8_t push_buf[256] = {0};
+      memcpy(push_buf, &push, sizeof(push));
+      struct hk_eval_ssbo sa[15];
+      unsigned n_sa = 0;
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 0, a_dummy, mid_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 1, proj_b, pb_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 2, proj_bias, (size_t)N * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 3, c_alt, c_elems * 4, 0 };
+      const uint32_t dual_off = hk_dual_write_push_offset(ug_m.push_bytes);
+      const uint64_t gd2_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 9, g_dst2, c_elems * 4, 0 };
+      struct hk_dual_copy_push dcp = {
+         .dst2_va_lo = (uint32_t)gd2_va, .dst2_va_hi = (uint32_t)(gd2_va >> 32),
+      };
+      memcpy(push_buf + dual_off, &dcp, sizeof(dcp));
+
+      const uint64_t exp_c_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 10, exp_c_alt, mid_elems * 4, 0 };
+      const uint64_t wt_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 11, wt_buf, wt_elems * 4, 0 };
+      const uint64_t dw_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 12, dw_bias, (size_t)K * 4, 0 };
+      const uint64_t dst1_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 13, dw_d1, mid_elems * 4, 0 };
+      const uint64_t dst2_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 14, dw_d2, mid_elems * 4, 0 };
+      const uint64_t src_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 15, src_buf, src_elems * 4, 0 };
+      const uint64_t exp_b_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 16, exp_b, eb_elems * 4, 0 };
+      const uint64_t exp_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 17, exp_bias, (size_t)K * 4, 0 };
+      const uint64_t im2_dst_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 18, im2_alt, im2_elems * 4, 0 };
+
+      const uint32_t dw_off = hk_dw_a_push_offset(ug_m.push_bytes, HK_COMPUTE_PAIR_DUAL_COPY);
+      const uint32_t exp_off = hk_exp_dw_a_push_offset(ug_m.push_bytes, HK_COMPUTE_PAIR_DUAL_COPY);
+      const uint32_t dw_flags =
+         HK_DW_A_FLAG_HAS_BIAS | HK_DW_A_FLAG_HAS_DST1 | HK_DW_A_FLAG_HAS_DST2;
+      struct hk_dw_a_push dp = {
+         .in_va_lo = (uint32_t)exp_c_va, .in_va_hi = (uint32_t)(exp_c_va >> 32),
+         .wt_va_lo = (uint32_t)wt_va, .wt_va_hi = (uint32_t)(wt_va >> 32),
+         .bias_va_lo = (uint32_t)dw_bias_va, .bias_va_hi = (uint32_t)(dw_bias_va >> 32),
+         .dst1_va_lo = (uint32_t)dst1_va, .dst1_va_hi = (uint32_t)(dst1_va >> 32),
+         .dst2_va_lo = (uint32_t)dst2_va, .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+         .in_wh = in_w | (in_h << 16),
+         .out_wh = in_w | (in_h << 16),
+         .pad_flags = ((uint32_t)(uint8_t)(int8_t)-1) |
+                      (((uint32_t)(uint8_t)(int8_t)-1) << 8) |
+                      (dw_flags << 16),
+      };
+      hk_dw_a_push_init_udiv(&dp, in_w);
+      memcpy(push_buf + dw_off, &dp, sizeof(dp));
+
+      struct hk_exp_dw_a_push ep = {
+         .exp_a_va_lo = (uint32_t)src_va, .exp_a_va_hi = (uint32_t)(src_va >> 32),
+         .exp_b_va_lo = (uint32_t)exp_b_va, .exp_b_va_hi = (uint32_t)(exp_b_va >> 32),
+         .exp_bias_va_lo = (uint32_t)exp_bias_va, .exp_bias_va_hi = (uint32_t)(exp_bias_va >> 32),
+         .im2_dst_va_lo = (uint32_t)im2_dst_va, .im2_dst_va_hi = (uint32_t)(im2_dst_va >> 32),
+         .exp_k = EK,
+         .flags = HK_EXP_DW_A_FLAG_HAS_BIAS |
+                  (skip_im2 ? HK_EXP_DW_A_FLAG_SKIP_IM2_DST : 0u),
+         .im2_iw_ih = iw | (src_h << 16),
+         .im2_kw_kh = kw | (kh << 16),
+         .im2_step_sh = 6u | (2u << 16),
+         .im2_pad_xy = 0u,
+      };
+      hk_exp_dw_a_push_init_udiv(&ep, in_w >> 3);
+      memcpy(push_buf + exp_off, &ep, sizeof(ep));
+
+      const uint32_t ag[3] = { N / tile_n, (in_h >> 3) * (in_w >> 3), 1u };
+      hk_eval_dispatch_wg(alt, ag, sa, n_sa, push_buf, exp_off + sizeof(ep));
+
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] = DIV_ROUND_UP(K, 16u);
+      params[HK_PACK_LOOP_PARAM_GEMM_K] = DIV_ROUND_UP(EK, 8u);
+      uint64_t bound = 0, eff = 0;
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound(&lb, params, &bound));
+      HK_EVAL_CHECK(bound >= hk_eval_last_max_loop_backedges + 1);
+      HK_EVAL_CHECK(hk_pack_eval_effective_instrs(&lb, 300u, params, &eff));
+      HK_EVAL_CHECK(eff > 0 && eff < 500000u);
+
+      for (size_t i = 0; i < im2_elems; ++i) {
+         if (skip_im2)
+            HK_EVAL_CHECK(hk_eval_f2u(im2_alt[i]) == hk_eval_f2u(-44.5f));
+         else
+            HK_EVAL_CHECK(hk_eval_f2u(im2_alt[i]) == hk_eval_f2u(im2_ref[i]));
+      }
+      for (size_t i = 0; i < mid_elems; ++i) {
+         HK_EVAL_CHECK(hk_eval_f2u(exp_c_alt[i]) == hk_eval_f2u(exp_c_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d1[i]) == hk_eval_f2u(dw_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d2[i]) == hk_eval_f2u(dw_ref[i]));
+      }
+      for (size_t i = 0; i < c_elems; ++i) {
+         HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(g_dst2[i]) == hk_eval_f2u(c_ref[i]));
+      }
+
+      free(src_buf); free(im2_ref); free(im2_alt); free(exp_b); free(exp_bias);
+      free(exp_c_ref); free(exp_c_alt); free(wt_buf); free(dw_bias); free(dw_ref);
+      free(dw_d1); free(dw_d2); free(a_dummy); free(proj_b); free(proj_bias);
+      free(c_ref); free(c_alt); free(g_dst2);
+      ralloc_free(alt);
+   }
+
+   /* Bit-exact verification of 1x1 exp_dw_a (1x1 Expand + clamp -> 3x3 s=1 DW +
+    * clamp + copy4 -> 1x1 Project + copy4) on a 16x16 (2x2 spatial tiles, EK=24,
+    * K=32, N=24, tile_n=24) problem, covering border halo zeroing and
+    * skip_exp_c=0/1. */
+   for (unsigned skip_exp_c = 0; skip_exp_c < 2; ++skip_exp_c) {
+      const uint32_t in_h = 16, in_w = 16, M = in_h * in_w;
+      const uint32_t EK = 24, K = 32, N = 24, tile_n = 24;
+
+      struct hk_nir_dw_a_cfg cfg = {
+         .has_epilogue = true,
+         .epilogue = relu6,
+         .has_expand = true,
+         .has_exp_im2col = false,
+         .has_exp_epilogue = true,
+         .exp_epilogue = relu6,
+      };
+      struct hk_pack_loop_bound lb = {0};
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         ug_pre, &ug_m, 64, tile_n, NULL, HK_COMPUTE_PAIR_DUAL_COPY,
+         NULL, false, &cfg, NULL, &lb);
+      HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
+      nir_validate_shader(alt, "gemm_cmat_exp1x1dwa");
+
+      const size_t exp_a_elems = (size_t)M * EK;
+      const size_t eb_elems = (size_t)EK * K;
+      const size_t mid_elems = (size_t)M * K;
+      const size_t wt_elems = 9u * K;
+      const size_t pb_elems = (size_t)K * N;
+      const size_t c_elems = (size_t)M * N;
+      float *exp_a = calloc(exp_a_elems, 4);
+      float *exp_b = calloc(eb_elems, 4);
+      float *exp_bias = calloc(K, 4);
+      float *exp_c_ref = calloc(mid_elems, 4);
+      float *exp_c_alt = calloc(mid_elems, 4);
+      float *wt_buf = calloc(wt_elems, 4);
+      float *dw_bias = calloc(K, 4);
+      float *dw_ref = calloc(mid_elems, 4);
+      float *dw_d1 = calloc(mid_elems, 4);
+      float *dw_d2 = calloc(mid_elems, 4);
+      float *a_dummy = calloc(mid_elems, 4);
+      float *proj_b = calloc(pb_elems, 4);
+      float *proj_bias = calloc(N, 4);
+      float *c_ref = calloc(c_elems, 4);
+      float *c_alt = calloc(c_elems, 4);
+      float *g_dst2 = calloc(c_elems, 4);
+
+      uint32_t rng = 0xb900u + skip_exp_c * 61u;
+      for (size_t i = 0; i < exp_a_elems; ++i) exp_a[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < eb_elems; ++i) exp_b[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < K; ++i) exp_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < wt_elems; ++i) wt_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < K; ++i) dw_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < pb_elems; ++i) proj_b[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < N; ++i) proj_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < mid_elems; ++i) {
+         exp_c_alt[i] = -66.5f; dw_d1[i] = -99.5f; dw_d2[i] = -77.5f; a_dummy[i] = -55.25f;
+      }
+
+      for (uint32_t p = 0; p < M; ++p) {
+         for (uint32_t c = 0; c < K; ++c) {
+            float acc = 0.0f;
+            for (uint32_t kk = 0; kk < EK; ++kk)
+               acc = fmaf(exp_a[(size_t)p * EK + kk], exp_b[(size_t)kk * K + c], acc);
+            acc += exp_bias[c];
+            exp_c_ref[(size_t)p * K + c] = fminf(fmaxf(acc, 0.0f), 6.0f);
+         }
+      }
+      for (uint32_t oy = 0; oy < in_h; ++oy) {
+         for (uint32_t ox = 0; ox < in_w; ++ox) {
+            for (uint32_t c = 0; c < K; ++c) {
+               float acc = 0.0f;
+               for (int32_t ky = 0; ky < 3; ++ky) {
+                  const int32_t iy = (int32_t)oy - 1 + ky;
+                  for (int32_t kx = 0; kx < 3; ++kx) {
+                     const int32_t ix = (int32_t)ox - 1 + kx;
+                     const float iv = (iy >= 0 && iy < (int32_t)in_h &&
+                                       ix >= 0 && ix < (int32_t)in_w)
+                                         ? exp_c_ref[((size_t)iy * in_w + ix) * K + c]
+                                         : 0.0f;
+                     acc = ref_mul_add_unfused(iv, wt_buf[(size_t)(ky * 3 + kx) * K + c], acc);
+                  }
+               }
+               acc += dw_bias[c];
+               dw_ref[(size_t)(oy * in_w + ox) * K + c] = fminf(fmaxf(acc, 0.0f), 6.0f);
+            }
+         }
+      }
+
+      struct gemm_push_layout push = {
+         .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = 1,
+      };
+      const uint32_t og[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
+      struct hk_eval_ssbo so[4] = {
+         { 0, 0, dw_ref, mid_elems * 4, 0 }, { 0, 1, proj_b, pb_elems * 4, 0 },
+         { 0, 2, proj_bias, (size_t)N * 4, 0 }, { 0, 3, c_ref, c_elems * 4, 0 },
+      };
+      hk_eval_dispatch_wg(ref_orig, og, so, 4, &push, sizeof(push));
+
+      uint8_t push_buf[256] = {0};
+      memcpy(push_buf, &push, sizeof(push));
+      struct hk_eval_ssbo sa[14];
+      unsigned n_sa = 0;
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 0, a_dummy, mid_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 1, proj_b, pb_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 2, proj_bias, (size_t)N * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 3, c_alt, c_elems * 4, 0 };
+      const uint32_t dual_off = hk_dual_write_push_offset(ug_m.push_bytes);
+      const uint64_t gd2_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 9, g_dst2, c_elems * 4, 0 };
+      struct hk_dual_copy_push dcp = {
+         .dst2_va_lo = (uint32_t)gd2_va, .dst2_va_hi = (uint32_t)(gd2_va >> 32),
+      };
+      memcpy(push_buf + dual_off, &dcp, sizeof(dcp));
+
+      const uint64_t exp_c_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 10, exp_c_alt, mid_elems * 4, 0 };
+      const uint64_t wt_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 11, wt_buf, wt_elems * 4, 0 };
+      const uint64_t dw_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 12, dw_bias, (size_t)K * 4, 0 };
+      const uint64_t dst1_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 13, dw_d1, mid_elems * 4, 0 };
+      const uint64_t dst2_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 14, dw_d2, mid_elems * 4, 0 };
+      const uint64_t exp_a_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 15, exp_a, exp_a_elems * 4, 0 };
+      const uint64_t exp_b_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 16, exp_b, eb_elems * 4, 0 };
+      const uint64_t exp_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 17, exp_bias, (size_t)K * 4, 0 };
+
+      const uint32_t dw_off = hk_dw_a_push_offset(ug_m.push_bytes, HK_COMPUTE_PAIR_DUAL_COPY);
+      const uint32_t exp_off = hk_exp_dw_a_push_offset(ug_m.push_bytes, HK_COMPUTE_PAIR_DUAL_COPY);
+      const uint32_t dw_flags =
+         HK_DW_A_FLAG_HAS_BIAS | HK_DW_A_FLAG_HAS_DST1 | HK_DW_A_FLAG_HAS_DST2;
+      struct hk_dw_a_push dp = {
+         .in_va_lo = (uint32_t)exp_c_va, .in_va_hi = (uint32_t)(exp_c_va >> 32),
+         .wt_va_lo = (uint32_t)wt_va, .wt_va_hi = (uint32_t)(wt_va >> 32),
+         .bias_va_lo = (uint32_t)dw_bias_va, .bias_va_hi = (uint32_t)(dw_bias_va >> 32),
+         .dst1_va_lo = (uint32_t)dst1_va, .dst1_va_hi = (uint32_t)(dst1_va >> 32),
+         .dst2_va_lo = (uint32_t)dst2_va, .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+         .in_wh = in_w | (in_h << 16),
+         .out_wh = in_w | (in_h << 16),
+         .pad_flags = ((uint32_t)(uint8_t)(int8_t)-1) |
+                      (((uint32_t)(uint8_t)(int8_t)-1) << 8) |
+                      (dw_flags << 16),
+      };
+      hk_dw_a_push_init_udiv(&dp, in_w);
+      memcpy(push_buf + dw_off, &dp, sizeof(dp));
+
+      struct hk_exp_dw_a_push ep = {
+         .exp_a_va_lo = (uint32_t)exp_a_va, .exp_a_va_hi = (uint32_t)(exp_a_va >> 32),
+         .exp_b_va_lo = (uint32_t)exp_b_va, .exp_b_va_hi = (uint32_t)(exp_b_va >> 32),
+         .exp_bias_va_lo = (uint32_t)exp_bias_va, .exp_bias_va_hi = (uint32_t)(exp_bias_va >> 32),
+         .exp_k = EK,
+         .flags = HK_EXP_DW_A_FLAG_HAS_BIAS |
+                  (skip_exp_c ? HK_EXP_DW_A_FLAG_SKIP_EXP_C : 0u),
+      };
+      hk_exp_dw_a_push_init_udiv(&ep, in_w >> 3);
+      memcpy(push_buf + exp_off, &ep, sizeof(ep));
+
+      const uint32_t ag[3] = { N / tile_n, (in_h >> 3) * (in_w >> 3), 1u };
+      hk_eval_dispatch_wg(alt, ag, sa, n_sa, push_buf, exp_off + sizeof(ep));
+
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] = DIV_ROUND_UP(K, 16u);
+      params[HK_PACK_LOOP_PARAM_GEMM_K] = DIV_ROUND_UP(EK, 8u);
+      uint64_t bound = 0, eff = 0;
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound(&lb, params, &bound));
+      HK_EVAL_CHECK(bound >= hk_eval_last_max_loop_backedges + 1);
+      HK_EVAL_CHECK(hk_pack_eval_effective_instrs(&lb, 300u, params, &eff));
+      HK_EVAL_CHECK(eff > 0 && eff < 500000u);
+
+      for (size_t i = 0; i < mid_elems; ++i) {
+         if (skip_exp_c)
+            HK_EVAL_CHECK(hk_eval_f2u(exp_c_alt[i]) == hk_eval_f2u(-66.5f));
+         else
+            HK_EVAL_CHECK(hk_eval_f2u(exp_c_alt[i]) == hk_eval_f2u(exp_c_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d1[i]) == hk_eval_f2u(dw_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d2[i]) == hk_eval_f2u(dw_ref[i]));
+      }
+      for (size_t i = 0; i < c_elems; ++i) {
+         HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(g_dst2[i]) == hk_eval_f2u(c_ref[i]));
+      }
+
+      free(exp_a); free(exp_b); free(exp_bias);
+      free(exp_c_ref); free(exp_c_alt); free(wt_buf); free(dw_bias); free(dw_ref);
+      free(dw_d1); free(dw_d2); free(a_dummy); free(proj_b); free(proj_bias);
+      free(c_ref); free(c_alt); free(g_dst2);
+      ralloc_free(alt);
+   }
+
+   ralloc_free(ug_pre);
+   ralloc_free(grd_pre);
+   ralloc_free(ref_orig);
+}
+
+static void
+test_gemm_dw_proj_fusion(void)
+{
+   /* Bit-exact NIR-eval verification of DUAL_GEMM_DW with fused 1x1 Project
+    * (Expand GEMM + clamp + PAD4 + 3x3 s=2 DW + clamp + copy4 + 1x1 Project +
+    * copy4), covering:
+    *   - tile_n=48 -> proj_n=24 (ord 2->3 shape, pad_b == 0)
+    *   - tile_n=24 -> proj_n=32 (ord 6->7 shape, pad_b == 0, K=24 tail)
+    *   - tile_n=32 -> proj_n=64 (ord 13->14 shape, pad_b == {0,1,0,0} fallback) */
+   const struct hk_nir_clamp_epilogue relu6 = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = hk_eval_f2u(0.0f), .upper_bits = hk_eval_f2u(6.0f),
+   };
+   const struct gemm_test_opts opts_ug = {
+      .guarded = false, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   nir_shader *ug_pre = build_tiled_gemm_nir_opts(&opts_ug);
+   run_hk_preprocess_for_test(ug_pre, false);
+   struct hk_nir_gemm_output ug_m = {0};
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      ug_pre, nir_address_format_64bit_global_32bit_offset, &ug_m));
+
+   const struct {
+      uint32_t tile_n, in_h, in_w, K, N, proj_n;
+      bool pad_nonzero;
+      bool skip_proj_c;
+   } cases[] = {
+      { 48, 16, 16, 16,  96, 24, false, false },
+      { 24,  8, 16, 24,  72, 32, false, false },
+      { 32,  8,  8, 32,  64, 64, true,  true  },
+   };
+
+   for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+      const uint32_t tile_n = cases[ci].tile_n;
+      const uint32_t in_h = cases[ci].in_h, in_w = cases[ci].in_w;
+      const uint32_t M = in_h * in_w, K = cases[ci].K, N = cases[ci].N;
+      const uint32_t out_h = in_h + 1, out_w = in_w + 1;
+      const uint32_t dw_oh = in_h >> 1, dw_ow = in_w >> 1;
+      const uint32_t M_pj = dw_oh * dw_ow, proj_n = cases[ci].proj_n;
+
+      struct hk_nir_dw_a_cfg cfg = {
+         .has_epilogue = true,
+         .epilogue = relu6,
+         .has_proj = true,
+         .proj_tile_n = (uint8_t)proj_n,
+      };
+      struct hk_pack_loop_bound lb = {0};
+      nir_shader *alt = hk_nir_build_gemm_cmat_tiled_with_bound(
+         ug_pre, &ug_m, 64, tile_n, &relu6, HK_COMPUTE_PAIR_DUAL_GEMM_DW,
+         NULL, false, NULL, &cfg, &lb);
+      HK_EVAL_CHECK(alt != NULL && lb.valid && lb.work_valid);
+      nir_validate_shader(alt, "gemm_cmat_gemmdwproj");
+
+      const size_t a_elems = (size_t)M * K;
+      const size_t b_elems = (size_t)K * N;
+      const size_t c_elems = (size_t)M * N;
+      const size_t pad_elems = (size_t)out_h * out_w * N;
+      const size_t wt_elems = 9u * N;
+      const size_t dw_elems = (size_t)M_pj * N;
+      const size_t pb_elems = (size_t)N * proj_n;
+      const size_t pc_elems = (size_t)M_pj * proj_n;
+
+      float *a_buf = calloc(a_elems, 4);
+      float *b_buf = calloc(b_elems, 4);
+      float *bias_buf = calloc(N, 4);
+      float *c_ref = calloc(c_elems, 4);
+      float *c_alt = calloc(c_elems, 4);
+      int32_t pad_b[4] = { 0, cases[ci].pad_nonzero ? 1 : 0, 0, 0 };
+      float *pad_ref = calloc(pad_elems, 4);
+      float *pad_alt = calloc(pad_elems, 4);
+      float *wt_buf = calloc(wt_elems, 4);
+      float *dw_bias = calloc(N, 4);
+      float *dw_ref = calloc(dw_elems, 4);
+      float *dw_d1 = calloc(dw_elems, 4);
+      float *dw_d2 = calloc(dw_elems, 4);
+      float *proj_b = calloc(pb_elems, 4);
+      float *proj_bias = calloc(proj_n, 4);
+      float *proj_c_ref = calloc(pc_elems, 4);
+      float *proj_c_alt = calloc(pc_elems, 4);
+      float *proj_cp_alt = calloc(pc_elems, 4);
+
+      uint32_t rng = 0xc300u + ci * 71u;
+      for (size_t i = 0; i < a_elems; ++i) a_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < b_elems; ++i) b_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < N; ++i) bias_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < wt_elems; ++i) wt_buf[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < N; ++i) dw_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < pb_elems; ++i) proj_b[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < proj_n; ++i) proj_bias[i] = gemm_test_rand_f32(&rng);
+      for (size_t i = 0; i < pc_elems; ++i) {
+         proj_c_alt[i] = -33.5f;
+         proj_cp_alt[i] = -44.5f;
+      }
+
+      /* CPU reference: Expand + relu6 -> PAD4 -> DW 3x3 s=2 + relu6 -> 1x1 Project. */
+      for (uint32_t p = 0; p < M; ++p) {
+         for (uint32_t c = 0; c < N; ++c) {
+            float acc = 0.0f;
+            for (uint32_t kk = 0; kk < K; ++kk)
+               acc = fmaf(a_buf[(size_t)p * K + kk], b_buf[(size_t)kk * N + c], acc);
+            acc += bias_buf[c];
+            c_ref[(size_t)p * N + c] = fminf(fmaxf(acc, 0.0f), 6.0f);
+         }
+      }
+      for (uint32_t oy = 0; oy < out_h; ++oy) {
+         for (uint32_t ox = 0; ox < out_w; ++ox) {
+            for (uint32_t c = 0; c < N; ++c) {
+               const int32_t iy = (int32_t)oy - pad_b[1];
+               const int32_t ix = (int32_t)ox - pad_b[2];
+               pad_ref[((size_t)oy * out_w + ox) * N + c] =
+                  (iy >= 0 && iy < (int32_t)in_h && ix >= 0 && ix < (int32_t)in_w)
+                     ? c_ref[((size_t)iy * in_w + ix) * N + c]
+                     : 0.0f;
+            }
+         }
+      }
+      for (uint32_t oy = 0; oy < dw_oh; ++oy) {
+         for (uint32_t ox = 0; ox < dw_ow; ++ox) {
+            for (uint32_t c = 0; c < N; ++c) {
+               float acc = 0.0f;
+               for (uint32_t ky = 0; ky < 3; ++ky) {
+                  for (uint32_t kx = 0; kx < 3; ++kx) {
+                     const float iv = pad_ref[((size_t)(oy * 2 + ky) * out_w + (ox * 2 + kx)) * N + c];
+                     acc = ref_mul_add_unfused(iv, wt_buf[(size_t)(ky * 3 + kx) * N + c], acc);
+                  }
+               }
+               acc += dw_bias[c];
+               dw_ref[((size_t)oy * dw_ow + ox) * N + c] = fminf(fmaxf(acc, 0.0f), 6.0f);
+            }
+         }
+      }
+      for (uint32_t p = 0; p < M_pj; ++p) {
+         for (uint32_t c = 0; c < proj_n; ++c) {
+            float acc = 0.0f;
+            for (uint32_t kk = 0; kk < N; ++kk)
+               acc = fmaf(dw_ref[(size_t)p * N + kk], proj_b[(size_t)kk * proj_n + c], acc);
+            proj_c_ref[(size_t)p * proj_n + c] = acc + proj_bias[c];
+         }
+      }
+
+      struct gemm_push_layout push = {
+         .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = 1,
+      };
+      uint8_t push_buf[256] = {0};
+      memcpy(push_buf, &push, sizeof(push));
+
+      struct hk_eval_ssbo sa[16];
+      unsigned n_sa = 0;
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 0, a_buf, a_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 1, b_buf, b_elems * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 2, bias_buf, (size_t)N * 4, 0 };
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 3, c_alt, c_elems * 4, 0 };
+      const uint64_t pad_dst_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 10, pad_alt, pad_elems * 4, 0 };
+      const uint64_t pad_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 11, pad_b, sizeof(pad_b), 0 };
+      const uint64_t wt_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 12, wt_buf, wt_elems * 4, 0 };
+      const uint64_t dw_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 13, dw_bias, (size_t)N * 4, 0 };
+      const uint64_t dw_d1_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 14, dw_d1, dw_elems * 4, 0 };
+      const uint64_t dw_d2_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 15, dw_d2, dw_elems * 4, 0 };
+      const uint64_t proj_b_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 16, proj_b, pb_elems * 4, 0 };
+      const uint64_t proj_bias_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 17, proj_bias, (size_t)proj_n * 4, 0 };
+      const uint64_t proj_c_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 18, proj_c_alt, pc_elems * 4, 0 };
+      const uint64_t proj_cp_va = hk_eval_make_vaddr(n_sa, 0);
+      sa[n_sa++] = (struct hk_eval_ssbo){ 0, 19, proj_cp_alt, pc_elems * 4, 0 };
+
+      const uint32_t dual_off = hk_dual_write_push_offset(ug_m.push_bytes);
+      const uint32_t proj_off = hk_dual_gemm_dw_proj_push_offset(ug_m.push_bytes);
+      struct hk_dual_gemm_dw_push dp = {
+         .pad_dst_va_lo = (uint32_t)pad_dst_va, .pad_dst_va_hi = (uint32_t)(pad_dst_va >> 32),
+         .pad_va_lo = (uint32_t)pad_va, .pad_va_hi = (uint32_t)(pad_va >> 32),
+         .dw_wt_va_lo = (uint32_t)wt_va, .dw_wt_va_hi = (uint32_t)(wt_va >> 32),
+         .dw_bias_va_lo = (uint32_t)dw_bias_va, .dw_bias_va_hi = (uint32_t)(dw_bias_va >> 32),
+         .dw_dst1_va_lo = (uint32_t)dw_d1_va, .dw_dst1_va_hi = (uint32_t)(dw_d1_va >> 32),
+         .dw_dst2_va_lo = (uint32_t)dw_d2_va, .dw_dst2_va_hi = (uint32_t)(dw_d2_va >> 32),
+         .in_wh = in_w | (in_h << 16),
+         .out_wh = out_w | (out_h << 16),
+         .pad_idx = { 0, 1, 2, 3 },
+         .flags = HK_GEMM_DW_FLAG_HAS_BIAS | HK_GEMM_DW_FLAG_HAS_DW_DST2,
+      };
+      hk_dual_gemm_dw_push_init_udiv(&dp, in_w >> 3);
+      memcpy(push_buf + dual_off, &dp, sizeof(dp));
+
+      struct hk_dual_gemm_dw_proj_push pp = {
+         .proj_b_va_lo = (uint32_t)proj_b_va, .proj_b_va_hi = (uint32_t)(proj_b_va >> 32),
+         .proj_bias_va_lo = (uint32_t)proj_bias_va, .proj_bias_va_hi = (uint32_t)(proj_bias_va >> 32),
+         .proj_c_va_lo = (uint32_t)proj_c_va, .proj_c_va_hi = (uint32_t)(proj_c_va >> 32),
+         .proj_copy_va_lo = (uint32_t)proj_cp_va, .proj_copy_va_hi = (uint32_t)(proj_cp_va >> 32),
+         .proj_n = proj_n,
+         .proj_flags = HK_GEMM_DW_PROJ_FLAG_HAS_BIAS | HK_GEMM_DW_PROJ_FLAG_HAS_COPY |
+                       (cases[ci].skip_proj_c ? HK_GEMM_DW_PROJ_FLAG_SKIP_C : 0u),
+      };
+      memcpy(push_buf + proj_off, &pp, sizeof(pp));
+
+      const uint32_t ag[3] = { 1u, (in_h >> 3) * (in_w >> 3), 1u };
+      hk_eval_dispatch_wg(alt, ag, sa, n_sa, push_buf, proj_off + sizeof(pp));
+
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_GEMM_K_ITERS] = DIV_ROUND_UP(K, 16u);
+      params[HK_PACK_LOOP_PARAM_GEMM_K] = DIV_ROUND_UP(K, 4u);
+      params[HK_PACK_LOOP_PARAM_DW_KH] = N / tile_n;
+      params[HK_PACK_LOOP_PARAM_PAD_ZLP_ITERS] = DIV_ROUND_UP(pad_elems, (uint64_t)ag[1] * 128u);
+      uint64_t bound = 0, eff = 0;
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound(&lb, params, &bound));
+      HK_EVAL_CHECK(bound >= hk_eval_last_max_loop_backedges + 1);
+      HK_EVAL_CHECK(hk_pack_eval_effective_instrs(&lb, 300u, params, &eff));
+      HK_EVAL_CHECK(eff > 0 && eff < 5000000u);
+
+      for (size_t i = 0; i < c_elems; ++i)
+         HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_ref[i]));
+      for (size_t i = 0; i < pad_elems; ++i)
+         HK_EVAL_CHECK(hk_eval_f2u(pad_alt[i]) == hk_eval_f2u(pad_ref[i]));
+      for (size_t i = 0; i < dw_elems; ++i) {
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d1[i]) == hk_eval_f2u(dw_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(dw_d2[i]) == hk_eval_f2u(dw_ref[i]));
+      }
+      for (size_t i = 0; i < pc_elems; ++i) {
+         if (cases[ci].skip_proj_c)
+            HK_EVAL_CHECK(hk_eval_f2u(proj_c_alt[i]) == hk_eval_f2u(-33.5f));
+         else
+            HK_EVAL_CHECK(hk_eval_f2u(proj_c_alt[i]) == hk_eval_f2u(proj_c_ref[i]));
+         HK_EVAL_CHECK(hk_eval_f2u(proj_cp_alt[i]) == hk_eval_f2u(proj_c_ref[i]));
+      }
+
+      free(a_buf); free(b_buf); free(bias_buf); free(c_ref); free(c_alt);
+      free(pad_ref); free(pad_alt); free(wt_buf); free(dw_bias); free(dw_ref);
+      free(dw_d1); free(dw_d2); free(proj_b); free(proj_bias);
+      free(proj_c_ref); free(proj_c_alt); free(proj_cp_alt);
+      ralloc_free(alt);
+   }
+   ralloc_free(ug_pre);
+}
+
 int
 main(void)
 {
@@ -5207,7 +5951,9 @@ main(void)
    test_dual_copy2_fusion();
    test_gemm_im2col_a_fusion();
    test_gemm_dw_a_fusion();
+   test_gemm_exp_dw_a_fusion();
    test_gemm_dw_fusion();
+   test_gemm_dw_proj_fusion();
    test_nir_derived_pack_loop_bounds();
    test_fast_udivmod_general();
    test_depthwise_shape_sweep_cpu_ref();

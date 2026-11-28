@@ -138,10 +138,10 @@ struct hk_device {
    struct hk_gpu_waits gpu_waits;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
-   /* Live buffers and image planes with a GPU virtual address of their own
-    * (sparse binding, capture/replay buffers), and memory mapped again for
-    * descriptor buffer capture/replay, atomic (hk_device_va_alias_get()).
-    * Their memory is also mapped at another address, see
+   /* Live resources through which memory has or may have a second GPU virtual
+    * address: sparse/capture-replay buffers and image planes, capture/replay
+    * memory mappings (hk_device_va_alias_get()), fd/dma-buf imports, and host
+    * imports that may alias (hk_host_import_track()). Atomic; see
     * hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
@@ -149,11 +149,24 @@ struct hk_device {
     * (hk_device_may_alias_memory()). M5 uses it in place of
     * va_alias_resources, see hk_cdm_alias_scope(). */
    bool may_alias_memory;
+   /* The kernel runs a render's fragment work after the previous render's
+    * on a queue, partial renders included
+    * (DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS): a render that only loads
+    * whole tiles an earlier render stores waits for it in its fragment half
+    * alone (hk_sync.h, tile hazards). */
+   bool load_hazard_frag;
    /* M5 with host_alias.dynamic: live resources through which memory has or
     * may have a second GPU address (hk_device_alias_get()), atomic:
     * va_alias_resources, fd and dma-buf imports, and host imports that may
     * alias. hk_cdm_alias_scope() asks for memory scope while it is not 0. */
    uint32_t alias_live;
+
+   /* Monotonic counter incremented atomically whenever a buffer is first bound
+    * to an hk_device_memory that already has an image binding. Checked at
+    * submit time so command buffers recorded before a post-record buffer bind
+    * conservatively upgrade their aliased attachment renders to
+    * HK_SYNC_GFX_MEM. */
+   uint32_t buffer_alias_mem_gen;
    struct {
       /* M5: the device enabled a feature through which memory can get a
        * second address, so the scope follows alias_live instead of
@@ -331,6 +344,8 @@ struct hk_device {
       uint64_t heap;
    } rodata;
 
+   uint32_t heap_next_slot;
+
    struct hk_internal_shaders prolog_epilog;
    struct hk_internal_shaders kernels;
    struct hk_api_shader *null_fs;
@@ -412,13 +427,13 @@ struct hk_device {
    /* Indirected for common secondary emulation */
    struct vk_device_dispatch_table cmd_dispatch;
 
-   /* Heap used for GPU-side memory allocation for geometry/tessellation.
-    *
-    * Control streams accessing the heap must be serialized. This is not
-    * expected to be a legitimate problem. If it is, we can rework later.
+   /* Heaps used for GPU-side memory allocation for geometry/tessellation and
+    * software index robustness. Each ring slot lazily allocates a full 128 MiB
+    * buffer on first use so per-pass capacity is never reduced while distinct
+    * slots execute without global serialization.
     */
-   struct agx_bo *heap;
-   util_once_flag heap_init_once;
+   struct agx_bo *heap_slots[HK_HEAP_SLOTS];
+   simple_mtx_t heap_lock;
 
    struct {
       struct agx_scratch vs, fs, cs;
@@ -473,17 +488,20 @@ enum hk_perftest {
  * mapped at more than one GPU VA an application compute/transfer barrier needs
  * the memory-scoped strong flush (hk_cdm_visibility_flush()).
  *
- * On M5, devices that enable aliasing-capable features (sparse, BDA,
- * capture/replay, fd/dma-buf, writable host imports) track active aliasing
- * resources in alias_live under host_alias.dynamic (or force memory scope via
- * may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded while
- * alias_live == 0 record patch sites (struct hk_alias_site) that are upgraded
- * in place when alias_live leaves 0 or at submission; unpatched paths
- * (graphics dependencies, event-using command buffers) and stream-end flushes
- * keep memory scope unconditionally while dynamic mode is active.
+ * On M5, devices whose barriers always take memory scope
+ * (agx_cdm_ordering_memory_scope()) take it on every barrier and in every
+ * launch's ordering record. Other M5 devices that enable aliasing-capable
+ * features (sparse, BDA, capture/replay, fd/dma-buf, writable host imports)
+ * track active aliasing resources in alias_live under host_alias.dynamic (or
+ * force memory scope via may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1).
+ * Barriers recorded while alias_live == 0 record patch sites (struct
+ * hk_alias_site) that are upgraded in place when alias_live leaves 0 or at
+ * submission; unpatched paths (graphics dependencies, event-using command
+ * buffers) and stream-end flushes keep memory scope unconditionally while
+ * dynamic mode is active.
  *
  * On G17P, memory scope is selected at barrier recording time whenever
- * va_alias_resources != 0 (live sparse, capture/replay, fd, or writable host
+ * va_alias_resources != 0 (live sparse, capture/replay, fd, or aliasing host
  * imports). The flush is emitted into an open compute stream holding work;
  * earlier closed streams already flushed at stream end.
  *
@@ -496,7 +514,8 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    if (agx_chip_g17_m5(dev->dev.chip))
-      return dev->may_alias_memory || p_atomic_read(&dev->alias_live);
+      return agx_cdm_ordering_memory_scope(&dev->dev) ||
+             dev->may_alias_memory || p_atomic_read(&dev->alias_live);
 
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;

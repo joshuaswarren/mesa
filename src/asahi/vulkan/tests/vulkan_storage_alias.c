@@ -98,17 +98,26 @@ barrier(VkCommandBuffer cb)
 }
 
 static void
-to_general(VkCommandBuffer cb, VkImage img, uint32_t layers)
+transition(VkCommandBuffer cb, VkImage img, VkImageLayout old_layout,
+           VkImageLayout new_layout, uint32_t layers)
 {
    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
       .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
       .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .oldLayout = old_layout, .newLayout = new_layout,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image = img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
    vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
       .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib});
+}
+
+static void
+to_general(VkCommandBuffer cb, VkImage img, uint32_t layers)
+{
+   transition(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, layers);
 }
 
 struct fmt {
@@ -131,6 +140,7 @@ static const struct fmt fmts[] = {
    {VK_FORMAT_R8_UNORM, "r8", 1, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT}, 3},
    {VK_FORMAT_B10G11R11_UFLOAT_PACK32, "r11g11b10f", 4, {VK_FORMAT_B10G11R11_UFLOAT_PACK32}, 1},
    {VK_FORMAT_R32G32B32A32_SFLOAT, "rgba32f", 16, {VK_FORMAT_R32G32B32A32_SFLOAT}, 1},
+   {VK_FORMAT_R32G32_SFLOAT, "rg32f", 8, {VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT}, 3},
 };
 
 static VkPipeline pipe;
@@ -314,6 +324,226 @@ run_case(const struct fmt *F, bool mutable_list, bool init_after_garbage, unsign
    return bad;
 }
 
+/* Exercises all 256 metadata byte patterns (0x00..0xff) followed by:
+ *   - two sequential partial compute imageStore dispatches (sparse + checker),
+ *   - UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL partial-renderArea LOAD_OP_DONT_CARE
+ *     render pass over unaligned coordinates, and
+ *   - UNDEFINED -> GENERAL partial compute imageStore -> LOAD_OP_LOAD render pass
+ *     updating an unaligned sub-rectangle while preserving compute-written texels.
+ * Returns total mismatching texels across all three subcases. */
+static unsigned
+run_extended_cases(const struct fmt *F, bool renderable)
+{
+   const uint32_t w = 300, h = 180;
+   VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .flags = VK_IMAGE_CREATE_ALIAS_BIT,
+      .imageType = VK_IMAGE_TYPE_2D, .format = F->f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               (renderable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+   VkImage S, R;
+   CHECK(vkCreateImage(dev, &ci, NULL, &S));
+   VkImageCreateInfo rci = ci;
+   rci.flags = 0;
+   rci.arrayLayers = 2;
+   CHECK(vkCreateImage(dev, &rci, NULL, &R));
+
+   VkMemoryRequirements sreq, rreq;
+   vkGetImageMemoryRequirements(dev, S, &sreq);
+   vkGetImageMemoryRequirements(dev, R, &rreq);
+
+   VkBuffer B;
+   CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = sreq.size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT},
+      NULL, &B));
+   VkMemoryRequirements breq;
+   vkGetBufferMemoryRequirements(dev, B, &breq);
+   VkDeviceMemory mS, mR;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = sreq.size > breq.size ? sreq.size : breq.size,
+      .memoryTypeIndex = mem_type(sreq.memoryTypeBits & breq.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)}, NULL, &mS));
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = rreq.size,
+      .memoryTypeIndex = mem_type(rreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)}, NULL, &mR));
+   CHECK(vkBindImageMemory(dev, S, mS, 0));
+   CHECK(vkBindBufferMemory(dev, B, mS, 0));
+   CHECK(vkBindImageMemory(dev, R, mR, 0));
+
+   VkImageView vS, vR;
+   CHECK(vkCreateImageView(dev, &(VkImageViewCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = S, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = F->f,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}, NULL, &vS));
+   CHECK(vkCreateImageView(dev, &(VkImageViewCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = R, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = F->f,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}, NULL, &vR));
+   VkDescriptorSet sS = make_set(vS), sR = make_set(vR);
+
+   const VkDeviceSize plane = (VkDeviceSize)w * h * F->bpp;
+   const VkDeviceSize hsz = sreq.size + 2 * plane;
+   VkBuffer H;
+   CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = hsz, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT}, NULL, &H));
+   VkMemoryRequirements hreq;
+   vkGetBufferMemoryRequirements(dev, H, &hreq);
+   VkDeviceMemory mH;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = hreq.size,
+      .memoryTypeIndex = mem_type(hreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}, NULL, &mH));
+   CHECK(vkBindBufferMemory(dev, H, mH, 0));
+   uint8_t *hp;
+   CHECK(vkMapMemory(dev, mH, 0, VK_WHOLE_SIZE, 0, (void **)&hp));
+
+   /* Fill every 8-byte word with repeated byte 0x00..0xff in turn, so every
+    * metadata tile mode encoding is hit across the surface. */
+   uint64_t *g64 = (uint64_t *)hp;
+   for (VkDeviceSize i = 0; i < sreq.size / 8; ++i)
+      g64[i] = (uint64_t)(i & 0xffu) * UINT64_C(0x0101010101010101);
+
+   unsigned bad = 0;
+   VkBufferImageCopy rcS = {.bufferOffset = sreq.size,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+   VkBufferImageCopy rcR = {.bufferOffset = sreq.size + plane,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+
+   /* Subcase 1: all-256 byte sweep -> UNDEFINED -> GENERAL -> two sequential
+    * partial compute stores (sparse + checker). */
+   {
+      VkCommandBuffer cb = begin();
+      vkCmdCopyBuffer(cb, H, B, 1, &(VkBufferCopy){0, 0, sreq.size});
+      barrier(cb);
+      to_general(cb, S, 1);
+      to_general(cb, R, 2);
+      store(cb, sS, 101, 1, w, h);
+      store(cb, sR, 101, 1, w, h);
+      barrier(cb);
+      store(cb, sS, 202, 2, w, h);
+      store(cb, sR, 202, 2, w, h);
+      barrier(cb);
+      vkCmdCopyImageToBuffer(cb, S, VK_IMAGE_LAYOUT_GENERAL, H, 1, &rcS);
+      vkCmdCopyImageToBuffer(cb, R, VK_IMAGE_LAYOUT_GENERAL, H, 1, &rcR);
+      submit(cb);
+
+      for (uint32_t y = 0; y < h; ++y)
+         for (uint32_t x = 0; x < w; ++x) {
+            if (!written(x, y, 101, 1) && !written(x, y, 202, 2))
+               continue;
+            const uint8_t *a = hp + sreq.size + ((size_t)y * w + x) * F->bpp;
+            const uint8_t *b = hp + sreq.size + plane + ((size_t)y * w + x) * F->bpp;
+            if (memcmp(a, b, F->bpp))
+               bad++;
+         }
+   }
+
+   if (renderable) {
+      /* Subcase 2: all-256 byte sweep -> UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+       * -> partial unaligned renderArea LOAD_OP_DONT_CARE + clear draw. */
+      const VkRect2D area = {.offset = {3, 5}, .extent = {131, 73}};
+      const VkClearAttachment catt = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+         .clearValue = {.color = {.float32 = {0.25f, 0.5f, 0.75f, 1.0f}}},
+      };
+      const VkClearRect crect = {.rect = area, .baseArrayLayer = 0, .layerCount = 1};
+      VkCommandBuffer cb = begin();
+      vkCmdCopyBuffer(cb, H, B, 1, &(VkBufferCopy){0, 0, sreq.size});
+      barrier(cb);
+      transition(cb, S, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 1);
+      transition(cb, R, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 2);
+      VkRenderingAttachmentInfo att = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView = vS, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      };
+      VkRenderingInfo ri = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+         .renderArea = area, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att,
+      };
+      vkCmdBeginRendering(cb, &ri);
+      vkCmdClearAttachments(cb, 1, &catt, 1, &crect);
+      vkCmdEndRendering(cb);
+      att.imageView = vR;
+      vkCmdBeginRendering(cb, &ri);
+      vkCmdClearAttachments(cb, 1, &catt, 1, &crect);
+      vkCmdEndRendering(cb);
+      transition(cb, S, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1);
+      transition(cb, R, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 2);
+      vkCmdCopyImageToBuffer(cb, S, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, H, 1, &rcS);
+      vkCmdCopyImageToBuffer(cb, R, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, H, 1, &rcR);
+      submit(cb);
+
+      for (uint32_t y = (uint32_t)area.offset.y; y < (uint32_t)area.offset.y + area.extent.height; ++y)
+         for (uint32_t x = (uint32_t)area.offset.x; x < (uint32_t)area.offset.x + area.extent.width; ++x) {
+            const uint8_t *a = hp + sreq.size + ((size_t)y * w + x) * F->bpp;
+            const uint8_t *b = hp + sreq.size + plane + ((size_t)y * w + x) * F->bpp;
+            if (memcmp(a, b, F->bpp))
+               bad++;
+         }
+
+      /* Subcase 3: all-256 byte sweep -> UNDEFINED -> GENERAL -> partial compute
+       * imageStore -> GENERAL -> COLOR_ATTACHMENT_OPTIMAL -> LOAD_OP_LOAD render
+       * pass updating an unaligned sub-rectangle. */
+      const VkRect2D sub = {.offset = {19, 13}, .extent = {97, 61}};
+      const VkClearAttachment catt2 = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+         .clearValue = {.color = {.float32 = {0.75f, 0.25f, 0.5f, 1.0f}}},
+      };
+      const VkClearRect crect2 = {.rect = sub, .baseArrayLayer = 0, .layerCount = 1};
+      cb = begin();
+      vkCmdCopyBuffer(cb, H, B, 1, &(VkBufferCopy){0, 0, sreq.size});
+      barrier(cb);
+      to_general(cb, S, 1);
+      to_general(cb, R, 2);
+      store(cb, sS, 303, 2, w, h);
+      store(cb, sR, 303, 2, w, h);
+      transition(cb, S, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 1);
+      transition(cb, R, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 2);
+      att.imageView = vS;
+      att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      ri.renderArea = (VkRect2D){{0, 0}, {w, h}};
+      vkCmdBeginRendering(cb, &ri);
+      vkCmdClearAttachments(cb, 1, &catt2, 1, &crect2);
+      vkCmdEndRendering(cb);
+      att.imageView = vR;
+      vkCmdBeginRendering(cb, &ri);
+      vkCmdClearAttachments(cb, 1, &catt2, 1, &crect2);
+      vkCmdEndRendering(cb);
+      transition(cb, S, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1);
+      transition(cb, R, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 2);
+      vkCmdCopyImageToBuffer(cb, S, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, H, 1, &rcS);
+      vkCmdCopyImageToBuffer(cb, R, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, H, 1, &rcR);
+      submit(cb);
+
+      for (uint32_t y = 0; y < h; ++y)
+         for (uint32_t x = 0; x < w; ++x) {
+            const bool in_sub =
+               x >= (uint32_t)sub.offset.x && x < (uint32_t)sub.offset.x + sub.extent.width &&
+               y >= (uint32_t)sub.offset.y && y < (uint32_t)sub.offset.y + sub.extent.height;
+            if (!in_sub && !written(x, y, 303, 2))
+               continue;
+            const uint8_t *a = hp + sreq.size + ((size_t)y * w + x) * F->bpp;
+            const uint8_t *b = hp + sreq.size + plane + ((size_t)y * w + x) * F->bpp;
+            if (memcmp(a, b, F->bpp))
+               bad++;
+         }
+   }
+
+   vkUnmapMemory(dev, mH);
+   vkDestroyBuffer(dev, H, NULL);
+   vkFreeMemory(dev, mH, NULL);
+   vkDestroyImageView(dev, vS, NULL);
+   vkDestroyImageView(dev, vR, NULL);
+   vkDestroyBuffer(dev, B, NULL);
+   vkDestroyImage(dev, S, NULL);
+   vkDestroyImage(dev, R, NULL);
+   vkFreeMemory(dev, mS, NULL);
+   vkFreeMemory(dev, mR, NULL);
+   CHECK(vkResetDescriptorPool(dev, dpool, 0));
+   return bad;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -333,11 +563,14 @@ main(int argc, char **argv)
    uint32_t nq = 8;
    VkQueueFamilyProperties qf[8];
    vkGetPhysicalDeviceQueueFamilyProperties(pdev, &nq, qf);
-   for (qfam = 0; qfam < nq && !(qf[qfam].queueFlags & VK_QUEUE_COMPUTE_BIT); ++qfam)
+   for (qfam = 0; qfam < nq && (qf[qfam].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) !=
+                                  (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT);
+        ++qfam)
       ;
    float prio = 1.0f;
    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                           .synchronization2 = VK_TRUE};
+                                           .synchronization2 = VK_TRUE,
+                                           .dynamicRendering = VK_TRUE};
    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13,
       .features = {.shaderStorageImageWriteWithoutFormat = VK_TRUE}};
    CHECK(vkCreateDevice(pdev, &(VkDeviceCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
@@ -411,6 +644,15 @@ main(int argc, char **argv)
                    bad_total, bad_total ? "FAIL" : "PASS");
          }
       }
+      const bool renderable =
+         (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+      unsigned ext_bad = run_extended_cases(F, renderable);
+      cases++;
+      if (ext_bad)
+         fails++;
+      printf("RESULT %-10s %-12s %-7s mismatching_texels=%u %s\n", F->name,
+             "byte-sweep", renderable ? "cs+gfx" : "cs-only", ext_bad,
+             ext_bad ? "FAIL" : "PASS");
    }
    printf("SUMMARY %u/%u case groups pass\n", cases - fails, cases);
    return fails ? 1 : 0;

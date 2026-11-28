@@ -141,15 +141,44 @@ correctness(struct fixture *f)
    CHECK(cmd->state.cs.descriptors.root.dynamic_buffers[0].base_addr == 0x400010);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    CHECK(memcmp(old, f->root_map, sizeof(old)) == 0);
+   /* Pure dynamic-offset rebind marks only HK_ROOT_DIRTY_DYNBUF and keeps
+    * non_dynbuf_generation stable; changing set/layout advances it. */
+   {
+      struct hk_descriptor_state *gd = &cmd->state.gfx.descriptors;
+      hk_root_mark_clean(gd);
+      const uint64_t g0 = gd->generation;
+      const uint64_t np0 = gd->non_push_generation;
+      const uint64_t nd0 = gd->non_dynbuf_generation;
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->generation == g0 + 1);
+      CHECK(gd->non_push_generation == np0 + 1);
+      CHECK(gd->non_dynbuf_generation == nd0);
+      CHECK(hk_root_bypass_dirty(gd));
+      CHECK(gd->root_change.dynbuf_dirty_mask == BITFIELD64_BIT(0));
+      /* Identical rebind is a no-op and preserves state. */
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->generation == g0 + 1 && gd->non_dynbuf_generation == nd0);
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(gd->non_dynbuf_generation == nd0);
+   }
    /* Switching from push descriptors back to the same set is a real bind. */
    cmd->state.gfx.descriptors.push_active = 1;
    cmd->state.gfx.descriptors.root.sets[0] = 0x500000;
-   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   {
+      const uint64_t nd_before = cmd->state.gfx.descriptors.non_dynbuf_generation;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(cmd->state.gfx.descriptors.non_dynbuf_generation == nd_before + 1);
+      CHECK(!hk_root_bypass_dirty(&cmd->state.gfx.descriptors));
+   }
    CHECK(!cmd->state.gfx.descriptors.push_active);
    CHECK(cmd->state.gfx.descriptors.root.sets[0] == f->set->addr);
    /* An identical set with changed dynamic-layout indexing is a real change. */
    f->layout.dynamic_descriptor_offset[0] = 1;
-   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   {
+      const uint64_t nd_before = cmd->state.gfx.descriptors.non_dynbuf_generation;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(cmd->state.gfx.descriptors.non_dynbuf_generation == nd_before + 1);
+   }
    CHECK(cmd->state.gfx.descriptors.root.set_dynamic_buffer_start[0] == 1);
    CHECK(cmd->state.gfx.descriptors.root.dynamic_buffers[1].base_addr == 0x400020);
    f->layout.dynamic_descriptor_offset[0] = 0;
@@ -1779,12 +1808,16 @@ graphics_launch_replay_correctness(struct fixture *f)
    f->dev.dev.shader_base = shader_base;
    util_dynarray_init(&cmd->large_bos, NULL);
 
-   const enum agx_chip chips[] = {
-      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
-      AGX_CHIP_G17C,
+   const struct {
+      enum agx_chip chip;
+      unsigned clusters;
+   } chips[] = {
+      {AGX_CHIP_G16G, 1}, {AGX_CHIP_G17P, 1}, {AGX_CHIP_G17G, 1},
+      {AGX_CHIP_G17S, 2}, {AGX_CHIP_G17C, 4}, {AGX_CHIP_G17D, 8},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
-      f->dev.dev.chip = chips[i];
+      f->dev.dev.chip = chips[i].chip;
+      f->dev.dev.params.num_clusters_total = chips[i].clusters;
       reset(f);
       cmd->vk.record_result = VK_SUCCESS;
       cmd->ioto = (struct hk_ioto_arena){
@@ -1882,7 +1915,7 @@ graphics_launch_replay_correctness(struct fixture *f)
          .max_bytes_per_tile = 32768,
       };
       const uint64_t msaa1 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
-      if (agx_chip_g17_m5(chips[i])) {
+      if (agx_chip_g17_m5(chips[i].chip)) {
          CHECK(msaa1 != 0 && cmd->vk.record_result == VK_SUCCESS);
          CHECK(cmd->ioto.programs == 1);
          CHECK(cmd->state.gfx.g17p_ioto[1].admit.s == hw_fs);
@@ -1919,6 +1952,7 @@ graphics_launch_replay_correctness(struct fixture *f)
    *hw_vs = saved_vs;
    *hw_fs = saved_fs;
    f->dev.dev.chip = AGX_CHIP_G17P;
+   f->dev.dev.params.num_clusters_total = 0;
    f->dev.dev.shader_base = 0;
    f->pdev.vk.instance = saved_instance;
    mtx_destroy(&inst.debug_utils.callbacks_mutex);

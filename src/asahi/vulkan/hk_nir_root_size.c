@@ -152,12 +152,13 @@ hk_nir_intrinsic_refuses_wg_coalesce(const nir_intrinsic_instr *intr)
     * depend on workgroup boundaries, and subgroup barriers are excluded along
     * with all subgroup ops below. */
    case nir_intrinsic_barrier:
-   /* Workgroup / local / subgroup identity builtins. */
+   /* Workgroup / local / subgroup identity builtins. load_num_workgroups reads
+    * the API group_count_addr on direct dispatches and load_workgroup_size
+    * folds to the compile-time API local size, so neither depends on the
+    * reshaped launch geometry. */
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_local_invocation_index:
    case nir_intrinsic_load_workgroup_id:
-   case nir_intrinsic_load_workgroup_size:
-   case nir_intrinsic_load_num_workgroups:
    case nir_intrinsic_load_workgroup_index:
    case nir_intrinsic_load_subgroup_size:
    case nir_intrinsic_load_subgroup_invocation:
@@ -274,14 +275,16 @@ hk_nir_can_coalesce_workgroup(const nir_shader *nir)
       return false;
 
    const uint64_t threads = (uint64_t)wg[0] * wg[1] * wg[2];
-   if (threads > 256 || (threads % 32) != 0)
+   if (threads > 1024 || (threads % 32) != 0)
       return false;
 
    unsigned sv;
    BITSET_FOREACH_SET(sv, nir->info.system_values_read, SYSTEM_VALUE_MAX) {
       if (sv != SYSTEM_VALUE_GLOBAL_INVOCATION_ID &&
           sv != SYSTEM_VALUE_BASE_WORKGROUP_ID &&
-          sv != SYSTEM_VALUE_BASE_GLOBAL_INVOCATION_ID)
+          sv != SYSTEM_VALUE_BASE_GLOBAL_INVOCATION_ID &&
+          sv != SYSTEM_VALUE_NUM_WORKGROUPS &&
+          sv != SYSTEM_VALUE_WORKGROUP_SIZE)
          return false;
    }
 
@@ -308,6 +311,32 @@ hk_nir_can_coalesce_workgroup(const nir_shader *nir)
       }
    }
 
+   return true;
+}
+
+static bool
+hk_coalesce_partial_padded(const uint32_t grid_threads[3],
+                           const uint16_t local[3],
+                           uint64_t total_threads,
+                           uint64_t req_wgs,
+                           uint64_t *padded_out)
+{
+   uint64_t wgs = 1, padded = 1;
+   for (unsigned i = 0; i < 3; ++i) {
+      const uint64_t g = DIV_ROUND_UP((uint64_t)grid_threads[i], local[i]);
+      uint64_t p_axis = 0;
+      if (__builtin_mul_overflow(g, (uint64_t)local[i], &p_axis) ||
+          __builtin_mul_overflow(wgs, g, &wgs) ||
+          __builtin_mul_overflow(padded, p_axis, &padded))
+         return false;
+   }
+
+   /* Keep core saturation and cap inactive edge lanes at <= 6.25% (1/16). */
+   if (wgs < req_wgs || padded < total_threads ||
+       padded - total_threads > total_threads / 16u)
+      return false;
+
+   *padded_out = padded;
    return true;
 }
 
@@ -351,6 +380,7 @@ hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
 
    bool changed = false;
 
+   /* Pass 1: exact-divisor doubling (zero partial workgroups). */
    for (unsigned axis = 0; axis < 3; ++axis) {
       while (cur_threads * 2 <= target_max) {
          const uint32_t next_dim = (uint32_t)out_local[axis] * 2;
@@ -374,6 +404,39 @@ hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
       }
    }
 
+   /* Pass 2: bounded partial-edge fallback for large odd/prime grids (e.g.
+    * 1512x984 at 8x8 -> 16x16). AGX3 direct CDM launches take global thread
+    * counts and clip trailing partial workgroups in hardware; pick the axis
+    * with minimal padded invocations while keeping edge waste <= 6.25%. */
+   while (cur_threads * 2 <= target_max) {
+      const uint64_t next_threads = cur_threads * 2;
+      const uint64_t req_wgs =
+         next_threads > 256u ? MAX2(min_workgroups, 1024ull)
+                             : MAX2(min_workgroups, 256ull);
+      unsigned best_axis = 3;
+      uint64_t best_padded = UINT64_MAX;
+      for (unsigned axis = 0; axis < 3; ++axis) {
+         const uint32_t next_dim = (uint32_t)out_local[axis] * 2;
+         if (next_dim > max_wg_size[axis] || grid_threads[axis] < next_dim)
+            continue;
+         uint16_t cand[3] = {out_local[0], out_local[1], out_local[2]};
+         cand[axis] = (uint16_t)next_dim;
+         uint64_t padded = 0;
+         if (!hk_coalesce_partial_padded(grid_threads, cand, total_threads,
+                                         req_wgs, &padded))
+            continue;
+         if (padded < best_padded) {
+            best_padded = padded;
+            best_axis = axis;
+         }
+      }
+      if (best_axis == 3)
+         break;
+      out_local[best_axis] = (uint16_t)(out_local[best_axis] * 2);
+      cur_threads = next_threads;
+      changed = true;
+   }
+
    return changed;
 }
 
@@ -387,4 +450,60 @@ hk_coalesce_workgroup_size(const uint16_t api_local[3],
    return hk_coalesce_workgroup_size_ex(api_local, grid_threads,
                                         default_max_wg_size, max_wg_threads,
                                         256u, 256ull, out_local);
+}
+
+bool
+hk_split_workgroup_size_ex(const uint16_t api_local[3],
+                           const uint32_t grid_threads[3],
+                           uint64_t min_workgroups,
+                           uint16_t out_local[3])
+{
+   out_local[0] = api_local[0];
+   out_local[1] = api_local[1];
+   out_local[2] = api_local[2];
+
+   if (!api_local[0] || !api_local[1] || !api_local[2] ||
+       !grid_threads[0] || !grid_threads[1] || !grid_threads[2] ||
+       min_workgroups <= 1ull)
+      return false;
+
+   uint64_t cur_threads =
+      (uint64_t)api_local[0] * api_local[1] * api_local[2];
+   if (cur_threads < 64ull || (cur_threads % 32ull) != 0)
+      return false;
+
+   if ((grid_threads[0] % api_local[0]) != 0 ||
+       (grid_threads[1] % api_local[1]) != 0 ||
+       (grid_threads[2] % api_local[2]) != 0)
+      return false;
+
+   uint64_t xy_threads = 0, total_threads = 0;
+   if (__builtin_mul_overflow((uint64_t)grid_threads[0],
+                              (uint64_t)grid_threads[1], &xy_threads) ||
+       __builtin_mul_overflow(xy_threads, (uint64_t)grid_threads[2],
+                              &total_threads))
+      return false;
+
+   uint64_t cur_wgs = total_threads / cur_threads;
+   if (cur_wgs >= min_workgroups)
+      return false;
+
+   bool changed = false;
+   while (cur_wgs < min_workgroups && cur_threads >= 64ull) {
+      const unsigned axis = out_local[2] > 1 ? 2 : out_local[1] > 1 ? 1 : 0;
+      if ((out_local[axis] % 2u) != 0)
+         break;
+      const uint16_t next_dim = (uint16_t)(out_local[axis] / 2u);
+      const uint64_t next_threads = cur_threads / 2ull;
+      if ((next_threads % 32ull) != 0)
+         break;
+      if ((grid_threads[axis] / next_dim) > 65535u)
+         break;
+      out_local[axis] = next_dim;
+      cur_threads = next_threads;
+      cur_wgs *= 2ull;
+      changed = true;
+   }
+
+   return changed;
 }

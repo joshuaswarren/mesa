@@ -605,7 +605,8 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
    agx_index uv = agx_preload(b, agx_register(2, AGX_SIZE_32));
    agx_index reg_desc = agx_preload(b, agx_register(6, AGX_SIZE_64));
    agx_index reg_smp = agx_preload(b, agx_register(10, AGX_SIZE_64));
-   agx_index reg_lod_val = agx_preload(b, agx_register(14, AGX_SIZE_32));
+   agx_index reg_lod_val = agx_preload(
+      b, agx_register(14, kind == FRAG_SAMPLE_TEX ? AGX_SIZE_16 : AGX_SIZE_32));
    agx_index acc = agx_mov_imm(b, 32, 0);
 
    if (with_cube_array) {
@@ -734,6 +735,23 @@ TEST(M5CopySchedule, AGX3BFragmentSamplesUseOccupancySlack)
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_ARRAY,
                 FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_AUTO_LOD,
                 false, false, 0),
+             5u);
+   /* Register-LOD and register-bias 2D and uniform-descriptor 2D_ARRAY samples
+    * also allocate disjoint 8-half banks on AGX3B and hoist ahead of consumers. */
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_LOD_MIN,
+                true, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_AUTO_LOD_BIAS,
+                true, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_LOD_MIN,
+                true, false, 0),
              5u);
 }
 
@@ -960,5 +978,148 @@ TEST(M5CopySchedule, SplitLoadChainsInterleaveIndependentAlu)
       fmuls_before_first_ffma += I->op == AGX_OPCODE_FMUL;
    }
    EXPECT_GE(fmuls_before_first_ffma, 2u);
+   ralloc_free(s.mem);
+}
+
+/* AGX3C (non-G18G) fragment device loads issue ahead of their uses and
+ * interleave independent SFU/ALU chains, while emit_agx3d keeps pressure order. */
+TEST(M5CopySchedule, FragmentDeviceLoadsIssueAheadOfUsesAndInterleaveAlu)
+{
+   for (bool emit_agx3d : {false, true}) {
+      SCOPED_TRACE(emit_agx3d);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, true);
+      if (emit_agx3d) {
+         s.key.dev.chip = AGX_CHIP_G17G;
+         s.key.dev.emit_agx3d = true;
+      }
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+      agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index acc[2] = {agx_mov_imm(b, 32, 0), agx_mov_imm(b, 32, 0)};
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index v0 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index v1 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, v0, address, agx_immediate(i * 8),
+                            AGX_FORMAT_I32, 1, 0, false);
+         agx_device_load_to(b, v1, address, agx_immediate(i * 8 + 4),
+                            AGX_FORMAT_I32, 1, 0, false);
+         agx_index s0 = agx_rsqrt(b, v0);
+         acc[0] = agx_ffma(b, s0, w, acc[0]);
+         agx_index s1 = agx_rsqrt(b, v1);
+         acc[1] = agx_ffma(b, s1, w, acc[1]);
+      }
+      agx_unit_test(b, agx_fadd(b, acc[0], acc[1]));
+
+      agx_ilp_schedule(b->shader);
+      const unsigned in_flight = max_device_loads_in_flight(s.body);
+      unsigned rsqrts_before_first_ffma = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_FFMA)
+            break;
+         rsqrts_before_first_ffma += I->op == AGX_OPCODE_RSQRT;
+      }
+      if (emit_agx3d) {
+         EXPECT_EQ(in_flight, 2u);
+         EXPECT_EQ(rsqrts_before_first_ffma, 1u);
+      } else {
+         EXPECT_GE(in_flight, 4u);
+         EXPECT_LE(in_flight, 8u);
+         EXPECT_GE(rsqrts_before_first_ffma, 2u);
+      }
+      ralloc_free(s.mem);
+   }
+}
+
+/* AGX3C (non-G18G) vertex shaders batch in-flight device loads in loop bodies
+ * (e.g. morph-target / skinning loops), while straight-line vertex blocks keep
+ * their tight pressure-scheduled register order. */
+TEST(M5CopySchedule, VertexLoopDeviceLoadsIssueAheadOfUses)
+{
+   for (bool loop : {false, true}) {
+      SCOPED_TRACE(loop);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_VERTEX, loop);
+      emit_load_uses(&s, 6);
+      agx_ilp_schedule(s.b->shader);
+      if (loop)
+         EXPECT_GT(loads_before_first_add(s.body), 1u);
+      else
+         EXPECT_EQ(loads_before_first_add(s.body), 1u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* AGX3C (non-G18G) straight-line fragment blocks with >= 4 texture samples keep
+ * all samples hoisted ahead of consumers and interleave independent SFU/ALU
+ * chains. */
+TEST(M5CopySchedule, FragmentTextureSamplesHoistAndInterleaveAlu)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index coords = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index acc[2] = {agx_mov_imm(b, 32, 0), agx_mov_imm(b, 32, 0)};
+
+   for (unsigned i = 0; i < 4; ++i) {
+      agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *smp = agx_texture_sample_to(
+         b, tex, coords, agx_zero(), agx_zero(), agx_immediate(i),
+         agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      smp->mask = 0x3;
+      agx_instr *split = agx_split(b, 4, tex);
+      for (unsigned c = 0; c < 4; ++c)
+         split->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index r0 = agx_rsqrt(b, split->dest[0]);
+      acc[0] = agx_ffma(b, r0, w, acc[0]);
+      agx_index r1 = agx_rsqrt(b, split->dest[1]);
+      acc[1] = agx_ffma(b, r1, w, acc[1]);
+   }
+   agx_unit_test(b, agx_fadd(b, acc[0], acc[1]));
+
+   agx_ilp_schedule(b->shader);
+   unsigned samples_before_first_rsqrt = 0;
+   unsigned rsqrts_before_first_ffma = 0;
+   bool saw_rsqrt = false;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_RSQRT)
+         saw_rsqrt = true;
+      if (!saw_rsqrt)
+         samples_before_first_rsqrt += I->op == AGX_OPCODE_TEXTURE_SAMPLE;
+      if (I->op == AGX_OPCODE_FFMA)
+         break;
+      rsqrts_before_first_ffma += I->op == AGX_OPCODE_RSQRT;
+   }
+   EXPECT_EQ(samples_before_first_rsqrt, 4u);
+   EXPECT_GE(rsqrts_before_first_ffma, 2u);
+   ralloc_free(s.mem);
+}
+
+/* Fragment blocks containing discard (SAMPLE_MASK) keep their order rather
+ * than hoisting device loads past control/coverage side effects. */
+TEST(M5CopySchedule, FragmentDiscardSkipsDeviceLoadIlp)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index mask = agx_preload(b, agx_register(6, AGX_SIZE_16));
+   agx_index sum = agx_mov_imm(b, 32, 0);
+   agx_sample_mask(b, agx_immediate(0xff), mask);
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+      agx_device_load_to(b, value, address, agx_immediate(i * 4),
+                         AGX_FORMAT_I32, 1, 0, false);
+      sum = agx_iadd(b, sum, value, 0);
+   }
+   agx_unit_test(b, sum);
+
+   agx_ilp_schedule(b->shader);
+   EXPECT_EQ(loads_before_first_add(s.body), 1u);
    ralloc_free(s.mem);
 }

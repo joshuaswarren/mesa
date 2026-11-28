@@ -37,6 +37,7 @@
 #include "asahi/lib/agx_usc.h"
 #include "asahi/lib/agx_vdm_barrier_core.h"
 #include "asahi/lib/agx_vdm_index_list_core.h"
+#include "asahi/lib/agx_vdm_state_core.h"
 #include "asahi/lib/agx_vdm_state_update_core.h"
 #include "asahi/lib/agx_vdm_ppp_state_core.h"
 #include "asahi/lib/agx_vdm_stream_link_core.h"
@@ -384,8 +385,8 @@ agx_create_blend_state(struct pipe_context *ctx,
          so->store |= (PIPE_CLEAR_COLOR0 << i);
 
       if (!state->logicop_enable && !state->alpha_to_coverage &&
-          !rt.blend_enable && rt.colormask == PIPE_MASK_RGBA)
-         so->opaque_overwrite |= (PIPE_CLEAR_COLOR0 << i);
+          !rt.blend_enable)
+         so->opaque_overwrite_mask[i] = rt.colormask & PIPE_MASK_RGBA;
    }
 
    return so;
@@ -1344,6 +1345,10 @@ agx_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
    }
 
    ctx->stage[shader].texture_count = new_nr;
+   if (new_nr)
+      ctx->stages_with_textures |= BITFIELD_BIT(shader);
+   else
+      ctx->stages_with_textures &= ~BITFIELD_BIT(shader);
    ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_IMAGE;
 }
 
@@ -2263,9 +2268,9 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       cfg.dimension =
          agx_translate_tex_dim(target, util_res_sample_count(&tex->base.b));
       /* G17G shaders store to layered images as 3D (agx3_pack_binary.c);
-       * G17C stores keep the array. */
+       * G17C stores keep the array (agx_chip_m5_layer_operand()). */
       if (descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
-          dev->chip != AGX_CHIP_G17C &&
+          !agx_chip_m5_layer_operand(dev->chip) &&
           !block_access && cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY)
          cfg.dimension = AGX_TEXTURE_DIMENSION_3D;
       cfg.layout = agx_translate_layout(tex->layout.tiling);
@@ -2610,6 +2615,23 @@ agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_stage *s = &ctx->stage[shader];
    struct pipe_constant_buffer *constants = &s->cb[index];
+   const unsigned mask = 1u << index;
+
+   if (cb && !cb->user_buffer && cb->buffer &&
+       cb->buffer == constants->buffer && !constants->user_buffer) {
+      const unsigned clamped_size = agx_buffer_range_in_resource(
+         cb->buffer, cb->buffer_offset, cb->buffer_size);
+      if ((s->cb_mask & mask) &&
+          constants->buffer_offset == cb->buffer_offset &&
+          constants->buffer_size == clamped_size)
+         return;
+
+      constants->buffer_offset = cb->buffer_offset;
+      constants->buffer_size = clamped_size;
+      s->cb_mask |= mask;
+      ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_CONST;
+      return;
+   }
 
    util_copy_constant_buffer(&s->cb[index], cb);
 
@@ -2625,8 +2647,6 @@ agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
       constants->buffer_size = agx_buffer_range_in_resource(
          constants->buffer, constants->buffer_offset, constants->buffer_size);
    }
-
-   unsigned mask = (1 << index);
 
    if (cb)
       s->cb_mask |= mask;
@@ -2649,6 +2669,23 @@ agx_set_vertex_buffers(struct pipe_context *pctx, unsigned count,
                        const struct pipe_vertex_buffer *buffers)
 {
    struct agx_context *ctx = agx_context(pctx);
+
+   if (buffers && !(ctx->vb_mask & ~BITFIELD_MASK(count))) {
+      bool same = true;
+      for (unsigned i = 0; i < count; ++i) {
+         const struct pipe_vertex_buffer *a = &ctx->vertex_buffers[i];
+         const struct pipe_vertex_buffer *b = &buffers[i];
+         if (a->is_user_buffer != b->is_user_buffer ||
+             a->buffer_offset != b->buffer_offset ||
+             (a->is_user_buffer ? (a->buffer.user != b->buffer.user)
+                                : (a->buffer.resource != b->buffer.resource))) {
+            same = false;
+            break;
+         }
+      }
+      if (same)
+         return;
+   }
 
    util_set_vertex_buffers_mask(ctx->vertex_buffers, &ctx->vb_mask, buffers,
                                 count);
@@ -2692,6 +2729,8 @@ static void
 agx_bind_vertex_elements_state(struct pipe_context *pctx, void *cso)
 {
    struct agx_context *ctx = agx_context(pctx);
+   if (ctx->attributes == cso)
+      return;
    ctx->attributes = cso;
    ctx->dirty |= AGX_DIRTY_VERTEX;
 }
@@ -3186,6 +3225,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
              compiled->b.info.binary_size);
    }
 
+   agx_compute_shader_upload_sizes(compiled);
    return compiled;
 }
 
@@ -4481,20 +4521,24 @@ agx_nir_analyze_fullscreen_tri(nir_shader *nir, bool *out_z_in_01,
    return ccw ? 1 : 2;
 }
 
-/* Determine which colour outputs a fragment shader writes unconditionally in
- * all four channels along its top-level control flow, and whether the shader
+/* Determine the per-RT 4-bit RGBA channel masks a fragment shader writes
+ * unconditionally along its top-level control flow, and whether the shader
  * can discard/demote/terminate fragments. */
-uint8_t
-agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
+void
+agx_nir_analyze_fs_color_output_masks(nir_shader *nir,
+                                      uint8_t out_masks[PIPE_MAX_COLOR_BUFS],
+                                      bool *out_uses_discard)
 {
    bool uses_discard = nir->info.fs.uses_discard;
    uint8_t rt_mask[PIPE_MAX_COLOR_BUFS] = {0};
    uint8_t broadcast_mask = 0;
 
+   memset(out_masks, 0, PIPE_MAX_COLOR_BUFS * sizeof(out_masks[0]));
+
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    if (!impl) {
       *out_uses_discard = true;
-      return 0;
+      return;
    }
 
    nir_foreach_block(block, impl) {
@@ -4516,7 +4560,7 @@ agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
 
    *out_uses_discard = uses_discard;
    if (uses_discard)
-      return 0;
+      return;
 
    foreach_list_typed(nir_cf_node, cf, node, &impl->body) {
       if (cf->type != nir_cf_node_block)
@@ -4524,7 +4568,7 @@ agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
       nir_block *block = nir_cf_node_as_block(cf);
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_jump)
-            return 0;
+            return;
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
@@ -4545,9 +4589,19 @@ agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
       }
    }
 
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt)
+      out_masks[rt] = (rt_mask[rt] | broadcast_mask) & 0xf;
+}
+
+uint8_t
+agx_nir_analyze_fs_color_outputs(nir_shader *nir, bool *out_uses_discard)
+{
+   uint8_t masks[PIPE_MAX_COLOR_BUFS];
+   agx_nir_analyze_fs_color_output_masks(nir, masks, out_uses_discard);
+
    uint8_t full = 0;
    for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
-      if (((rt_mask[rt] | broadcast_mask) & 0xf) == 0xf)
+      if (masks[rt] == 0xf)
          full |= BITFIELD_BIT(rt);
    }
    return full;
@@ -4693,8 +4747,8 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       so->info.writes_memory = nir->info.writes_memory;
       so->info.writes_api_sample_mask =
          nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
-      so->info.fs_unconditional_color_outputs =
-         agx_nir_analyze_fs_color_outputs(nir, &so->info.fs_uses_discard);
+      agx_nir_analyze_fs_color_output_masks(
+         nir, so->info.fs_unconditional_color_masks, &so->info.fs_uses_discard);
       so->info.inputs_linear_shaded = nir->info.linear_varyings;
       so->info.inputs_read = nir->info.inputs_read;
       so->info.inputs_flat_shaded = nir->info.inputs_read &
@@ -4788,7 +4842,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    if (agx_chip_g17_m5(dev->chip)) {
       /* agx3c's name for the same preprocessing mode (false, true), which
        * theirs exposed as agx_preprocess_nir_g17g(). */
-      agx_preprocess_nir_m5(nir);
+      agx_preprocess_nir_m5_chip(nir, dev->chip);
       if (nir->info.stage == MESA_SHADER_FRAGMENT &&
           (nir->info.inputs_read & VARYING_BIT_LAYER)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
@@ -5665,6 +5719,8 @@ agx_compile_inline_blend_fs(struct agx_context *ctx,
    fs->g17p_custom_border_emulation = main->g17p_custom_border_emulation;
    fs->push_range_count = main->push_range_count;
    memcpy(fs->push, main->push, sizeof(fs->push[0]) * main->push_range_count);
+   fs->stage_uniforms_upload_size = main->stage_uniforms_upload_size;
+   fs->root_uniforms_upload_size = main->root_uniforms_upload_size;
    fs->epilog_key = main->epilog_key;
 
    /* Blend constants are uploaded with every fragment program. A textured
@@ -6485,6 +6541,7 @@ agx_delete_compiled_shader(struct agx_device *dev,
 
    free(so->b.binary);
    free(so->inline_blend_nir);
+   agx_g17p_compute_templates_free(&so->g17p_compute_templates);
    agx_bo_unreference(dev, so->agx3_compute_bo);
    agx_bo_unreference(dev, so->bo);
    FREE(so);
@@ -6596,6 +6653,11 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
       if (bl->g17p_mip_cs[i])
          ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
    }
+
+   if (bl->g17p_block_mip_cs)
+      ctx->delete_compute_state(ctx, bl->g17p_block_mip_cs);
+   if (bl->g17p_block_mip_sampler)
+      ctx->delete_sampler_state(ctx, bl->g17p_block_mip_sampler);
 
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
@@ -7725,42 +7787,16 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_stage_uniforms_size(agx_device(ctx->base.screen)->chip);
    size_t size = full_size;
 
-   /* A vertex or fragment shader reads its stage table only through the
-    * ranges it pushes, unless it indexes the table dynamically, which loads
-    * the table address from the root table. Without such a load, upload only
-    * the pushed prefix of the table, or nothing when no range is pushed.
-    * Geometry and tessellation draws keep the whole table.
+   /* A vertex, fragment, or compute shader reads its stage table only through
+    * the ranges it pushes, unless it indexes the table dynamically (marked by
+    * UINT16_MAX in stage_uniforms_upload_size). Geometry and tessellation
+    * draws keep the whole table.
     */
    if (!ctx->gs && !ctx->in_tess &&
-       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT)) {
-      const unsigned stage_table = AGX_SYSVAL_STAGE(stage);
-      const size_t table_ptr_off =
-         offsetof(struct agx_draw_uniforms, tables[stage_table]);
-      const size_t table_ptr_end = table_ptr_off + sizeof(uint64_t);
-      bool indirect = false;
-      size_t pushed_end = 0;
-
-      for (unsigned i = 0; i < cs->push_range_count; ++i) {
-         const struct agx_push_range *push = &cs->push[i];
-         if (push->table == AGX_SYSVAL_TABLE_ROOT) {
-            const size_t start = push->offset;
-            const size_t end = start + (size_t)push->length * 2;
-            if (start < table_ptr_end && end > table_ptr_off) {
-               indirect = true;
-               break;
-            }
-         } else if (push->table == stage_table) {
-            /* Native Ioto loaders move uniform dwords, so an odd 16-bit
-             * range reads one more half (agx_build_g17p_graphics_program).
-             */
-            const size_t end =
-               (size_t)push->offset + (size_t)ALIGN_POT(push->length, 2) * 2;
-            pushed_end = MAX2(pushed_end, end);
-         }
-      }
-
-      if (!indirect)
-         size = MIN2(ALIGN_POT(pushed_end, 16), full_size);
+       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT ||
+        stage == MESA_SHADER_COMPUTE)) {
+      if (cs->stage_uniforms_upload_size != UINT16_MAX)
+         size = MIN2((size_t)cs->stage_uniforms_upload_size, full_size);
    }
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
@@ -7805,37 +7841,174 @@ struct agx_g17p_graphics_template {
    struct agx3_g17p_graphics_program_desc desc;
    struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
    struct agx3_g17p_graphics_program_template program;
+   bool has_plan;
+   struct hk_g17p_patch_plan plan;
 };
 
 #define AGX_G17P_GRAPHICS_TEMPLATE_LIMIT 8u
+#define AGX_G17P_GRAPHICS_TEMPLATE_MAX_SHAPES 2u
 
-static bool
-agx_g17p_graphics_program_cached(enum agx_chip chip,
-                                 struct agx_linked_shader *linked,
-                                 const struct agx3_g17p_graphics_program_desc *desc,
-                                 void *output, size_t capacity,
-                                 size_t *written)
+static inline bool
+agx_g17p_graphics_desc_supports_plan(
+   const struct agx3_g17p_graphics_program_desc *desc)
 {
+   return !desc->preshader && !desc->preloaded_root &&
+          !desc->constant_program.code_size &&
+          !(desc->cprog_inputs && desc->cprog_inputs->count);
+}
+
+static inline bool
+agx_g17p_graphics_template_matches_shape(
+   const struct agx_g17p_graphics_template *entry,
+   const struct agx3_g17p_graphics_program_desc *desc)
+{
+   const struct agx3_g17p_graphics_program_desc *a = &entry->desc;
+   if (a->uniform_range_count != desc->uniform_range_count ||
+       a->shader_va != desc->shader_va ||
+       a->shader_binary_size != desc->shader_binary_size ||
+       a->scratch_size != desc->scratch_size || a->nr_gprs != desc->nr_gprs ||
+       a->compiler_d_valid != desc->compiler_d_valid ||
+       a->compiler_d != desc->compiler_d || a->fragment != desc->fragment ||
+       a->writes_sample_mask != desc->writes_sample_mask ||
+       a->colour_classes != desc->colour_classes ||
+       a->imageblock.sample_size_B != desc->imageblock.sample_size_B ||
+       a->imageblock.nr_samples != desc->imageblock.nr_samples ||
+       a->imageblock.tile_size_px != desc->imageblock.tile_size_px)
+      return false;
+
+   for (unsigned i = 0; i < desc->uniform_range_count; ++i) {
+      if (entry->ranges[i].start_halfs != desc->uniform_ranges[i].start_halfs ||
+          entry->ranges[i].size_halfs != desc->uniform_ranges[i].size_halfs)
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_g17p_graphics_template_ranges_valid(
+   const struct agx3_ioto_uniform_range *ranges, size_t count)
+{
+   for (size_t i = 0; i < count; ++i) {
+      const uint64_t bytes = (uint64_t)ranges[i].size_halfs * 2;
+      if (!ranges[i].size_halfs || (ranges[i].size_halfs & 1) ||
+          (ranges[i].start_halfs & 1) || (ranges[i].address & 3) ||
+          ranges[i].address > UINT64_MAX - (bytes - 4))
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_g17p_graphics_template_emit_plan(
+   const struct agx_g17p_graphics_template *entry,
+   const struct agx3_ioto_uniform_range *ranges, void *output, size_t capacity,
+   size_t *written)
+{
+   const uint16_t len = entry->program.program.length;
+   if (len > capacity)
+      return false;
+
+   /* Patch in cached stack memory before one sequential write into the
+    * write-combined pipeline pool for ordinary program sizes. */
+   if (likely(len <= 512)) {
+      uint8_t buf[512];
+      memcpy(buf, entry->program.program.bytes, len);
+      hk_g17p_patch_plan_apply(&entry->plan, ranges, buf);
+      memcpy(output, buf, len);
+   } else {
+      memcpy(output, entry->program.program.bytes, len);
+      hk_g17p_patch_plan_apply(&entry->plan, ranges, output);
+   }
+   *written = len;
+   return true;
+}
+
+static struct agx_g17p_graphics_template *
+agx_g17p_graphics_program_find_plan(
+   struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc)
+{
+   if (!agx_g17p_graphics_desc_supports_plan(desc) ||
+       !agx_g17p_graphics_template_ranges_valid(desc->uniform_ranges,
+                                                desc->uniform_range_count))
+      return NULL;
+
    struct agx_g17p_graphics_template **slot =
       &linked->g17p_graphics_templates;
-   unsigned count = 0;
    while (*slot) {
       struct agx_g17p_graphics_template *entry = *slot;
+      if (entry->has_plan &&
+          agx_g17p_graphics_template_matches_shape(entry, desc) &&
+          hk_g17p_patch_plan_fits(&entry->plan, desc->uniform_ranges)) {
+         if (*slot != linked->g17p_graphics_templates) {
+            *slot = entry->next;
+            entry->next = linked->g17p_graphics_templates;
+            linked->g17p_graphics_templates = entry;
+         }
+         return entry;
+      }
+      slot = &entry->next;
+   }
+   return NULL;
+}
+
+static bool
+agx_g17p_graphics_program_relocate_cached(
+   enum agx_chip chip, struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc, void *output,
+   size_t capacity, size_t *written)
+{
+   const struct agx_g17p_graphics_template *plan =
+      agx_g17p_graphics_program_find_plan(linked, desc);
+   if (plan)
+      return agx_g17p_graphics_template_emit_plan(plan, desc->uniform_ranges,
+                                                  output, capacity, written);
+
+   struct agx_g17p_graphics_template **slot =
+      &linked->g17p_graphics_templates;
+   while (*slot) {
+      struct agx_g17p_graphics_template *entry = *slot;
+      if (entry->has_plan) {
+         slot = &entry->next;
+         continue;
+      }
       uint16_t length;
       /* The composer checks the complete shader/imageblock state, range
        * layout, address-cache topology and immediate instruction widths.
        * Only the draw-varying addresses may be patched; a different shape
        * goes through full generation instead. */
       if (agx3_g17p_graphics_program_template_relocate(
-             chip, &entry->desc, desc, &entry->program, output,
-             capacity, &length)) {
-         *slot = entry->next;
-         entry->next = linked->g17p_graphics_templates;
-         linked->g17p_graphics_templates = entry;
+             chip, &entry->desc, desc, &entry->program, output, capacity,
+             &length)) {
+         if (*slot != linked->g17p_graphics_templates) {
+            *slot = entry->next;
+            entry->next = linked->g17p_graphics_templates;
+            linked->g17p_graphics_templates = entry;
+         }
          *written = length;
          return true;
       }
       slot = &entry->next;
+   }
+   return false;
+}
+
+static bool
+agx_g17p_graphics_program_generate_cached(
+   enum agx_chip chip, struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *desc, void *output,
+   size_t capacity, size_t *written)
+{
+   const bool can_plan = agx_g17p_graphics_desc_supports_plan(desc);
+   unsigned count = 0;
+   unsigned shapes = 0;
+   struct agx_g17p_graphics_template **slot =
+      &linked->g17p_graphics_templates;
+   while (*slot) {
+      if (can_plan && (*slot)->has_plan &&
+          agx_g17p_graphics_template_matches_shape(*slot, desc))
+         ++shapes;
+      slot = &(*slot)->next;
       ++count;
    }
 
@@ -7849,11 +8022,36 @@ agx_g17p_graphics_program_cached(enum agx_chip chip,
    memcpy(entry->ranges, desc->uniform_ranges,
           desc->uniform_range_count * sizeof(entry->ranges[0]));
    entry->desc.uniform_ranges = entry->ranges;
-   if (!agx3_g17p_graphics_program_template_generate(
-          chip, &entry->desc, &entry->program) ||
-       entry->program.program.length > capacity) {
-      ralloc_free(entry);
-      return false;
+
+   /* A layout whose ranges keep moving relative to each other gets one
+    * address-independent template (each range its own 8-byte LDIMM base),
+    * matching Honeykrisp's loader cache. */
+   const bool try_independent =
+      can_plan && shapes >= AGX_G17P_GRAPHICS_TEMPLATE_MAX_SHAPES &&
+      desc->uniform_range_count <= HK_G17P_PATCH_MAX_RANGES;
+   bool generated = false;
+   if (try_independent) {
+      entry->desc.patchable = true;
+      generated = agx3_g17p_graphics_program_template_generate(
+                     chip, &entry->desc, &entry->program) &&
+                  entry->program.program.length <= capacity;
+      if (!generated)
+         entry->desc.patchable = desc->patchable;
+   }
+   if (!generated) {
+      if (!agx3_g17p_graphics_program_template_generate(
+             chip, &entry->desc, &entry->program) ||
+          entry->program.program.length > capacity) {
+         ralloc_free(entry);
+         return false;
+      }
+   }
+
+   if (can_plan) {
+      entry->has_plan = hk_g17p_patch_plan_init(
+         &entry->plan, entry->ranges, entry->desc.uniform_range_count,
+         entry->program.relocations, entry->program.relocation_count,
+         entry->program.program.length, entry->desc.patchable);
    }
 
    /* Bound memory and lookup cost even when an application keeps changing
@@ -7871,6 +8069,20 @@ agx_g17p_graphics_program_cached(enum agx_chip chip,
    *written = entry->program.program.length;
    memcpy(output, entry->program.program.bytes, *written);
    return true;
+}
+
+static bool
+agx_g17p_graphics_program_cached(enum agx_chip chip,
+                                 struct agx_linked_shader *linked,
+                                 const struct agx3_g17p_graphics_program_desc *desc,
+                                 void *output, size_t capacity,
+                                 size_t *written)
+{
+   if (agx_g17p_graphics_program_relocate_cached(chip, linked, desc, output,
+                                                 capacity, written))
+      return true;
+   return agx_g17p_graphics_program_generate_cached(chip, linked, desc, output,
+                                                    capacity, written);
 }
 /* The static TPS frame a graphics program declares. G18 programs it in both
  * SPECTPR words as a 16-byte-aligned byte count divided by four (native1054:
@@ -8101,23 +8313,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                                  &count, NULL))
       return 0;
 
-   size_t capacity;
-   if (!agx3_g17p_graphics_program_bound(dev->chip, ranges, count,
-                                          &capacity))
-      return 0;
-
-   /* The constant program branches to its code in the shader's own upload;
-    * the loader grows by that branch and its prelude only. */
-   if (fs_cprog)
-      capacity += 512;
-
-   struct agx_bo *program_bo = NULL;
-   struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
-      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
-      &program_bo);
-   if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
-       !agx_va_in_usc_window(dev,
-                            linked->bo->va->addr + linked->entry_offset))
+   if (!agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
       return 0;
 
    const uint32_t pass_type =
@@ -8125,7 +8321,8 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = t.gpu,
+      .usc_clusters = dev->params.num_clusters_total,
+      .program_va = 0,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8145,25 +8342,69 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          .tile_size_px = batch->tilebuffer_layout.tile_size,
       },
    };
-   if (fs_cprog) {
-      /* As hk_upload_g17p_graphics_program(): the main shader's own upload
-       * holds the constant program; linking relocates only the main part. */
-      const struct agx_shader_info *pi = &cs->b.info;
-      desc.constant_program = (struct agx_ioto_constant_program){
-         .code = (const uint8_t *)agx_bo_map(cs->bo) + pi->preamble_offset,
-         .code_size = pi->preamble_size,
-         .code_va = cs->bo->va->addr + pi->preamble_offset,
-         .absolute_branch = true,
-         .request_prelude = pi->agx3_preamble_uniform_inputs,
-      };
-      if (pi->agx3_preamble_tps_inputs)
-         desc.cprog_inputs = &pi->agx3_preamble_inputs;
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr t;
+   size_t program_length = 0;
+
+   /* Without a constant program suffix, relocation does not depend on
+    * program_va. Try the cached patch plan before computing a conservative size
+    * bound so plan hits allocate the exact program size with no 6 KiB staging
+    * buffer. */
+   bool relocated = false;
+   if (!fs_cprog && linked->g17p_graphics_templates) {
+      const struct agx_g17p_graphics_template *plan =
+         agx_g17p_graphics_program_find_plan(linked, &desc);
+      if (plan) {
+         const size_t len = plan->program.program.length;
+         t = agx_pool_alloc_aligned_with_bo(
+            &batch->pipeline_pool, len, AGX_IOTO_PROGRAM_ALIGNMENT,
+            &program_bo);
+         if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
+             !agx_g17p_graphics_template_emit_plan(plan, ranges, t.cpu, len,
+                                                   &program_length))
+            return 0;
+         relocated = true;
+      }
    }
 
-   size_t program_length;
-   if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
-                                         capacity, &program_length))
-      return 0;
+   if (!relocated) {
+      size_t capacity;
+      if (!agx3_g17p_graphics_program_bound(dev->chip, ranges, count,
+                                             &capacity))
+         return 0;
+
+      /* The constant program branches to its code in the shader's own upload;
+       * the loader grows by that branch and its prelude only. */
+      if (fs_cprog)
+         capacity += 512;
+
+      t = agx_pool_alloc_aligned_with_bo(
+         &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
+         &program_bo);
+      if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu))
+         return 0;
+
+      desc.program_va = t.gpu;
+      if (fs_cprog) {
+         /* As hk_upload_g17p_graphics_program(): the main shader's own upload
+          * holds the constant program; linking relocates only the main part. */
+         const struct agx_shader_info *pi = &cs->b.info;
+         desc.constant_program = (struct agx_ioto_constant_program){
+            .code = (const uint8_t *)agx_bo_map(cs->bo) + pi->preamble_offset,
+            .code_size = pi->preamble_size,
+            .code_va = cs->bo->va->addr + pi->preamble_offset,
+            .absolute_branch = true,
+            .request_prelude = pi->agx3_preamble_uniform_inputs,
+         };
+         if (pi->agx3_preamble_tps_inputs)
+            desc.cprog_inputs = &pi->agx3_preamble_inputs;
+      }
+
+      if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
+                                            capacity, &program_length))
+         return 0;
+   }
 
    agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
                        program_length);
@@ -8429,6 +8670,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8912,6 +9154,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -9208,6 +9451,275 @@ agx_record_cdm_dispatch(struct agx_batch *batch, uint32_t start, uint32_t end,
  * invocation index) already lives in its own AGX3 code container, so it is
  * dispatched from there; a bare main program is wrapped in a container here.
  */
+#define AGX_G17P_COMPUTE_TEMPLATE_LIMIT 8u
+#define AGX_G17P_COMPUTE_TEMPLATE_MAX_SHAPES 2u
+
+struct agx_g17p_compute_template {
+   struct agx_g17p_compute_template *next;
+   uint64_t shader_va;
+   uint64_t constant_program_va;
+   const struct agx3_cprog_inputs *cprog_inputs;
+   struct agx3_cdm_direct_template_sources launch_sources;
+   uint32_t shader_binary_size;
+   uint32_t scratch_size;
+   uint32_t compiler_d;
+   uint32_t threadgroup_memory_size_B;
+   uint32_t imageblock_stride_B;
+   uint32_t constant_program_size;
+   uint16_t nr_gprs;
+   uint16_t length;
+   bool compiler_d_valid;
+   bool constant_program_prelude;
+   bool independent;
+   uint8_t ldshdr_f1;
+   uint8_t range_count;
+   uint16_t range_start[HK_G17P_PATCH_MAX_RANGES];
+   uint16_t range_size[HK_G17P_PATCH_MAX_RANGES];
+   struct agx3_compute_program launch;
+   struct hk_g17p_patch_plan plan;
+   uint8_t bytes[];
+};
+
+void
+agx_g17p_compute_templates_free(struct agx_g17p_compute_template **head)
+{
+   struct agx_g17p_compute_template *cur = *head;
+   *head = NULL;
+   while (cur) {
+      struct agx_g17p_compute_template *next = cur->next;
+      free(cur);
+      cur = next;
+   }
+}
+
+static inline bool
+agx_g17p_compute_template_matches(
+   const struct agx_g17p_compute_template *t,
+   const struct agx3_g17p_compute_program_desc *d)
+{
+   if (t->shader_va != d->shader_va || t->ldshdr_f1 != d->ldshdr_f1 ||
+       t->range_count != d->uniform_range_count ||
+       t->shader_binary_size != d->shader_binary_size ||
+       t->scratch_size != d->scratch_size || t->nr_gprs != d->nr_gprs ||
+       t->compiler_d_valid != d->compiler_d_valid ||
+       t->compiler_d != d->compiler_d ||
+       t->threadgroup_memory_size_B != d->threadgroup_memory_size_B ||
+       t->imageblock_stride_B != d->imageblock_stride_B ||
+       t->launch_sources.ti_spill_bytes != d->launch_sources.ti_spill_bytes ||
+       t->launch_sources.ti_largest_ipr_bytes !=
+          d->launch_sources.ti_largest_ipr_bytes ||
+       t->launch_sources.ray_traversal_depth_nonzero !=
+          d->launch_sources.ray_traversal_depth_nonzero ||
+       t->constant_program_va != d->constant_program.code_va ||
+       t->constant_program_size != d->constant_program.code_size ||
+       t->constant_program_prelude != d->constant_program.request_prelude ||
+       t->cprog_inputs != d->cprog_inputs)
+      return false;
+
+   for (unsigned i = 0; i < t->range_count; ++i) {
+      if (t->range_start[i] != d->uniform_ranges[i].start_halfs ||
+          t->range_size[i] != d->uniform_ranges[i].size_halfs)
+         return false;
+   }
+   return true;
+}
+
+static struct agx_g17p_compute_template *
+agx_g17p_compute_template_get(struct agx_device *dev,
+                              struct agx_g17p_compute_template **head,
+                              unsigned *generated_count,
+                              const struct agx3_g17p_compute_program_desc *desc)
+{
+   if (!head || desc->preshader ||
+       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES ||
+       (desc->constant_program.code_size &&
+        (!desc->constant_program.force_external ||
+         !desc->constant_program.absolute_branch)) ||
+       !agx_g17p_graphics_template_ranges_valid(desc->uniform_ranges,
+                                                desc->uniform_range_count))
+      return NULL;
+
+   unsigned count = 0;
+   unsigned shapes = 0;
+   struct agx_g17p_compute_template **slot = head;
+   while (*slot) {
+      struct agx_g17p_compute_template *entry = *slot;
+      if (agx_g17p_compute_template_matches(entry, desc)) {
+         if (hk_g17p_patch_plan_fits(&entry->plan, desc->uniform_ranges)) {
+            if (*slot != *head) {
+               *slot = entry->next;
+               entry->next = *head;
+               *head = entry;
+            }
+            return entry;
+         }
+         ++shapes;
+      }
+      slot = &entry->next;
+      ++count;
+   }
+
+   const uint64_t dummy_va = dev->shader_base + 0x10000;
+   if (!agx_va_in_usc_window(dev, dummy_va) ||
+       (dummy_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) ||
+       dummy_va >= (UINT64_C(1) << 48))
+      return NULL;
+
+   struct agx_ioto_load_relocation rels[HK_G17P_PATCH_MAX_RELOCS];
+   size_t rel_count = 0;
+   const bool independent = shapes >= AGX_G17P_COMPUTE_TEMPLATE_MAX_SHAPES;
+   struct agx3_g17p_compute_program_desc composed = *desc;
+   composed.program_va = dummy_va;
+   composed.relocations = rels;
+   composed.relocation_capacity = ARRAY_SIZE(rels);
+   composed.relocation_count = &rel_count;
+   composed.patchable = independent;
+
+   struct agx3_g17p_compute_program *generated = malloc(sizeof(*generated));
+   if (!generated)
+      return NULL;
+
+   struct agx_g17p_compute_template *tpl = NULL;
+   if (!agx3_g17p_compute_program_generate(dev->chip, &composed, generated))
+      goto out;
+
+   tpl = calloc(1, sizeof(*tpl) + generated->length);
+   if (!tpl)
+      goto out;
+
+   *tpl = (struct agx_g17p_compute_template){
+      .shader_va = desc->shader_va,
+      .constant_program_va = desc->constant_program.code_va,
+      .cprog_inputs = desc->cprog_inputs,
+      .launch_sources = desc->launch_sources,
+      .shader_binary_size = desc->shader_binary_size,
+      .scratch_size = desc->scratch_size,
+      .compiler_d = desc->compiler_d,
+      .threadgroup_memory_size_B = desc->threadgroup_memory_size_B,
+      .imageblock_stride_B = desc->imageblock_stride_B,
+      .constant_program_size = desc->constant_program.code_size,
+      .nr_gprs = desc->nr_gprs,
+      .length = generated->length,
+      .compiler_d_valid = desc->compiler_d_valid,
+      .constant_program_prelude = desc->constant_program.request_prelude,
+      .independent = independent,
+      .ldshdr_f1 = desc->ldshdr_f1,
+      .range_count = desc->uniform_range_count,
+      .launch = generated->launch,
+   };
+   memcpy(tpl->bytes, generated->bytes, generated->length);
+   for (unsigned i = 0; i < tpl->range_count; ++i) {
+      tpl->range_start[i] = desc->uniform_ranges[i].start_halfs;
+      tpl->range_size[i] = desc->uniform_ranges[i].size_halfs;
+   }
+
+   if (!hk_g17p_patch_plan_init(&tpl->plan, desc->uniform_ranges,
+                                desc->uniform_range_count, rels, rel_count,
+                                generated->length, independent)) {
+      free(tpl);
+      tpl = NULL;
+      goto out;
+   }
+
+   if (count == AGX_G17P_COMPUTE_TEMPLATE_LIMIT) {
+      slot = head;
+      while ((*slot)->next)
+         slot = &(*slot)->next;
+      free(*slot);
+      *slot = NULL;
+   }
+   tpl->next = *head;
+   *head = tpl;
+   if (generated_count)
+      (*generated_count)++;
+
+out:
+   free(generated);
+   return tpl;
+}
+
+static bool
+agx_g17p_compute_program_emit_cached(
+   struct agx_batch *batch, struct agx_g17p_compute_template **head,
+   unsigned *generated_count,
+   const struct agx3_g17p_compute_program_desc *desc,
+   struct agx3_compute_program *launch_out)
+{
+   struct agx_device *dev = agx_device(batch->ctx->base.screen);
+   if (!agx_va_in_usc_window(dev, desc->shader_va))
+      return false;
+
+   const struct agx_g17p_compute_template *tpl =
+      agx_g17p_compute_template_get(dev, head, generated_count, desc);
+   if (tpl) {
+      struct agx_bo *program_bo = NULL;
+      struct agx_ptr program = agx_pool_alloc_aligned_with_bo(
+         &batch->pipeline_pool, tpl->length, AGX_IOTO_PROGRAM_ALIGNMENT,
+         &program_bo);
+      if (!program.cpu || !program_bo || !agx_va_in_usc_window(dev, program.gpu))
+         return false;
+
+      if (likely(tpl->length <= 512)) {
+         uint8_t buf[512];
+         memcpy(buf, tpl->bytes, tpl->length);
+         hk_g17p_patch_plan_apply(&tpl->plan, desc->uniform_ranges, buf);
+         memcpy(program.cpu, buf, tpl->length);
+      } else {
+         memcpy(program.cpu, tpl->bytes, tpl->length);
+         hk_g17p_patch_plan_apply(&tpl->plan, desc->uniform_ranges,
+                                  program.cpu);
+      }
+
+      if (unlikely(dev->debug & AGX_DBG_VERIFY)) {
+         struct agx3_g17p_compute_program *fresh = malloc(sizeof(*fresh));
+         if (fresh) {
+            struct agx3_g17p_compute_program_desc verify_desc = *desc;
+            verify_desc.program_va = program.gpu;
+            verify_desc.patchable = tpl->independent;
+            const bool ok =
+               agx3_g17p_compute_program_generate(dev->chip, &verify_desc,
+                                                  fresh) &&
+               fresh->length == tpl->length &&
+               memcmp(fresh->bytes, program.cpu, tpl->length) == 0;
+            if (!ok) {
+               mesa_loge("asahi: G17P compute template mismatch (ranges=%zu)",
+                         desc->uniform_range_count);
+            }
+            free(fresh);
+         }
+      }
+
+      agx_bo_assert_range(program_bo, program.gpu - program_bo->va->addr,
+                          tpl->length);
+      *launch_out = tpl->launch;
+      launch_out->program_va = program.gpu;
+      return true;
+   }
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr program = agx_pool_alloc_aligned_with_bo(
+      &batch->pipeline_pool, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+      AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
+   if (!program.cpu || !program_bo || !agx_va_in_usc_window(dev, program.gpu))
+      return false;
+
+   struct agx3_g17p_compute_program_desc direct = *desc;
+   direct.program_va = program.gpu;
+   struct agx3_g17p_compute_program *native = malloc(sizeof(*native));
+   if (!native)
+      return false;
+   const bool ok =
+      agx3_g17p_compute_program_generate(dev->chip, &direct, native);
+   if (ok) {
+      memcpy(program.cpu, native->bytes, native->length);
+      agx_bo_assert_range(program_bo, program.gpu - program_bo->va->addr,
+                          native->length);
+      *launch_out = native->launch;
+   }
+   free(native);
+   return ok;
+}
+
 static bool
 agx_g17p_append_compute(struct agx_batch *batch,
                         struct agx_compiled_shader *cs,
@@ -9339,6 +9851,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
          .compiler_d = compiler_d,
          .threadgroup_memory_size_B =
             shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+         .imageblock_stride_B = info->imageblock_stride,
          .launch_sources = launch_sources,
          /* The program announces how it will be launched.  An indirectly
           * launched one takes its dimensions from the geometry block; a record
@@ -9358,6 +9871,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       size_t program_length;
       if (g17g) {
          const struct agx3_g17p_graphics_program_desc g17g_desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program.gpu,
             .shader_va = shader_va,
             .uniform_ranges = ranges,
@@ -9609,12 +10123,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       compiler_d = (uint32_t)info->agx3_staging_halfs * 2;
    }
 
-   struct agx_bo *program_bo = NULL;
-   struct agx_ptr program = agx_pool_alloc_aligned_with_bo(
-      &batch->pipeline_pool, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
-      AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
-   if (!program.cpu || !program_bo || !agx_va_in_usc_window(dev, shader_va) ||
-       !agx_va_in_usc_window(dev, program.gpu))
+   if (!agx_va_in_usc_window(dev, shader_va))
       return agx_g17p_compute_failed("program allocation or USC window");
 
    struct agx3_cdm_direct_template_sources launch_sources;
@@ -9657,7 +10166,6 @@ agx_g17p_append_compute(struct agx_batch *batch,
    if (shared > UINT32_MAX)
       return agx_g17p_compute_failed("shared memory size");
    const struct agx3_g17p_compute_program_desc desc = {
-      .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
       .uniform_range_count = range_count,
@@ -9668,6 +10176,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -9679,15 +10188,14 @@ agx_g17p_append_compute(struct agx_batch *batch,
       .constant_program = constant_program,
       .cprog_inputs = cprog_inputs,
    };
-   struct agx3_g17p_compute_program native;
-   if (!agx3_g17p_compute_program_generate(dev->chip, &desc, &native))
+   struct agx3_compute_program launch;
+   if (!agx_g17p_compute_program_emit_cached(
+          batch, cs ? &cs->g17p_compute_templates : NULL,
+          cs ? &cs->g17p_compute_templates_generated : NULL, &desc, &launch))
       return agx_g17p_compute_failed("Ioto program generation");
-   memcpy(program.cpu, native.bytes, native.length);
 
    if (shader_bo)
       agx_bo_assert_range(shader_bo, shader_sync_offset, shader_sync_size);
-   agx_bo_assert_range(program_bo, program.gpu - program_bo->va->addr,
-                       native.length);
 
    struct agx3_compute_dispatch_sink sink = {
       .data = batch->cdm.current,
@@ -9713,7 +10221,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       /* The kernel that writes this grid is already its own dispatch earlier
        * in the stream, behind a full barrier, so the launch stands alone. */
       if (!agx3_g17p_native_indirect_compute_launch_append(
-             &native.launch, grid.ptr, barrier_flags, &sink))
+             &launch, grid.ptr, barrier_flags, &sink))
          return agx_g17p_compute_failed("indirect launch append");
    } else {
       const struct agx3_compute_direct_grid direct = {
@@ -9725,7 +10233,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
                        : grid.count[1] != 1 || wg.y != 1 ? 2 : 1,
       };
       if (!agx3_g17p_native_compute_dispatch_append_with_barrier(
-             &native.launch, &direct, barrier_flags, &sink))
+             &launch, &direct, barrier_flags, &sink))
          return agx_g17p_compute_failed("direct launch append");
    }
    batch->cdm.current += sink.length;
@@ -9922,6 +10430,7 @@ agx_g18_append_compute(struct agx_batch *batch,
       .compiler_d = compiler_d,
       .threadgroup_memory_size_B =
          shared ? MAX2(256u, ALIGN_POT((uint32_t)shared, 64u)) : 0,
+      .imageblock_stride_B = info->imageblock_stride,
       .launch_sources = launch_sources,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
@@ -9941,6 +10450,7 @@ agx_g18_append_compute(struct agx_batch *batch,
    size_t program_length;
    if (g18) {
       const struct agx3_g17p_graphics_program_desc g17g_desc = {
+         .usc_clusters = dev->params.num_clusters_total,
          .program_va = program.gpu,
          .shader_va = shader_va,
          .uniform_ranges = ranges,
@@ -10296,6 +10806,7 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
    const uint32_t scratch_bytes = MAX3(cs->info.scratch_size,
       cs->info.agx3_spectpr_scratch_size, cs->info.agx3_tps_size);
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10485,6 +10996,7 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
       AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
    const uint64_t shader_va = cs->ptr + cs->entry_offset;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10707,12 +11219,7 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                                                      &launch_sources))
          agx_native_descriptor_rejected(dev, "precompiled compute resources");
 
-      struct agx_bo *program_bo = NULL;
-      struct agx_ptr native_program = agx_pool_alloc_aligned_with_bo(
-         &batch->pipeline_pool, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
-         AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
       const struct agx3_g17p_compute_program_desc desc = {
-         .program_va = native_program.gpu,
          .shader_va = cs->ptr + cs->entry_offset,
          .uniform_ranges = ranges,
          .uniform_range_count = range_count,
@@ -10736,21 +11243,18 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
             cs->info.local_size
                ? MAX2(256u, ALIGN_POT(cs->info.local_size, 64u))
                : 0,
+         .imageblock_stride_B = cs->info.imageblock_stride,
          /* The program announces how it is launched, as the API compute
           * path's does (agx_g17p_append_compute()). */
          .ldshdr_f1 = indirect_local
                          ? AGX3_G17P_INDIRECT_MAIN_LDSHDR_F1
                          : AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
       };
-      struct agx3_g17p_compute_program native;
-      if (!native_program.cpu || !program_bo ||
-          !agx_va_in_usc_window(dev, native_program.gpu) ||
-          !agx_va_in_usc_window(dev, desc.shader_va) ||
-          !agx3_g17p_compute_program_generate(dev->chip, &desc, &native))
+      struct agx3_compute_program launch;
+      if (!agx_g17p_compute_program_emit_cached(
+             batch, &batch->ctx->g17p_precomp_templates[program],
+             &batch->ctx->g17p_precomp_templates_generated, &desc, &launch))
          agx_native_descriptor_rejected(dev, "precompiled compute Ioto");
-      memcpy(native_program.cpu, native.bytes, native.length);
-      agx_bo_assert_range(program_bo, native_program.gpu - program_bo->va->addr,
-                          native.length);
 
       const struct agx3_compute_direct_grid direct = {
          .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
@@ -10773,9 +11277,9 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
          (barrier & AGX_BARRIER_ALL) ? 0x5 : 0;
       if (indirect_local
              ? !agx3_g17p_native_indirect_compute_launch_append(
-                  &native.launch, grid.ptr, barrier_flags, &sink)
+                  &launch, grid.ptr, barrier_flags, &sink)
              : !agx3_g17p_native_compute_dispatch_append_with_barrier(
-                  &native.launch, &direct, barrier_flags, &sink))
+                  &launch, &direct, barrier_flags, &sink))
          agx_native_descriptor_rejected(dev, "precompiled compute launch");
       batch->cdm.current += sink.length;
       agx_batch_add_bo(batch, cs->bo);
@@ -11119,6 +11623,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -11430,6 +11935,7 @@ agx_m5_publish_tile_program(struct agx_batch *batch,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -12212,6 +12718,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
       } else if (op == AGX_BG_EOT_NONE) {
          const struct agx3_g17p_graphics_program_desc desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program_ptr.gpu,
             .shader_va = shader->ptr + shader->info.main_offset,
             .shader_binary_size = shader->info.binary_size,
@@ -16548,12 +17055,14 @@ agx_nr_textures_read(const struct agx_context *ctx, mesa_shader_stage stage)
 static void
 agx_legalize_feedback_loops(struct agx_context *ctx)
 {
+   const unsigned mask =
+      ctx->stages_with_textures & ~BITFIELD_BIT(MESA_SHADER_COMPUTE);
    /* Trust that u_blitter knows what it's doing */
-   if (ctx->blitter->running)
+   if (!mask || ctx->blitter->running)
       return;
 
-   for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
-      if (stage == MESA_SHADER_COMPUTE)
+   u_foreach_bit(stage, mask) {
+      if (!ctx->stage[stage].shader)
          continue;
 
       bool new_shader =
@@ -17402,13 +17911,133 @@ agx_mdi_alloc_draw_id_chunk(struct agx_pool *pool, size_t total_bytes,
    return fallback;
 }
 
+struct agx_mdi_dyn_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   uint8_t short_mask;
+   bool is_draw_id;
+};
+
+static bool
+agx_mdi_prepare_batch_ioto(
+   struct agx_device *dev, struct agx_linked_shader *linked,
+   const struct agx3_g17p_graphics_program_desc *vs_desc,
+   const struct agx3_ioto_uniform_range *base_ranges, size_t range_count,
+   const struct agx_g17p_uniform_range_locs *locs, bool uses_draw_id,
+   bool uses_base_param, uint64_t first_draw_id_va, uint64_t last_draw_id_va,
+   uint64_t first_params_va, uint64_t last_params_va, uint8_t tpl_bytes[512],
+   uint16_t *tpl_len_out,
+   struct agx_mdi_dyn_reloc dyn_relocs[HK_G17P_PATCH_MAX_RELOCS],
+   unsigned *dyn_reloc_count_out)
+{
+   struct agx3_ioto_uniform_range first_ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   struct agx3_ioto_uniform_range last_ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   memcpy(first_ranges, base_ranges, range_count * sizeof(base_ranges[0]));
+   memcpy(last_ranges, base_ranges, range_count * sizeof(base_ranges[0]));
+
+   uint32_t draw_id_mask = 0;
+   uint32_t params_mask = 0;
+   if (uses_draw_id && locs->draw_id_range >= 0) {
+      first_ranges[locs->draw_id_range].address = first_draw_id_va;
+      last_ranges[locs->draw_id_range].address = last_draw_id_va;
+      draw_id_mask |= BITFIELD_BIT(locs->draw_id_range);
+   }
+   if (uses_base_param && locs->params_range >= 0) {
+      first_ranges[locs->params_range].address = first_params_va;
+      last_ranges[locs->params_range].address = last_params_va;
+      params_mask |= BITFIELD_BIT(locs->params_range);
+   }
+   const uint32_t dyn_mask = draw_id_mask | params_mask;
+   if (!dyn_mask ||
+       !agx_g17p_graphics_template_ranges_valid(first_ranges, range_count) ||
+       !agx_g17p_graphics_template_ranges_valid(last_ranges, range_count))
+      return false;
+
+   struct agx3_g17p_graphics_program_desc find_desc = *vs_desc;
+   find_desc.uniform_ranges = first_ranges;
+   find_desc.program_va = 0;
+   const struct agx_g17p_graphics_template *plan =
+      agx_g17p_graphics_program_find_plan(linked, &find_desc);
+   if (!plan) {
+      const uint64_t dummy_va = dev->shader_base + 0x10000;
+      if (!agx_va_in_usc_window(dev, dummy_va) ||
+          (dummy_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)))
+         return false;
+      find_desc.program_va = dummy_va;
+      uint8_t scratch[512];
+      size_t scratch_written = 0;
+      if (!agx_g17p_graphics_program_generate_cached(
+             dev->chip, linked, &find_desc, scratch, sizeof(scratch),
+             &scratch_written))
+         return false;
+      find_desc.program_va = 0;
+      plan = agx_g17p_graphics_program_find_plan(linked, &find_desc);
+   }
+   if (!plan || !plan->has_plan)
+      return false;
+
+   const uint16_t len = plan->program.program.length;
+   if (!len || len > 512)
+      return false;
+
+   if (!hk_g17p_patch_plan_fits(&plan->plan, first_ranges) ||
+       !hk_g17p_patch_plan_fits(&plan->plan, last_ranges))
+      return false;
+
+   /* Require that no dynamic range shares an address-cache cluster with any
+    * other range so per-draw patching cannot invalidate cluster offsets. */
+   if (plan->plan.shared) {
+      for (unsigned r = 0; r < plan->plan.range_count; ++r) {
+         const unsigned leader = plan->plan.leader[r];
+         if (dyn_mask & BITFIELD_BIT(r)) {
+            if (leader != r)
+               return false;
+         } else if (dyn_mask & BITFIELD_BIT(leader)) {
+            return false;
+         }
+      }
+   }
+
+   unsigned dyn_count = 0;
+   for (unsigned r = 0; r < plan->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &plan->plan.relocs[r];
+      if (!(dyn_mask & BITFIELD_BIT(rel->range)))
+         continue;
+      const uint64_t base_first = first_ranges[rel->range].address + rel->delta;
+      const uint64_t base_last = last_ranges[rel->range].address + rel->delta;
+      if (base_last < base_first)
+         return false;
+      if ((rel->short_mask & 1u) && (base_first >> 32) != (base_last >> 32))
+         return false;
+      if (dyn_count >= HK_G17P_PATCH_MAX_RELOCS)
+         return false;
+      dyn_relocs[dyn_count++] = (struct agx_mdi_dyn_reloc){
+         .dest = {rel->dest[0], rel->dest[1]},
+         .delta = rel->delta,
+         .offset = rel->offset,
+         .short_mask = rel->short_mask,
+         .is_draw_id = (draw_id_mask & BITFIELD_BIT(rel->range)) != 0,
+      };
+   }
+   if (!dyn_count)
+      return false;
+
+   /* Bake all static relocations into the template once. */
+   memcpy(tpl_bytes, plan->program.program.bytes, len);
+   hk_g17p_patch_plan_apply(&plan->plan, first_ranges, tpl_bytes);
+   *tpl_len_out = len;
+   *dyn_reloc_count_out = dyn_count;
+   return true;
+}
+
 /* Indirect multi-draws (glMultiDraw*Indirect) share every bound state across
  * sub-draws, varying only the indirect argument address and, when consumed,
  * gl_DrawID and base vertex/instance parameters. After the first full draw
  * validates state and latches the HAL200 bind tail, emit subsequent sub-draws
- * directly: body-only when vertex parameters do not vary, or a cached VS Ioto
- * relocation + 24-byte VDM_STATE_UPDATE without a bind tail (re-latching only
- * after a 64 KiB VDM STREAM_LINK). */
+ * directly: body-only when vertex parameters do not vary, or a batched VS Ioto
+ * template patch + pre-packed 28-byte VDM_STATE_UPDATE without a bind tail
+ * (re-latching only after a 64 KiB VDM STREAM_LINK). */
 static void
 agx_draw_multi_indirect(struct pipe_context *pctx,
                         const struct pipe_draw_info *info,
@@ -17471,6 +18100,27 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
    unsigned draw_id_end = 0;
    size_t draw_id_stride = 0;
 
+   /* Pre-packed VDM templates and batched Ioto program state for the active
+    * clean batch / draw_id chunk. */
+   struct agx_vdm_state_update vs_state_tpl = {0};
+   uint32_t vs_outputs_tpl[2] = {0, 0};
+   bool vs_state_tpl_valid = false;
+   uint8_t draw_body_tpl[AGX_VDM_HAL200_INDIRECT_INDEXED_DRAW_LENGTH];
+   size_t draw_body_len = 0;
+   const size_t draw_body_addr_off = info->index_size ? 16u : 4u;
+   bool draw_body_tpl_valid = false;
+   uint8_t ioto_tpl[512];
+   uint16_t ioto_tpl_len = 0;
+   struct agx_mdi_dyn_reloc dyn_relocs[HK_G17P_PATCH_MAX_RELOCS];
+   unsigned dyn_reloc_count = 0;
+   bool ioto_tpl_valid = false;
+   bool batch_ioto_failed = false;
+   uint8_t *prog_batch_cpu = NULL;
+   uint64_t prog_batch_gpu = 0;
+   size_t prog_batch_stride = 0;
+   unsigned prog_batch_start = 0;
+   unsigned prog_batch_end = 0;
+
    for (unsigned i = 0; i < valid_draw_count; ++i) {
       uint32_t sub_offset = 0;
       if (!agx_mdi_subdraw_offset(indirect, i, arg_size_B, &sub_offset))
@@ -17485,6 +18135,8 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
          uint32_t draw_state_offset = 0;
 
          if (needs_vs_update) {
+            uint64_t draw_id_va = 0;
+            uint64_t params_va = 0;
             if (uses_draw_id && locs.draw_id_range >= 0) {
                if (unlikely(i >= draw_id_end)) {
                   const size_t stride = ALIGN_POT(locs.draw_id_size, 4);
@@ -17531,20 +18183,129 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                      draw_id_start = i;
                      draw_id_end = i + chunk;
                      draw_id_stride = stride;
+                     ioto_tpl_valid = false;
+                     batch_ioto_failed = false;
+                     prog_batch_end = 0;
                   }
                }
                if (fast) {
-                  clean->uniforms.draw_id = i;
-                  ranges[locs.draw_id_range].address =
+                  draw_id_va =
                      draw_id_gpu + (uint64_t)(i - draw_id_start) * draw_id_stride;
+                  clean->uniforms.draw_id = i;
+                  ranges[locs.draw_id_range].address = draw_id_va;
                }
             }
             if (fast && uses_base_param && locs.params_range >= 0) {
-               const uint64_t params_va = indirect_ptr + params_offset_B;
+               params_va = indirect_ptr + params_offset_B;
                clean->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS] = params_va;
                ranges[locs.params_range].address = params_va;
             }
-            if (fast) {
+            if (fast && vs_state_tpl_valid && !batch_ioto_failed &&
+                unlikely(i >= prog_batch_end)) {
+               const unsigned sub_limit =
+                  (uses_draw_id && locs.draw_id_range >= 0) ? draw_id_end
+                                                            : valid_draw_count;
+               uint32_t chunk_last_off = 0;
+               if (!ioto_tpl_valid) {
+                  if (sub_limit > i &&
+                      agx_mdi_subdraw_offset(indirect, sub_limit - 1,
+                                             arg_size_B, &chunk_last_off)) {
+                     const uint64_t last_draw_id_va =
+                        (uses_draw_id && locs.draw_id_range >= 0)
+                           ? draw_id_gpu +
+                                (uint64_t)(sub_limit - 1 - draw_id_start) *
+                                   draw_id_stride
+                           : 0;
+                     const uint64_t last_params_va =
+                        (uses_base_param && locs.params_range >= 0)
+                           ? indirect_rsrc_base + chunk_last_off +
+                                params_offset_B
+                           : 0;
+                     ioto_tpl_valid = agx_mdi_prepare_batch_ioto(
+                        dev, ctx->linked.vs, &vs_desc, ranges, range_count,
+                        &locs, uses_draw_id, uses_base_param, draw_id_va,
+                        last_draw_id_va, params_va, last_params_va, ioto_tpl,
+                        &ioto_tpl_len, dyn_relocs, &dyn_reloc_count);
+                  }
+                  if (!ioto_tpl_valid)
+                     batch_ioto_failed = true;
+               }
+               if (ioto_tpl_valid && sub_limit > i) {
+                  const size_t stride =
+                     ALIGN_POT(ioto_tpl_len, AGX_IOTO_PROGRAM_ALIGNMENT);
+                  const unsigned max_sub =
+                     MAX2(1u, (unsigned)(65536u / stride));
+                  const unsigned sub_chunk = MIN2(sub_limit - i, max_sub);
+                  const size_t total_bytes = (size_t)sub_chunk * stride;
+                  struct agx_bo *block_bo = NULL;
+                  struct agx_ptr block = agx_pool_alloc_aligned_with_bo(
+                     &clean->pipeline_pool, total_bytes,
+                     AGX_IOTO_PROGRAM_ALIGNMENT, &block_bo);
+                  if (block.cpu && block_bo &&
+                      agx_va_in_usc_window(dev, block.gpu) &&
+                      agx_va_in_usc_window(dev, block.gpu + total_bytes - 1)) {
+                     agx_bo_assert_range(
+                        block_bo, block.gpu - block_bo->va->addr, total_bytes);
+                     prog_batch_cpu = block.cpu;
+                     prog_batch_gpu = block.gpu;
+                     prog_batch_stride = stride;
+                     prog_batch_start = i;
+                     prog_batch_end = i + sub_chunk;
+                  } else {
+                     batch_ioto_failed = true;
+                  }
+               }
+            }
+            if (fast && i < prog_batch_end && vs_state_tpl_valid) {
+               for (unsigned r = 0; r < dyn_reloc_count; ++r) {
+                  const struct agx_mdi_dyn_reloc *rel = &dyn_relocs[r];
+                  const uint64_t base =
+                     (rel->is_draw_id ? draw_id_va : params_va) + rel->delta;
+                  uint8_t *patch = ioto_tpl + rel->offset;
+                  const bool low_short = rel->short_mask & 1;
+                  hk_g17p_patch_ldimm(patch, low_short, rel->dest[0],
+                                      (uint32_t)base);
+                  hk_g17p_patch_ldimm(patch + (low_short ? 2 : 8),
+                                      rel->short_mask & 2, rel->dest[1],
+                                      (uint32_t)(base >> 32));
+               }
+               const size_t slot_off =
+                  (size_t)(i - prog_batch_start) * prog_batch_stride;
+               memcpy(prog_batch_cpu + slot_off, ioto_tpl, ioto_tpl_len);
+               const uint64_t prog_gpu = prog_batch_gpu + slot_off;
+
+               struct agx_vdm_state_vertex_pipeline_pair pair;
+               if (!agx_vdm_state_vertex_pipeline_pair_pack(
+                      dev->chip, prog_gpu, 0, &pair)) {
+                  fast = false;
+               } else {
+                  memcpy(&vs_state_tpl.bytes[8], pair.bytes,
+                         sizeof(pair.bytes));
+                  memcpy(out, vs_state_tpl.bytes, vs_state_tpl.length);
+                  out += vs_state_tpl.length;
+
+                  if (unlikely(!clean->g17p_bind_tail_latched ||
+                               !clean->g17p_have_latched_vs)) {
+                     out = agx_g17p_emit_bind_state(
+                        clean, out, ctx->vs, &draw_state_offset);
+                     if (!out) {
+                        fast = false;
+                     } else {
+                        clean->g17p_bind_tail_latched = true;
+                        clean->g17p_have_latched_vs = true;
+                        clean->g17p_latched_vs_shader = ctx->vs;
+                        clean->g17p_latched_vs_word0 = vs_word0;
+                        clean->g17p_latched_vs_outputs[0] = vs_outputs_tpl[0];
+                        clean->g17p_latched_vs_outputs[1] = vs_outputs_tpl[1];
+                     }
+                  }
+                  if (fast) {
+                     if (unlikely(dev->debug & AGX_DBG_PERF))
+                        ctx->perf.vs_emits++;
+                     clean->vs_root_valid = false;
+                  }
+               }
+            } else if (fast) {
                struct agx_bo *program_bo = NULL;
                struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
                   &clean->pipeline_pool, vs_capacity,
@@ -17595,19 +18356,34 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
          }
 
          if (fast) {
-            struct agx_draw draw = {0};
-            if (info->index_size) {
-               draw.index_size = agx_translate_index_size(info->index_size);
-               draw.index_buffer = ib_base;
-               draw.index_buffer_range_B = ib_size;
-               draw.restart = info->primitive_restart;
-               draw.indexed = true;
-            }
-            draw.b = agx_grid_indirect(indirect_ptr);
+            if (likely(draw_state_offset == 0 && draw_body_tpl_valid &&
+                       indirect_ptr < (UINT64_C(1) << 48) &&
+                       (indirect_ptr & 3u) == 0)) {
+               const uint32_t addr_hi =
+                  util_cpu_to_le32((uint32_t)((indirect_ptr >> 32) & 0xffffu));
+               const uint32_t addr_lo =
+                  util_cpu_to_le32((uint32_t)indirect_ptr);
+               memcpy(draw_body_tpl + draw_body_addr_off, &addr_hi,
+                      sizeof(addr_hi));
+               memcpy(draw_body_tpl + draw_body_addr_off + 4, &addr_lo,
+                      sizeof(addr_lo));
+               memcpy(out, draw_body_tpl, draw_body_len);
+               out += draw_body_len;
+            } else {
+               struct agx_draw draw = {0};
+               if (info->index_size) {
+                  draw.index_size = agx_translate_index_size(info->index_size);
+                  draw.index_buffer = ib_base;
+                  draw.index_buffer_range_B = ib_size;
+                  draw.restart = info->primitive_restart;
+                  draw.indexed = true;
+               }
+               draw.b = agx_grid_indirect(indirect_ptr);
 
-            out = agx_g17p_emit_indirect_draw(
-               dev->chip, out, &draw, primitive, info->restart_index,
-               draw_state_offset);
+               out = agx_g17p_emit_indirect_draw(
+                  dev->chip, out, &draw, primitive, info->restart_index,
+                  draw_state_offset);
+            }
             clean->vdm.current = out;
             assert((clean->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <=
                       clean->vdm.end &&
@@ -17631,11 +18407,21 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
             if (ctx->batch != clean) {
                clean = NULL;
                draw_id_end = 0;
+               prog_batch_end = 0;
+               ioto_tpl_valid = false;
+               batch_ioto_failed = false;
+               vs_state_tpl_valid = false;
+               draw_body_tpl_valid = false;
             }
             continue;
          }
          clean = NULL;
          draw_id_end = 0;
+         prog_batch_end = 0;
+         ioto_tpl_valid = false;
+         batch_ioto_failed = false;
+         vs_state_tpl_valid = false;
+         draw_body_tpl_valid = false;
       }
 
       const struct pipe_draw_indirect_info subindirect = {
@@ -17651,6 +18437,11 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
 
       clean = NULL;
       draw_id_end = 0;
+      prog_batch_end = 0;
+      ioto_tpl_valid = false;
+      batch_ioto_failed = false;
+      vs_state_tpl_valid = false;
+      draw_body_tpl_valid = false;
       if (ctx->batch && !agx_batch_is_compute(ctx->batch) &&
           (ctx->batch != before || ctx->batch->draws != before_draws) &&
           agx_multidraw_state_clean(ctx) &&
@@ -17678,6 +18469,31 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
          if (ctx->time_elapsed)
             agx_batch_add_timestamp_query(clean, ctx->time_elapsed);
+
+         const struct agx_vdm_hal200_indirect_draw_fields body_fields = {
+            .draw_state_context_offset = 4,
+            .primitive = primitive,
+            .indexed = info->index_size != 0,
+            .index_size_B = info->index_size
+                               ? agx_index_size_to_B(
+                                    agx_translate_index_size(info->index_size))
+                               : 0,
+            .restart_enable = info->primitive_restart,
+            .restart_index = info->restart_index,
+            .index_buffer = ib_base,
+            .index_buffer_range_B = ib_size,
+            .indirect_buffer = indirect_rsrc_base + base_offset,
+         };
+         struct agx_vdm_hal200_indirect_draw packed_body;
+         if (agx_vdm_hal200_indirect_draw_pack(dev->chip, &body_fields,
+                                               &packed_body) &&
+             packed_body.length > AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH &&
+             agx_vdm_hal200_draw_emit(dev->chip, packed_body.bytes,
+                                      packed_body.length, false, draw_body_tpl,
+                                      sizeof(draw_body_tpl), &draw_body_len) &&
+             draw_body_addr_off + 8 <= draw_body_len) {
+            draw_body_tpl_valid = true;
+         }
 
          uses_draw_id = ctx->vs->b.info.uses_draw_id;
          uses_base_param = ctx->linked.vs->uses_base_param;
@@ -17711,6 +18527,24 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                      translate_sampler_state_count(ctx, vs->stage);
                }
                vs_word0 = counts.opaque[0];
+               const uint32_t provoking =
+                  ctx->rast->base.flatshade_first ? 0 : 2;
+               vs_outputs_tpl[0] =
+                  vs->uvs.vdm.opaque[0] +
+                  (clean->generate_primitive_id ? UINT32_C(0x100) : 0);
+               vs_outputs_tpl[1] =
+                  (ctx->rast->base.rasterizer_discard ? 0x30 + provoking
+                                                      : provoking) |
+                  (clean->generate_primitive_id ? UINT32_C(0x40) : 0);
+               const struct agx_vdm_state_update_info vs_info = {
+                  .raw_vertex_shader_word0 = vs_word0,
+                  .pipeline = AGX_IOTO_PROGRAM_ALIGNMENT,
+                  .raw_pipeline_template = 0,
+                  .raw_vertex_outputs = {vs_outputs_tpl[0], vs_outputs_tpl[1]},
+                  .raw_vertex_unknown = 0,
+               };
+               vs_state_tpl_valid =
+                  agx_vdm_state_update_pack(dev->chip, &vs_info, &vs_state_tpl);
                vs_desc = (struct agx3_g17p_graphics_program_desc){
                   .shader_va = linked->bo->va->addr + linked->entry_offset,
                   .uniform_ranges = ranges,
@@ -17829,10 +18663,17 @@ agx_try_elide_color_reload(struct agx_context *ctx, struct agx_batch *batch,
 
    uint32_t elide = 0;
    for (unsigned rt = 0; rt < batch->key.nr_cbufs; ++rt) {
-      const uint32_t bit = PIPE_CLEAR_COLOR0 << rt;
-      if ((fs->info.fs_unconditional_color_outputs & BITFIELD_BIT(rt)) &&
-          (ctx->blend->opaque_overwrite & bit))
-         elide |= bit;
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      if (!surf->texture)
+         continue;
+      const uint8_t fmt_mask =
+         util_format_colormask(util_format_description(surf->format)) &
+         PIPE_MASK_RGBA;
+      if (!fmt_mask)
+         continue;
+      if ((fs->info.fs_unconditional_color_masks[rt] & fmt_mask) == fmt_mask &&
+          (ctx->blend->opaque_overwrite_mask[rt] & fmt_mask) == fmt_mask)
+         elide |= (PIPE_CLEAR_COLOR0 << rt);
    }
 
    batch->load &= ~elide;
@@ -18351,11 +19192,15 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct pipe_draw_indirect_info indirect_gs;
    struct pipe_draw_start_count_bias draw_gs;
 
-   /* Wrap the pool allocation in a fake resource for meta-Gallium use */
-   struct agx_resource indirect_rsrc = {.bo = batch->geom_params_bo};
-   struct agx_resource index_rsrc = {};
+   /* Wrap the pool allocation in a fake resource for meta-Gallium use.
+    * Defer initialization until ctx->gs is active to avoid ~2 KiB of stack
+    * zeroing on every non-GS draw. */
+   struct agx_resource indirect_rsrc;
+   struct agx_resource index_rsrc;
 
-   if (ctx->gs) {
+   if (unlikely(ctx->gs)) {
+      indirect_rsrc = (struct agx_resource){.bo = batch->geom_params_bo};
+      index_rsrc = (struct agx_resource){0};
       /* Launch the pre-rasterization parts of the geometry shader */
       agx_launch_gs_prerast(batch, info, draws, indirect);
 
@@ -19133,15 +19978,19 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          agx_chip_native_agx3(agx_device(pipe->screen)->chip) &&
          ctx->stage[MESA_SHADER_COMPUTE].custom_borders,
    };
-   /* The variant compiled at link time, or by an earlier dispatch, is in
-    * the shader's table; agx_get_shader_variant() would compile (or fetch
-    * from the disk cache) and insert it again on every dispatch. */
-   struct hash_entry *variant =
-      _mesa_hash_table_search(uncompiled->variants, &key);
-   struct agx_compiled_shader *cs =
-      variant ? variant->data
-              : agx_get_shader_variant(agx_screen(pipe->screen), &pipe->debug,
-                                       uncompiled, &key);
+   const unsigned cs_idx = key.cs.custom_borders ? 1u : 0u;
+   struct agx_compiled_shader *cs = uncompiled->cached_cs[cs_idx];
+   if (unlikely(!cs)) {
+      /* The variant compiled at link time, or by an earlier dispatch, is in
+       * the shader's table; agx_get_shader_variant() would compile (or fetch
+       * from the disk cache) and insert it again on every dispatch. */
+      struct hash_entry *variant =
+         _mesa_hash_table_search(uncompiled->variants, &key);
+      cs = variant ? variant->data
+                   : agx_get_shader_variant(agx_screen(pipe->screen),
+                                            &pipe->debug, uncompiled, &key);
+      uncompiled->cached_cs[cs_idx] = cs;
+   }
 
    struct agx_grid grid;
    if (indirect && agx_chip_native_agx3(agx_device(pipe->screen)->chip)) {

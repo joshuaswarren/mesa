@@ -509,6 +509,7 @@ main(void)
       { AGX_CHIP_G17G, true },
       { AGX_CHIP_G17S, true },
       { AGX_CHIP_G17C, true },
+      { AGX_CHIP_G17D, true },
       { AGX_CHIP_G18G, false },
    };
 

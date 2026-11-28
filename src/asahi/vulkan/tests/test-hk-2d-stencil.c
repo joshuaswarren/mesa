@@ -537,6 +537,26 @@ test_stereo_sad_matcher_and_builder(void)
             NULL, s, &plan, nir_address_format_64bit_bounded_global);
          assert(tiled != NULL);
          assert(tiled->info.workgroup_size[0] == 256);
+         /* Phase 2 horizontal box-sum loop should load 4 u16s per iteration
+          * so load/store vectorization packs them into 8-byte shared loads. */
+         unsigned u16_sh_loads_in_hl = 0;
+         nir_function_impl *impl = nir_shader_get_entrypoint(tiled);
+         nir_foreach_block(block, impl) {
+            unsigned cnt = 0;
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_deref &&
+                   intr->def.bit_size == 16 &&
+                   nir_deref_mode_is(nir_src_as_deref(intr->src[0]),
+                                     nir_var_mem_shared))
+                  cnt++;
+            }
+            if (cnt == 4)
+               u16_sh_loads_in_hl++;
+         }
+         assert(u16_sh_loads_in_hl >= 1);
          ralloc_free(tiled);
       }
       ralloc_free(s);

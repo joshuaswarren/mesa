@@ -57,6 +57,11 @@ struct hk_identity_copy4 {
    bool fadd_meta_valid;
 };
 
+/* Fast pre-filter before cloning/lowering NIR to check whether a compute
+ * shader can possibly match any identity_copy4 pattern.
+ */
+bool hk_nir_copy_identity4_may_match(const struct nir_shader *orig);
+
 /* Pre-descriptor NIR after explicit push IO. The returned alternate requires
  * the direct, zero-base, packed-vec4 dispatch and storage certificate external
  * to this matcher. The original and unsuccessful metadata remain unchanged.

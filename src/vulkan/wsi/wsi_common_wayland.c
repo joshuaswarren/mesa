@@ -2336,8 +2336,36 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
 }
 
+static bool
+wsi_wl_swapchain_modifier_supported(const struct wsi_wl_swapchain *chain,
+                                    uint64_t modifier)
+{
+   for (uint32_t i = 0; i < chain->base.image_info.modifier_prop_count; i++) {
+      if (chain->base.image_info.modifier_props[i].drmFormatModifier == modifier)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+wsi_wl_format_has_supported_modifier(const struct wsi_wl_swapchain *chain,
+                                     struct wsi_wl_format *f)
+{
+   uint32_t num_mods = u_vector_length(&f->modifiers);
+   const uint64_t *mods = u_vector_tail(&f->modifiers);
+
+   for (uint32_t i = 0; i < num_mods; i++) {
+      if (wsi_wl_swapchain_modifier_supported(chain, mods[i]))
+         return true;
+   }
+
+   return false;
+}
+
 static struct wsi_wl_format *
 pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
+                                         const struct wsi_wl_swapchain *chain,
                                          VkFormat vk_format)
 {
    struct wsi_wl_format *f = NULL;
@@ -2349,8 +2377,14 @@ pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
    util_dynarray_foreach(&wsi_wl_surface->dmabuf_feedback.tranches,
                          struct dmabuf_feedback_tranche, tranche) {
       f = find_format(&tranche->formats, vk_format);
-      if (f)
-         break;
+      if (!f)
+         continue;
+      if (chain && chain->base.image_info.modifier_prop_count > 0 &&
+          !wsi_wl_format_has_supported_modifier(chain, f)) {
+         f = NULL;
+         continue;
+      }
+      break;
    }
 
    return f;
@@ -2474,6 +2508,31 @@ sets_of_modifiers_are_the_same(uint32_t num_drm_modifiers_A, const uint64_t *mod
    return true;
 }
 
+static bool
+sets_of_supported_modifiers_are_the_same(const struct wsi_wl_swapchain *chain,
+                                         uint32_t num_candidates,
+                                         const uint64_t *candidates)
+{
+   uint32_t supported_count = 0;
+
+   for (uint32_t i = 0; i < num_candidates; i++) {
+      if (!wsi_wl_swapchain_modifier_supported(chain, candidates[i]))
+         continue;
+      supported_count++;
+      bool mod_found = false;
+      for (uint32_t j = 0; j < chain->num_drm_modifiers; j++) {
+         if (candidates[i] == chain->drm_modifiers[j]) {
+            mod_found = true;
+            break;
+         }
+      }
+      if (!mod_found)
+         return false;
+   }
+
+   return supported_count == chain->num_drm_modifiers;
+}
+
 static void
 surface_dmabuf_feedback_done(void *data,
                              struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback)
@@ -2486,6 +2545,9 @@ surface_dmabuf_feedback_done(void *data,
    wsi_wl_surface->dmabuf_feedback = wsi_wl_surface->pending_dmabuf_feedback;
    dmabuf_feedback_init(&wsi_wl_surface->pending_dmabuf_feedback);
 
+   if (!chain)
+      return;
+
    /* It's not just because we received dma-buf feedback that re-allocation is a
     * good idea. In order to know if we should re-allocate or not, we must
     * compare the most recent parameters that we used to allocate with the ones
@@ -2496,17 +2558,29 @@ surface_dmabuf_feedback_done(void *data,
     * we disconsider this. As we can't switch to another format (it is selected
     * by the client), we just need to compare the set of modifiers.
     *
-    * So we just look for the vk_format in the tranches (respecting their
-    * preferences), and compare its set of modifiers with the set of modifiers
-    * we've used to allocate previously. If they differ, we are using suboptimal
-    * parameters and should re-allocate.
+    * Walk tranches in preference order, skipping any tranche whose modifiers
+    * are all unsupported for this swapchain's format/usage (matching the
+    * fallback performed by wsi_configure_native_image()), and compare the
+    * supported modifier set against the one we allocated with.
     */
-   f = pick_format_from_surface_dmabuf_feedback(wsi_wl_surface, chain->vk_format);
-   if (f && !sets_of_modifiers_are_the_same(u_vector_length(&f->modifiers),
-                                            u_vector_tail(&f->modifiers),
-                                            chain->num_drm_modifiers,
-                                            chain->drm_modifiers))
+   f = pick_format_from_surface_dmabuf_feedback(wsi_wl_surface, chain, chain->vk_format);
+   if (chain->base.image_info.modifier_prop_count > 0) {
+      if (!f) {
+         struct wsi_wl_format *display_f =
+            find_format(&wsi_wl_surface->display->formats, chain->vk_format);
+         if (display_f && wsi_wl_format_has_supported_modifier(chain, display_f))
+            f = display_f;
+      }
+      if (f && !sets_of_supported_modifiers_are_the_same(chain,
+                                                         u_vector_length(&f->modifiers),
+                                                         u_vector_tail(&f->modifiers)))
+         wsi_wl_surface->chain->suboptimal = true;
+   } else if (f && !sets_of_modifiers_are_the_same(u_vector_length(&f->modifiers),
+                                                   u_vector_tail(&f->modifiers),
+                                                   chain->num_drm_modifiers,
+                                                   chain->drm_modifiers)) {
       wsi_wl_surface->chain->suboptimal = true;
+   }
 }
 
 static const struct zwp_linux_dmabuf_feedback_v1_listener
@@ -3957,6 +4031,8 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_drm_image_params drm_image_params;
    uint32_t num_drm_modifiers = 0;
    const uint64_t *drm_modifiers = NULL;
+   uint32_t *num_drm_modifiers_list = NULL;
+   const uint64_t **drm_modifiers_list = NULL;
    if (wsi_device->sw) {
       cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
@@ -3976,28 +4052,62 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
          .explicit_sync = wsi_wl_use_explicit_sync(wsi_wl_surface->display, wsi_device),
       };
       /* Use explicit DRM format modifiers when both the server and the driver
-       * support them.
+       * support them. Pass every matching surface feedback tranche in
+       * preference order followed by the display's format list so
+       * wsi_configure_native_image() can fall back if a higher-priority
+       * tranche (such as a scanout tranche) contains only modifiers
+       * unsupported for this swapchain's format or usage flags.
        */
       if (wsi_wl_surface->display->wl_dmabuf && wsi_device->supports_modifiers) {
-         struct wsi_wl_format *f = NULL;
-         /* Try to select modifiers for our vk_format from surface dma-buf
-          * feedback. If that doesn't work, fallback to the list of supported
-          * formats/modifiers by the display. */
-         if (wsi_wl_surface->wl_dmabuf_feedback)
-            f = pick_format_from_surface_dmabuf_feedback(wsi_wl_surface,
-                                                         pCreateInfo->imageFormat);
-         if (f == NULL)
-            f = find_format(&chain->wsi_wl_surface->display->formats,
-                            pCreateInfo->imageFormat);
-         if (f != NULL) {
-            num_drm_modifiers = u_vector_length(&f->modifiers);
-            drm_modifiers = u_vector_tail(&f->modifiers);
-            if (num_drm_modifiers > 0)
-               drm_image_params.num_modifier_lists = 1;
-            else
-               drm_image_params.num_modifier_lists = 0;
-            drm_image_params.num_modifiers = &num_drm_modifiers;
-            drm_image_params.modifiers = &drm_modifiers;
+         uint32_t max_lists = 1;
+         if (wsi_wl_surface->wl_dmabuf_feedback &&
+             wsi_wl_surface->dmabuf_feedback.main_device != 0) {
+            max_lists += util_dynarray_num_elements(&wsi_wl_surface->dmabuf_feedback.tranches,
+                                                    struct dmabuf_feedback_tranche);
+         }
+
+         num_drm_modifiers_list =
+            vk_alloc(pAllocator, sizeof(*num_drm_modifiers_list) * max_lists, 8,
+                     VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+         drm_modifiers_list =
+            vk_alloc(pAllocator, sizeof(*drm_modifiers_list) * max_lists, 8,
+                     VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+         if (!num_drm_modifiers_list || !drm_modifiers_list) {
+            vk_free(pAllocator, num_drm_modifiers_list);
+            vk_free(pAllocator, drm_modifiers_list);
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+         }
+
+         uint32_t num_lists = 0;
+         if (wsi_wl_surface->wl_dmabuf_feedback &&
+             wsi_wl_surface->dmabuf_feedback.main_device != 0) {
+            util_dynarray_foreach(&wsi_wl_surface->dmabuf_feedback.tranches,
+                                  struct dmabuf_feedback_tranche, tranche) {
+               struct wsi_wl_format *f =
+                  find_format(&tranche->formats, pCreateInfo->imageFormat);
+               if (f && u_vector_length(&f->modifiers) > 0) {
+                  num_drm_modifiers_list[num_lists] = u_vector_length(&f->modifiers);
+                  drm_modifiers_list[num_lists] = u_vector_tail(&f->modifiers);
+                  num_lists++;
+               }
+            }
+         }
+         struct wsi_wl_format *display_f =
+            find_format(&chain->wsi_wl_surface->display->formats,
+                        pCreateInfo->imageFormat);
+         if (display_f && u_vector_length(&display_f->modifiers) > 0) {
+            num_drm_modifiers_list[num_lists] = u_vector_length(&display_f->modifiers);
+            drm_modifiers_list[num_lists] = u_vector_tail(&display_f->modifiers);
+            num_lists++;
+         }
+
+         if (num_lists > 0) {
+            num_drm_modifiers = num_drm_modifiers_list[0];
+            drm_modifiers = drm_modifiers_list[0];
+            drm_image_params.num_modifier_lists = num_lists;
+            drm_image_params.num_modifiers = num_drm_modifiers_list;
+            drm_image_params.modifiers = drm_modifiers_list;
          }
       }
       buffer_type = WSI_WL_BUFFER_NATIVE;
@@ -4006,8 +4116,16 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                pCreateInfo, image_params, pAllocator);
+   vk_free(pAllocator, num_drm_modifiers_list);
+   vk_free(pAllocator, drm_modifiers_list);
    if (result != VK_SUCCESS)
       goto fail;
+
+   if (buffer_type == WSI_WL_BUFFER_NATIVE &&
+       chain->base.image_info.drm_mod_list.drmFormatModifierCount > 0) {
+      num_drm_modifiers = chain->base.image_info.drm_mod_list.drmFormatModifierCount;
+      drm_modifiers = chain->base.image_info.drm_mod_list.pDrmFormatModifiers;
+   }
 
    bool alpha = pCreateInfo->compositeAlpha ==
                       VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;

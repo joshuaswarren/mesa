@@ -812,6 +812,36 @@ test_rgba8_matcher_builder_and_dispatch(void)
                   assert(tiled->info.shared_size == 0);
                   assert(tiled->info.workgroup_size[0] == (vert ? 16 : 32));
                   assert(tiled->info.workgroup_size[1] == (vert ? 16 : 4));
+                  /* Horizontal streaming loop loads 4 decoded pixels per 4-tap
+                   * block (not 7) and stays within 8 KiB shared staging. */
+                  if (!vert) {
+                     unsigned shared_loads_in_loop = 0;
+                     nir_function_impl *impl = nir_shader_get_entrypoint(tiled);
+                     nir_foreach_block(blk, impl) {
+                        bool inside_loop = false;
+                        for (nir_cf_node *n = blk->cf_node.parent; n; n = n->parent) {
+                           if (n->type == nir_cf_node_loop) {
+                              inside_loop = true;
+                              break;
+                           }
+                        }
+                        if (!inside_loop)
+                           continue;
+                        unsigned blk_loads = 0;
+                        nir_foreach_instr(ins, blk) {
+                           if (ins->type != nir_instr_type_intrinsic)
+                              continue;
+                           nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+                           if (intr->intrinsic == nir_intrinsic_load_deref &&
+                               nir_deref_mode_is(nir_src_as_deref(intr->src[0]),
+                                                 nir_var_mem_shared))
+                              blk_loads++;
+                        }
+                        if (blk_loads > shared_loads_in_loop)
+                           shared_loads_in_loop = blk_loads;
+                     }
+                     assert(shared_loads_in_loop == 4);
+                  }
                   ralloc_free(tiled);
                }
             }
