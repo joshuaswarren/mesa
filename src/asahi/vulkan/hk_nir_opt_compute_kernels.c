@@ -3318,8 +3318,10 @@ walk_mirror_border_list(struct exec_list *list, unsigned active_guards,
    return true;
 }
 
-/* Match `float(src_dim) * frcp(float(dst_dim))` strictly (exact grouping
- * emitted by build_bilinear_resize_border_u8_kernel). */
+/* Match `float(src_dim) / float(dst_dim)` or `float(src_dim) * frcp(float(dst_dim))`
+ * strictly without non-default fp_math_ctrl. For non-internal shaders, AGX lowers
+ * relaxed `nir_op_fdiv` to `fmul(num, frcp(den))`, matching the expression emitted
+ * by build_bilinear_resize_border_u8_kernel. */
 static bool
 match_pc_f32_ratio(nir_def *def, uint16_t *num_pc_out, uint16_t *den_pc_out)
 {
@@ -3327,20 +3329,27 @@ match_pc_f32_ratio(nir_def *def, uint16_t *num_pc_out, uint16_t *den_pc_out)
    if (!def || nir_def_instr(def)->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
-   if (alu->op != nir_op_fmul || alu->fp_math_ctrl != 0)
+   if (alu->fp_math_ctrl != 0)
       return false;
 
    nir_def *num = NULL, *den = NULL;
-   for (unsigned side = 0; side < 2; side++) {
-      nir_def *r = strip_mov(alu->src[side].src.ssa);
-      if (r && nir_def_instr(r)->type == nir_instr_type_alu) {
-         nir_alu_instr *ra = nir_instr_as_alu(nir_def_instr(r));
-         if (ra->op == nir_op_frcp && ra->fp_math_ctrl == 0) {
-            den = strip_mov(ra->src[0].src.ssa);
-            num = strip_mov(alu->src[1 - side].src.ssa);
-            break;
+   if (alu->op == nir_op_fdiv) {
+      num = strip_mov(alu->src[0].src.ssa);
+      den = strip_mov(alu->src[1].src.ssa);
+   } else if (alu->op == nir_op_fmul) {
+      for (unsigned side = 0; side < 2; side++) {
+         nir_def *r = strip_mov(alu->src[side].src.ssa);
+         if (r && nir_def_instr(r)->type == nir_instr_type_alu) {
+            nir_alu_instr *ra = nir_instr_as_alu(nir_def_instr(r));
+            if (ra->op == nir_op_frcp && ra->fp_math_ctrl == 0) {
+               den = strip_mov(ra->src[0].src.ssa);
+               num = strip_mov(alu->src[1 - side].src.ssa);
+               break;
+            }
          }
       }
+   } else {
+      return false;
    }
    if (!num || !den || nir_def_instr(num)->type != nir_instr_type_alu ||
        nir_def_instr(den)->type != nir_instr_type_alu)
