@@ -614,6 +614,12 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
 
+      /* AGX3B's immediate-addend FMA forms carry no saturate bit, so keep a
+       * constant addend in its register on a saturated FFMA. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_FFMA && I->saturate && s == 2)
+         continue;
+
       agx_instr *def = defs[src.value];
       if (!def || def->op != AGX_OPCODE_MOV_IMM)
          continue;
@@ -830,16 +836,20 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
    /* G17P's standalone saturate is an f32add.ep2 of the value and -0.
     * G18G keeps the same rule for its native narrowing saturate.
     * Pulling that modifier into its producer invents saturated forms for
-    * operations such as fmul and transcendental functions. AGX3B's FFMA and
-    * FADD do have saturated forms, register and immediate alike, so a clamp
-    * of their result folds into them; every other producer keeps the
-    * separate saturate. */
+    * operations such as fmul and transcendental functions. AGX3B's 32-bit
+    * FFMA and FADD do have saturated forms (except FFMA with an immediate
+    * addend), so a 32-bit clamp of their result folds into them; every
+    * other producer keeps the separate saturate. */
    if (ctx->key &&
        (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&ctx->key->dev)) &&
        use->saturate &&
        !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-         (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FADD)))
+         I->dest[0].size == AGX_SIZE_32 &&
+         use->dest[0].size == AGX_SIZE_32 &&
+         (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FADD) &&
+         !(I->op == AGX_OPCODE_FFMA &&
+           I->src[2].type == AGX_INDEX_IMMEDIATE)))
       return false;
 
    /* M5 (AGX3C) encodes reciprocal and reciprocal square root without a

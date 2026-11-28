@@ -1205,10 +1205,26 @@ agx_lower_uniform_sources(agx_context *ctx)
                agx_instr *split = agx_split(&b, 2, word);
                split->dest[0] = agx_temp(ctx, AGX_SIZE_16);
                split->dest[1] = agx_temp(ctx, AGX_SIZE_16);
-               agx_replace_src(I, s, split->dest[idx.value & 1]);
+               agx_index extracted = split->dest[idx.value & 1];
                if (materialized < ARRAY_SIZE(materialized_from)) {
                   materialized_from[materialized] = idx;
-                  materialized_to[materialized++] = split->dest[idx.value & 1];
+                  materialized_to[materialized++] = extracted;
+               }
+               /* agx_materialize_agx3_alu_constants() already ran before
+                * uniform lowering, so widening a 16-bit uniform into a 32-bit
+                * FADD with an immediate (e.g. saturate(f32(u16) + 1.0f)) must
+                * happen here rather than leaving a 16-bit GPR beside an
+                * immediate. */
+               if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                   I->op == AGX_OPCODE_FADD && I->nr_dests == 1 &&
+                   I->nr_srcs == 2 && I->dest[0].size == AGX_SIZE_32 &&
+                   I->src[1 - s].type == AGX_INDEX_IMMEDIATE &&
+                   (I->saturate || !agx_is_equiv(I->src[1 - s], agx_negzero()))) {
+                  agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+                  agx_fmov_to(&b, wide, extracted);
+                  agx_replace_src(I, s, wide);
+               } else {
+                  agx_replace_src(I, s, extracted);
                }
             } else {
                agx_index copy = agx_mov(&b, idx);

@@ -7375,6 +7375,21 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
+      /* AGX3B's immediate-addend FMA forms carry no saturate bit. Materialize
+       * any immediate addend that reaches a saturated FFMA so the register or
+       * immediate-multiplier saturate forms encode it cleanly. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_FFMA && I->saturate && I->nr_dests == 1 &&
+          I->nr_srcs == 3 && I->dest[0].size == AGX_SIZE_32 &&
+          I->src[2].type == AGX_INDEX_IMMEDIATE) {
+         float value = agx_minifloat_decode(I->src[2].value);
+         if (I->src[2].abs)
+            value = fabsf(value);
+         if (I->src[2].neg)
+            value = -value;
+         I->src[2] = agx_mov_imm(&b, 32, fui(value));
+      }
+
       /* AGX3's integer compare-select names an immediate comparand in eight
        * bits (agx3_pack_binary.c). A wider constant goes through a register
        * of the other comparand's width. */
