@@ -8023,11 +8023,27 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             : 0;
       uint8_t run_vdm_kinds = first ? first->sync.kind : 0;
       uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS] = {0};
+      uint8_t post_heap_slots =
+         first_post && first_post->sync.heap_slot
+            ? BITFIELD_BIT(first_post->sync.heap_slot - 1)
+            : 0;
+      bool run_post_heap_only =
+         !first_post || hk_render_pack_post_is_heap_reset(first_post);
+      uint8_t run_post_tail_req[HK_SYNC_NUM_KINDS] = {0};
       if (first) {
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
             if (cmds[i]->sync.req[k][HK_SYNC_VDM].cut)
                run_vdm_tail_req[k] |= first->sync.kind;
             run_vdm_tail_req[k] |= cmds[i]->sync.req[k][HK_SYNC_VDM].prior;
+         }
+      }
+      if (first_post) {
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+            const struct hk_sync_dep *creq =
+               &cmds[i]->sync.req[k][HK_SYNC_CDM];
+            if (creq->cut == first_post ||
+                (creq->prior & first_post->sync.kind))
+               run_post_tail_req[k] |= first_post->sync.kind;
          }
       }
       unsigned run_pre = first_pre ? 1 : 0;
@@ -8085,9 +8101,9 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          const char *why =
             hk_render_pack_boundary(&state, cmds[prev], cmds[b], bs, first);
          if (!why && bs_pre) {
-            why = hk_render_pack_pre_cs_refusal(&state, bs_pre, run_post,
-                                                run_vdm_kinds,
-                                                run_vdm_tail_req);
+            why = hk_render_pack_pre_cs_refusal(
+               &state, bs_pre, run_post, post_heap_slots, run_post_heap_only,
+               run_vdm_kinds, run_vdm_tail_req, run_post_tail_req);
          }
          if (!why && bs->sync.heap_slot &&
              (used_heap_slots & BITFIELD_BIT(bs->sync.heap_slot - 1)))
@@ -8138,8 +8154,21 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          }
          if (bs_pre)
             run_pre++;
-         if (bs_post)
+         if (bs_post) {
+            if (bs_post->sync.heap_slot)
+               post_heap_slots |= BITFIELD_BIT(bs_post->sync.heap_slot - 1);
+            run_post_heap_only &= hk_render_pack_post_is_heap_reset(bs_post);
             run_post++;
+         }
+         if (run_post > 0) {
+            for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+               const struct hk_sync_dep *creq =
+                  &cmds[b]->sync.req[k][HK_SYNC_CDM];
+               if ((bs_post && creq->cut == bs_post) ||
+                   (creq->prior & (HK_SYNC_GFX | HK_SYNC_GFX_MEM)))
+                  run_post_tail_req[k] |= (HK_SYNC_GFX | HK_SYNC_GFX_MEM);
+            }
+         }
          resources += bs->render_resources.size;
          hk_render_pack_run_join(&state, cmds[prev], cmds[b], bs);
          stamps |= hk_render_pack_stamp_slots(bs);
@@ -8180,8 +8209,10 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       uint8_t preceding = 0;
       unsigned added = 0;
       uint8_t cdm_preceding = 0;
+      uint8_t pre_cdm_preceding = 0;
       uint8_t carried_req[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ] = {0};
       bool cdm_req_cut[HK_SYNC_NUM_KINDS] = {false};
+      bool pre_cdm_req_cut[HK_SYNC_NUM_KINDS] = {false};
       bool pre_needs_cdm_cut[HK_RENDER_PACK_MAX_PRE] = {false};
       unsigned n_pre = 0, n_post = 0;
       bool ok = true;
@@ -8215,13 +8246,14 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                }
             }
             if (pre_idx > 0 &&
-                ((dst->sync.dep[HK_SYNC_CDM].prior & cdm_preceding) ||
-                 (dst->sync.dep_ta[HK_SYNC_CDM].prior & cdm_preceding)))
+                ((dst->sync.dep[HK_SYNC_CDM].prior & pre_cdm_preceding) ||
+                 (dst->sync.dep_ta[HK_SYNC_CDM].prior & pre_cdm_preceding)))
                pre_needs_cdm_cut[pre_idx] = true;
             u_foreach_bit(k, pre_carry) {
-               if (pre_idx > 0 && cdm_req_cut[k])
+               if (pre_idx > 0 && pre_cdm_req_cut[k])
                   pre_needs_cdm_cut[pre_idx] = true;
             }
+            pre_cdm_preceding |= pre->sync.kind;
             cdm_preceding |= pre->sync.kind;
          }
          if (post) {
@@ -8247,6 +8279,9 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             const struct hk_sync_dep *creq = &source->sync.req[k][HK_SYNC_CDM];
             if (creq->cut || (creq->prior & cdm_preceding))
                cdm_req_cut[k] = true;
+            if ((pre && creq->cut == pre) ||
+                (creq->prior & pre_cdm_preceding))
+               pre_cdm_req_cut[k] = true;
             for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
                carried_req[k][sq] |= source->sync.req[k][sq].prior;
          }

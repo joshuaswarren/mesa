@@ -3513,6 +3513,30 @@ main(void)
         p_atomic_read(&mq->drm.signalled_value) == 12);
    }
    test_vertex_image_bloom();
+   /* Forgetting a singleton render pass (such as an absorbed deferred-clear
+    * VDM render) drops its pass footprint instead of rebinding it to an
+    * earlier unrelated render on the subqueue. */
+   {
+      const void *img_a = (const void *)0x1111;
+      const void *img_b = (const void *)0x2222;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      struct hk_cs *pass_a = render_pass(cmd, img_a, 1, false);
+      struct hk_cs *clear_b = render_pass(cmd, img_b, 1, false);
+      hk_sync_forget_stream(cmd, clear_b);
+      list_del(&clear_b->node);
+
+      hk_sync_begin_rendering(cmd, false);
+      hk_sync_pass_footprint(cmd, img_b, 0, 0, 1, 32, 32,
+                             (VkRect2D){{0, 0}, {32, 32}}, false, true);
+      hk_sync_pass_footprints_done(cmd);
+      struct hk_cs *draw_b = add(cmd, false);
+      hk_sync_end_rendering(cmd, false);
+
+      T("forgotten singleton clear leaves no false dependency on earlier pass",
+        draw_b->sync.dep[HK_SYNC_VDM].cut == NULL &&
+           draw_b->sync.dep_ta[HK_SYNC_VDM].cut == NULL &&
+           pass_a->sync.seq != 0);
+   }
    /* Retired exact prior pruning drops completed VDM/CDM ordinals while
     * preserving unretired dependencies and FRAGMENT_BARRIERS ta_split. */
    {

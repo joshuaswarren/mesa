@@ -314,6 +314,32 @@ hk_nir_can_coalesce_workgroup(const nir_shader *nir)
    return true;
 }
 
+static bool
+hk_coalesce_partial_padded(const uint32_t grid_threads[3],
+                           const uint16_t local[3],
+                           uint64_t total_threads,
+                           uint64_t req_wgs,
+                           uint64_t *padded_out)
+{
+   uint64_t wgs = 1, padded = 1;
+   for (unsigned i = 0; i < 3; ++i) {
+      const uint64_t g = DIV_ROUND_UP((uint64_t)grid_threads[i], local[i]);
+      uint64_t p_axis = 0;
+      if (__builtin_mul_overflow(g, (uint64_t)local[i], &p_axis) ||
+          __builtin_mul_overflow(wgs, g, &wgs) ||
+          __builtin_mul_overflow(padded, p_axis, &padded))
+         return false;
+   }
+
+   /* Keep core saturation and cap inactive edge lanes at <= 6.25% (1/16). */
+   if (wgs < req_wgs || padded < total_threads ||
+       padded - total_threads > total_threads / 16u)
+      return false;
+
+   *padded_out = padded;
+   return true;
+}
+
 bool
 hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
                               const uint32_t grid_threads[3],
@@ -354,6 +380,7 @@ hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
 
    bool changed = false;
 
+   /* Pass 1: exact-divisor doubling (zero partial workgroups). */
    for (unsigned axis = 0; axis < 3; ++axis) {
       while (cur_threads * 2 <= target_max) {
          const uint32_t next_dim = (uint32_t)out_local[axis] * 2;
@@ -375,6 +402,39 @@ hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
          cur_threads = next_threads;
          changed = true;
       }
+   }
+
+   /* Pass 2: bounded partial-edge fallback for large odd/prime grids (e.g.
+    * 1512x984 at 8x8 -> 16x16). AGX3 direct CDM launches take global thread
+    * counts and clip trailing partial workgroups in hardware; pick the axis
+    * with minimal padded invocations while keeping edge waste <= 6.25%. */
+   while (cur_threads * 2 <= target_max) {
+      const uint64_t next_threads = cur_threads * 2;
+      const uint64_t req_wgs =
+         next_threads > 256u ? MAX2(min_workgroups, 1024ull)
+                             : MAX2(min_workgroups, 256ull);
+      unsigned best_axis = 3;
+      uint64_t best_padded = UINT64_MAX;
+      for (unsigned axis = 0; axis < 3; ++axis) {
+         const uint32_t next_dim = (uint32_t)out_local[axis] * 2;
+         if (next_dim > max_wg_size[axis] || grid_threads[axis] < next_dim)
+            continue;
+         uint16_t cand[3] = {out_local[0], out_local[1], out_local[2]};
+         cand[axis] = (uint16_t)next_dim;
+         uint64_t padded = 0;
+         if (!hk_coalesce_partial_padded(grid_threads, cand, total_threads,
+                                         req_wgs, &padded))
+            continue;
+         if (padded < best_padded) {
+            best_padded = padded;
+            best_axis = axis;
+         }
+      }
+      if (best_axis == 3)
+         break;
+      out_local[best_axis] = (uint16_t)(out_local[best_axis] * 2);
+      cur_threads = next_threads;
+      changed = true;
    }
 
    return changed;

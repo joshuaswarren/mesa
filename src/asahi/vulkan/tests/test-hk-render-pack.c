@@ -1294,34 +1294,89 @@ test_pregfx_and_union_elision(void)
    pre->stats.calls = 0;
 
    /* Hoisting refusal gate: must refuse hoisting pre_cs past an earlier
-    * member's post_cs, memory writes, or VDM->CDM ordering dependencies. */
+    * member's dependent/non-heap post_cs, same-slot heap reset, memory
+    * writes, or VDM->CDM ordering dependencies, while allowing driver
+    * pre-graphics on a disjoint heap slot past a pure heap-slot reset. */
    struct hk_render_pack_run_state hoist = {0};
    uint8_t tail_req[HK_SYNC_NUM_KINDS] = {0};
+   uint8_t post_tail_req[HK_SYNC_NUM_KINDS] = {0};
+   const uint8_t slot1_mask = BITFIELD_BIT(0);
+   const uint8_t slot2_mask = BITFIELD_BIT(1);
+   T("pure heap-reset post_cs recognized",
+     hk_render_pack_post_is_heap_reset(post));
+   post->query_access = true;
+   T("query-access post_cs is not a pure heap reset",
+     !hk_render_pack_post_is_heap_reset(post));
+   post->query_access = false;
+
    pre->stats.calls = 1;
    pre->sync.kind = HK_SYNC_COMPUTE;
+   pre->sync.heap_slot = 0;
    T("clean API pre_cs hoists when run_post == 0",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
-   T("API pre_cs refused when earlier member has post_cs",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) == NULL);
+   T("API pre_cs refused when earlier member has pure heap post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+
    pre->stats.calls = 0;
-   T("driver pre_cs refused when earlier member has post_cs",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->sync.heap_slot = 2;
+   T("driver pre_cs on disjoint heap slot hoists past pure heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) == NULL);
+   T("driver pre_cs on same heap slot refused after heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot2_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   T("driver pre_cs refused after non-heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, false,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.dep[HK_SYNC_CDM].prior = HK_SYNC_GFX;
+   T("driver pre_cs with CDM prior dependency refused after post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.dep[HK_SYNC_CDM].prior = 0;
+   post_tail_req[util_logbase2(HK_SYNC_GFX)] = HK_SYNC_GFX;
+   T("driver pre_cs refused when earlier tail barrier orders post_cs before pre_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   post_tail_req[util_logbase2(HK_SYNC_GFX)] = 0;
+   pre->sync.kind = HK_SYNC_XFER;
+   T("non-GFX driver pre_cs refused after post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
    T("driver pre_cs allowed when run_post == 0",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) == NULL);
+
    pre->stats.calls = 1;
+   pre->sync.kind = HK_SYNC_COMPUTE;
+   pre->sync.heap_slot = 0;
    hoist.writes_memory = true;
    T("API pre_cs refused after memory-writing render",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    hoist.writes_memory = false;
    pre->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_GFX;
    T("API pre_cs refused when depending on earlier render",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    pre->sync.dep[HK_SYNC_VDM].prior = 0;
    tail_req[util_logbase2(HK_SYNC_COMPUTE)] = HK_SYNC_GFX;
    T("API pre_cs refused when earlier tail barrier orders VDM->CDM",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    tail_req[util_logbase2(HK_SYNC_COMPUTE)] = 0;
    pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->sync.heap_slot = 2;
    pre->stats.calls = 0;
 
    post->stats.calls = 1;

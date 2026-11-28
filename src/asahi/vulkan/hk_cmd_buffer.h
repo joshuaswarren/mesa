@@ -1290,6 +1290,10 @@ struct hk_graphics_state {
     * has an emulating twin to switch to once the device needs it. */
    uint32_t border_free_stages;
 
+   /* Stages bound to a shader compiled without image-view minLod emulation
+    * that has an emulating twin to switch to once the device needs it. */
+   uint32_t min_lod_free_stages;
+
    /* G17P: the twin of the bound fragment shader that reads its per-primitive
     * inputs from the bound mesh shader's records (hk_mesh_fs_twin()), or
     * NULL to draw with the bound fragment shader itself. */
@@ -2344,8 +2348,19 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->unordered_start_ts = b->unordered_start_ts;
    }
 
-   util_dynarray_append_array(&a->compute_resources, uint8_t,
-                             b->compute_resources.data, b->compute_resources.size);
+   util_dynarray_foreach(&b->compute_resources,
+                         const struct drm_asahi_compute_program, b_entry) {
+      bool seen = false;
+      util_dynarray_foreach(&a->compute_resources,
+                            const struct drm_asahi_compute_program, a_entry) {
+         if (!memcmp(a_entry, b_entry, sizeof(*b_entry))) {
+            seen = true;
+            break;
+         }
+      }
+      if (!seen)
+         util_dynarray_append(&a->compute_resources, *b_entry);
+   }
 
    a->g17p_timestamp_query |= b->g17p_timestamp_query;
 
@@ -2570,6 +2585,13 @@ struct hk_cmd_buffer {
          VkImageAspectFlags aspects;
          VkClearValue value;
          bool from_gfx;
+         /* Finalized clear-only VDM stream kept alive when an empty clear
+          * pass is deferred on native AGX3 / M5. Dropped if every cleared
+          * attachment it owns is absorbed or superseded; left in
+          * control_streams when a later render pass flushes it, so the clear
+          * stays on VDM without a VDM->CDM->VDM crossing; dropped for a
+          * compute fill on any other flush. */
+         struct hk_cs *vdm_cs;
          struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
@@ -3210,6 +3232,10 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
+
+/* As hk_flush_deferred_clears(), for the deferred clears a render pass that
+ * is being recorded did not absorb. */
+void hk_flush_deferred_clears_before_render(struct hk_cmd_buffer *cmd);
 
 /* Aspects of the depth/stencil image of the pending store are overwritten as a
  * whole before anything read them: drop those aspect stores (see
