@@ -9538,21 +9538,26 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
           (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
           !agx_is_g18g(&b->shader->key->dev)) {
-         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
-         if (narrow &&
-             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
-             nir_src_bit_size(narrow->src[0].src) == 16)
-            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
-                                  agx_alu_src_index(b, narrow->src[0]),
-                                  AGX_ROUND_RTE);
+         nir_scalar s = nir_scalar_chase_movs(
+            nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
+         if (nir_scalar_is_alu(s) &&
+             (nir_scalar_alu_op(s) == nir_op_u2u8 ||
+              nir_scalar_alu_op(s) == nir_op_i2i8)) {
+            nir_scalar src = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+            if (src.def->bit_size == 16 && !nir_scalar_is_const(src))
+               return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                     agx_extract_nir_src(b, nir_src_for_ssa(src.def),
+                                                         src.comp),
+                                     AGX_ROUND_RTE);
+         }
       }
 
       /* M5 converts the low byte of a half register to f32 directly. Byte 0
-       * or 2 of a word, as a packed RGBA8 pixel is unpacked, is the low byte
-       * of its low or high half: no mask or shift. Bytes 1 and 3 take a
-       * 16-bit shift of their half. All four read only the halves, so the
-       * word dies at its split and needs no copy. */
-      if (instr->op == nir_op_u2f32 && src_sz == 32 &&
+       * or 2 of a word, as a packed RGBA8 pixel or GLSL unpack8() is unpacked,
+       * is the low byte of its low or high half: no mask or shift. Bytes 1 and
+       * 3 take a 16-bit shift of their half. All four read only the halves, so
+       * the word dies at its split and needs no copy. */
+      if (instr->op == nir_op_u2f32 && (src_sz == 32 || src_sz == 8) &&
           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
           !b->shader->key->dev.emit_agx3d) {
          nir_scalar x = nir_scalar_chase_movs(
@@ -9560,7 +9565,71 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
          nir_scalar word = {0};
          int half = -1;
          bool high_byte = false;
-         if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_ushr) {
+         if (src_sz == 8) {
+            /* u2u8/i2i8 truncates a 32-bit source to its low byte, so match
+             * shifted/extracted bytes of a 32-bit word or byte 0 directly. */
+            if (nir_scalar_is_alu(x) &&
+                (nir_scalar_alu_op(x) == nir_op_u2u8 ||
+                 nir_scalar_alu_op(x) == nir_op_i2i8)) {
+               nir_scalar s =
+                  nir_scalar_chase_movs(nir_scalar_chase_alu_src(x, 0));
+               if (s.def->bit_size == 32) {
+                  if (nir_scalar_is_alu(s) &&
+                      nir_scalar_alu_op(s) == nir_op_iand) {
+                     for (unsigned i = 0; i < 2; ++i) {
+                        nir_scalar k = nir_scalar_chase_alu_src(s, i);
+                        if (nir_scalar_is_const(k) &&
+                            (nir_scalar_as_uint(k) & 0xff) == 0xff) {
+                           s = nir_scalar_chase_movs(
+                              nir_scalar_chase_alu_src(s, 1 - i));
+                           break;
+                        }
+                     }
+                  }
+                  if (nir_scalar_is_alu(s) &&
+                      (nir_scalar_alu_op(s) == nir_op_ushr ||
+                       nir_scalar_alu_op(s) == nir_op_ishr)) {
+                     nir_scalar k = nir_scalar_chase_alu_src(s, 1);
+                     const unsigned sh =
+                        nir_scalar_is_const(k) ? nir_scalar_as_uint(k) & 31 : 0;
+                     if (sh == 8 || sh == 16 || sh == 24) {
+                        word = nir_scalar_chase_alu_src(s, 0);
+                        half = sh / 16;
+                        high_byte = sh & 8;
+                     }
+                  } else if (nir_scalar_is_alu(s) &&
+                             (nir_scalar_alu_op(s) == nir_op_ubitfield_extract ||
+                              nir_scalar_alu_op(s) == nir_op_ubfe ||
+                              nir_scalar_alu_op(s) == nir_op_ibitfield_extract ||
+                              nir_scalar_alu_op(s) == nir_op_ibfe)) {
+                     nir_scalar off = nir_scalar_chase_alu_src(s, 1);
+                     nir_scalar bits = nir_scalar_chase_alu_src(s, 2);
+                     if (nir_scalar_is_const(off) && nir_scalar_is_const(bits) &&
+                         nir_scalar_as_uint(bits) >= 8 &&
+                         nir_scalar_as_uint(off) < 32 &&
+                         !(nir_scalar_as_uint(off) & 7)) {
+                        word = nir_scalar_chase_alu_src(s, 0);
+                        half = nir_scalar_as_uint(off) / 16;
+                        high_byte = nir_scalar_as_uint(off) & 8;
+                     }
+                  } else if (nir_scalar_is_alu(s) &&
+                             (nir_scalar_alu_op(s) == nir_op_extract_u8 ||
+                              nir_scalar_alu_op(s) == nir_op_extract_i8)) {
+                     nir_scalar idx = nir_scalar_chase_alu_src(s, 1);
+                     if (nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) < 4) {
+                        word = nir_scalar_chase_alu_src(s, 0);
+                        half = nir_scalar_as_uint(idx) / 2;
+                        high_byte = nir_scalar_as_uint(idx) & 1;
+                     }
+                  }
+                  if (half < 0) {
+                     word = s;
+                     half = 0;
+                     high_byte = false;
+                  }
+               }
+            }
+         } else if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_ushr) {
             nir_scalar k = nir_scalar_chase_alu_src(x, 1);
             if (nir_scalar_is_const(k) && (nir_scalar_as_uint(k) & 31) == 24) {
                word = nir_scalar_chase_alu_src(x, 0);
@@ -9608,14 +9677,16 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                high_byte = nir_scalar_as_uint(idx) & 1;
             }
          }
-         if (half >= 0 && word.def->bit_size == 32) {
+         if (half >= 0 && word.def->bit_size == 32 && !nir_scalar_is_const(word)) {
             agx_index h;
             nir_scalar narrow = {0};
             if (nir_scalar_is_alu(word) &&
-                nir_scalar_alu_op(word) == nir_op_u2u32)
+                (nir_scalar_alu_op(word) == nir_op_u2u32 ||
+                 nir_scalar_alu_op(word) == nir_op_i2i32))
                narrow = nir_scalar_chase_alu_src(word, 0);
-            if (half == 0 && narrow.def && narrow.def->bit_size == 16) {
-               /* The low half of a zero-extended half is the half. */
+            if (half == 0 && narrow.def && narrow.def->bit_size == 16 &&
+                !nir_scalar_is_const(narrow)) {
+               /* The low half of a widened half is the half. */
                h = agx_extract_nir_src(b, nir_src_for_ssa(narrow.def),
                                        narrow.comp);
             } else {
@@ -9652,18 +9723,105 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
          UNREACHABLE("64-bit conversions unimplemented");
 
       /* The signed-byte conversion reads only the low eight bits of its half
-       * register, so the byte of a u2u8/i2i8 of a half needs no mask
-       * (agx_nir_fold_byte_to_float). */
+       * register, so the byte of a u2u8/i2i8 of a half or 32-bit word needs no
+       * mask (agx_nir_fold_byte_to_float, GLSL unpack8()). */
       if (src_sz == 8 &&
           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !b->shader->key->dev.emit_agx3d &&
           !agx_is_g18g(&b->shader->key->dev)) {
-         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
-         if (narrow &&
-             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
-             nir_src_bit_size(narrow->src[0].src) == 16)
-            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_S8_TO_F),
-                                  agx_alu_src_index(b, narrow->src[0]),
-                                  AGX_ROUND_RTE);
+         nir_scalar s = nir_scalar_chase_movs(
+            nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
+         if (nir_scalar_is_alu(s) &&
+             (nir_scalar_alu_op(s) == nir_op_u2u8 ||
+              nir_scalar_alu_op(s) == nir_op_i2i8)) {
+            nir_scalar src = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+            if (src.def->bit_size == 16 && !nir_scalar_is_const(src)) {
+               return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_S8_TO_F),
+                                     agx_extract_nir_src(b, nir_src_for_ssa(src.def),
+                                                         src.comp),
+                                     AGX_ROUND_RTE);
+            }
+            if (src.def->bit_size == 32 && !nir_scalar_is_const(src)) {
+               nir_scalar word = {0};
+               int half = -1;
+               bool high_byte = false;
+               if (nir_scalar_is_alu(src) &&
+                   nir_scalar_alu_op(src) == nir_op_iand) {
+                  for (unsigned i = 0; i < 2; ++i) {
+                     nir_scalar k = nir_scalar_chase_alu_src(src, i);
+                     if (nir_scalar_is_const(k) &&
+                         (nir_scalar_as_uint(k) & 0xff) == 0xff) {
+                        src = nir_scalar_chase_movs(
+                           nir_scalar_chase_alu_src(src, 1 - i));
+                        break;
+                     }
+                  }
+               }
+               if (nir_scalar_is_alu(src) &&
+                   (nir_scalar_alu_op(src) == nir_op_ushr ||
+                    nir_scalar_alu_op(src) == nir_op_ishr)) {
+                  nir_scalar k = nir_scalar_chase_alu_src(src, 1);
+                  const unsigned sh =
+                     nir_scalar_is_const(k) ? nir_scalar_as_uint(k) & 31 : 0;
+                  if (sh == 8 || sh == 16 || sh == 24) {
+                     word = nir_scalar_chase_alu_src(src, 0);
+                     half = sh / 16;
+                     high_byte = sh & 8;
+                  }
+               } else if (nir_scalar_is_alu(src) &&
+                          (nir_scalar_alu_op(src) == nir_op_ubitfield_extract ||
+                           nir_scalar_alu_op(src) == nir_op_ubfe ||
+                           nir_scalar_alu_op(src) == nir_op_ibitfield_extract ||
+                           nir_scalar_alu_op(src) == nir_op_ibfe)) {
+                  nir_scalar off = nir_scalar_chase_alu_src(src, 1);
+                  nir_scalar bits = nir_scalar_chase_alu_src(src, 2);
+                  if (nir_scalar_is_const(off) && nir_scalar_is_const(bits) &&
+                      nir_scalar_as_uint(bits) >= 8 &&
+                      nir_scalar_as_uint(off) < 32 &&
+                      !(nir_scalar_as_uint(off) & 7)) {
+                     word = nir_scalar_chase_alu_src(src, 0);
+                     half = nir_scalar_as_uint(off) / 16;
+                     high_byte = nir_scalar_as_uint(off) & 8;
+                  }
+               } else if (nir_scalar_is_alu(src) &&
+                          (nir_scalar_alu_op(src) == nir_op_extract_u8 ||
+                           nir_scalar_alu_op(src) == nir_op_extract_i8)) {
+                  nir_scalar idx = nir_scalar_chase_alu_src(src, 1);
+                  if (nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) < 4) {
+                     word = nir_scalar_chase_alu_src(src, 0);
+                     half = nir_scalar_as_uint(idx) / 2;
+                     high_byte = nir_scalar_as_uint(idx) & 1;
+                  }
+               }
+               if (half < 0) {
+                  word = src;
+                  half = 0;
+                  high_byte = false;
+               }
+               if (word.def->bit_size == 32 && !nir_scalar_is_const(word)) {
+                  agx_index h;
+                  nir_scalar narrow = {0};
+                  if (nir_scalar_is_alu(word) &&
+                      (nir_scalar_alu_op(word) == nir_op_u2u32 ||
+                       nir_scalar_alu_op(word) == nir_op_i2i32))
+                     narrow = nir_scalar_chase_alu_src(word, 0);
+                  if (half == 0 && narrow.def && narrow.def->bit_size == 16 &&
+                      !nir_scalar_is_const(narrow)) {
+                     h = agx_extract_nir_src(b, nir_src_for_ssa(narrow.def),
+                                             narrow.comp);
+                  } else {
+                     agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def),
+                                                       word.comp);
+                     h = agx_temp(b->shader, AGX_SIZE_16);
+                     agx_subdivide_to(b, h, w, half);
+                  }
+                  if (high_byte)
+                     h = agx_ushr(b, h, agx_immediate(8));
+                  return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_S8_TO_F),
+                                        h, AGX_ROUND_RTE);
+               }
+            }
+         }
       }
 
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_S32_TO_F
