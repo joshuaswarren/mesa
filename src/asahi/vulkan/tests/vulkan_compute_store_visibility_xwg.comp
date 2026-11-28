@@ -1,0 +1,117 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+layout(local_size_x = 64) in;
+
+/* Intentionally non-coherent payload SSBOs written by producer workgroups and
+ * read by consumer workgroups after a device-scope memoryBarrierBuffer() and
+ * atomic release/acquire handoff. */
+layout(std430, set = 0, binding = 0) buffer Payload32 { uint p32[]; };
+layout(std430, set = 0, binding = 1) buffer Payload128 { uvec4 p128[]; };
+layout(std430, set = 0, binding = 2) coherent buffer Flags { uint flag[]; };
+layout(std430, set = 0, binding = 3) coherent buffer Acks { uint ack[]; };
+layout(std430, set = 0, binding = 4) coherent buffer Stats {
+   uint errs;
+   uint rounds_done;
+   uint timeouts;
+   uint first_got;
+   uint first_want;
+} stats;
+
+layout(push_constant) uniform PC {
+   uint num_rounds;
+   uint spin_limit;
+} pc;
+
+shared uint s_timed_out;
+
+uint
+pat(uint idx, uint r)
+{
+   uint x = (idx * 2654435761u) ^ (r * 3266489917u) ^ 0x517cc1b7u;
+   x ^= x >> 16;
+   x *= 0x85ebca6bu;
+   x ^= x >> 13;
+   return x | 1u;
+}
+
+uvec4
+pat4(uint idx, uint r)
+{
+   return uvec4(pat(idx, r ^ 0x1010101u), pat(idx + 5u, r ^ 0x2020202u),
+                pat(idx + 9u, r ^ 0x3030303u), pat(idx + 13u, r ^ 0x4040404u));
+}
+
+void
+main()
+{
+   uint pair = gl_WorkGroupID.x >> 1;
+   bool is_consumer = (gl_WorkGroupID.x & 1u) != 0u;
+   uint lid = gl_LocalInvocationID.x;
+   uint base = pair * 64u;
+
+   for (uint r = 1u; r <= pc.num_rounds; ++r) {
+      if (!is_consumer) {
+         uint idx = base + lid;
+         p32[idx] = pat(idx, r);
+         p128[idx] = pat4(idx, r);
+         memoryBarrierBuffer();
+         barrier();
+         if (lid == 0u) {
+            s_timed_out = 0u;
+            atomicExchange(flag[pair], r);
+            uint spins = 0u;
+            while (atomicAdd(ack[pair], 0u) < r) {
+               if (++spins >= pc.spin_limit) {
+                  s_timed_out = 1u;
+                  atomicAdd(stats.timeouts, 1u);
+                  break;
+               }
+            }
+         }
+         barrier();
+         if (s_timed_out != 0u)
+            break;
+      } else {
+         if (lid == 0u) {
+            s_timed_out = 0u;
+            uint spins = 0u;
+            while (atomicAdd(flag[pair], 0u) < r) {
+               if (++spins >= pc.spin_limit) {
+                  s_timed_out = 1u;
+                  atomicAdd(stats.timeouts, 1u);
+                  break;
+               }
+            }
+         }
+         barrier();
+         memoryBarrierBuffer();
+         if (s_timed_out != 0u)
+            break;
+
+         uint idx = base + (lid ^ 31u);
+         uint w32 = pat(idx, r);
+         uint g32 = p32[idx];
+         if (g32 != w32) {
+            if (atomicAdd(stats.errs, 1u) == 0u) {
+               stats.first_got = g32;
+               stats.first_want = w32;
+            }
+         }
+         uvec4 w128 = pat4(idx, r);
+         uvec4 g128 = p128[idx];
+         if (any(notEqual(g128, w128))) {
+            if (atomicAdd(stats.errs, 1u) == 0u) {
+               stats.first_got = g128.x ^ g128.y ^ g128.z ^ g128.w;
+               stats.first_want = w128.x ^ w128.y ^ w128.z ^ w128.w;
+            }
+         }
+         barrier();
+         if (lid == 0u) {
+            atomicAdd(stats.rounds_done, 1u);
+            atomicExchange(ack[pair], r);
+         }
+      }
+   }
+}

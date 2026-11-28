@@ -268,6 +268,8 @@ struct agx_push_range {
    uint8_t length;
 };
 
+struct agx_g17p_compute_template;
+
 struct agx_compiled_shader {
    /* Base struct */
    struct agx_shader_part b;
@@ -281,6 +283,10 @@ struct agx_compiled_shader {
    /* Persistent AGX3 compute code container for non-linked native dispatches */
    struct agx_bo *agx3_compute_bo;
    uint64_t agx3_compute_va;
+
+   /* Cached HAL200 compute Ioto loader templates (freed with the variant). */
+   struct agx_g17p_compute_template *g17p_compute_templates;
+   unsigned g17p_compute_templates_generated;
 
    /* The backend refused to encode this variant. agx_compile_shader_nir() is
     * fail-closed: it returns false and leaves a zeroed agx_shader_part, so
@@ -418,10 +424,10 @@ struct agx_uncompiled_shader {
       bool fullscreen_tri_z_in_01;
       bool fullscreen_tri_z_in_m11;
 
-      /* Fragment shader static opaque overwrite analysis: bit i is set iff
-       * colour attachment i is unconditionally written in all four channels
+      /* Fragment shader static opaque overwrite analysis: entry i holds the
+       * 4-bit RGBA channel mask unconditionally written to colour attachment i
        * on every non-discarded execution path. */
-      uint8_t fs_unconditional_color_outputs;
+      uint8_t fs_unconditional_color_masks[PIPE_MAX_COLOR_BUFS];
       bool fs_uses_discard;
 
       /* Some image intrinsic other than a read or a size/sample query:
@@ -454,6 +460,8 @@ struct agx_uncompiled_shader {
    } info;
 
    struct hash_table *variants;
+   /* Fast-path cache for compute variants indexed by custom_borders (0/1). */
+   struct agx_compiled_shader *cached_cs[2];
    struct agx_uncompiled_shader *passthrough_progs[MESA_PRIM_COUNT][3][2];
    struct agx_uncompiled_shader *passthrough_tcs[32];
 
@@ -858,9 +866,9 @@ struct agx_blend {
    /* PIPE_CLEAR_* bitmask corresponding to this blend state */
    uint32_t store;
 
-   /* PIPE_CLEAR_COLOR* mask of render targets whose blend state writes all
-    * four channels without reading the destination tilebuffer. */
-   uint32_t opaque_overwrite;
+   /* Per-RT 4-bit RGBA channel mask written without reading the destination
+    * tilebuffer (no blending, logicop, or alpha-to-coverage). */
+   uint8_t opaque_overwrite_mask[PIPE_MAX_COLOR_BUFS];
 };
 
 struct asahi_vs_shader_key {
@@ -1008,6 +1016,12 @@ struct asahi_blitter {
     * sampler for exact 2x2 compressed mip levels. */
    void *g17p_block_mip_cs;
    void *g17p_block_mip_sampler;
+
+   /* HAL200/AGX3B buffer-to-image upload compute shaders:
+    * - g17p_block_buf2img_cs[format_slot][partial]: 32x32 imgwblk uploads
+    * - g17p_tiled_buf2img_cs[log2_block_B][log2_per_thread]: Morton uploads */
+   void *g17p_block_buf2img_cs[3][2];
+   void *g17p_tiled_buf2img_cs[5][3];
 
    /* [filter] */
    void *sampler[2];
@@ -1258,6 +1272,10 @@ struct agx_context {
 
    struct hash_table *generic_meta;
    struct agx_bg_eot_cache bg_eot;
+
+   /* Cached HAL200 compute Ioto loader templates for precompiled libagx kernels. */
+   struct agx_g17p_compute_template *g17p_precomp_templates[LIBAGX_NUM_PROGRAMS];
+   unsigned g17p_precomp_templates_generated;
 
    bool any_faults;
    bool submit_quarantined;
@@ -2071,6 +2089,24 @@ bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          unsigned last_level, unsigned first_layer,
                          unsigned last_layer);
 
+enum pipe_format agx_g17p_block_buf2img_format(enum pipe_format format);
+
+bool agx_g17p_block_buf2img_aligned(const struct pipe_box *box, uint32_t mip_w,
+                                    uint32_t mip_h);
+
+bool agx_g17p_tiled_buf2img_plan(const struct ail_layout *layout,
+                                 unsigned level, const struct pipe_box *box,
+                                 unsigned buffer_offset, unsigned row_stride,
+                                 unsigned layer_stride, uint32_t groups[3],
+                                 uint32_t *per_thread_out);
+
+void agx_image_copy_buffer(struct pipe_context *pctx,
+                           struct pipe_resource *dst,
+                           struct pipe_resource *src, unsigned buffer_offset,
+                           unsigned buffer_stride,
+                           unsigned buffer_layer_stride, unsigned level,
+                           const struct pipe_box *box);
+
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,
                               unsigned dstx, unsigned dsty, unsigned dstz,
@@ -2099,6 +2135,10 @@ uint8_t agx_nir_analyze_fullscreen_tri(nir_shader *nir,
                                        bool *out_z_in_m11);
 uint8_t agx_nir_analyze_fs_color_outputs(nir_shader *nir,
                                          bool *out_uses_discard);
+void agx_nir_analyze_fs_color_output_masks(
+   nir_shader *nir, uint8_t out_masks[PIPE_MAX_COLOR_BUFS],
+   bool *out_uses_discard);
+void agx_g17p_compute_templates_free(struct agx_g17p_compute_template **head);
 
 struct asahi_bg_eot {
    uint64_t usc;

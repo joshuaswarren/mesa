@@ -11,6 +11,7 @@
 #include "hk_entrypoints.h"
 #include "hk_event.h"
 #include "hk_query_oq.h"
+#include "hk_queue.h"
 #include "asahi/libagx/query.h"
 
 static unsigned tests, failures;
@@ -395,10 +396,21 @@ test_inline_transition(void)
    struct hk_cmd_buffer *cmd = new_cmd();
    struct hk_cs *render = add_inline_render(cmd, 1);
    brl_sync_transition_prepare(cmd, HK_SYNC_GFX);
+   T("layout transition waits for the render, not query availability",
+     cmd->sync.brl_transition_dep[HK_SYNC_VDM].cut == render &&
+        cmd->sync.brl_transition_dep[HK_SYNC_CDM].cut == NULL);
+
+   /* Beginning a transition flushes inline availability before setting
+    * brl_transition_active, so the availability stream is never tagged as a
+    * transition stream and brl_sync_transition_end() does not order later
+    * graphics work behind it. */
+   brl_sync_transition_begin(cmd);
    struct hk_cs *post = last_cs(cmd);
-   T("layout transition captures the post-graphics dependency",
-     post != render && post->oq_avail_deferred &&
-        cmd->sync.brl_transition_dep[HK_SYNC_CDM].cut == post);
+   brl_sync_transition_end(cmd, HK_SYNC_GFX);
+   T("transition begin flushes inline availability outside the transition",
+     post != render && post->oq_avail_deferred && !post->sync.brl_transition &&
+        (post->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+        cmd->sync.req[util_logbase2(HK_SYNC_GFX)][HK_SYNC_CDM].cut == NULL);
 }
 
 static void
@@ -431,10 +443,16 @@ test_inline_event(bool wait)
 
    struct hk_cs *post = list_first_entry(&render->node, struct hk_cs, node);
    struct hk_cs *event_cs = last_cs(cmd);
-   T(wait ? "event wait waits for post-graphics availability"
-          : "event write waits for post-graphics availability",
-     post != render && post != event_cs && post->oq_avail_deferred &&
-        event_cs->sync.dep[HK_SYNC_CDM].cut == post);
+   if (wait) {
+      T("event wait waits for the render, not post-graphics availability",
+        post != render && post != event_cs && post->oq_avail_deferred &&
+           event_cs->sync.dep[HK_SYNC_VDM].cut == render &&
+           event_cs->sync.dep[HK_SYNC_CDM].cut == NULL);
+   } else {
+      T("event write waits for post-graphics availability",
+        post != render && post != event_cs && post->oq_avail_deferred &&
+           event_cs->sync.dep[HK_SYNC_CDM].cut == post);
+   }
 }
 
 static void
@@ -819,11 +837,12 @@ test_order_forward(void)
 static void
 test_stamp_chips(void)
 {
-   T("chips: native HAL200 and M5 renders carry availability",
+   T("chips: native HAL200, M5, and G18G renders carry availability",
      hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
-        hk_oq_render_stamps_supported(AGX_CHIP_G17S));
+        hk_oq_render_stamps_supported(AGX_CHIP_G17S) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G18G));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&
@@ -985,6 +1004,114 @@ test_no_query_access_and_m5_reverse(void)
    test_chip = AGX_CHIP_G17P;
 }
 
+static void
+test_oq_post_gfx_stamp_kind(void)
+{
+   /* A post-graphics query availability stream gets HK_SYNC_STAMP: pipeline
+    * barriers (even ALL_COMMANDS -> ALL_COMMANDS) do not stall subsequent
+    * renders or computes behind it, while query commands still order after it
+    * both in-CB and across CBs. */
+   struct hk_cmd_buffer *cb1 = new_cmd();
+   struct hk_cs *r1 = add_inline_render(cb1, 1);
+   hk_sync_barrier(cb1, HK_SYNC_ALL, HK_SYNC_ALL);
+   struct hk_cs *post = last_cs(cb1);
+   T("post_gfx OQ availability carries HK_SYNC_STAMP only",
+     post != r1 && post->oq_avail_deferred &&
+        (post->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+
+   struct hk_cs *r2 = add(cb1, false);
+   T("subsequent render waits on r1, not post_gfx OQ availability",
+     r2->sync.dep[HK_SYNC_VDM].cut == r1 &&
+        r2->sync.dep[HK_SYNC_CDM].cut == NULL &&
+        r2->sync.dep_ta[HK_SYNC_CDM].cut == NULL);
+
+   struct hk_cs *comp = add(cb1, true);
+   T("subsequent compute waits on r1, not post_gfx OQ availability",
+     comp->sync.dep[HK_SYNC_VDM].cut == r1 &&
+        comp->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+   /* Verify directly without an intervening compute stream that an in-CB
+    * query command (copy / reset) still waits on HK_SYNC_STAMP post_gfx. */
+   struct hk_cmd_buffer *cb_direct = new_cmd();
+   struct hk_cs *rd = add_inline_render(cb_direct, 1);
+   hk_sync_barrier(cb_direct, HK_SYNC_ALL, HK_SYNC_ALL);
+   struct hk_cs *post_d = last_cs(cb_direct);
+   struct hk_cs *rd2 = add(cb_direct, false);
+   cb_direct->sync.kind_override = HK_SYNC_ALL;
+   struct hk_cs *copy_d = hk_query_command_cs(cb_direct);
+   if (!copy_d)
+      abort();
+   copy_d->stats.cmds++;
+   cb_direct->sync.kind_override = 0;
+   hk_cmd_buffer_end_compute(cb_direct);
+   T("in-CB query command directly waits on HK_SYNC_STAMP post_gfx",
+     rd2->sync.dep[HK_SYNC_CDM].cut == NULL &&
+        copy_d->sync.dep[HK_SYNC_CDM].cut == post_d &&
+        rd != rd2);
+
+   /* Cross-CB submission: cb_a ends with post_gfx OQ + ALL_COMMANDS barrier;
+    * cb_b runs a render (must NOT wait on post_gfx) and cb_c runs a query
+    * command (MUST wait on post_gfx). */
+   struct hk_cmd_buffer *cb_a = new_cmd();
+   struct hk_cs *ra = add_inline_render(cb_a, 1);
+   hk_sync_barrier(cb_a, HK_SYNC_ALL, HK_SYNC_ALL);
+   struct hk_cs *post_a = last_cs(cb_a);
+   hk_resolve_deferred_oq_available(cb_a);
+
+   struct hk_cmd_buffer *cb_b = new_cmd();
+   struct hk_cs *rb = add(cb_b, false);
+
+   struct hk_cmd_buffer *cb_c = new_cmd();
+   cb_c->sync.kind_override = HK_SYNC_ALL;
+   struct hk_cs *copy_c = hk_query_command_cs(cb_c);
+   if (!copy_c)
+      abort();
+   copy_c->stats.cmds++;
+   cb_c->sync.kind_override = 0;
+   hk_cmd_buffer_end_compute(cb_c);
+
+   struct hk_queue q = {0};
+   q.sync.exact_prior = true;
+   struct hk_cmd_buffer *cbs[] = {cb_a, cb_b, cb_c};
+   T("cross-CB resolve succeeds",
+     hk_sync_resolve_submit(&q, cbs, ARRAY_SIZE(cbs), false, false, 0, NULL));
+   T("cross-CB render waits on ra, not post_a",
+     rb->sync.barrier[HK_SYNC_VDM] == ra->sync.index &&
+        rb->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        rb->sync.prior[HK_SYNC_CDM] == 0);
+   T("cross-CB query command waits on post_a",
+     copy_c->sync.barrier[HK_SYNC_CDM] == post_a->sync.index);
+}
+
+static void
+test_oq_post_gfx_heap_promotion(void)
+{
+   /* When a render pass opens post_gfx for query availability (HK_SYNC_STAMP)
+    * and a later draw in the same pass uses the geometry heap,
+    * hk_sync_heap_used() promotes post_gfx to HK_SYNC_GFX so subsequent
+    * barriers and heap passes wait for the heap reset. */
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *r1 = add_inline_render(cmd, 1);
+   cmd->current_cs.gfx = r1;
+   hk_flush_oq_pending(cmd);
+   struct hk_cs *post = cmd->current_cs.post_gfx;
+   T("heap promotion setup: post_gfx starts as HK_SYNC_STAMP",
+     post != NULL && (post->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+
+   hk_sync_heap_used(cmd);
+   T("hk_sync_heap_used promotes post_gfx to HK_SYNC_GFX | HK_SYNC_GFX_MEM",
+     (post->sync.kind & HK_SYNC_GFX) != 0 &&
+        (post->sync.kind & HK_SYNC_GFX_MEM) != 0 &&
+        cmd->sync.last[util_logbase2(HK_SYNC_GFX)][HK_SYNC_CDM] == post);
+
+   cmd->current_cs.gfx = NULL;
+   cmd->current_cs.post_gfx = NULL;
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+   struct hk_cs *r2 = add(cmd, false);
+   T("subsequent render after promoted heap post_gfx waits on post_gfx",
+     r2->sync.dep[HK_SYNC_CDM].cut == post);
+}
+
 int
 main(void)
 {
@@ -1006,6 +1133,8 @@ main(void)
    test_stamp_chips();
    test_join_moves_query_access_ranges();
    test_no_query_access_and_m5_reverse();
+   test_oq_post_gfx_stamp_kind();
+   test_oq_post_gfx_heap_promotion();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

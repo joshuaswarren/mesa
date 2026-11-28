@@ -49,6 +49,7 @@ extern "C" {
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 extern "C" {
 #include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
@@ -18852,6 +18853,9 @@ TEST_F(AGX3PackBinary, AGX3SignedMemoryByteOffsetLoadAndStore)
                }
                if (!is_store)
                   d.slot = 1;
+               else if (agx_chip_has_cap(t.chip,
+                                         AGX_CAP_COMPUTE_COHERENT_STORE))
+                  d.coherent = true;
 
                uint8_t bytes[AGX3_MEM_MAX_LENGTH], len = 0;
                ASSERT_TRUE(is_store
@@ -19257,8 +19261,9 @@ TEST_F(AGX3PackBinary, ComputeShadow2DArrayRegisterDescRetiresLiveSlot6OnAGX3C)
    EXPECT_EQ(b->shader->agx3_staging_halfs, 32u);
 }
 
-/* Negative cases: compute 2D-array shadow samples with register LOD stay on
- * bank 0 for AGX3B, for AGX3D (emit_agx3d), and for non-compute stages. */
+/* Negative cases: register-descriptor 2D-array shadow samples with register
+ * LOD stay on bank 0 outside AGX3C compute (uniform/immediate descriptors use
+ * relocatable_2d_array on both AGX3B and non-AGX3D AGX3C). */
 TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
 {
    const struct {
@@ -19284,6 +19289,8 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
       b->shader->stage = c.stage;
       b->shader->max_reg = 127;
 
+      const agx_index tex = agx_register(40, AGX_SIZE_64);
+      const agx_index smp = agx_register(44, AGX_SIZE_64);
       for (unsigned i = 0; i < 2; ++i) {
          agx_index dest = agx_register(60 + 8 * i, AGX_SIZE_32);
          dest.channels_m1 = 3;
@@ -19296,7 +19303,7 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
          ref.discard = true;
          auto *I = agx_texture_sample_to(
             b, dest, coord, lod, agx_immediate(0),
-            agx_immediate(0), agx_immediate(0), ref,
+            tex, smp, ref,
             AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0,
             false, true, false, AGX_GATHER_NONE, false);
          I->mask = 1;
@@ -19310,6 +19317,105 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
        * only non-G18G cases keep staging_halfs == 8. */
       if (!c.agx3d) {
          EXPECT_EQ(b->shader->agx3_staging_halfs, 8u);
+      }
+   }
+}
+
+/* Consecutive 2D register-LOD / register-bias samples and 9-tap 2D-array
+ * shadow register-LOD samples (e.g. VK_EXT_image_view_min_lod lowering of
+ * SampleLevel/SampleCmpLevelZero) allocate disjoint 8-half staging banks on
+ * AGX3B without early slot-1 retirement. */
+TEST_F(AGX3PackBinary, RegisterLodAndBias2DAnd2DArrayUseDisjointBanksOnAGX3B)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   for (enum agx_lod_mode mode :
+        {AGX_LOD_MODE_LOD_MIN, AGX_LOD_MODE_AUTO_LOD_BIAS}) {
+      SCOPED_TRACE(mode);
+      agx_builder *b = builder(enc);
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 127;
+
+      const agx_index lod = agx_register(4, AGX_SIZE_16);
+      for (unsigned i = 0; i < 5; ++i) {
+         agx_index dest = agx_register(48 + 8 * i, AGX_SIZE_32);
+         dest.channels_m1 = 3;
+         agx_index coord = agx_register(8 + 4 * i, AGX_SIZE_32);
+         coord.channels_m1 = 1;
+         auto *I = agx_texture_sample_to(
+            b, dest, coord, lod, agx_immediate(0),
+            agx_uniform(0, AGX_SIZE_64), agx_uniform(4, AGX_SIZE_64),
+            agx_null(), AGX_DIM_2D, mode, 0, false, false, false,
+            AGX_GATHER_NONE, false);
+         I->mask = 15;
+      }
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+      EXPECT_TRUE(b->shader->agx3_staging_known);
+      EXPECT_EQ(b->shader->agx3_staging_halfs, 40u);
+
+      for (unsigned i = 0; i < 5; ++i) {
+         uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_tex_stage_typed_lod_at(
+            enc, 8 * i, 4, 1 + i, 0, false, false, AGX3_TEX_LEVEL_FLOAT,
+            bytes, &len));
+         EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                   code.end())
+            << "missing typed LOD staging at bank " << (8 * i);
+      }
+
+      /* Later taps must not retire slot 1 early to reclaim bank 0. */
+      for (unsigned i = 1; i < 5; ++i) {
+         uint8_t retire_s1[AGX3_ALU_MAX_LENGTH], rlen = 0;
+         ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 48 + 8 * i, 0x1,
+                                                 retire_s1, &rlen));
+         EXPECT_EQ(std::search(code.begin(), code.end(), retire_s1,
+                               retire_s1 + rlen),
+                   code.end())
+            << "unexpected early slot-1 retirement on tap " << i;
+      }
+   }
+
+   /* 9-tap 2D-array shadow comparison with register LOD (3x3 PCF with
+    * image_view_min_lod): stages on slot 6, spreads across banks 0..64
+    * (escalating bank 64 to ep4), and keeps all 9 taps in flight. */
+   {
+      agx_builder *b = builder(enc);
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 127;
+
+      const agx_index lod = agx_register(4, AGX_SIZE_16);
+      const agx_index ref = agx_register(6, AGX_SIZE_32);
+      for (unsigned i = 0; i < 9; ++i) {
+         agx_index dest = agx_register(24 + 8 * i, AGX_SIZE_32);
+         dest.channels_m1 = 3;
+         agx_index coord = agx_register(8 + 8 * (i % 2), AGX_SIZE_32);
+         coord.channels_m1 = 2;
+         auto *I = agx_texture_sample_to(
+            b, dest, coord, lod, agx_immediate(0),
+            agx_uniform(0, AGX_SIZE_64), agx_uniform(4, AGX_SIZE_64),
+            ref, AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0, false, true, false,
+            AGX_GATHER_NONE, false);
+         I->mask = 1;
+      }
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+      EXPECT_TRUE(b->shader->agx3_staging_known);
+      EXPECT_EQ(b->shader->agx3_staging_halfs, 72u);
+
+      for (unsigned i = 0; i < 9; ++i) {
+         uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_tex_stage_array_lod_at(
+            enc, 8 * i, (8 + 8 * (i % 2)) + 4, 4, 6, 0,
+            false, false, false, false, bytes, &len));
+         EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                   code.end())
+            << "missing array+LOD staging at bank " << (8 * i);
       }
    }
 }
@@ -19719,4 +19825,137 @@ TEST_F(AGX3PackBinary, ComputeImageblockBlockStorePacks)
    ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
    append(want, end.bytes, end.length);
    EXPECT_EQ(pack(b), want);
+}
+
+TEST_F(AGX3PackBinary, G17PComputeDeviceStoreSetsCoherentPolicy)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      mesa_shader_stage stage;
+      bool expect_coherent;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_COMPUTE, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_VERTEX, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, MESA_SHADER_COMPUTE, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_COMPUTE, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, MESA_SHADER_COMPUTE, false},
+   };
+   for (const auto &c : cases) {
+      EXPECT_EQ(c.expect_coherent,
+                c.stage == MESA_SHADER_COMPUTE &&
+                   agx_chip_has_cap(c.chip, AGX_CAP_COMPUTE_COHERENT_STORE));
+      agx_builder *b = builder(c.enc);
+      key.dev.chip = c.chip;
+      b->shader->stage = c.stage;
+      agx_device_store(b, agx_register(0, AGX_SIZE_32),
+                       agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                       AGX_FORMAT_I32, 1, 0, false);
+      agx_stop(b);
+
+      struct agx3_mem_desc d = {};
+      d.data = 0;
+      d.width = AGX3_MEM_W32;
+      d.mask = 1;
+      d.shift = 0;
+      d.base_is_uniform = true;
+      d.base = 0;
+      d.idx_kind = AGX3_MEM_IDX_IMM;
+      d.byte_off = 0;
+      d.slot = 0;
+      d.wait_mask = 0;
+      d.coherent = c.expect_coherent;
+
+      uint8_t st[AGX3_MEM_MAX_LENGTH], st_len = 0;
+      ASSERT_TRUE(agx3_mem_encode_store(c.enc, &d, st, &st_len));
+      struct agx3_encoded_end end;
+      ASSERT_TRUE(agx3_pack_end(c.enc, &end));
+      std::vector<uint8_t> want;
+      append(want, st, st_len);
+      append(want, end.bytes, end.length);
+      const auto got = pack(b);
+      ASSERT_GE(got.size(), want.size());
+      if (c.stage == MESA_SHADER_FRAGMENT) {
+         EXPECT_EQ(std::vector<uint8_t>(got.end() - want.size(), got.end()),
+                   want);
+      } else {
+         EXPECT_EQ(got, want);
+      }
+   }
+}
+
+/* PIXINFO composes the destination half, the coverage half, the scoreboard
+ * slot and the incoming wait mask into their fields and nothing else. */
+TEST(AGX3PixInfo, ComposesSampleGroupFields)
+{
+   const struct {
+      uint16_t dest, src;
+      uint8_t slot;
+      uint16_t wait;
+   } cases[] = {
+      {2, 1, 6, 0}, {26, 8, 6, 1}, {12, 8, 6, 1}, {190, 191, 1, 0x21},
+   };
+   for (const auto &c : cases) {
+      uint8_t bytes[AGX3_TILE_MAX_LENGTH];
+      uint8_t len = 0;
+      ASSERT_TRUE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, c.dest, c.src, c.slot,
+                               c.wait, bytes, &len));
+      ASSERT_EQ(len, 14u);
+      uint64_t f[AGX3_MAX_FIELDS];
+      ASSERT_GE(agx3_decode(&agx3b_table, bytes, len, AGX3_MN_pixinfo, f), 0);
+      EXPECT_EQ(f[2], c.dest);
+      EXPECT_EQ(f[44], c.src);
+      EXPECT_EQ(f[12], c.slot);
+      for (unsigned i = 0; i < 6; ++i)
+         EXPECT_EQ(f[18 + i], (c.wait >> i) & 1u) << "wait slot " << i + 1;
+      /* A 16-bit result from a register source. */
+      EXPECT_EQ(f[9], 2u);
+      EXPECT_EQ(f[10], 1u);
+      EXPECT_EQ(f[51], 2u);
+      EXPECT_EQ(f[56], 0x100u);
+   }
+
+   uint8_t bytes[AGX3_TILE_MAX_LENGTH];
+   uint8_t len = 0;
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3C, 2, 1, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 0, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 7, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 192, 1, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 192, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 6, 0x40, bytes, &len));
+   EXPECT_EQ(len, 0u);
+}
+
+/* A sample-groups tile load packs as PIXINFO of its coverage register on the
+ * tile-read slot, and is refused where PIXINFO has no form. */
+TEST_F(AGX3PackBinary, SampleGroupsLoadPacksAsPixinfo)
+{
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_instr *I = agx_ld_tile_to(b, agx_register(2, AGX_SIZE_16),
+                                    agx_register(1, AGX_SIZE_16), agx_null(),
+                                    AGX_FORMAT_I16, 1, 0, false, 0);
+      I->sample_groups = true;
+      agx_stop(b);
+      const std::vector<uint8_t> code = pack(b);
+      ASSERT_GE(code.size(), 14u);
+      uint64_t f[AGX3_MAX_FIELDS];
+      ASSERT_GE(agx3_decode(&agx3b_table, code.data(), 14, AGX3_MN_pixinfo, f),
+                0);
+      EXPECT_EQ(f[2], 2u);
+      EXPECT_EQ(f[44], 1u);
+      EXPECT_EQ(f[12], 6u);
+   }
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_instr *I = agx_ld_tile_to(b, agx_register(2, AGX_SIZE_16),
+                                    agx_register(1, AGX_SIZE_16), agx_null(),
+                                    AGX_FORMAT_I16, 1, 0, false, 0);
+      I->sample_groups = true;
+      agx_stop(b);
+      EXPECT_TRUE(pack(b, false).empty());
+   }
 }

@@ -47,8 +47,9 @@ extern "C" {
 
 /* Representable spill-slot bitfield capacity in agx_index::reg (8192 halves =
  * 16 KiB). Actual RA spill allocation is bounded per-target and per-stage in
- * agx_register_allocate.c; AGX2 stays at AGX2_MAX_SPILL_SLOTS (4 KiB) to
- * preserve its per-core agx_scratch memory bound.
+ * agx_register_allocate.c; AGX2 defaults to AGX2_MAX_SPILL_SLOTS (4 KiB) when
+ * max_scratch_B is unset and honors larger max_scratch_B up to
+ * AGX_NUM_MODELED_REGS within its 64 KiB immediate stack offset ceiling.
  */
 #define AGX_NUM_MODELED_REGS_LOG2 (13)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
@@ -453,6 +454,12 @@ typedef struct {
 
    /* TODO: Handle tilebuffer ops more efficient */
    bool explicit_coords : 1;
+
+   /* AGX3B: this ld_tile is PIXINFO (nir_intrinsic_load_sample_groups_agx).
+    * Its source is the coverage word and its 16-bit destination the packed
+    * sample groups. It names no target bytes: the tile protocols give it the
+    * colour transaction of a first read, and nothing else. */
+   bool sample_groups : 1;
 
    /* Logical attachment identity, independent of the physical pixel_offset. */
    uint8_t colour_target;
@@ -1126,14 +1133,16 @@ enum agx_cursor_option {
 /* The stages whose AGX3 samples take an explicit level the vertex way: the
  * packer's vertex_explicit_lod (agx3_pack_binary.c), which also lets an array
  * comparison keep an immediate level (agx_optimizer_inline_imm). A G17P mesh
- * program is VDM-launched like a vertex program. */
+ * program and M5 mesh/task programs are VDM-launched like vertex programs. */
 static inline bool
 agx3_vertex_explicit_lod_stage(mesa_shader_stage stage,
                                enum agx_isa_encoding enc)
 {
    return stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY ||
           stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL ||
-          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH);
+          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH) ||
+          (enc == AGX_ISA_ENCODING_AGX3C &&
+           (stage == MESA_SHADER_MESH || stage == MESA_SHADER_TASK));
 }
 
 typedef struct {

@@ -732,6 +732,18 @@ vk_queue_submit_final(struct vk_queue *queue,
          result = vk_queue_set_lost(queue, "Failed to unwrap sync signal");
    }
 
+   /* A waiter may consume a binary signal, or destroy the sync after observing
+    * completion, as soon as the kernel installs it — which can happen before
+    * driver_submit returns.  Pin each signal sync and take its pending token
+    * now so that vk_sync_finish() waits until we are done noting pending
+    * state, and any concurrent consume wins over vk_sync_note_pending().
+    */
+   STACK_ARRAY(uint64_t, pending_tokens, submit->signal_count);
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      pending_tokens[i] = submit->signals[i].sync != NULL ?
+                          vk_sync_pending_begin(submit->signals[i].sync) : 0;
+   }
+
    /* For queues participating in emulation, redirect the submission to the
     * real underlying queue so that driver_submit always sees the queue with
     * actual hardware resources. The lock on the real queue unconditionally
@@ -762,8 +774,22 @@ vk_queue_submit_final(struct vk_queue *queue,
          result = vk_queue_set_lost(queue, "queue::driver_submit failed");
          vk_queue_submit_signal_dropped(queue, submit);
       }
+      for (uint32_t i = 0; i < submit->signal_count; i++) {
+         if (submit->signals[i].sync != NULL)
+            vk_sync_pending_end(submit->signals[i].sync, false, 0, 0);
+      }
+      STACK_ARRAY_FINISH(pending_tokens);
       return result;
    }
+
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      if (submit->signals[i].sync != NULL) {
+         vk_sync_pending_end(submit->signals[i].sync, true,
+                             submit->signals[i].signal_value,
+                             pending_tokens[i]);
+      }
+   }
+   STACK_ARRAY_FINISH(pending_tokens);
 
    if (submit->_signal_points) {
       for (uint32_t i = 0; i < submit->signal_count; i++) {
@@ -844,6 +870,39 @@ done:
    return result;
 }
 
+static VkResult
+vk_queue_wait_pending(struct vk_device *device,
+                      uint32_t wait_count,
+                      const struct vk_sync_wait *waits,
+                      uint64_t abs_timeout_ns)
+{
+   if (wait_count == 0)
+      return VK_SUCCESS;
+
+   uint32_t first_unknown = wait_count;
+   for (uint32_t i = 0; i < wait_count; i++) {
+      if (!vk_sync_wait_is_known_pending(waits[i].sync, waits[i].wait_value)) {
+         first_unknown = i;
+         break;
+      }
+   }
+
+   if (first_unknown == wait_count)
+      return VK_SUCCESS;
+
+   STACK_ARRAY(struct vk_sync_wait, pending_waits, wait_count - first_unknown);
+   uint32_t pending_count = 0;
+   for (uint32_t i = first_unknown; i < wait_count; i++) {
+      if (!vk_sync_wait_is_known_pending(waits[i].sync, waits[i].wait_value))
+         pending_waits[pending_count++] = waits[i];
+   }
+
+   VkResult result = vk_sync_wait_many(device, pending_count, pending_waits,
+                                       VK_SYNC_WAIT_PENDING, abs_timeout_ns);
+   STACK_ARRAY_FINISH(pending_waits);
+   return result;
+}
+
 static int
 vk_queue_submit_thread_func(void *_data)
 {
@@ -878,9 +937,9 @@ vk_queue_submit_thread_func(void *_data)
       /* Drop the lock while we wait */
       mtx_unlock(&queue->submit.mutex);
 
-      result = vk_sync_wait_many(queue->base.device,
-                                 submit->wait_count, submit->waits,
-                                 VK_SYNC_WAIT_PENDING, UINT64_MAX);
+      result = vk_queue_wait_pending(queue->base.device,
+                                     submit->wait_count, submit->waits,
+                                     UINT64_MAX);
       if (unlikely(result != VK_SUCCESS)) {
          vk_queue_set_lost(queue, "Wait for time points failed");
          mtx_lock(&queue->submit.mutex);
@@ -1151,10 +1210,12 @@ vk_queue_submit_move_binary_waits_to_temps(struct vk_device *device,
        * won't actually block for long.  This ensures that the
        * vk_sync_move below will succeed.
        */
-      result = vk_sync_wait(device, submit->waits[i].sync, 0,
-                            VK_SYNC_WAIT_PENDING, UINT64_MAX);
-      if (unlikely(result != VK_SUCCESS))
-         return result;
+      if (!vk_sync_wait_is_known_pending(submit->waits[i].sync, 0)) {
+         result = vk_sync_wait(device, submit->waits[i].sync, 0,
+                               VK_SYNC_WAIT_PENDING, UINT64_MAX);
+         if (unlikely(result != VK_SUCCESS))
+            return result;
+      }
 
       result = vk_sync_create(device,
                               submit->waits[i].sync->type,
@@ -1176,6 +1237,49 @@ vk_queue_submit_move_binary_waits_to_temps(struct vk_device *device,
 }
 
 static VkResult
+vk_queue_reset_binary_waits(struct vk_queue *queue,
+                            struct vk_queue_submit *submit)
+{
+   /* If threaded submit is possible on this device, we need to ensure that
+    * binary semaphore payloads get reset so that any other threads can
+    * properly wait on them for dependency checking.  Because we don't
+    * currently have a submit thread, we can directly reset those binary
+    * semaphore payloads.
+    *
+    * If the vk_sync is in our signal set, we can consider it to have been
+    * both reset and signaled by queue_submit_final().  A reset in this case
+    * would be wrong because it would throw away our signal operation.  If we
+    * don't signal the vk_sync, then we need to reset it.
+    */
+   if (!vk_device_supports_threaded_submit(queue->base.device) ||
+       !submit->_has_binary_permanent_semaphore_wait)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      if ((submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) ||
+          submit->_wait_temps[i] != NULL)
+         continue;
+
+      bool was_signaled = false;
+      for (uint32_t j = 0; j < submit->signal_count; j++) {
+         if (submit->signals[j].sync == submit->waits[i].sync) {
+            was_signaled = true;
+            break;
+         }
+      }
+
+      if (!was_signaled) {
+         VkResult result = vk_sync_reset(queue->base.device,
+                                         submit->waits[i].sync);
+         if (unlikely(result != VK_SUCCESS))
+            return result;
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 vk_queue_submit(struct vk_queue *queue,
                 struct vk_queue_submit *submit)
 {
@@ -1187,15 +1291,15 @@ vk_queue_submit(struct vk_queue *queue,
     * if this queue doesn't have a submit thread, another queue (possibly in a
     * different process) may and that means we our dependencies may not have
     * been submitted to the kernel yet.  Do a quick zero-timeout WAIT_PENDING
-    * on all the wait semaphores to see if we need to start up our own thread.
+    * on any wait semaphores not already known pending to see if we need to
+    * start up our own thread.
     */
    if (device->submit_mode == VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND &&
        queue->submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED) {
       assert(queue->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE);
 
-      result = vk_sync_wait_many(queue->base.device,
-                                 submit->wait_count, submit->waits,
-                                 VK_SYNC_WAIT_PENDING, 0);
+      result = vk_queue_wait_pending(queue->base.device,
+                                     submit->wait_count, submit->waits, 0);
       if (result == VK_TIMEOUT)
          result = vk_queue_enable_submit_thread(queue);
       if (unlikely(result != VK_SUCCESS))
@@ -1224,40 +1328,9 @@ vk_queue_submit(struct vk_queue *queue,
       if (unlikely(result != VK_SUCCESS))
          goto fail;
 
-      /* If threaded submit is possible on this device, we need to ensure that
-       * binary semaphore payloads get reset so that any other threads can
-       * properly wait on them for dependency checking.  Because we don't
-       * currently have a submit thread, we can directly reset that binary
-       * semaphore payloads.
-       *
-       * If we the vk_sync is in our signal set, we can consider it to have
-       * been both reset and signaled by queue_submit_final().  A reset in
-       * this case would be wrong because it would throw away our signal
-       * operation.  If we don't signal the vk_sync, then we need to reset it.
-       */
-      if (vk_device_supports_threaded_submit(device) &&
-          submit->_has_binary_permanent_semaphore_wait) {
-         for (uint32_t i = 0; i < submit->wait_count; i++) {
-            if ((submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) ||
-                submit->_wait_temps[i] != NULL)
-               continue;
-
-            bool was_signaled = false;
-            for (uint32_t j = 0; j < submit->signal_count; j++) {
-               if (submit->signals[j].sync == submit->waits[i].sync) {
-                  was_signaled = true;
-                  break;
-               }
-            }
-
-            if (!was_signaled) {
-               result = vk_sync_reset(queue->base.device,
-                                      submit->waits[i].sync);
-               if (unlikely(result != VK_SUCCESS))
-                  goto fail;
-            }
-         }
-      }
+      result = vk_queue_reset_binary_waits(queue, submit);
+      if (unlikely(result != VK_SUCCESS))
+         goto fail;
 
       vk_queue_submit_destroy(queue, submit);
       return result;
@@ -1421,44 +1494,82 @@ vk_common_QueueSubmit2(VkQueue _queue,
       }
    }
 
-   /* Fast path for a single immediate submit without wait semaphores: keep
-    * the submission descriptor and small arrays on the stack instead of
-    * hitting the device allocator on every queue submission. */
+   /* Fast path for a single immediate submit with small arrays: keep the
+    * submission descriptor and small arrays on the stack instead of hitting
+    * the device allocator on every queue submission.  Wait semaphores can
+    * stay on this path when every wait uses a non-shared permanent payload
+    * and (for THREADED_ON_DEMAND) is already known pending.
+    */
    if (submitCount == 1 &&
        queue->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE &&
        queue->base.device->timeline_mode != VK_DEVICE_TIMELINE_MODE_EMULATED &&
-       pSubmits[0].waitSemaphoreInfoCount == 0 &&
+       pSubmits[0].waitSemaphoreInfoCount <= 4 &&
        pSubmits[0].commandBufferInfoCount <= 4 &&
        pSubmits[0].signalSemaphoreInfoCount <= 4u - (fence != NULL)) {
-      struct vk_command_buffer *cmd_bufs[4];
-      struct vk_sync_signal signals[4];
-      struct vk_queue_submit stack_submit = {
-         .command_buffers = cmd_bufs,
-         .signals = signals,
-         .is_protected = !!(pSubmits[0].flags & VK_SUBMIT_PROTECTED_BIT),
-      };
-      const VkPerformanceQuerySubmitInfoKHR *perf_info =
-         vk_find_struct_const(pSubmits[0].pNext,
-                              PERFORMANCE_QUERY_SUBMIT_INFO_KHR);
-      stack_submit.perf_pass_index =
-         perf_info ? perf_info->counterPassIndex : 0;
+      const bool check_pending =
+         queue->base.device->submit_mode == VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND;
+      bool can_fast_path = true;
 
-      for (uint32_t j = 0; j < pSubmits[0].commandBufferInfoCount; j++) {
-         vk_queue_submit_add_command_buffer(queue, &stack_submit,
-                                            &pSubmits[0].pCommandBufferInfos[j]);
+      for (uint32_t j = 0; j < pSubmits[0].waitSemaphoreInfoCount; j++) {
+         const VkSemaphoreSubmitInfo *wait_info =
+            &pSubmits[0].pWaitSemaphoreInfos[j];
+         VK_FROM_HANDLE(vk_semaphore, semaphore, wait_info->semaphore);
+         const uint64_t wait_value =
+            semaphore->type == VK_SEMAPHORE_TYPE_TIMELINE ? wait_info->value : 0;
+
+         if (semaphore->temporary != NULL ||
+             (semaphore->permanent.flags & VK_SYNC_IS_SHARED) ||
+             (check_pending &&
+              !vk_sync_wait_is_known_pending(&semaphore->permanent, wait_value))) {
+            can_fast_path = false;
+            break;
+         }
       }
 
-      for (uint32_t j = 0; j < pSubmits[0].signalSemaphoreInfoCount; j++) {
-         result = vk_queue_submit_add_semaphore_signal(
-            queue, &stack_submit, &pSubmits[0].pSignalSemaphoreInfos[j]);
+      if (can_fast_path) {
+         struct vk_sync_wait waits[4];
+         struct vk_sync *wait_temps[4] = { NULL };
+         struct vk_command_buffer *cmd_bufs[4];
+         struct vk_sync_signal signals[4];
+         struct vk_queue_submit stack_submit = {
+            .waits = waits,
+            ._wait_temps = wait_temps,
+            .command_buffers = cmd_bufs,
+            .signals = signals,
+            .is_protected = !!(pSubmits[0].flags & VK_SUBMIT_PROTECTED_BIT),
+         };
+         const VkPerformanceQuerySubmitInfoKHR *perf_info =
+            vk_find_struct_const(pSubmits[0].pNext,
+                                 PERFORMANCE_QUERY_SUBMIT_INFO_KHR);
+         stack_submit.perf_pass_index =
+            perf_info ? perf_info->counterPassIndex : 0;
+
+         for (uint32_t j = 0; j < pSubmits[0].waitSemaphoreInfoCount; j++) {
+            vk_queue_submit_add_semaphore_wait(queue, &stack_submit,
+                                               &pSubmits[0].pWaitSemaphoreInfos[j]);
+         }
+
+         for (uint32_t j = 0; j < pSubmits[0].commandBufferInfoCount; j++) {
+            vk_queue_submit_add_command_buffer(queue, &stack_submit,
+                                               &pSubmits[0].pCommandBufferInfos[j]);
+         }
+
+         for (uint32_t j = 0; j < pSubmits[0].signalSemaphoreInfoCount; j++) {
+            result = vk_queue_submit_add_semaphore_signal(
+               queue, &stack_submit, &pSubmits[0].pSignalSemaphoreInfos[j]);
+            if (unlikely(result != VK_SUCCESS))
+               return result;
+         }
+
+         if (fence != NULL)
+            vk_queue_submit_add_fence_signal(queue, &stack_submit, fence);
+
+         result = vk_queue_submit_final(queue, &stack_submit);
          if (unlikely(result != VK_SUCCESS))
             return result;
+
+         return vk_queue_reset_binary_waits(queue, &stack_submit);
       }
-
-      if (fence != NULL)
-         vk_queue_submit_add_fence_signal(queue, &stack_submit, fence);
-
-      return vk_queue_submit_final(queue, &stack_submit);
    }
 
    struct vk_queue_submit *last_submit = NULL;

@@ -56,7 +56,8 @@ build_fs_tri_vs(bool cw, float z_val, bool partial)
 }
 
 static nir_shader *
-build_color_fs(uint8_t rt_mask, bool discard, bool conditional)
+build_color_fs_masked(const uint8_t rt_wmask[PIPE_MAX_COLOR_BUFS],
+                      bool discard, bool conditional)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "color-fs");
@@ -71,9 +72,10 @@ build_color_fs(uint8_t rt_mask, bool discard, bool conditional)
 
    nir_def *c = nir_imm_vec4(&b, 0.25f, 0.5f, 0.75f, 1.0f);
    for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
-      if (!(rt_mask & BITFIELD_BIT(rt)))
+      if (!rt_wmask[rt])
          continue;
-      nir_store_output(&b, c, nir_imm_int(&b, 0), .base = rt, .write_mask = 0xf,
+      nir_store_output(&b, c, nir_imm_int(&b, 0), .base = rt,
+                       .write_mask = rt_wmask[rt],
                        .io_semantics.location = FRAG_RESULT_DATA0 + rt);
       b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt);
    }
@@ -83,6 +85,17 @@ build_color_fs(uint8_t rt_mask, bool discard, bool conditional)
 
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    return b.shader;
+}
+
+static nir_shader *
+build_color_fs(uint8_t rt_mask, bool discard, bool conditional)
+{
+   uint8_t rt_wmask[PIPE_MAX_COLOR_BUFS] = {0};
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+      if (rt_mask & BITFIELD_BIT(rt))
+         rt_wmask[rt] = 0xf;
+   }
+   return build_color_fs_masked(rt_wmask, discard, conditional);
 }
 
 static void
@@ -119,14 +132,25 @@ check_nir_analyzers(void)
    CHECK(agx_nir_analyze_fs_color_outputs(fs_cond, &uses_discard) == 0);
    CHECK(!uses_discard);
    ralloc_free(fs_cond);
+
+   const uint8_t partial_wmask[PIPE_MAX_COLOR_BUFS] = {0xf, 0x3, 0x7, 0x1};
+   nir_shader *fs_partial = build_color_fs_masked(partial_wmask, false, false);
+   uint8_t masks[PIPE_MAX_COLOR_BUFS] = {0};
+   agx_nir_analyze_fs_color_output_masks(fs_partial, masks, &uses_discard);
+   CHECK(!uses_discard);
+   CHECK(masks[0] == 0xf && masks[1] == 0x3 && masks[2] == 0x7 &&
+         masks[3] == 0x1);
+   CHECK(agx_nir_analyze_fs_color_outputs(fs_partial, &uses_discard) == 0x1);
+   ralloc_free(fs_partial);
 }
 
 static struct pipe_resource *
-create_rt(struct pipe_screen *screen, unsigned w, unsigned h, unsigned samples)
+create_rt_format(struct pipe_screen *screen, enum pipe_format format,
+                 unsigned w, unsigned h, unsigned samples)
 {
    struct pipe_resource templ = {
       .target = PIPE_TEXTURE_2D,
-      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .format = format,
       .width0 = w,
       .height0 = h,
       .depth0 = 1,
@@ -140,6 +164,12 @@ create_rt(struct pipe_screen *screen, unsigned w, unsigned h, unsigned samples)
    /* Mark level 0 valid so agx_batch_init_state() schedules a colour reload. */
    agx_resource_set_valid(agx_resource(rsrc), 0);
    return rsrc;
+}
+
+static struct pipe_resource *
+create_rt(struct pipe_screen *screen, unsigned w, unsigned h, unsigned samples)
+{
+   return create_rt_format(screen, PIPE_FORMAT_R8G8B8A8_UNORM, w, h, samples);
 }
 
 static uint32_t
@@ -346,6 +376,63 @@ check_draw_elision(void)
                               &base_zs, &base_vp, &full_ss, 0x3, 3) &
           PIPE_CLEAR_COLOR0) != 0);
 
+   /* Format-aware reload elision: R32_FLOAT (wmask 0x1), R16G16_FLOAT (0x3),
+    * and R8G8B8X8_UNORM (0x7) elide reloads when all live channels are written,
+    * while missing a live channel preserves the reload. */
+   const uint8_t wmask_r_rg[PIPE_MAX_COLOR_BUFS] = {0x1, 0x3};
+   struct pipe_shader_state fs_r_rg_cso = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = build_color_fs_masked(wmask_r_rg, false, false),
+   };
+   void *fs_r_rg = pctx->create_fs_state(pctx, &fs_r_rg_cso);
+
+   const uint8_t wmask_rgb[PIPE_MAX_COLOR_BUFS] = {0x7};
+   struct pipe_shader_state fs_rgb_cso = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = build_color_fs_masked(wmask_rgb, false, false),
+   };
+   void *fs_rgb = pctx->create_fs_state(pctx, &fs_rgb_cso);
+
+   struct pipe_resource *rt_r32f =
+      create_rt_format(screen, PIPE_FORMAT_R32_FLOAT, 128, 64, 1);
+   struct pipe_resource *rt_rg16f =
+      create_rt_format(screen, PIPE_FORMAT_R16G16_FLOAT, 128, 64, 1);
+   struct pipe_resource *rt_rgbx =
+      create_rt_format(screen, PIPE_FORMAT_R8G8B8X8_UNORM, 128, 64, 1);
+
+   /* Positive: R32_FLOAT + R16G16_FLOAT with matching FS masks and colormasks. */
+   struct pipe_blend_state bl_r_rg = {
+      .independent_blend_enable = true,
+      .rt[0] = {.colormask = PIPE_MASK_R},
+      .rt[1] = {.colormask = PIPE_MASK_R | PIPE_MASK_G},
+   };
+   CHECK((run_first_draw_case(pctx, rt_r32f, rt_rg16f, vs, fs_r_rg, &base_rs,
+                              &bl_r_rg, &base_zs, &base_vp, &full_ss, 0xf, 3) &
+          (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_COLOR1)) == 0);
+
+   /* Positive: R8G8B8X8_UNORM with RGB-only FS output and RGB colormask. */
+   CHECK((run_first_draw_case(pctx, rt_rgbx, NULL, vs, fs_rgb, &base_rs,
+                              &mask_rgb, &base_zs, &base_vp, &full_ss, 0xf, 3) &
+          PIPE_CLEAR_COLOR0) == 0);
+
+   /* Negative: R16G16_FLOAT with R-only FS output keeps reload. */
+   CHECK((run_first_draw_case(pctx, rt_rg16f, NULL, vs, fs_r_rg, &base_rs,
+                              &base_bl, &base_zs, &base_vp, &full_ss, 0xf, 3) &
+          PIPE_CLEAR_COLOR0) != 0);
+
+   /* Negative: R16G16_FLOAT with R-only blend colormask keeps reload. */
+   struct pipe_blend_state bl_r_only = {
+      .rt[0] = {.colormask = PIPE_MASK_R},
+   };
+   CHECK((run_first_draw_case(pctx, rt_rg16f, NULL, vs, fs0, &base_rs,
+                              &bl_r_only, &base_zs, &base_vp, &full_ss, 0xf, 3) &
+          PIPE_CLEAR_COLOR0) != 0);
+
+   /* Negative: RGBA8 with RGB-only FS output keeps reload. */
+   CHECK((run_first_draw_case(pctx, rt0, NULL, vs, fs_rgb, &base_rs, &base_bl,
+                              &base_zs, &base_vp, &full_ss, 0xf, 3) &
+          PIPE_CLEAR_COLOR0) != 0);
+
    pctx->bind_vertex_elements_state(pctx, NULL);
    pctx->delete_vertex_elements_state(pctx, ve);
    pctx->bind_vs_state(pctx, NULL);
@@ -354,9 +441,14 @@ check_draw_elision(void)
    pctx->delete_fs_state(pctx, fs0);
    pctx->delete_fs_state(pctx, fs01);
    pctx->delete_fs_state(pctx, fs_disc);
+   pctx->delete_fs_state(pctx, fs_r_rg);
+   pctx->delete_fs_state(pctx, fs_rgb);
    pipe_resource_reference(&rt0, NULL);
    pipe_resource_reference(&rt1, NULL);
    pipe_resource_reference(&rt_ms, NULL);
+   pipe_resource_reference(&rt_r32f, NULL);
+   pipe_resource_reference(&rt_rg16f, NULL);
+   pipe_resource_reference(&rt_rgbx, NULL);
    pctx->destroy(pctx);
    screen->destroy(screen);
    driDestroyOptionInfo(&info);

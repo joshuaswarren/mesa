@@ -54,6 +54,11 @@ struct hk_tensor_op_info {
    uint16_t scale_y_off;       /* scale_y for RESAMPLE */
 };
 
+/* Fast pre-filter before cloning/lowering NIR to check whether a compute
+ * shader can possibly match any tensor-op pattern.
+ */
+bool hk_nir_tensor_op_may_match(const struct nir_shader *orig);
+
 /* Pre-descriptor NIR after explicit push IO. Builds up to two zero-division
  * vectorized compute alternates (`alt_primary_out`, optional `alt_secondary_out`)
  * for certified 3D tensor concat or nearest-neighbor resample shaders. */

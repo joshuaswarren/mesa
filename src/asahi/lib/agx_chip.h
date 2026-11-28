@@ -1155,6 +1155,15 @@ agx_chip_has_packed_ycbcr(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether hardware ASTC HDR decode is qualified on this chip: AGX2, native
+ * AGX3, and M5 (AGX3C/HAL300: G17G/G17S/G17C). Other HAL300 encodings such as
+ * AGX3D (G18G) stay off until qualified on their hardware. */
+static inline bool
+agx_chip_has_astc_hdr(enum agx_chip chip)
+{
+   return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
@@ -1263,14 +1272,23 @@ agx_chip_hw_texel_fetch_bounds(enum agx_chip chip)
 
 /*
  * Whether the Apple9 imageblock applies: up to 128 bytes a sample in a full
- * 32 KiB (32768-byte) tile. Apple's Metal feature set tables give G15 (M3)
- * and G17P (A18 Pro) the same Apple9 limits.
+ * 32 KiB (32768-byte) tile, or 48 KiB where the kernel admits it
+ * (AGX_NATIVE_TILE_BUFFER_48K_BYTES). Apple's Metal feature set tables give
+ * G15 (M3) and G17P (A18 Pro) the same Apple9 limits.
  */
 static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_IMAGEBLOCK;
 }
+
+/* Tile buffer budget of a render on chips with the native imageblock. A
+ * kernel that reports DRM_ASAHI_FEATURE_TILE_BUFFER_48K admits 48 KiB. With
+ * 24-byte samples at 4x that fits 32x16 tiles instead of 16x16, so a render
+ * bins half as many tiles.
+ */
+#define AGX_NATIVE_TILE_BUFFER_BYTES     (32768)
+#define AGX_NATIVE_TILE_BUFFER_48K_BYTES (49152)
 
 /*
  * Whether single-sample 2D colour images are losslessly compressed in the

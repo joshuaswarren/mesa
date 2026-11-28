@@ -2739,6 +2739,9 @@ agx_destroy_context(struct pipe_context *pctx)
    agx_swtnl_destroy(ctx);
    agx_destroy_oq_heap_ctx(ctx);
 
+   for (unsigned i = 0; i < LIBAGX_NUM_PROGRAMS; ++i)
+      agx_g17p_compute_templates_free(&ctx->g17p_precomp_templates[i]);
+
    if (ctx->submit_quarantined) {
       slab_destroy_child(&ctx->transfer_pool);
       slab_destroy_child(&ctx->transfer_pool_unsync);
@@ -3043,6 +3046,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->blit = agx_blit;
    if (screen->caps.generate_mipmap)
       pctx->generate_mipmap = agx_generate_mipmap;
+   if (agx_chip_native_agx3(agx_device(screen)->chip))
+      pctx->image_copy_buffer = agx_image_copy_buffer;
    pctx->flush_resource = agx_flush_resource;
 
    pctx->buffer_map = u_transfer_helper_transfer_map;

@@ -777,6 +777,34 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    return packed;
 }
 
+bool
+hk_image_pack_eot_pbe(struct hk_device *dev, struct hk_image *image,
+                      uint32_t mip_level, uint32_t base_layer,
+                      struct hk_native_pbe_descriptor *out)
+{
+   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       mip_level >= image->vk.mip_levels ||
+       base_layer >= image->vk.array_layers)
+      return false;
+
+   struct hk_image_view view = {
+      .vk = {
+         .image = &image->vk,
+         .view_type = VK_IMAGE_VIEW_TYPE_2D,
+         .format = image->vk.format,
+         .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+         .base_mip_level = mip_level,
+         .level_count = 1,
+         .base_array_layer = base_layer,
+         .layer_count = 1,
+      },
+      .planes = {
+         [0] = { .image_plane = 0 },
+      },
+   };
+   return pack_pbe(dev, &view, 0, HK_DESC_USAGE_BG_EOT, out, NULL, NULL);
+}
+
 /* Put a view texture in the device heap: at the captured index when the view
  * replays (VK_EXT_descriptor_buffer), else anywhere. *index is 0 on failure,
  * so the destroy path never frees an index the view does not own. */
@@ -843,6 +871,12 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
    const float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
    view->sampled_min_lod_fp16 = _mesa_float_to_half(min_lod);
    view->sampled_min_lod_uint16 = min_lod;
+   if (unlikely(min_lod > 0.0f)) {
+      struct hk_physical_device *pdev = hk_device_physical(dev);
+      if (!p_atomic_read(&pdev->min_lod_emulation) &&
+          p_atomic_cmpxchg(&pdev->min_lod_emulation, 0, 1) == 0)
+         hk_min_lod_emulation_remember(pdev);
+   }
 
    {
       const enum pipe_format logical = hk_format_to_pipe_format(view->vk.format);

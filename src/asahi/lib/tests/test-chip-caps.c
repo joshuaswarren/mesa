@@ -52,7 +52,8 @@ static const unsigned all_caps =
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |
    AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH |
-   AGX_CAP_COMPUTE_SMART_WAITS | AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS;
+   AGX_CAP_COMPUTE_SMART_WAITS | AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS |
+   AGX_CAP_COMPUTE_COHERENT_STORE | AGX_CAP_PBE_QUEUED_BUFFER_COPY;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -311,6 +312,40 @@ test_cdm_defer_flush(void)
    }
 }
 
+/* AGX_CAP_COMPUTE_COHERENT_STORE is enabled on the measured G17P row only, and
+ * requires an AGX3B/AGX3C encoder that supports stdev f75=1 (never AGX2 or
+ * AGX3D). */
+static void
+test_compute_coherent_store(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool has = agx_chip_has_cap(c, AGX_CAP_COMPUTE_COHERENT_STORE);
+      const bool expected = c == AGX_CHIP_G17P;
+      CHECK_CHIP(has == expected, c);
+      if (has) {
+         const enum agx_isa_encoding enc = agx_chip_isa_encoding(c);
+         CHECK_CHIP(enc == AGX_ISA_ENCODING_AGX3B ||
+                       enc == AGX_ISA_ENCODING_AGX3C,
+                    c);
+      }
+   }
+}
+
+/* AGX_CAP_PBE_QUEUED_BUFFER_COPY is enabled only on G17C where queued >= 32 MiB
+ * PBE buffer copies have been hardware-qualified; G17P serializes queued PBE
+ * copies, and other M5 SKUs stay off until measured on hardware. */
+static void
+test_pbe_queued_buffer_copy(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_PBE_QUEUED_BUFFER_COPY) ==
+                    (c == AGX_CHIP_G17C),
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -338,6 +373,8 @@ main(void)
       CHECK_CHIP(
          agx_chip_has_cap(c, AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS) == expected, c);
    }
+   test_compute_coherent_store();
+   test_pbe_queued_buffer_copy();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

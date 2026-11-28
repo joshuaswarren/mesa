@@ -407,7 +407,15 @@ hk_queue_query_available_write(struct hk_cmd_buffer *cmd,
                                struct hk_query_pool *pool, uint32_t query,
                                uint32_t value, bool after_gfx)
 {
+   /* A post-graphics availability stream writes only query memory: classify
+    * it as HK_SYNC_STAMP so application pipeline barriers do not stall later
+    * graphics or compute work behind it, while query commands, timestamps,
+    * and events still order after it (hk_sync.h). */
+   const uint8_t saved_kind = cmd->sync.kind_override;
+   if (after_gfx)
+      cmd->sync.kind_override = HK_SYNC_STAMP;
    hk_queue_write(cmd, hk_query_available_addr(pool, query), value, after_gfx);
+   cmd->sync.kind_override = saved_kind;
    if (!pool->handle || vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -631,6 +639,11 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
    hk_note_query_access(cmd, pool, first_index, num_queries);
+   if (!set_available && !vk_command_buffer_has_error(&cmd->vk) &&
+       cmd->current_cs.cs) {
+      cmd->current_cs.cs->stats.query_reset_dispatches++;
+      cmd->current_cs.cs->stats.query_reset_queries += num_queries;
+   }
 }
 
 static void

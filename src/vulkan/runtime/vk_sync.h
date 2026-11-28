@@ -325,6 +325,28 @@ enum vk_sync_flags {
 struct vk_sync {
    const struct vk_sync_type *type;
    enum vk_sync_flags flags;
+
+   /** Number of in-flight signal or submit operations that may still access
+    * this sync (including vk_sync_note_pending()) after publishing a signal
+    * to the backend.  Bit 31 is set when vk_sync_finish() is waiting for the
+    * count to reach zero.
+    */
+   uint32_t pending_submit_count;
+
+   /** What this device knows is already submitted or signaled in the
+    * underlying primitive of a non-shareable, non-shared sync.
+    *
+    * For a timeline, a lower bound on the pending value.  It only grows,
+    * except when the payload is replaced by an import.
+    *
+    * For a binary sync, bit 0 says a signal is pending and the other bits
+    * are a generation.  vk_sync_pending_token() is read before the backend
+    * signal or submit starts and vk_sync_note_pending() sets bit 0 only if
+    * the generation is unchanged.  Every reset, move, import or export
+    * advances the generation both before and after it touches the payload,
+    * so a signal that overlaps one of them never marks the sync pending.
+    */
+   uint64_t pending_value;
 };
 
 /* See VkSemaphoreSubmitInfo */
@@ -424,6 +446,21 @@ VkResult MUST_CHECK vk_sync_set_win32_export_params(struct vk_device *device,
 VkResult MUST_CHECK vk_sync_move(struct vk_device *device,
                                  struct vk_sync *dst,
                                  struct vk_sync *src);
+
+uint64_t vk_sync_pending_token(struct vk_sync *sync);
+
+uint64_t vk_sync_pending_begin(struct vk_sync *sync);
+
+void vk_sync_note_pending(struct vk_sync *sync, uint64_t value,
+                          uint64_t token);
+
+void vk_sync_pending_end(struct vk_sync *sync, bool note, uint64_t value,
+                         uint64_t token);
+
+void vk_sync_clear_pending(struct vk_sync *sync);
+
+bool vk_sync_wait_is_known_pending(struct vk_sync *sync,
+                                   uint64_t wait_value);
 
 struct vk_sync_timeline_point;
 

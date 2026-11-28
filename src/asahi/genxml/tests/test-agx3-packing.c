@@ -643,6 +643,90 @@ test_agx3_live_vdm_draw(void)
       exit(1);
    }
 
+   /* Empty-draw stream-link coalescing for batched robust-index draws:
+    * contiguous empty runs jump in at most LIBAGX_ROBUST_INDEX_COALESCE_BLOCK
+    * strides so VDM never chases tens of thousands of consecutive links. */
+   {
+      const uint32_t n = LIBAGX_ROBUST_INDEX_COALESCE_BLOCK * 2u + 452u;
+      struct libagx_robust_index_draw *jobs = calloc(n, sizeof(*jobs));
+      uint32_t (*cmds)[5] = calloc(n, sizeof(*cmds));
+      CHECK_EQ(jobs != NULL && cmds != NULL, true);
+
+      for (uint32_t i = 0; i < n; ++i) {
+         /* Exercise count==0, instances==0, and both-zero empty shapes. */
+         cmds[i][0] = (i % 3u == 1u) ? 3u : 0u;
+         cmds[i][1] = (i % 3u == 2u) ? 1u : 0u;
+         jobs[i].command = (uintptr_t)cmds[i];
+         jobs[i].empty_draw_jump = UINT64_C(0x100000) + (uint64_t)(i + 1u) * 32u;
+      }
+
+      const enum agx_chip coalesce_chips[] = {
+         AGX_CHIP_G17P,
+         AGX_CHIP_G17G,
+         AGX_CHIP_G17D,
+      };
+      for (unsigned c = 0; c < ARRAY_SIZE(coalesce_chips); ++c) {
+         const enum agx_chip chip = coalesce_chips[c];
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, n, chip),
+                  jobs[LIBAGX_ROBUST_INDEX_COALESCE_BLOCK - 1u].empty_draw_jump);
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(
+                     jobs, LIBAGX_ROBUST_INDEX_COALESCE_BLOCK, n, chip),
+                  jobs[2u * LIBAGX_ROBUST_INDEX_COALESCE_BLOCK - 1u]
+                     .empty_draw_jump);
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(
+                     jobs, 2u * LIBAGX_ROBUST_INDEX_COALESCE_BLOCK, n, chip),
+                  jobs[n - 1u].empty_draw_jump);
+         /* Interior empty slots do not scan. */
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 1, n, chip),
+                  jobs[1].empty_draw_jump);
+         /* Single-draw batch is untouched. */
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, 1, chip),
+                  jobs[0].empty_draw_jump);
+      }
+
+      /* AGX2 chips do not use empty-draw stream links and stay untouched. */
+      CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, n,
+                                                       AGX_CHIP_G13G),
+               jobs[0].empty_draw_jump);
+
+      /* Mixed pattern: verify walking VDM jumps visits every non-empty draw in
+       * exact order while skipping contiguous empty runs in bounded hops. */
+      const uint32_t live[] = { 0u, 5u, 1023u, 1024u, 1030u, n - 1u };
+      for (unsigned k = 0; k < ARRAY_SIZE(live); ++k) {
+         cmds[live[k]][0] = 3u;
+         cmds[live[k]][1] = 1u;
+      }
+      uint32_t seen[ARRAY_SIZE(live)];
+      unsigned n_seen = 0;
+      uint32_t max_consec_links = 0, consec_links = 0;
+      uint32_t cur = 0;
+      while (cur < n) {
+         if (cmds[cur][0] != 0u && cmds[cur][1] != 0u) {
+            CHECK_EQ(n_seen < ARRAY_SIZE(live), true);
+            seen[n_seen++] = cur;
+            consec_links = 0;
+            ++cur;
+         } else {
+            uint64_t target = libagx_robust_index_coalesce_empty_jump(
+               jobs, cur, n, AGX_CHIP_G17D);
+            CHECK_EQ(target > UINT64_C(0x100000), true);
+            uint32_t next = (uint32_t)((target - UINT64_C(0x100000)) / 32u);
+            CHECK_EQ(next > cur && next <= n, true);
+            ++consec_links;
+            if (consec_links > max_consec_links)
+               max_consec_links = consec_links;
+            cur = next;
+         }
+      }
+      CHECK_EQ(n_seen, ARRAY_SIZE(live));
+      for (unsigned k = 0; k < ARRAY_SIZE(live); ++k)
+         CHECK_EQ(seen[k], live[k]);
+      CHECK_EQ(max_consec_links <= 3u, true);
+
+      free(cmds);
+      free(jobs);
+   }
+
    /* The shadow-buffer calculation must never wrap either the 32-index
     * extension limit or the byte allocation passed to the GPU heap. */
    CHECK_EQ(agx_robust_index_clamped_count(64, UINT32_MAX - 16,

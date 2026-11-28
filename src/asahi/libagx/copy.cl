@@ -452,7 +452,7 @@ libagx_resolve_unorm8x4(global uint8_t *dest, global uint8_t *src,
    }
 }
 
-KERNEL(32)
+KERNEL(256)
 libagx_fill_uint4(global uint4 *address, uint layer_stride_uint4, uint a,
                   uint b, uint c, uint d)
 {

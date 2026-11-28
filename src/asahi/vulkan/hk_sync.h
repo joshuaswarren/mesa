@@ -95,13 +95,14 @@ enum hk_sync_kind {
    HK_SYNC_GFX_MEM = 1 << 5,
 
    /* Stream kinds and first scopes only, never named by an application
-    * dependency: a command the driver records to carry a timestamp alone, or
-    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
-    * query memory, which only query commands and later timestamps read, so
-    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
-    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
-    * does not order later work after it. It waits like work of every class
-    * (hk_sync_full_kinds()). */
+    * dependency: a command the driver records to carry a timestamp alone, to
+    * copy timestamps (hk_sync_write_timestamp()), or to publish post-graphics
+    * query availability (hk_flush_oq_pending(),
+    * hk_queue_query_available_write()). It writes nothing but query memory,
+    * which only query commands, events, and later timestamps observe, so only
+    * their first scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope());
+    * a pipeline barrier, even an ALL_COMMANDS one, does not order later work
+    * after it. It waits like work of every class (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
 
    /* Stream kinds and first scopes only, never named by an application
@@ -849,6 +850,15 @@ bool hk_sync_submit_has_unretired_priors(const struct hk_queue *queue);
 /* The driver's own resolve pass after a render: waits on the render. */
 void hk_sync_resolve_begin(struct hk_cmd_buffer *cmd);
 void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
+
+struct hk_image;
+/* Fold a trailing vkCmdResolveImage2 into cs's end-of-tile store_and_resolve:
+ * applies pending transfer waits to cs's fragment half, records dst_image's
+ * tile footprint and attachment bloom, and marks cs as transfer work for
+ * subsequent dependencies. */
+void hk_sync_fold_resolve(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                          const struct hk_image *dst_image, uint32_t level,
+                          uint32_t layer, uint32_t width, uint32_t height);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class. Defined in hk_cmd_buffer.h. */

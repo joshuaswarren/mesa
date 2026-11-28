@@ -62,6 +62,7 @@
 #include "agx3_writeout_core.h"
 #include "agx_compiler.h"
 #include "agx_debug.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "util/half_float.h"
 #include "util/u_debug.h"
 
@@ -4735,7 +4736,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       !query_lod && !I->sparse && (bank_base & 7) == 0;
    const bool relocatable_array = array && !cube && !register_operands &&
       !query_lod && !staged_offset && !register_offset &&
-      !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
+      !gradient_lod && !bias_min && !gradient_min &&
       !(bank_base & 7);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
@@ -4746,15 +4747,15 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
         (three_d && !m5_banked_3d &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
         cube || (gradient_lod && !m5_banked_3d) || bias_min || gradient_min || query_lod ||
-        (enc == AGX_ISA_ENCODING_AGX3B &&
-         ((explicit_lod && !immediate_lod) || register_bias)) ||
-        (enc == AGX_ISA_ENCODING_AGX3C &&
-         (((explicit_lod && !immediate_lod) || register_bias) &&
-          (bank_base & 7))) ||
+        (((explicit_lod && !immediate_lod) || register_bias) &&
+         (bank_base & 7)) ||
         register_offset || (bank_base & 3) ||
         bank_base > AGX3_STAGING_HALFS -
            (m5_banked_3d && gradient_lod
-               ? (vertex_stage ? 40 : 32) : (array || three_d) ? 8 : 4)))
+               ? (vertex_stage ? 40 : 32)
+               : (vertex_stage && explicit_lod && !immediate_lod) ? 16
+               : (array || three_d ||
+                  (explicit_lod && !immediate_lod) || register_bias) ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            enc == AGX_ISA_ENCODING_AGX3C ||
@@ -5381,10 +5382,25 @@ agx3_emit_tile(struct util_dynarray *emission, enum agx_isa_encoding enc,
                bool mrt_store, bool store_f13, bool g18_msaa4, bool g18g)
 {
    const bool load = I->op == AGX_OPCODE_LD_TILE;
+   /* PIXINFO: a 16-bit result from a 16-bit coverage register. Unlike LLDCol
+    * it takes an incoming wait (on the coverage read) in its own wait field. */
+   if (load && I->sample_groups) {
+      const agx_index d = I->dest[0], s = I->src[0];
+      if (enc != AGX_ISA_ENCODING_AGX3B || I->nr_dests != 1 ||
+          I->nr_srcs != 2 || I->explicit_coords ||
+          !agx3_src_is_register(d) || d.size != AGX_SIZE_16 ||
+          !agx3_src_is_register(s) || s.size != AGX_SIZE_16 ||
+          !agx_is_null(I->src[1]))
+         return false;
+      uint8_t bytes[AGX3_TILE_MAX_LENGTH], length = 0;
+      return agx3_pixinfo(enc, d.value, s.value, slot, wait_mask, bytes,
+                          &length) &&
+             agx3_append(emission, bytes, length);
+   }
    if ((!load && I->op != AGX_OPCODE_ST_TILE) ||
        I->nr_dests != (load ? 1 : 0) || I->nr_srcs != (load ? 2 : 3) ||
        I->mask < 1 || I->mask > 15 || I->pixel_offset > UINT8_MAX ||
-       I->explicit_coords)
+       I->explicit_coords || I->sample_groups)
       return false;
 
    const agx_index value = load ? I->dest[0] : I->src[0];
@@ -10156,7 +10172,8 @@ agx3_g17p_lone_colour_pair(agx_context *ctx, unsigned *pair)
    const agx_instr *tile = NULL;
    *pair = 0;
    agx_foreach_instr_global(ctx, I) {
-      if (I->op != AGX_OPCODE_LD_TILE && I->op != AGX_OPCODE_ST_TILE)
+      if ((I->op != AGX_OPCODE_LD_TILE && I->op != AGX_OPCODE_ST_TILE) ||
+          I->sample_groups)
          continue;
       if (tile && (tile->pixel_offset != I->pixel_offset ||
                    tile->colour_target != I->colour_target))
@@ -10848,6 +10865,18 @@ agx3_g17p_local_read_protocol(agx_context *ctx)
             continue;
 
          const bool load = I->op == AGX_OPCODE_LD_TILE;
+         /* PIXINFO opens the colour transaction as a first read does
+          * (agx3_order_g17p_local_read_tile_ops() admitted it), touches no
+          * partition and is not one of the reads the classes count. */
+         if (load && I->sample_groups) {
+            if (!p.multisample || saw_store)
+               return agx3_g17p_mrt_refused();
+            if (!tile_started) {
+               tile_started = true;
+               first_tile_before_cf = (block == first_block && !saw_block0_cf);
+            }
+            continue;
+         }
          struct agx3_tile_sample sample;
          if (I->explicit_coords || I->pixel_offset > UINT8_MAX ||
              I->nr_srcs != (load ? 2 : 3) || I->nr_dests != (load ? 1 : 0) ||
@@ -11108,7 +11137,8 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
                return agx3_g17p_mrt_refused();
             p.ms_tile_stride = stride;
          }
-         if (I->explicit_coords || I->pixel_offset > UINT8_MAX)
+         if (I->explicit_coords || I->sample_groups ||
+             I->pixel_offset > UINT8_MAX)
             return agx3_g17p_mrt_refused();
 
          tile_ops = true;
@@ -16231,9 +16261,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                I->src[3].type != AGX_INDEX_REGISTER &&
                I->src[4].type != AGX_INDEX_REGISTER &&
                (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 I->src[1].type == AGX_INDEX_IMMEDIATE));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool banked_shadow_array =
                enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
                ctx->stage == MESA_SHADER_COMPUTE && I->dim == AGX_DIM_2D_ARRAY &&
@@ -16256,10 +16285,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
                (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
                 I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 (I->src[1].type == AGX_INDEX_IMMEDIATE ||
-                  enc == AGX_ISA_ENCODING_AGX3C)));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool staged_scalar =
                (I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE) ||
@@ -17567,6 +17594,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t len = 0;
             if (!agx3_translate_mem(enc, I, is_store, slot, wait, &d))
                AGX3_REFUSE(I);
+            if (is_store && ctx->stage == MESA_SHADER_COMPUTE &&
+                agx_chip_has_cap(ctx->key->dev.chip,
+                                 AGX_CAP_COMPUTE_COHERENT_STORE)) {
+               /* Promote non-coherent compute device stores to stdev f75=1 on
+                * chips carrying AGX_CAP_COMPUTE_COHERENT_STORE (see
+                * agx_chip_caps.h): writes bypass per-core L1 write-allocation
+                * directly into the shared L2 domain, preserving L1 capacity
+                * for streaming reads while maintaining strictly stronger store
+                * visibility for same-core and post-barrier consumers. */
+               d.coherent = true;
+            }
             if (g17p_vertex_load_policy && !is_store) {
                const bool first = vertex_loads_seen++ == 0;
                const bool last = --device_loads_left == 0;

@@ -190,6 +190,63 @@ check_gen9_astc_4x4_texture(void)
 }
 
 static void
+check_gen10_astc_hdr_textures(void)
+{
+   static const enum agx_channels astc_channels[] = {
+      AGX_CHANNELS_ASTC_4X4,   AGX_CHANNELS_ASTC_5X4,
+      AGX_CHANNELS_ASTC_5X5,   AGX_CHANNELS_ASTC_6X5,
+      AGX_CHANNELS_ASTC_6X6,   AGX_CHANNELS_ASTC_8X5,
+      AGX_CHANNELS_ASTC_8X6,   AGX_CHANNELS_ASTC_8X8,
+      AGX_CHANNELS_ASTC_10X5,  AGX_CHANNELS_ASTC_10X6,
+      AGX_CHANNELS_ASTC_10X8,  AGX_CHANNELS_ASTC_10X10,
+      AGX_CHANNELS_ASTC_12X10, AGX_CHANNELS_ASTC_12X12,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(astc_channels); ++i) {
+      const struct AGX_TEXTURE semantic = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = astc_channels[i],
+         .type = AGX_TEXTURE_TYPE_FLOAT,
+         .swizzle_r = AGX_CHANNEL_R,
+         .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B,
+         .swizzle_a = AGX_CHANNEL_A,
+         .width = 32,
+         .height = 32,
+         .depth = 1,
+         .address = UINT64_C(0x1000001c500),
+      };
+      struct hk_native_texture_descriptor packed;
+      assert(hk_pack_native_texture(10, &packed, &semantic));
+
+      char *log = NULL;
+      size_t log_size = 0;
+      FILE *fp = open_memstream(&log, &log_size);
+      assert(fp);
+      struct AGX_TEXTURE_GEN10 gen10;
+      const bool valid =
+         AGX_TEXTURE_GEN10_unpack(fp, (const uint8_t *)packed.opaque, &gen10);
+      fclose(fp);
+      assert(valid && log_size == 0);
+      free(log);
+
+      assert(gen10.dimension == AGX_TEXTURE_DIMENSION_2D);
+      assert(gen10.layout == AGX_LAYOUT_GPU);
+      assert(gen10.channels == astc_channels[i]);
+      assert(gen10.type == AGX_TEXTURE_TYPE_FLOAT);
+      assert(!gen10.srgb);
+      assert(gen10.width == 32 && gen10.height == 32);
+      assert(gen10.address == semantic.address);
+
+      uint32_t repacked[8];
+      AGX_TEXTURE_GEN10_pack(repacked, &gen10);
+      assert(memcmp(repacked, packed.opaque, sizeof(repacked)) == 0);
+   }
+}
+
+static void
 check_gen9_cube_textures(void)
 {
    /* EXP-0017/EXP-M4-07 prove that an uncompressed cube is six consecutive
@@ -1014,6 +1071,7 @@ main(void)
    check_gen9_bc1_rgba_texture();
    check_gen9_etc2_rgba8_texture();
    check_gen9_astc_4x4_texture();
+   check_gen10_astc_hdr_textures();
    check_gen9_cube_textures();
    check_gen9_cube_array_texture();
    check_gen9_bc_textures();

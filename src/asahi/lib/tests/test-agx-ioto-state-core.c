@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: MIT
  *
  * Differential and fail-closed contract tests for the direct-write G17P
- * compiler LDSHDR and SPECTPR packers in agx_ioto_state_core.c.
+ * compiler LDSHDR and SPECTPR packers in agx_ioto_state_core.c, and for the
+ * fragment SPECLM imageblock record.
  */
 
 #include "../agx_ioto_core.h"
@@ -513,11 +514,53 @@ test_g17p_compiler_spectpr_differential(void)
    return 0;
 }
 
+/* The fragment SPECLM imageblock record. 32x16 tiles of 24-byte samples at 4x
+ * are 48 KiB; our J773g (G16G) trace of a deferred 4x pass programs exactly
+ * this record on its fragment, background and end-of-tile programs. Larger
+ * tiles stay refused, and the output is left untouched. */
+static int
+test_g17p_fragment_speclm(void)
+{
+   static const uint8_t trace_32x16_24b_4x[AGX_IOTO_SPECLM_SIZE] = {
+      0x77, 0x00, 0xaa, 0x06, 0x43, 0x00, 0x00, 0x00,
+   };
+   uint8_t out[AGX_IOTO_SPECLM_SIZE];
+
+   const struct agx_ioto_g17p_imageblock tile48k = {
+      .sample_size_B = 24, .nr_samples = 4, .tile_size_px = 32 * 16,
+   };
+   CHECK(tile48k.sample_size_B * tile48k.nr_samples * tile48k.tile_size_px ==
+         AGX_NATIVE_TILE_BUFFER_48K_BYTES);
+   CHECK(agx_ioto_g17p_fragment_speclm_build(&tile48k, out, sizeof(out)));
+   CHECK(memcmp(out, trace_32x16_24b_4x, sizeof(out)) == 0);
+   ++valid_encodes;
+
+   const struct agx_ioto_g17p_imageblock too_large[] = {
+      /* 64 KiB */
+      {.sample_size_B = 32, .nr_samples = 4, .tile_size_px = 32 * 16},
+      /* 96 KiB */
+      {.sample_size_B = 24, .nr_samples = 4, .tile_size_px = 32 * 32},
+      /* 56 KiB */
+      {.sample_size_B = 56, .nr_samples = 1, .tile_size_px = 32 * 32},
+   };
+   for (size_t i = 0; i < ARRAY_SIZE(too_large); ++i) {
+      memset(out, 0xa5, sizeof(out));
+      CHECK(!agx_ioto_g17p_fragment_speclm_build(&too_large[i], out,
+                                                 sizeof(out)));
+      for (size_t b = 0; b < sizeof(out); ++b)
+         CHECK(out[b] == 0xa5);
+      ++buffer_preserving_rejections;
+   }
+
+   return 0;
+}
+
 int
 main(void)
 {
    CHECK(test_g17p_compiler_ldshdr_differential() == 0);
    CHECK(test_g17p_compiler_spectpr_differential() == 0);
+   CHECK(test_g17p_fragment_speclm() == 0);
    printf("agx_ioto_state_core: %llu valid_encodes, "
           "%llu buffer_preserving_rejections, %llu null_rejections, "
           "0 mismatches\n",

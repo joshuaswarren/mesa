@@ -954,6 +954,49 @@ test_bilinear_resize_border(void)
    }
    s->info.float_controls_execution_mode = 0;
 
+   /* Verify unlowered relaxed nir_op_fdiv matches (as produced after deferred
+    * fdiv lowering), while exact nir_op_fdiv is rejected. */
+   {
+      nir_shader *fdiv_s = build_test_bilinear_resize_border(false);
+      nir_foreach_function_impl(impl, fdiv_s) {
+         nir_builder rb = nir_builder_create(impl);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_alu)
+                  continue;
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (alu->op != nir_op_fmul)
+                  continue;
+               nir_instr *s1 = nir_def_instr(alu->src[1].src.ssa);
+               if (s1->type != nir_instr_type_alu ||
+                   nir_instr_as_alu(s1)->op != nir_op_frcp)
+                  continue;
+               rb.cursor = nir_before_instr(instr);
+               nir_def *q = nir_fdiv(&rb, alu->src[0].src.ssa,
+                                     nir_instr_as_alu(s1)->src[0].src.ssa);
+               nir_def_rewrite_uses(&alu->def, q);
+               nir_instr_remove(instr);
+               nir_instr_remove(s1);
+            }
+         }
+      }
+      struct hk_compute_opt_plan fdiv_plan = {0};
+      assert(hk_nir_match_compute_opt(fdiv_s, 1, layouts, &fdiv_plan));
+      assert(fdiv_plan.kind == HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8);
+
+      nir_foreach_function_impl(impl, fdiv_s) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_alu &&
+                   nir_instr_as_alu(instr)->op == nir_op_fdiv)
+                  nir_instr_as_alu(instr)->fp_math_ctrl = nir_fp_exact;
+            }
+         }
+      }
+      assert(!hk_nir_match_compute_opt(fdiv_s, 1, layouts, &fdiv_plan));
+      ralloc_free(fdiv_s);
+   }
+
    /* SPIR-V FClamp lowers fmax/fmin with nir_fp_preserve_inf; matcher must accept
     * and propagate it onto the emitted clamp ops. */
    {

@@ -917,12 +917,28 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
       agx_builder b =
          agx_init_builder(ctx->shader, agx_before_function(ctx->shader));
 
-      /* Copy immediate/uniform phi sources to memory variables at the start of
+      /* An immediate or uniform phi source needs no memory variable of its
+       * own: parallel copy lowering writes it to the phi's slot on the edge,
+       * through the scratch register a memory-memory copy uses
+       * (agx_lower_parallel_copy.c do_copy()). A variable made at the start
+       * of the program would instead stay live, in a slot of its own, until
+       * the phi, and the edge would copy it from memory to memory. That is
+       * a fill per traversal of the edge where a uniform read suffices.
+       *
+       * A uniform the program writes must still be read at the start.
+       */
+      if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
+          (I->src[s].type == AGX_INDEX_UNIFORM &&
+           !ctx->shader->uniforms_written)) {
+         record_spill(ctx);
+         continue;
+      }
+
+      /* Copy other uniform phi sources to memory variables at the start of
        * the program, where pressure is zero and hence the copy is legal.
        */
       if (I->src[s].type != AGX_INDEX_NORMAL) {
-         assert(I->src[s].type == AGX_INDEX_IMMEDIATE ||
-                I->src[s].type == AGX_INDEX_UNIFORM);
+         assert(I->src[s].type == AGX_INDEX_UNIFORM);
 
          agx_index mem = agx_temp_like(ctx->shader, I->dest[0]);
          assert(mem.memory);
@@ -1548,17 +1564,27 @@ compute_w_entry(struct spill_ctx *ctx)
          all_found &= found;
       }
 
+      const dist_t dist =
+         search_next_uses(&sb->next_use_in, I->dest[0].value);
+
       /* Heuristic: if any phi source is spilled, spill the whole phi. This is
        * suboptimal, but it massively reduces pointless fill/spill chains with
        * massive phi webs. A remat-only pass never spills: the missing sources
        * are constants, rematerialized along their edges.
+       *
+       * A phi this block reads is the exception. Spilled, it is filled before
+       * that read on every path into the block, and its sources still in
+       * registers are spilled on their edges. In registers, only its spilled
+       * sources are filled, each on its own edge, so that costs no more
+       * memory traffic and frees the slot. Whether it fits is left to the
+       * next-use order below, like any other candidate.
        */
-      if (!all_found && !ctx->remat_only)
+      if (!all_found && !ctx->remat_only && dist >= sb->cycles)
          continue;
 
       candidates[j++] = (struct candidate){
          .node = I->dest[0].value,
-         .dist = search_next_uses(&sb->next_use_in, I->dest[0].value),
+         .dist = dist,
       };
    }
 

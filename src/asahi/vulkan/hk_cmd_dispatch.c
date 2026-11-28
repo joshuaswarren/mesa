@@ -587,6 +587,17 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
    struct hk_api_shader *shader = cmd->state.cs.shader;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   if (shader && unlikely(shader->min_lod_source) &&
+       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
+      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+      if (twin) {
+         cmd->state.cs.shader = twin;
+         shader = twin;
+      } else {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
    if (shader && unlikely(shader->border_source) &&
        p_atomic_read(&hk_device_physical(dev)->border_emulation)) {
       struct hk_api_shader *twin = hk_border_twin(dev, shader);
@@ -1769,6 +1780,8 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct hk_g17p_compute_program_ref program;
    if (!hk_g17p_get_precomp_program(cmd, prog, idx, data, data_size,
@@ -1912,6 +1925,8 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct agx_ptr uploaded = hk_pool_alloc(cmd, uploaded_size, 4);
    if (!uploaded.cpu) {
@@ -5217,13 +5232,20 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, selected);
-      const uint64_t wg = agx_workgroup_threads(local_size);
       const uint64_t threads = agx_is_indirect(grid) ? 0 :
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
-      hk_frame_anatomy_note_grid(cs, selected, threads, wg ? threads / wg : 0,
+      const uint64_t wgs =
+         agx_is_indirect(grid) || !local_size.x || !local_size.y || !local_size.z
+            ? 0
+            : (uint64_t)DIV_ROUND_UP(grid.count[0], local_size.x) *
+                 DIV_ROUND_UP(grid.count[1], local_size.y) *
+                 DIV_ROUND_UP(grid.count[2], local_size.z);
+      hk_frame_anatomy_note_grid(cs, selected, threads, wgs,
                                  agx_is_indirect(grid));
    }
    cs->stats.calls++;
+   if (cmd->in_meta)
+      cs->render_pack_compute_internal = true;
 }
 
 static void

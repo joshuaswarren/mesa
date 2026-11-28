@@ -26,6 +26,12 @@
 #include <assert.h>
 #include <string.h>
 
+#include "util/futex.h"
+#if !UTIL_FUTEX_SUPPORTED
+#include "c11/threads.h"
+#endif
+#include "util/stack_array.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/macros.h"
 #include "util/os_time.h"
@@ -81,6 +87,154 @@ vk_sync_type_validate(const struct vk_sync_type *type)
       assert(type->signal);
 }
 
+static inline bool
+vk_sync_is_private(const struct vk_sync *sync)
+{
+   return !(sync->flags & (VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED)) &&
+          !vk_sync_type_is_vk_sync_timeline(sync->type) &&
+          !vk_sync_type_is_vk_sync_binary(sync->type);
+}
+
+#define VK_SYNC_PENDING_WAITERS_BIT (1u << 31)
+
+#if UTIL_FUTEX_SUPPORTED
+static uint32_t vk_sync_pending_wake_seq;
+#endif
+
+uint64_t
+vk_sync_pending_token(struct vk_sync *sync)
+{
+   return p_atomic_read(&sync->pending_value);
+}
+
+uint64_t
+vk_sync_pending_begin(struct vk_sync *sync)
+{
+   ASSERTED uint32_t cur = p_atomic_inc_return(&sync->pending_submit_count);
+   assert((cur & ~VK_SYNC_PENDING_WAITERS_BIT) > 0);
+   return vk_sync_pending_token(sync);
+}
+
+void
+vk_sync_note_pending(struct vk_sync *sync, uint64_t value, uint64_t token)
+{
+   if (!vk_sync_is_private(sync))
+      return;
+
+   if (sync->flags & VK_SYNC_IS_TIMELINE) {
+      uint64_t cur = p_atomic_read(&sync->pending_value);
+      while (value > cur) {
+         uint64_t prev = p_atomic_cmpxchg(&sync->pending_value, cur, value);
+         if (prev == cur)
+            break;
+         cur = prev;
+      }
+   } else {
+      /* Only mark the generation the signal started in.  If a reset, move
+       * or import cleared the sync after the token was taken, the payload
+       * may no longer hold this signal and the clear wins.
+       */
+      p_atomic_cmpxchg(&sync->pending_value, token, token | 1);
+   }
+}
+
+void
+vk_sync_pending_end(struct vk_sync *sync, bool note, uint64_t value,
+                    uint64_t token)
+{
+   if (note)
+      vk_sync_note_pending(sync, value, token);
+
+   uint32_t cur = p_atomic_dec_return(&sync->pending_submit_count);
+   assert((cur & ~VK_SYNC_PENDING_WAITERS_BIT) !=
+          (VK_SYNC_PENDING_WAITERS_BIT - 1));
+
+   if (unlikely(cur == VK_SYNC_PENDING_WAITERS_BIT)) {
+      /* sync may be destroyed and freed as soon as our decrement becomes
+       * visible, so do not touch sync after this point.  Wake any waiting
+       * vk_sync_finish() through the shared wake sequence instead.
+       */
+#if UTIL_FUTEX_SUPPORTED
+      p_atomic_inc(&vk_sync_pending_wake_seq);
+      futex_wake(&vk_sync_pending_wake_seq, INT32_MAX);
+#endif
+   }
+}
+
+static void
+vk_sync_wait_pending_notes(struct vk_sync *sync)
+{
+   if (likely((p_atomic_read(&sync->pending_submit_count) &
+               ~VK_SYNC_PENDING_WAITERS_BIT) == 0))
+      return;
+
+   for (;;) {
+#if UTIL_FUTEX_SUPPORTED
+      uint32_t wake_seq = p_atomic_read(&vk_sync_pending_wake_seq);
+#endif
+      uint32_t cur = p_atomic_read(&sync->pending_submit_count);
+
+      while ((cur & ~VK_SYNC_PENDING_WAITERS_BIT) != 0 &&
+             !(cur & VK_SYNC_PENDING_WAITERS_BIT)) {
+         uint32_t prev = p_atomic_cmpxchg(&sync->pending_submit_count, cur,
+                                          cur | VK_SYNC_PENDING_WAITERS_BIT);
+         if (prev == cur) {
+            cur |= VK_SYNC_PENDING_WAITERS_BIT;
+            break;
+         }
+         cur = prev;
+      }
+
+      if ((cur & ~VK_SYNC_PENDING_WAITERS_BIT) == 0)
+         return;
+
+#if UTIL_FUTEX_SUPPORTED
+      futex_wait(&vk_sync_pending_wake_seq, wake_seq, NULL);
+#else
+      thrd_yield();
+#endif
+   }
+}
+
+void
+vk_sync_clear_pending(struct vk_sync *sync)
+{
+   if (sync->flags & VK_SYNC_IS_TIMELINE) {
+      p_atomic_set(&sync->pending_value, 0);
+      return;
+   }
+
+   /* Move to the next unmarked generation, so that any signal whose token
+    * predates this clear can no longer mark the sync pending.
+    */
+   uint64_t cur = p_atomic_read(&sync->pending_value);
+   for (;;) {
+      uint64_t prev = p_atomic_cmpxchg(&sync->pending_value, cur,
+                                       (cur | 1) + 1);
+      if (prev == cur)
+         break;
+      cur = prev;
+   }
+}
+
+bool
+vk_sync_wait_is_known_pending(struct vk_sync *sync,
+                              uint64_t wait_value)
+{
+   if (sync->flags & VK_SYNC_IS_TIMELINE) {
+      if (wait_value == 0)
+         return true;
+      if (!vk_sync_is_private(sync))
+         return false;
+      return p_atomic_read(&sync->pending_value) >= wait_value;
+   }
+
+   if (!vk_sync_is_private(sync))
+      return false;
+
+   return p_atomic_read(&sync->pending_value) & 1;
+}
+
 VkResult
 vk_sync_init(struct vk_device *device,
              struct vk_sync *sync,
@@ -100,13 +254,18 @@ vk_sync_init(struct vk_device *device,
    sync->type = type;
    sync->flags = flags;
 
-   return type->init(device, sync, initial_value);
+   VkResult result = type->init(device, sync, initial_value);
+   if (likely(result == VK_SUCCESS) && initial_value != 0)
+      vk_sync_note_pending(sync, initial_value, 0);
+
+   return result;
 }
 
 void
 vk_sync_finish(struct vk_device *device,
                struct vk_sync *sync)
 {
+   vk_sync_wait_pending_notes(sync);
    sync->type->finish(device, sync);
 }
 
@@ -160,7 +319,10 @@ vk_sync_signal(struct vk_device *device,
                uint64_t value)
 {
    assert_signal_valid(sync, value);
-   return sync->type->signal(device, sync, value);
+   const uint64_t token = vk_sync_pending_begin(sync);
+   VkResult result = sync->type->signal(device, sync, value);
+   vk_sync_pending_end(sync, likely(result == VK_SUCCESS), value, token);
+   return result;
 }
 
 static bool
@@ -196,13 +358,24 @@ vk_sync_signal_many(struct vk_device *device,
    for (uint32_t i = 0; i < signal_count; i++)
       assert_signal_valid(signals[i].sync, signals[i].signal_value);
 
-   if (can_signal_many(device, signal_count, signals))
-      return signals[0].sync->type->signal_many(device, signal_count, signals);
+   if (can_signal_many(device, signal_count, signals)) {
+      STACK_ARRAY(uint64_t, tokens, signal_count);
+      for (uint32_t i = 0; i < signal_count; i++)
+         tokens[i] = vk_sync_pending_begin(signals[i].sync);
+
+      VkResult result =
+         signals[0].sync->type->signal_many(device, signal_count, signals);
+      for (uint32_t i = 0; i < signal_count; i++) {
+         vk_sync_pending_end(signals[i].sync, likely(result == VK_SUCCESS),
+                             signals[i].signal_value, tokens[i]);
+      }
+      STACK_ARRAY_FINISH(tokens);
+      return result;
+   }
 
    for (uint32_t i = 0; i < signal_count; i++) {
-      struct vk_sync *sync = signals[i].sync;
-      uint64_t value = signals[i].signal_value;
-      VkResult result = sync->type->signal(device, sync, value);
+      VkResult result = vk_sync_signal(device, signals[i].sync,
+                                       signals[i].signal_value);
       if (unlikely(result != VK_SUCCESS))
          return result;
    }
@@ -231,7 +404,10 @@ vk_sync_reset(struct vk_device *device,
               struct vk_sync *sync)
 {
    assert_reset_valid(sync);
-   return sync->type->reset(device, sync);
+   vk_sync_clear_pending(sync);
+   VkResult result = sync->type->reset(device, sync);
+   vk_sync_clear_pending(sync);
+   return result;
 }
 
 static bool
@@ -263,19 +439,26 @@ vk_sync_reset_many(struct vk_device *device,
    if (sync_count == 0)
       return VK_SUCCESS;
 
-   for (uint32_t i = 0; i < sync_count; i++)
-      assert_reset_valid(syncs[i]);
-
-   if (can_reset_many(device, sync_count, syncs))
-      return syncs[0]->type->reset_many(device, sync_count, syncs);
-
    for (uint32_t i = 0; i < sync_count; i++) {
-      VkResult result = syncs[i]->type->reset(device, syncs[i]);
-      if (unlikely(result != VK_SUCCESS))
-         return result;
+      assert_reset_valid(syncs[i]);
+      vk_sync_clear_pending(syncs[i]);
    }
 
-   return VK_SUCCESS;
+   VkResult result = VK_SUCCESS;
+   if (can_reset_many(device, sync_count, syncs)) {
+      result = syncs[0]->type->reset_many(device, sync_count, syncs);
+   } else {
+      for (uint32_t i = 0; i < sync_count; i++) {
+         result = syncs[i]->type->reset(device, syncs[i]);
+         if (unlikely(result != VK_SUCCESS))
+            break;
+      }
+   }
+
+   for (uint32_t i = 0; i < sync_count; i++)
+      vk_sync_clear_pending(syncs[i]);
+
+   return result;
 }
 
 VkResult vk_sync_move(struct vk_device *device,
@@ -286,7 +469,12 @@ VkResult vk_sync_move(struct vk_device *device,
    assert(!(src->flags & VK_SYNC_IS_TIMELINE));
    assert(dst->type == src->type);
 
-   return src->type->move(device, dst, src);
+   vk_sync_clear_pending(dst);
+   vk_sync_clear_pending(src);
+   VkResult result = src->type->move(device, dst, src);
+   vk_sync_clear_pending(dst);
+   vk_sync_clear_pending(src);
+   return result;
 }
 
 static void
@@ -463,7 +651,10 @@ vk_sync_import_opaque_fd(struct vk_device *device,
                          struct vk_sync *sync,
                          int fd)
 {
+   vk_sync_clear_pending(sync);
+
    VkResult result = sync->type->import_opaque_fd(device, sync, fd);
+   vk_sync_clear_pending(sync);
    if (unlikely(result != VK_SUCCESS))
       return result;
 
@@ -495,14 +686,19 @@ vk_sync_import_sync_file(struct vk_device *device,
                          int sync_file)
 {
    assert(!(sync->flags & VK_SYNC_IS_TIMELINE));
+   vk_sync_clear_pending(sync);
 
    /* Silently handle negative file descriptors in case the driver doesn't
     * want to bother.
     */
+   VkResult result;
    if (sync_file < 0 && sync->type->signal)
-      return sync->type->signal(device, sync, 0);
+      result = sync->type->signal(device, sync, 0);
+   else
+      result = sync->type->import_sync_file(device, sync, sync_file);
 
-   return sync->type->import_sync_file(device, sync, sync_file);
+   vk_sync_clear_pending(sync);
+   return result;
 }
 
 VkResult
@@ -511,7 +707,10 @@ vk_sync_export_sync_file(struct vk_device *device,
                          int *sync_file)
 {
    assert(!(sync->flags & VK_SYNC_IS_TIMELINE));
-   return sync->type->export_sync_file(device, sync, sync_file);
+   vk_sync_clear_pending(sync);
+   VkResult result = sync->type->export_sync_file(device, sync, sync_file);
+   vk_sync_clear_pending(sync);
+   return result;
 }
 
 VkResult
@@ -520,7 +719,10 @@ vk_sync_import_win32_handle(struct vk_device *device,
                             void *handle,
                             const wchar_t *name)
 {
+   vk_sync_clear_pending(sync);
+
    VkResult result = sync->type->import_win32_handle(device, sync, handle, name);
+   vk_sync_clear_pending(sync);
    if (unlikely(result != VK_SUCCESS))
       return result;
 

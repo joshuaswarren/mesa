@@ -79,23 +79,163 @@ agx_nir_narrow_single_subgroup_barriers(nir_shader *shader)
  */
 
 struct sg0 {
-   nir_def *id; /* load_local_invocation_id, used as .x when 1D */
+   uint32_t wg[3];
 };
+
+/* Express a non-overflowing linear combination of local_invocation_id.{x,y,z}
+ * as coeff[0]*x + coeff[1]*y + coeff[2]*z. Handles load_local_invocation_index
+ * as well as lowered 1D/2D/3D linearizations (iadd, disjoint ior, imul, ishl,
+ * imadshl_agx). */
+static bool
+eval_local_id_coeffs(const struct sg0 *t, nir_scalar s, uint64_t coeff[3],
+                     unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def->bit_size < 16)
+      return false;
+
+   while (nir_scalar_is_alu(s) && (nir_scalar_alu_op(s) == nir_op_u2u32 ||
+                                   nir_scalar_alu_op(s) == nir_op_u2u16 ||
+                                   nir_scalar_alu_op(s) == nir_op_i2i32 ||
+                                   nir_scalar_alu_op(s) == nir_op_i2i16)) {
+      nir_scalar src = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+      if (src.def->bit_size < 16)
+         return false;
+      s = src;
+   }
+
+   coeff[0] = coeff[1] = coeff[2] = 0;
+
+   if (nir_scalar_is_intrinsic(s)) {
+      nir_intrinsic_op op = nir_scalar_intrinsic_op(s);
+      if (op == nir_intrinsic_load_local_invocation_index) {
+         coeff[0] = 1;
+         coeff[1] = t->wg[0];
+         coeff[2] = (uint64_t)t->wg[0] * t->wg[1];
+         return true;
+      }
+      if (op == nir_intrinsic_load_local_invocation_id && s.comp < 3) {
+         coeff[s.comp] = 1;
+         return true;
+      }
+      return false;
+   }
+
+   if (!depth || !nir_scalar_is_alu(s))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(s);
+   switch (op) {
+   case nir_op_iadd:
+   case nir_op_ior: {
+      uint64_t ca[3], cb[3];
+      if (!eval_local_id_coeffs(t, nir_scalar_chase_alu_src(s, 0), ca,
+                                depth - 1) ||
+          !eval_local_id_coeffs(t, nir_scalar_chase_alu_src(s, 1), cb,
+                                depth - 1))
+         return false;
+      if (op == nir_op_ior) {
+         /* Bitwise OR equals addition only when every bit that can be set by
+          * one operand is guaranteed zero in the other. */
+         uint64_t max_a = 0, max_b = 0;
+         unsigned tz_a = 64, tz_b = 64;
+         for (unsigned i = 0; i < 3; ++i) {
+            if (ca[i] && t->wg[i] > 1) {
+               max_a += ca[i] * (uint64_t)(t->wg[i] - 1);
+               tz_a = MIN2(tz_a, (unsigned)__builtin_ctzll(ca[i]));
+            }
+            if (cb[i] && t->wg[i] > 1) {
+               max_b += cb[i] * (uint64_t)(t->wg[i] - 1);
+               tz_b = MIN2(tz_b, (unsigned)__builtin_ctzll(cb[i]));
+            }
+         }
+         const bool a_below_b = max_a == 0 || (tz_b < 64 && max_a < (1ull << tz_b));
+         const bool b_below_a = max_b == 0 || (tz_a < 64 && max_b < (1ull << tz_a));
+         if (!a_below_b && !b_below_a)
+            return false;
+      }
+      for (unsigned i = 0; i < 3; ++i) {
+         if (ca[i] > 1024 || cb[i] > 1024)
+            return false;
+         coeff[i] = ca[i] + cb[i];
+      }
+      return true;
+   }
+   case nir_op_imul: {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(a) == nir_scalar_is_const(b))
+         return false;
+      nir_scalar c = nir_scalar_is_const(a) ? a : b;
+      nir_scalar v = nir_scalar_is_const(a) ? b : a;
+      const uint64_t k = nir_scalar_as_uint(c);
+      if (k > 1024 || !eval_local_id_coeffs(t, v, coeff, depth - 1))
+         return false;
+      for (unsigned i = 0; i < 3; ++i) {
+         if (coeff[i] > 1024)
+            return false;
+         coeff[i] *= k;
+      }
+      return true;
+   }
+   case nir_op_ishl: {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      if (!nir_scalar_is_const(sh))
+         return false;
+      const uint64_t shift = nir_scalar_as_uint(sh);
+      if (shift > 10 || !eval_local_id_coeffs(t, a, coeff, depth - 1))
+         return false;
+      for (unsigned i = 0; i < 3; ++i) {
+         if (coeff[i] > 1024)
+            return false;
+         coeff[i] <<= shift;
+      }
+      return true;
+   }
+   case nir_op_imadshl_agx: {
+      /* (src0 * src1) + (src2 << src3) */
+      nir_scalar s0 = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar s1 = nir_scalar_chase_alu_src(s, 1);
+      nir_scalar s2 = nir_scalar_chase_alu_src(s, 2);
+      nir_scalar s3 = nir_scalar_chase_alu_src(s, 3);
+      if (!nir_scalar_is_const(s3) ||
+          nir_scalar_is_const(s0) == nir_scalar_is_const(s1))
+         return false;
+      const uint64_t shift = nir_scalar_as_uint(s3);
+      nir_scalar mul_c = nir_scalar_is_const(s0) ? s0 : s1;
+      nir_scalar mul_v = nir_scalar_is_const(s0) ? s1 : s0;
+      const uint64_t k = nir_scalar_as_uint(mul_c);
+      uint64_t ca[3], cb[3];
+      if (shift > 10 || k > 1024 ||
+          !eval_local_id_coeffs(t, mul_v, ca, depth - 1) ||
+          !eval_local_id_coeffs(t, s2, cb, depth - 1))
+         return false;
+      for (unsigned i = 0; i < 3; ++i) {
+         if (ca[i] > 1024 || cb[i] > 1024)
+            return false;
+         coeff[i] = ca[i] * k + (cb[i] << shift);
+      }
+      return true;
+   }
+   default:
+      return false;
+   }
+}
 
 static bool
 is_tid(const struct sg0 *t, nir_scalar s)
 {
-   s = nir_scalar_chase_movs(s);
-   while (nir_scalar_is_alu(s) && (nir_scalar_alu_op(s) == nir_op_u2u32 ||
-                                   nir_scalar_alu_op(s) == nir_op_u2u16 ||
-                                   nir_scalar_alu_op(s) == nir_op_i2i32))
-      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
-   if (!nir_scalar_is_intrinsic(s))
+   uint64_t coeff[3];
+   if (!eval_local_id_coeffs(t, s, coeff, 6))
       return false;
-   nir_intrinsic_op op = nir_scalar_intrinsic_op(s);
-   if (op == nir_intrinsic_load_local_invocation_index)
-      return true;
-   return op == nir_intrinsic_load_local_invocation_id && t->id && s.comp == 0;
+   if (t->wg[0] > 1 && coeff[0] != 1)
+      return false;
+   if (t->wg[1] > 1 && coeff[1] != t->wg[0])
+      return false;
+   if (t->wg[2] > 1 && coeff[2] != (uint64_t)t->wg[0] * t->wg[1])
+      return false;
+   return true;
 }
 
 /* Whether cond being `value` implies local index < 32. */
@@ -279,8 +419,6 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
                                 (uint64_t)shader->info.workgroup_size[2];
    if (invocations <= 32)
       return false;
-   const bool one_d = shader->info.workgroup_size[1] == 1 &&
-                      shader->info.workgroup_size[2] == 1;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    if (!impl)
@@ -293,7 +431,10 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
    util_dynarray_init(&barriers, NULL);
    const struct exec_list *list = NULL;
    bool usable = true;
-   struct sg0 t = {0};
+   const struct sg0 t = {
+      .wg = {shader->info.workgroup_size[0], shader->info.workgroup_size[1],
+             shader->info.workgroup_size[2]},
+   };
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_call)
@@ -301,8 +442,6 @@ agx_nir_narrow_subgroup0_barriers(nir_shader *shader)
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic == nir_intrinsic_load_local_invocation_id && one_d)
-            t.id = &intr->def;
          if (intr->intrinsic != nir_intrinsic_barrier)
             continue;
          const struct exec_list *l = member_list(block);

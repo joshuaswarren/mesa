@@ -59,6 +59,24 @@ bool agx3_bind_compose(enum agx_isa_encoding encoding,
                        unsigned noverrides, uint8_t *out, uint8_t *len);
 
 /*
+ * Try encoding points `first_ep..last_ep` (inclusive) in ascending order with
+ * a single scratch-vector populate/clear. When `max_length` is non-zero, only
+ * forms strictly shorter than `max_length` are tried; when `monotonic_size` is
+ * also true, probing stops at the first form whose size >= `max_length`.
+ * `skip_ep` (if >= 0) is skipped.
+ */
+bool agx3_bind_compose_ep_range(enum agx_isa_encoding encoding,
+                                enum agx3_mnemonic mnemonic,
+                                unsigned first_ep, unsigned last_ep,
+                                int skip_ep, unsigned max_length,
+                                bool monotonic_size,
+                                const struct agx3_field_kv *baseline,
+                                unsigned nbaseline,
+                                const struct agx3_field_kv *overrides,
+                                unsigned noverrides, uint8_t *out,
+                                uint8_t *len);
+
+/*
  * The encoding point a core encoder that has grounded its field vector for
  * G18G passes: its own agx3b/agx3c `ep` unchanged, Apple's order for AGX3D.
  * Only for encoders whose AGX3D admission is argued at the call site.

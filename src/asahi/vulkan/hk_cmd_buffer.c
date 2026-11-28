@@ -615,6 +615,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   cmd->suspended_pass.valid = false;
    memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
@@ -1125,6 +1126,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
+          !(last->sync.heap_slot && cs->sync.heap_slot &&
+            last->sync.heap_slot != cs->sync.heap_slot) &&
           !hk_sync_merge_delays(cmd, last, cs)) {
 
          hk_sync_merge(cmd, last, cs);
@@ -1262,9 +1265,14 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool rpack_tail_clean =
+      cmd->render_pack.tail_open &&
+      cmd->render_pack.tail_epoch == cmd->sync.epoch;
    if (likely(!(dev->dev.debug & AGX_DBG_NOMERGE))) {
       merge_control_streams(cmd);
    }
+   if (rpack_tail_clean)
+      cmd->render_pack.tail_epoch = cmd->sync.epoch;
 
    /* We cannot terminate CDM control streams until after merging, since merging
     * needs to append stream links late. Now that we've merged, insert all the
@@ -1561,6 +1569,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    if (HK_PERF(dev, NOBARRIER))
       return;
 
+   cmd->suspended_pass.valid = false;
+
    perf_debug(cmd, "Pipeline barrier");
 
    if (unlikely(dev->frame_anatomy)) {
@@ -1627,6 +1637,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          brl_discard_init_record(cmd, pDependencyInfo, init_dst);
       return;
    }
+
+   if (unlikely(cmd->state.pending_msaa_resolve.cs) && !cmd->sync.in_pass &&
+       hk_resolve_fold_barrier_orders_fs(pDependencyInfo))
+      cmd->state.pending_msaa_resolve.fs_barrier_seen = true;
 
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
@@ -2036,12 +2050,40 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
    /* D3D translation layers re-push unchanged constants before most draws.
     * While the root is clean the uploaded root holds exactly these bytes, so
     * an identical push changes nothing; keep the root and every preparation
-    * keyed to the current descriptor generation. */
-   if (memcmp(desc->root.push + info->offset, info->pValues, info->size) == 0)
-      return;
-
-   memcpy(desc->root.push + info->offset, info->pValues, info->size);
-   hk_root_mark_push_dirty(desc);
+    * keyed to the current descriptor generation. Fast-path common 4/8/16-byte
+    * push updates (root constants and root CBV VAs) to avoid PLT memcmp/memcpy
+    * overhead on hot draw loops. */
+   uint8_t *dst = desc->root.push + info->offset;
+   if (info->size == 8) {
+      uint64_t cur, val;
+      memcpy(&cur, dst, 8);
+      memcpy(&val, info->pValues, 8);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 8);
+   } else if (info->size == 4) {
+      uint32_t cur, val;
+      memcpy(&cur, dst, 4);
+      memcpy(&val, info->pValues, 4);
+      if (cur == val)
+         return;
+      memcpy(dst, &val, 4);
+   } else if (info->size == 16) {
+      uint64_t c0, c1, v0, v1;
+      memcpy(&c0, dst, 8);
+      memcpy(&c1, dst + 8, 8);
+      memcpy(&v0, info->pValues, 8);
+      memcpy(&v1, (const uint8_t *)info->pValues + 8, 8);
+      if (c0 == v0 && c1 == v1)
+         return;
+      memcpy(dst, &v0, 8);
+      memcpy(dst + 8, &v1, 8);
+   } else {
+      if (memcmp(dst, info->pValues, info->size) == 0)
+         return;
+      memcpy(dst, info->pValues, info->size);
+   }
+   hk_root_mark_push_dirty_range(desc, info->offset, info->size);
    /* non_push_generation intentionally does not advance on push constants
     * (push constants carry no tracked resource addresses; BDA transfers
     * already set sync.xfer_any). */
@@ -2110,6 +2152,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
                                  const VkSetDescriptorBufferOffsetsInfoEXT *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+   bool changed = false;
 
    for (uint32_t i = 0; i < info->setCount; ++i) {
       const uint32_t s = info->firstSet + i;
@@ -2121,10 +2164,22 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
       const uint64_t addr =
          cmd->state.descriptor_buffers[info->pBufferIndices[i]] +
          info->pOffsets[i];
+      const uint32_t size = set_layout ? set_layout->max_buffer_size : 0;
+      const uint32_t bit = BITFIELD_BIT(s);
 
-      hk_bind_buffer_set(desc, pipeline_layout, s, addr,
-                         set_layout ? set_layout->max_buffer_size : 0);
+      if ((desc->buffer_active & bit) && !(desc->push_active & bit) &&
+          desc->sets[s] == NULL && desc->root.sets[s] == addr &&
+          desc->set_sizes[s] == size &&
+          desc->root.set_dynamic_buffer_start[s] ==
+             pipeline_layout->dynamic_descriptor_offset[s])
+         continue;
+
+      hk_bind_buffer_set(desc, pipeline_layout, s, addr, size);
+      changed = true;
    }
+
+   if (!changed)
+      return;
 
    hk_root_mark_dirty(desc);
    desc->generation++;
@@ -3821,17 +3876,28 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
       case HK_G17P_RANGE_SOURCE_CONSTANT:
          offset = ranges[i].address;
          break;
-      case HK_G17P_RANGE_SOURCE_ROOT:
+      case HK_G17P_RANGE_SOURCE_ROOT: {
          offset = ranges[i].address - root;
-         /* The root/set table header range at offset 0 only exposes the
-          * root_desc_addr pointer when the main body, preamble, or prolog
-          * reads it; otherwise it only supplies root.sets[], which never
-          * change on push, dynamic-buffer, or VB base/clamp updates. */
-         if (offset != 0 || !s->b.info.agx3_root_uniform_usage_valid ||
-             s->b.info.agx3_main_uses_root_uniform ||
-             s->b.info.has_preamble || linked->g17p_prolog_uses_root)
+         const uint64_t end = offset + 2u * ranges[i].size_halfs;
+         /* Offset 0 is the root/set header: it exposes root_desc_addr only
+          * when the main body, preamble, or prolog reads it; otherwise it only
+          * supplies root.sets[], which never change on bypassable updates.
+          * Non-zero root uniform-DMA spans (e.g. draw.attrib_strides[]) read
+          * only [offset, end), so they remain up to date in gfx->root whenever
+          * disjoint from the four bypass-dirtyable regions. */
+         if (offset == 0) {
+            if (!s->b.info.agx3_root_uniform_usage_valid ||
+                s->b.info.agx3_main_uses_root_uniform ||
+                (s->b.info.has_preamble &&
+                 s->b.info.agx3_preamble_uses_root_uniform) ||
+                linked->g17p_prolog_uses_root ||
+                hk_root_span_overlaps_bypassable(offset, end))
+               has_general_root = true;
+         } else if (hk_root_span_overlaps_bypassable(offset, end)) {
             has_general_root = true;
+         }
          break;
+      }
       case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
          offset = ranges[i].address - root;
          if (offset != hk_root_descriptor_offset(draw.attrib_base) ||
@@ -4220,14 +4286,14 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
           ? !linked->b.g17p_compiler_d_valid
-          : (dev->dev.chip != AGX_CHIP_G17S ||
+          : (!agx_chip_g17_m5(dev->dev.chip) ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
    /* An API task shader is a compiled object program with the ordinary
     * driver-root/descriptor ranges and its own threadgroup memory. */
-   const bool task_object = object && task && dev->dev.chip == AGX_CHIP_G17S &&
+   const bool task_object = object && task && agx_chip_g17_m5(dev->dev.chip) &&
                             s->info.stage == MESA_SHADER_TASK;
    if (task_object) {
       if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
@@ -4994,7 +5060,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    if (launch->has_general_root &&
        !hk_root_reads_ignore_dirty(s->info.agx3_root_reads,
-                                   s->info.agx3_dynbuf_reads, desc))
+                                   s->info.agx3_dynbuf_reads,
+                                   s->info.agx3_push_read_dwords, desc))
       return 0;
 
    const uint8_t dirty_mask = desc->root_change.dirty_mask;
@@ -5495,6 +5562,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
       if (!cs)
          return;
+      if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+         cs->render_pack_compute_internal = true;
 
       const uint32_t shared_bytes =
          prog->info.local_size
@@ -5579,6 +5648,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct agx_ptr t = hk_pool_usc_alloc(cmd, agx_usc_size(15), 64);
    uint64_t uploaded_data = hk_pool_upload(cmd, data, data_size, 4);
@@ -6070,7 +6141,8 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
                         VkImageAspectFlags aspects, const VkClearValue *value,
                         uint32_t range_count,
                         const VkImageSubresourceRange *ranges, bool from_gfx,
-                        const struct hk_sync_dep *gfx_dep);
+                        const struct hk_sync_dep *gfx_dep,
+                        struct hk_cs *vdm_cs);
 
 static bool
 hk_deferred_clear_eligible(struct hk_cmd_buffer *cmd,
@@ -6078,13 +6150,84 @@ hk_deferred_clear_eligible(struct hk_cmd_buffer *cmd,
                            VkImageAspectFlags aspects, uint32_t range_count,
                            const VkImageSubresourceRange *ranges);
 
+static void
+hk_init_empty_vdm_render_state(struct hk_cs *cs)
+{
+   /* Normally supplied by the first draw. A clear has no application
+    * sample-location state; use the attachment sample count and leave
+    * has_sample_locations uncommitted, just like other meta operations.
+    */
+   cs->ppp_multisamplectl =
+      hk_default_sample_positions(MAX2(cs->tib.nr_samples, 1));
+
+   /* The render submission still binds these arrays even without PPP draw
+    * state referencing them. Give it an owned, neutral full-frame entry
+    * rather than a zero-byte upload. Render-area handling and empty-tile
+    * selection remain in the existing render setup.
+    */
+   if (cs->scissor.size == 0) {
+      uint8_t *scissor =
+         util_dynarray_grow_bytes(&cs->scissor, 1, AGX_SCISSOR_LENGTH);
+      agx_pack(scissor, SCISSOR, cfg) {
+         cfg.min_x = cfg.min_y = 0;
+         cfg.max_x = cs->cr.width;
+         cfg.max_y = cs->cr.height;
+         cfg.min_z = 0.0f;
+         cfg.max_z = 1.0f;
+      }
+   }
+
+   if (cs->depth_bias.size == 0) {
+      void *bias = util_dynarray_grow_bytes(&cs->depth_bias, 1,
+                                            AGX_DEPTH_BIAS_LENGTH);
+      memset(bias, 0, AGX_DEPTH_BIAS_LENGTH);
+   }
+}
+
+static bool
+hk_deferred_clear_vdm_in_use(const struct hk_cmd_buffer *cmd,
+                             const struct hk_cs *vdm_cs)
+{
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      if (cmd->state.deferred_clear[i].vdm_cs == vdm_cs)
+         return true;
+   }
+   return false;
+}
+
+static void
+hk_drop_deferred_clear_vdm(struct hk_cmd_buffer *cmd, struct hk_cs *vdm_cs)
+{
+   if (!vdm_cs || hk_deferred_clear_vdm_in_use(cmd, vdm_cs))
+      return;
+
+   if (cmd->render_pack.head_stream == vdm_cs) {
+      cmd->render_pack.head = false;
+      cmd->render_pack.head_stream = NULL;
+      cmd->render_pack.head_why = "deferred clear";
+   }
+   if (cmd->render_pack.tail_stream == vdm_cs) {
+      cmd->render_pack.tail_open = false;
+      cmd->render_pack.tail_stream = NULL;
+   }
+   if (cmd->pass_merge.cs == vdm_cs) {
+      cmd->pass_merge.valid = false;
+      cmd->pass_merge.cs = NULL;
+   }
+
+   hk_sync_forget_stream(cmd, vdm_cs);
+   list_del(&vdm_cs->node);
+   hk_cs_destroy(vdm_cs);
+}
+
 /* Try to fold an empty clear-only render pass into deferred whole-image clears
  * so a following pass that loads (or re-clears) the attachment absorbs the
  * clear directly as a tilebuffer load-op clear without an extra compute fill
  * job or memory round-trip. Only folds when every cleared attachment in the
  * pass is eligible; otherwise returns false so the caller emits compute fills. */
 static bool
-hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                 bool keep_vdm)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -6092,8 +6235,7 @@ hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!agx_chip_native_or_m5(dev->dev.chip) || cmd->in_meta ||
        render->view_mask || render->layer_count != 1 ||
        (render->flags &
-        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT |
-         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) ||
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) ||
        hk_sync_xfer_pending(&cmd->sync))
       return false;
 
@@ -6227,7 +6369,7 @@ hk_try_defer_empty_render_clears(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       };
       bool ok = hk_defer_clear_internal(cmd, cands[i].image, cands[i].aspects,
                                         &cands[i].value, 1, &range, true,
-                                        saved_dep);
+                                        saved_dep, keep_vdm ? cs : NULL);
       assert(ok);
    }
 
@@ -6295,36 +6437,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
         (continuation || (cs->cr.process_empty_tiles &&
                           (m5_ms_clear ||
                            !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4)))))) {
-      /* Normally supplied by the first draw. A clear has no application
-       * sample-location state; use the attachment sample count and leave
-       * has_sample_locations uncommitted, just like other meta operations.
-       */
-      cs->ppp_multisamplectl =
-         hk_default_sample_positions(MAX2(cs->tib.nr_samples, 1));
-
-      /* The render submission still binds these arrays even without PPP draw
-       * state referencing them. Give it an owned, neutral full-frame entry
-       * rather than a zero-byte upload. Render-area handling and empty-tile
-       * selection remain in the existing render setup.
-       */
-      if (cs->scissor.size == 0) {
-         uint8_t *scissor =
-            util_dynarray_grow_bytes(&cs->scissor, 1, AGX_SCISSOR_LENGTH);
-         agx_pack(scissor, SCISSOR, cfg) {
-            cfg.min_x = cfg.min_y = 0;
-            cfg.max_x = cs->cr.width;
-            cfg.max_y = cs->cr.height;
-            cfg.min_z = 0.0f;
-            cfg.max_z = 1.0f;
-         }
-      }
-
-      if (cs->depth_bias.size == 0) {
-         void *bias = util_dynarray_grow_bytes(&cs->depth_bias, 1,
-                                              AGX_DEPTH_BIAS_LENGTH);
-         memset(bias, 0, AGX_DEPTH_BIAS_LENGTH);
-      }
-
+      hk_init_empty_vdm_render_state(cs);
       return false;
    }
 
@@ -6334,8 +6447,19 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
    /* Fold whole-image single-sample clear-only render passes into deferred
     * clears so a following pass that loads (or re-clears) the attachment
-    * absorbs the clear directly without an extra compute fill kick. */
-   if (hk_try_defer_empty_render_clears(cmd, cs)) {
+    * absorbs the clear directly without an extra kick. On native AGX3 / M5,
+    * keep the finalized VDM render stream alive while deferred: if absorbed,
+    * hk_take_deferred_clears() drops it; if a later pass with different
+    * attachments flushes it, the clear stays on VDM instead of a compute fill
+    * between two renders (VDM->CDM->VDM); any other flush (for example
+    * vkEndCommandBuffer()) drops it and fills the image as before. */
+   const bool keep_vdm =
+      native_eot && cs->cr.process_empty_tiles && cs->g17p_pass_ends;
+   if (hk_try_defer_empty_render_clears(cmd, cs, keep_vdm)) {
+      if (keep_vdm) {
+         hk_init_empty_vdm_render_state(cs);
+         return false;
+      }
       hk_sync_forget_stream(cmd, cs);
       list_del(&cs->node);
       hk_cs_destroy(cs);
@@ -6451,10 +6575,13 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
                         VkImageAspectFlags aspects, const VkClearValue *value,
                         uint32_t range_count,
                         const VkImageSubresourceRange *ranges, bool from_gfx,
-                        const struct hk_sync_dep *gfx_dep)
+                        const struct hk_sync_dep *gfx_dep,
+                        struct hk_cs *vdm_cs)
 {
    if (!hk_deferred_clear_eligible(cmd, image, aspects, range_count, ranges))
       return false;
+
+   cmd->state.pending_msaa_resolve.cs = NULL;
 
    /* The deferred clear overwrites the whole image, whether it becomes a
     * load-op clear or a fill: a pending store of those aspects is dead. */
@@ -6466,13 +6593,17 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
       if (e->image == image) {
+         struct hk_cs *old_vdm = e->vdm_cs;
          e->aspects = aspects;
          e->value = *value;
          e->from_gfx = from_gfx;
+         e->vdm_cs = vdm_cs;
          if (from_gfx && gfx_dep)
             memcpy(e->gfx_dep, gfx_dep, sizeof(e->gfx_dep));
          else
             memset(e->gfx_dep, 0, sizeof(e->gfx_dep));
+         if (old_vdm && old_vdm != vdm_cs)
+            hk_drop_deferred_clear_vdm(cmd, old_vdm);
          return true;
       }
    }
@@ -6487,6 +6618,7 @@ hk_defer_clear_internal(struct hk_cmd_buffer *cmd, struct hk_image *image,
       .aspects = aspects,
       .value = *value,
       .from_gfx = from_gfx,
+      .vdm_cs = vdm_cs,
    };
    if (from_gfx && gfx_dep)
       memcpy(slot->gfx_dep, gfx_dep, sizeof(slot->gfx_dep));
@@ -6499,7 +6631,7 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
                uint32_t range_count, const VkImageSubresourceRange *ranges)
 {
    return hk_defer_clear_internal(cmd, image, aspects, value, range_count,
-                                  ranges, false, NULL);
+                                  ranges, false, NULL, NULL);
 }
 
 /* A buffer command (copy, fill, update) cannot access an image except
@@ -6545,20 +6677,65 @@ hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
    cmd->state.deferred_clear_hold = true;
 }
 
-void
-hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
+/* Unless a render pass follows, turn the kept clear-only VDM renders back
+ * into deferred fills: a clear-only command buffer, or a clear that compute,
+ * a transfer or a barrier flushes, is cheaper as a compute fill than as a
+ * render of its own. Every entry of a dropped render is filled. */
+static void
+hk_unkeep_deferred_clear_vdms(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *vdm[HK_MAX_DEFERRED_CLEARS];
+   unsigned vdm_count = 0;
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      if (!e->vdm_cs)
+         continue;
+      bool seen = false;
+      for (unsigned k = 0; k < vdm_count; ++k)
+         seen |= vdm[k] == e->vdm_cs;
+      if (!seen)
+         vdm[vdm_count++] = e->vdm_cs;
+      e->vdm_cs = NULL;
+   }
+   for (unsigned i = 0; i < vdm_count; ++i)
+      hk_drop_deferred_clear_vdm(cmd, vdm[i]);
+}
+
+static void
+hk_flush_deferred_clears_impl(struct hk_cmd_buffer *cmd, const char *why,
+                              bool render_follows)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
+   cmd->state.pending_msaa_resolve.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;
+
+   if (!render_follows)
+      hk_unkeep_deferred_clear_vdms(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.deferred_clear_flushing = true;
    bool any_xfer = false, any_gfx = false;
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       const struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      if (e->vdm_cs) {
+         /* The empty clear-only render stream is already in control_streams
+          * at its recorded VDM position with its dependencies and footprints
+          * intact; the render pass that follows would otherwise wait on a
+          * compute fill between two renders (VDM->CDM->VDM). */
+         if (unlikely(dev->frame_anatomy)) {
+            hk_frame_anatomy_note(
+               dev,
+               "deferred-clear kept vdm by %s: %ux%u %s aspects=0x%x compressed=%u",
+               why, e->image->vk.extent.width, e->image->vk.extent.height,
+               util_format_short_name(
+                  hk_format_to_pipe_format(e->image->vk.format)),
+               e->aspects, e->image->planes[0].layout.compressed);
+         }
+         continue;
+      }
       if (unlikely(dev->frame_anatomy)) {
          hk_frame_anatomy_note(
             dev,
@@ -6604,19 +6781,33 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
    /* The barriers that followed the clears were recorded before the fills;
     * order everything recorded from now on after them, as
     * hk_CmdPipelineBarrier2() does outside a render pass. */
-   struct hk_cs *cs = cmd->current_cs.cs;
-   const bool alias_scope = hk_cmd_alias_scope(cmd);
-   if (cs && hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
-      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_visibility_flush(dev, cs, alias_scope);
+   if (any_xfer || any_gfx) {
+      struct hk_cs *cs = cmd->current_cs.cs;
+      const bool alias_scope = hk_cmd_alias_scope(cmd);
+      if (cs && hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, cs, alias_scope);
+      }
+      if (cs && !alias_scope)
+         hk_cdm_note_alias_site(cmd, cs);
+      if (any_xfer)
+         hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
+      if (any_gfx)
+         hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_ALL);
    }
-   if (cs && !alias_scope)
-      hk_cdm_note_alias_site(cmd, cs);
-   if (any_xfer)
-      hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
-   if (any_gfx)
-      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_ALL);
    cmd->state.deferred_clear_flushing = false;
+}
+
+void
+hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
+{
+   hk_flush_deferred_clears_impl(cmd, why, false);
+}
+
+void
+hk_flush_deferred_clears_before_render(struct hk_cmd_buffer *cmd)
+{
+   hk_flush_deferred_clears_impl(cmd, "render pass", true);
 }
 
 /* How a pass may use a deferred clear for an attachment of the given aspect
@@ -6802,7 +6993,10 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    }
 
    /* Drop the taken clears that need no fill; the caller records the rest
-    * before the pass. */
+    * before the pass. Any clear-only VDM render whose attachments were all
+    * absorbed without needing a memory fill is dropped here as well. */
+   struct hk_cs *dropped_vdm[HK_MAX_DEFERRED_CLEARS];
+   unsigned dropped_vdm_count = 0;
    unsigned kept = 0;
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
@@ -6812,9 +7006,18 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          taken |= e == col[j];
          fill |= e == col[j] && col_fill[j];
       }
-      if (!taken || fill)
+      if (!taken || fill) {
          cmd->state.deferred_clear[kept++] = *e;
+      } else if (e->vdm_cs) {
+         bool seen = false;
+         for (unsigned k = 0; k < dropped_vdm_count; ++k)
+            seen |= dropped_vdm[k] == e->vdm_cs;
+         if (!seen)
+            dropped_vdm[dropped_vdm_count++] = e->vdm_cs;
+      }
    }
    cmd->state.deferred_clear_count = kept;
+   for (unsigned i = 0; i < dropped_vdm_count; ++i)
+      hk_drop_deferred_clear_vdm(cmd, dropped_vdm[i]);
    return copy;
 }

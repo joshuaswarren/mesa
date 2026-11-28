@@ -605,7 +605,8 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
    agx_index uv = agx_preload(b, agx_register(2, AGX_SIZE_32));
    agx_index reg_desc = agx_preload(b, agx_register(6, AGX_SIZE_64));
    agx_index reg_smp = agx_preload(b, agx_register(10, AGX_SIZE_64));
-   agx_index reg_lod_val = agx_preload(b, agx_register(14, AGX_SIZE_32));
+   agx_index reg_lod_val = agx_preload(
+      b, agx_register(14, kind == FRAG_SAMPLE_TEX ? AGX_SIZE_16 : AGX_SIZE_32));
    agx_index acc = agx_mov_imm(b, 32, 0);
 
    if (with_cube_array) {
@@ -734,6 +735,23 @@ TEST(M5CopySchedule, AGX3BFragmentSamplesUseOccupancySlack)
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_ARRAY,
                 FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_AUTO_LOD,
                 false, false, 0),
+             5u);
+   /* Register-LOD and register-bias 2D and uniform-descriptor 2D_ARRAY samples
+    * also allocate disjoint 8-half banks on AGX3B and hoist ahead of consumers. */
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_LOD_MIN,
+                true, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_AUTO_LOD_BIAS,
+                true, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_LOD_MIN,
+                true, false, 0),
              5u);
 }
 
