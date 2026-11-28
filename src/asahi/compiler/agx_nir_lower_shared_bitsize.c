@@ -238,17 +238,17 @@ agx_nir_lower_shared_element_index(nir_shader *shader)
  * of its constants. */
 static bool
 gather_sum(nir_scalar s, unsigned depth, nir_scalar *terms, unsigned *count,
-           uint64_t *constant)
+           uint64_t *constant, bool limit_u16)
 {
    if (nir_scalar_is_const(s)) {
       *constant += nir_scalar_as_uint(s);
-      return *constant <= UINT16_MAX;
+      return !limit_u16 || *constant <= UINT16_MAX;
    }
    if (depth && nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
       return gather_sum(nir_scalar_chase_alu_src(s, 0), depth - 1, terms, count,
-                        constant) &&
+                        constant, limit_u16) &&
              gather_sum(nir_scalar_chase_alu_src(s, 1), depth - 1, terms, count,
-                        constant);
+                        constant, limit_u16);
    }
    if (*count == 4)
       return false;
@@ -292,6 +292,8 @@ compare_scalars(const void *a, const void *b)
 
 struct elem_candidate {
    nir_intrinsic_instr *intr;
+   nir_block *block;
+   unsigned segment;
    nir_scalar sum;
    nir_scalar terms[4];
    unsigned count;
@@ -300,6 +302,8 @@ struct elem_candidate {
    unsigned e_lo;
    unsigned shift;
    unsigned base;
+   bool bounded;
+   bool rewritten;
 };
 
 static bool
@@ -329,6 +333,7 @@ sum_matches_canonical(nir_scalar sum, const nir_scalar *terms, unsigned count)
 
 static bool
 analyze_elem_candidate(nir_shader *shader, struct hash_table *ranges,
+                       nir_block *block, unsigned segment,
                        nir_intrinsic_instr *intr, struct elem_candidate *out)
 {
    if (intr->intrinsic != nir_intrinsic_load_shared &&
@@ -350,36 +355,51 @@ analyze_elem_candidate(nir_shader *shader, struct hash_table *ranges,
 
    s = nir_scalar_chase_alu_src(s, 0);
    const unsigned base = nir_intrinsic_base(intr);
-   if (base > 255 || s.def->bit_size != 32 || !nir_scalar_is_alu(s) ||
-       nir_scalar_alu_op(s) != nir_op_iadd)
+   const bool small_shared =
+      shader->info.shared_size > 0 && shader->info.shared_size <= 32768;
+   if (base > 255 || s.def->bit_size != 32)
+      return false;
+
+   const bool is_iadd =
+      nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd;
+   if (!is_iadd && !small_shared)
       return false;
 
    unsigned count = 0;
    uint64_t elements = 0;
-   if (!gather_sum(s, 3, out->terms, &count, &elements) || !count)
+   if (!gather_sum(s, 5, out->terms, &count, &elements, !small_shared) || !count)
       return false;
 
    const unsigned max_lo = (255u - base) >> shift;
    uint64_t e_hi = 0;
    unsigned e_lo = 0;
-   if (elements <= max_lo) {
-      e_lo = elements;
-   } else {
-      const unsigned chunk = 256u >> shift;
-      e_hi = (elements / chunk) * chunk;
-      e_lo = elements - e_hi;
-      if (e_lo > max_lo)
-         return false;
+   bool bounded = false;
+   if (is_iadd && elements <= UINT16_MAX) {
+      bool split_ok = true;
+      if (elements <= max_lo) {
+         e_lo = elements;
+      } else {
+         const unsigned chunk = 256u >> shift;
+         e_hi = (elements / chunk) * chunk;
+         e_lo = elements - e_hi;
+         if (e_lo > max_lo)
+            split_ok = false;
+      }
+      if (split_ok) {
+         uint64_t bound = 0;
+         for (unsigned t = 0; t < count; ++t)
+            bound += term_upper_bound(shader, ranges, out->terms[t], 2);
+         bounded = bound <= UINT16_MAX - elements;
+      }
    }
 
-   uint64_t bound = 0;
-   for (unsigned t = 0; t < count; ++t)
-      bound += term_upper_bound(shader, ranges, out->terms[t], 2);
-   if (bound > UINT16_MAX - elements)
+   if (!bounded && !small_shared)
       return false;
 
    qsort(out->terms, count, sizeof(out->terms[0]), compare_scalars);
    out->intr = intr;
+   out->block = block;
+   out->segment = segment;
    out->sum = s;
    out->count = count;
    out->elements = elements;
@@ -387,6 +407,8 @@ analyze_elem_candidate(nir_shader *shader, struct hash_table *ranges,
    out->e_lo = e_lo;
    out->shift = shift;
    out->base = base;
+   out->bounded = bounded;
+   out->rewritten = false;
    return true;
 }
 
@@ -460,13 +482,25 @@ fold_elem_offsets_impl(nir_function_impl *impl, struct hash_table *ranges)
    struct util_dynarray cands;
    util_dynarray_init(&cands, NULL);
 
+   nir_shader *shader = impl->function->shader;
+   const bool small_shared =
+      shader->info.shared_size > 0 && shader->info.shared_size <= 32768;
+
    nir_foreach_block(block, impl) {
+      unsigned segment = 0;
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_terminate ||
+             intr->intrinsic == nir_intrinsic_terminate_if ||
+             intr->intrinsic == nir_intrinsic_demote ||
+             intr->intrinsic == nir_intrinsic_demote_if) {
+            segment++;
+            continue;
+         }
          struct elem_candidate cand;
-         if (analyze_elem_candidate(impl->function->shader, ranges,
-                                    nir_instr_as_intrinsic(instr), &cand))
+         if (analyze_elem_candidate(shader, ranges, block, segment, intr, &cand))
             util_dynarray_append(&cands, cand);
       }
    }
@@ -482,12 +516,102 @@ fold_elem_offsets_impl(nir_function_impl *impl, struct hash_table *ranges)
    nir_builder b = nir_builder_create(impl);
    bool progress = false;
 
+   /* When shared memory fits in 32 KiB, every in-bounds 16/32-bit element
+    * index is strictly below 2^14 (shift >= 1), so signed 16-bit deltas
+    * between same-block accesses sharing the same variable terms are exact
+    * and anchor + delta cannot wrap 16 bits. Greedily anchor each 256-byte
+    * window at its lowest executed member so offsets fold into LDTG/STTG.base
+    * even when variable terms include preamble uniforms or subgroup IDs. */
+   if (small_shared) {
+      bool *visited = calloc(num_cands, sizeof(bool));
+      for (unsigned i = 0; i < num_cands; ++i) {
+         if (visited[i])
+            continue;
+         unsigned members[512];
+         int rel[512];
+         unsigned m = 0;
+         for (unsigned j = i; j < num_cands && m < ARRAY_SIZE(members); ++j) {
+            if (visited[j])
+               continue;
+            if (arr[j].block != arr[i].block ||
+                arr[j].segment != arr[i].segment ||
+                arr[j].shift != arr[i].shift ||
+                !same_terms(&arr[i], &arr[j]))
+               continue;
+            visited[j] = true;
+            rel[m] = (int16_t)(uint16_t)(arr[j].elements - arr[i].elements);
+            members[m++] = j;
+         }
+         if (m < 2)
+            continue;
+
+         /* Insertion sort by relative offset ascending. */
+         for (unsigned a = 1; a < m; ++a) {
+            int r = rel[a];
+            unsigned idx = members[a];
+            unsigned k = a;
+            while (k > 0 && rel[k - 1] > r) {
+               rel[k] = rel[k - 1];
+               members[k] = members[k - 1];
+               k--;
+            }
+            rel[k] = r;
+            members[k] = idx;
+         }
+
+         const int max_span = (int)(32768u >> arr[i].shift);
+         if (rel[m - 1] - rel[0] >= max_span)
+            continue;
+
+         unsigned start = 0;
+         while (start < m) {
+            struct elem_candidate *anchor = &arr[members[start]];
+            const int anchor_rel = rel[start];
+            unsigned end = start + 1;
+            while (end < m) {
+               struct elem_candidate *cand = &arr[members[end]];
+               const unsigned delta = (unsigned)(rel[end] - anchor_rel);
+               if (cand->base + (delta << cand->shift) > 255u)
+                  break;
+               end++;
+            }
+            if (end - start >= 2) {
+               const uint32_t anchor_c = (uint16_t)anchor->elements;
+               for (unsigned k = start; k < end; ++k) {
+                  struct elem_candidate *cand = &arr[members[k]];
+                  const unsigned delta = (unsigned)(rel[k] - anchor_rel);
+                  cand->rewritten = true;
+                  if (k == start && cand->count == 1 && anchor_c == 0)
+                     continue;
+                  b.cursor = nir_before_instr(&cand->intr->instr);
+                  nir_def *variable = nir_mov_scalar(&b, cand->terms[0]);
+                  for (unsigned t = 1; t < cand->count; ++t)
+                     variable =
+                        nir_iadd(&b, variable, nir_mov_scalar(&b, cand->terms[t]));
+                  if (anchor_c > 0)
+                     variable = nir_iadd_imm(&b, variable, anchor_c);
+                  nir_src_rewrite(nir_get_io_offset_src(cand->intr),
+                                  nir_u2u16(&b, variable));
+                  if (delta > 0)
+                     nir_intrinsic_set_base(cand->intr,
+                                            cand->base + (delta << cand->shift));
+                  progress = true;
+               }
+            }
+            start = end;
+         }
+      }
+      free(visited);
+   }
+
    for (unsigned i = 0; i < num_cands; ++i) {
       const struct elem_candidate *c = &arr[i];
+      if (!c->bounded || c->rewritten)
+         continue;
       unsigned var_uses = 0;
       unsigned bucket_uses = 0;
       for (unsigned j = 0; j < num_cands; ++j) {
-         if (!same_terms(c, &arr[j]))
+         if (!arr[j].bounded || arr[j].rewritten || !same_terms(c, &arr[j]))
             continue;
          var_uses++;
          if (c->e_hi == arr[j].e_hi)

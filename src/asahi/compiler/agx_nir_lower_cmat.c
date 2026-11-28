@@ -103,9 +103,11 @@ static nir_def *
 matrix_row(nir_builder *b, nir_def *lane,
            struct glsl_cmat_description desc, unsigned element)
 {
-   if (desc.rows == 16)
-      return nir_ior_imm(b, nir_ior(b, nir_iand_imm(b, lane, 6),
-                 nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 8)), element >> 2);
+   if (desc.rows == 16) {
+      nir_def *base = nir_ior(b, nir_iand_imm(b, lane, 6),
+                              nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 8));
+      return (element >> 2) ? nir_iadd_imm(b, base, element >> 2) : base;
+   }
    return nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 3),
                     nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 4));
 }
@@ -115,18 +117,22 @@ matrix_col(nir_builder *b, nir_def *lane,
            struct glsl_cmat_description desc, unsigned element)
 {
    if (desc.cols == 16) {
-      if (desc.use == GLSL_CMAT_USE_A)
-         return nir_ior_imm(b, nir_ior(b,
+      if (desc.use == GLSL_CMAT_USE_A) {
+         nir_def *base = nir_ior(b,
             nir_iand_imm(b, nir_ushr_imm(b, lane, 3), 1),
-            nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 3)),
-            (element & 3) << 1);
-      return nir_ior_imm(b, nir_ior(b,
+            nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 3));
+         unsigned off = (element & 3) << 1;
+         return off ? nir_iadd_imm(b, base, off) : base;
+      }
+      nir_def *base = nir_ior(b,
          nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 2),
-         nir_iand_imm(b, lane, 8)), element & 3);
+         nir_iand_imm(b, lane, 8));
+      unsigned off = element & 3;
+      return off ? nir_iadd_imm(b, base, off) : base;
    }
-   return nir_ior_imm(b, nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 1),
-                                   nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 4)),
-                         element);
+   nir_def *base = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 1),
+                           nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 4));
+   return element ? nir_iadd_imm(b, base, element) : base;
 }
 
 /* Where a matrix's elements are: bit i of an element's index within its lane
@@ -196,16 +202,18 @@ layout_coord(nir_builder *b, const struct cmat_layout *l, nir_def *lane,
       if ((l->element[i] >= COL(0)) == col && (element & (1 << i)))
          imm |= 1 << COORD_BIT(l->element[i]);
    }
-   nir_def *coord = nir_imm_int(b, imm);
+   nir_def *coord = NULL;
    for (unsigned j = 0; j < 5; ++j) {
       if ((l->lane[j] >= COL(0)) != col)
          continue;
       nir_def *bit = nir_iand_imm(b, lane, 1 << j);
       unsigned to = COORD_BIT(l->lane[j]);
       bit = to >= j ? nir_ishl_imm(b, bit, to - j) : nir_ushr_imm(b, bit, j - to);
-      coord = nir_ior(b, coord, bit);
+      coord = coord ? nir_ior(b, coord, bit) : bit;
    }
-   return coord;
+   if (!coord)
+      return nir_imm_int(b, imm);
+   return imm ? nir_iadd_imm(b, coord, imm) : coord;
 }
 
 /* out[i] = subgroupShuffleXor(in[i], mask). The 16-bit values go two to a
