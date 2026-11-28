@@ -371,45 +371,44 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 static inline GLOBAL uint32_t *
 agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
-   agx_push(out, CDM_BARRIER, cfg) {
-      cfg.unk_5 = true;
-      cfg.unk_6 = true;
-      cfg.unk_8 = true;
-      // cfg.unk_11 = true;
-      // cfg.unk_20 = true;
-      // cfg.unk_24 = true; if clustered?
-      if (chip == AGX_CHIP_G13X) {
-         cfg.unk_4 = true;
-         // cfg.unk_26 = true;
-      }
+   /* DEC-32 bisect (wAQ): AGX_CDM_BARRIER_MASK overrides the catch-all.
+    * Bit N controls unk_N; usc_cache_inval stays on (correctness). The
+    * default (unset) is the legacy catch-all (0xFFFFF). The bit meaning is
+    * not reverse-engineered; the bisect finds the minimal coherent subset
+    * on G14C (w7X's catch-all comment above). */
+   static uint32_t mask = 0xFFFFFu;
+   static bool mask_init = false;
+   if (!mask_init) {
+      mask_init = true;
+      const char *e = getenv("AGX_CDM_BARRIER_MASK");
+      if (e && *e)
+         mask = ((uint32_t) strtoul(e, NULL, 0)) & 0xFFFFFu;
+   }
 
-      /* With multiple launches in the same CDM stream, we can get cache
-       * coherency (? or sync?) issues. We hit this with blits, which need - in
-       * between dispatches - need the PBE cache to be flushed and the texture
-       * cache to be invalidated. Until we know what bits mean what exactly,
-       * let's just set these after every launch to be safe. We can revisit in
-       * the future when we figure out what the bits mean.
-       */
-      cfg.unk_0 = true;
-      cfg.unk_1 = true;
-      cfg.unk_2 = true;
-      cfg.usc_cache_inval = true;
-      cfg.unk_4 = true;
-      cfg.unk_5 = true;
-      cfg.unk_6 = true;
-      cfg.unk_7 = true;
-      cfg.unk_8 = true;
-      cfg.unk_9 = true;
-      cfg.unk_10 = true;
-      cfg.unk_11 = true;
-      cfg.unk_12 = true;
-      cfg.unk_13 = true;
-      cfg.unk_14 = true;
-      cfg.unk_15 = true;
-      cfg.unk_16 = true;
-      cfg.unk_17 = true;
-      cfg.unk_18 = true;
-      cfg.unk_19 = true;
+   agx_push(out, CDM_BARRIER, cfg) {
+      /* The mask drives every unk bit (see above). */
+      cfg.unk_0 = (mask & (1u << 0)) != 0;
+      cfg.unk_1 = (mask & (1u << 1)) != 0;
+      cfg.unk_2 = (mask & (1u << 2)) != 0;
+      cfg.unk_4 = (mask & (1u << 4)) != 0;
+      cfg.unk_5 = (mask & (1u << 5)) != 0;
+      cfg.unk_6 = (mask & (1u << 6)) != 0;
+      cfg.unk_7 = (mask & (1u << 7)) != 0;
+      cfg.unk_8 = (mask & (1u << 8)) != 0;
+      cfg.unk_9 = (mask & (1u << 9)) != 0;
+      cfg.unk_10 = (mask & (1u << 10)) != 0;
+      cfg.unk_11 = (mask & (1u << 11)) != 0;
+      cfg.unk_12 = (mask & (1u << 12)) != 0;
+      cfg.unk_13 = (mask & (1u << 13)) != 0;
+      cfg.unk_14 = (mask & (1u << 14)) != 0;
+      cfg.unk_15 = (mask & (1u << 15)) != 0;
+      cfg.unk_16 = (mask & (1u << 16)) != 0;
+      cfg.unk_17 = (mask & (1u << 17)) != 0;
+      cfg.unk_18 = (mask & (1u << 18)) != 0;
+      cfg.unk_19 = (mask & (1u << 19)) != 0;
+      if (chip == AGX_CHIP_G13X)
+         cfg.unk_4 = true;
+      cfg.usc_cache_inval = true;   /* always: the USC cache invalidate */
    }
 
    return out;
