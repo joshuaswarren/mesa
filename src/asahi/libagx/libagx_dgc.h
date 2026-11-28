@@ -1109,6 +1109,8 @@ libagx_draw_robust_index_vdm_size(enum agx_chip chip,
 
 /* A batch shares its index binding, topology and heap. Every record keeps its
  * own source arguments, VDM destination and native state/empty-draw link. */
+#define LIBAGX_ROBUST_INDEX_COALESCE_BLOCK 1024u
+
 struct libagx_robust_index_draw {
    uint64_t vdm;
    uint64_t command;
@@ -1118,6 +1120,60 @@ struct libagx_robust_index_draw {
 };
 static_assert(sizeof(struct libagx_robust_index_draw) == 32,
               "robust index batch host/device ABI");
+
+static inline bool
+libagx_robust_index_cmd_is_empty(uint64_t command)
+{
+   CONST uint32_t *words = (CONST uint32_t *)(uintptr_t)command;
+   return words[0] == 0u || words[1] == 0u;
+}
+
+/* On AGX3 (G15/G16/G17P) and HAL300 (M5/G18G) hardware,
+ * agx_vdm_draw_robust_index() emits a VDM_STREAM_LINK over each empty slot
+ * because direct indexed packets require non-zero counts. Chasing tens of
+ * thousands of skipped-draw links without executing a draw hits the VDM
+ * timeout observed on M5 and triggers firmware recovery.
+ *
+ * Coalesce each contiguous empty run into jumps of up to
+ * LIBAGX_ROBUST_INDEX_COALESCE_BLOCK slots (1024 bounds one lane's scan time
+ * and is not derived from the hardware limit): only the head of an empty run
+ * or a block-aligned empty slot scans forward to the next non-empty draw (or
+ * the block boundary), keeping total scan work O(N) while bounding skipped
+ * hops to at most ceil(N / block) + 1 (plus any chunk-roll links landed on).
+ * Runs identically on lane 0 on GPU and in host unit tests. */
+static inline uint64_t
+libagx_robust_index_coalesce_empty_jump(
+   CONST struct libagx_robust_index_draw *draws, uint32_t g,
+   uint32_t batch_count, enum agx_chip chip)
+{
+   uint64_t empty_draw_jump = draws[g].empty_draw_jump;
+   if (!(agx_chip_native_hal200(chip) ||
+         agx_vdm_index_list_direct_is_hal300_inline(chip)) ||
+       batch_count <= 1u || g >= batch_count ||
+       !libagx_robust_index_cmd_is_empty(draws[g].command))
+      return empty_draw_jump;
+
+   const uint32_t block = LIBAGX_ROBUST_INDEX_COALESCE_BLOCK;
+   bool is_head = (g & (block - 1u)) == 0u;
+   if (!is_head)
+      is_head = !libagx_robust_index_cmd_is_empty(draws[g - 1u].command);
+   if (!is_head)
+      return empty_draw_jump;
+
+   const uint32_t block_rem = block - (g & (block - 1u));
+   const uint32_t batch_rem = batch_count - g;
+   const uint32_t end = g + (block_rem < batch_rem ? block_rem : batch_rem);
+   uint32_t first_nonempty = end;
+
+   for (uint32_t j = g + 1u; j < end; ++j) {
+      if (!libagx_robust_index_cmd_is_empty(draws[j].command)) {
+         first_nonempty = j;
+         break;
+      }
+   }
+
+   return draws[first_nonempty - 1u].empty_draw_jump;
+}
 
 #define LIBAGX_INDIRECT_VDM_MAX_RELOCS 8u
 #define LIBAGX_INDIRECT_VDM_LANES_PER_DRAW 4u
