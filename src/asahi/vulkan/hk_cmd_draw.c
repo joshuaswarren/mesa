@@ -7155,9 +7155,10 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * load the earlier pass's stored colour without an application barrier.
     * The native dependency tracker otherwise permits full-tile passes to
     * overlap. Retain upstream ordering on AGX2, including across command
-    * buffers/submissions through the tracker's prior requirements. M5
-    * schedules its render passes like native AGX3. */
-   if (!agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+    * buffers/submissions through the tracker's prior requirements. M5 and
+    * G18G schedule their render passes like native AGX3. */
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   if (!agx_chip_native_or_m5(chip) && chip != AGX_CHIP_G18G)
       hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
 
    if (suspend_resumable && cs->end == end_before &&
