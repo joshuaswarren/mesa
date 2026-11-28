@@ -682,6 +682,18 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 4 &&
           ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 && def->imm > 15)
          continue;
+      /* AGX3B/AGX3C immediate ASR only encodes shift counts in [1, width - 1];
+       * a shift count of 0 or >= width has no immediate encoding and causes
+       * agx3_pack_program() to refuse the shader (e.g. cooperative-matrix
+       * dequant decode shaders). Keep out-of-range counts in a register. */
+      if (ctx->key &&
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+          I->op == AGX_OPCODE_ASR && s == 1) {
+         unsigned max_shift = I->src[0].size == AGX_SIZE_16 ? 15 : 31;
+         if (def->imm == 0 || def->imm > max_shift)
+            continue;
+      }
       if ((I->op == AGX_OPCODE_DEVICE_STORE ||
            I->op == AGX_OPCODE_LOCAL_STORE || I->op == AGX_OPCODE_ATOMIC ||
            I->op == AGX_OPCODE_LOCAL_ATOMIC) &&

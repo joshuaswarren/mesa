@@ -2956,3 +2956,42 @@ TEST_F(Optimizer, Agx2ConvertByteMask)
          << c.name;
    }
 }
+
+TEST_F(Optimizer, Agx3AsrImmediateRange)
+{
+   const struct {
+      const char *name;
+      enum agx_isa_encoding encoding;
+      enum agx_size val_size;
+      uint32_t shift;
+      bool expect_imm;
+   } cases[] = {
+      {"agx3c-32-zero", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_32, 0, false},
+      {"agx3c-32-one", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_32, 1, true},
+      {"agx3c-32-max", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_32, 31, true},
+      {"agx3c-32-over", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_32, 32, false},
+      {"agx3c-16-zero", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_16, 0, false},
+      {"agx3c-16-max", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_16, 15, true},
+      {"agx3c-16-over", AGX_ISA_ENCODING_AGX3C, AGX_SIZE_16, 16, false},
+      {"agx3b-32-zero", AGX_ISA_ENCODING_AGX3B, AGX_SIZE_32, 0, false},
+      {"agx3b-32-one", AGX_ISA_ENCODING_AGX3B, AGX_SIZE_32, 1, true},
+      {"agx2-32-zero", AGX_ISA_ENCODING_AGX2, AGX_SIZE_32, 0, true},
+   };
+
+   for (const auto &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      b->shader->key = &key;
+
+      agx_index val = c.val_size == AGX_SIZE_16 ? hx : wx;
+      agx_index amt = agx_mov_imm(b, 32, c.shift);
+      agx_index dst = agx_temp(b->shader, c.val_size);
+      agx_instr *asr = agx_asr_to(b, dst, val, amt);
+      agx_unit_test(b, dst);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(asr->src[1].type == AGX_INDEX_IMMEDIATE, c.expect_imm) << c.name;
+   }
+}
