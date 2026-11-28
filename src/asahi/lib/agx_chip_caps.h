@@ -186,6 +186,18 @@ enum agx_chip_cap {
     * synchronization/memory_model/compute CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
 
+   /* Partition AGX2 compute async scoreboard slots by first-use distance and
+    * avoid premature AGX_MAX_PENDING=8 slot-0 overflow stalls when early-use
+    * loads mix with late-use loads (agx_insert_waits). Measured on G14X (M2 Max);
+    * other chips keep the stock pass until measured on aurora-wip. */
+   AGX_CAP_COMPUTE_SMART_WAITS = 1u << 28,
+
+   /* Hoist non-coherent AGX2 compute device_loads together with pure SSA
+    * address-producer chains (depth <= 4) up to 64 instructions earlier
+    * (agx_hoist_loads). Measured on G14X (M2 Max); other chips keep
+    * the stock schedule until measured on aurora-wip. */
+   AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS = 1u << 29,
+
    /* Compute device stores (`AGX_OPCODE_DEVICE_STORE` in MESA_SHADER_COMPUTE)
     * pack with the AGX3 coherent-store bit (`stdev f75=1`, `d.coherent=true`).
     *
@@ -287,7 +299,10 @@ enum agx_chip_cap {
    X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G14X,                                                                     \
+     AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SMART_WAITS |                             \
+        AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS,                                      \
+     __VA_ARGS__)                                                              \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15S, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \

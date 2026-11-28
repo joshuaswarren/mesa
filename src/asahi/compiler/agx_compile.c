@@ -16251,6 +16251,12 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED)))
       AGX_PASS(ctx, agx_ilp_schedule);
 
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+       agx_chip_has_cap(ctx->key->dev.chip, AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS)) {
+      AGX_PASS(ctx, agx_hoist_loads);
+   }
+
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
