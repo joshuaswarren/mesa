@@ -518,7 +518,7 @@ hk_get_device_features(
 
       /* VK_NV_cooperative_matrix2: each feature is enabled where it is
        * implemented. */
-      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixWorkgroupScope = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixFlexibleDimensions = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
@@ -1181,6 +1181,11 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix
          ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      /* Keep max flexible dimension at 256: AGX3 has 256 16-bit GPRs/thread
+       * (128 32-bit GPRs/thread), and advertising >= 512 causes clients such
+       * as ggml-vulkan to select 128x256 f32 workgroup tiles across 256
+       * threads (128 f32 accumulators/lane = 100% of the register file),
+       * triggering severe register spilling. */
       .cooperativeMatrixFlexibleDimensionsMaxDimension =
          features->cooperativeMatrixFlexibleDimensions ? 256 : 0,
       .apiVersion = hk_get_vk_version(),
@@ -2713,6 +2718,7 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
       VkComponentTypeKHR a, b, c;
    } configs[] = {
       {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
@@ -2732,6 +2738,35 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
             .scope = VK_SCOPE_SUBGROUP_KHR,
             .workgroupInvocations = 0,
          };
+      }
+   }
+   if (pdev->vk.supported_features.cooperativeMatrixWorkgroupScope) {
+      const struct {
+         uint32_t wg_invocations;
+         uint32_t m_gran, n_gran, k_gran;
+      } wg_shapes[] = {
+         {128, 32, 16, 16},
+         {256, 32, 32, 16},
+      };
+      for (unsigned w = 0; w < ARRAY_SIZE(wg_shapes); ++w) {
+         for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
+            if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+                          configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+               continue;
+            vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
+               *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {
+                  .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+                  .MGranularity = wg_shapes[w].m_gran,
+                  .NGranularity = wg_shapes[w].n_gran,
+                  .KGranularity = wg_shapes[w].k_gran,
+                  .AType = configs[i].a, .BType = configs[i].b,
+                  .CType = configs[i].c, .ResultType = configs[i].c,
+                  .saturatingAccumulation = VK_FALSE,
+                  .scope = VK_SCOPE_WORKGROUP_KHR,
+                  .workgroupInvocations = wg_shapes[w].wg_invocations,
+               };
+            }
+         }
       }
    }
    return vk_outarray_status(&out);
