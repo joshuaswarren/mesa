@@ -1598,8 +1598,11 @@ TEST(AGX3UniformALU, M5SelectKeepsWitnessedUniformComparand)
                                        exchanged ? imm : y,
                                        (enum agx_fcond)cond);
          agx_lower_uniform_sources(b->shader);
-         EXPECT_EQ(I->src[0].type == AGX_INDEX_UNIFORM,
-                   zero && cond != AGX_FCOND_EQ);
+         /* GE/LE against a selected zero is the fself32 uniform-first form;
+          * every other case packs as `x op' u ? ...` with the uniform as the
+          * second comparand (agx3_m5_fcmpsel_gpu1_desc). Either way the
+          * uniform is read in place. */
+         EXPECT_EQ(I->src[0].type, AGX_INDEX_UNIFORM) << cond << " " << zero;
          ralloc_free(mem);
       }
    }

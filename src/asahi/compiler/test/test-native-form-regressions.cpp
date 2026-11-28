@@ -935,12 +935,14 @@ m5_absolute_comparison_instrs(bool repeat_absolute)
 }
 
 /* M5 compares |x| through a plain copy. Comparing the same |x| twice in a
- * block costs no more than comparing |x| and x. */
+ * block costs no more than comparing |x| and x. (The x comparison reads x's
+ * uniform in place, so the two shaders no longer lower to the same copies;
+ * only the bound is the property.) */
 TEST(NativeForms, M5RepeatedAbsoluteComparandSharesItsCopy)
 {
    unsigned once = m5_absolute_comparison_instrs(false);
    EXPECT_GT(once, 0u);
-   EXPECT_EQ(m5_absolute_comparison_instrs(true), once);
+   EXPECT_LE(m5_absolute_comparison_instrs(true), once);
 }
 
 TEST(NativeForms, M5SignedByteToHalfReachesPacker)
