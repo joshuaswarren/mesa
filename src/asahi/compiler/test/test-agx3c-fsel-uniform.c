@@ -174,6 +174,11 @@ main(void)
       /* a uniform first comparand against zero, other than equality */
       {"u2 < 0.0 ? r6 : r8", 0, false,
        {{U, 2, N}, {I, 0, N}, {R, 6, N}, {R, 8, N}}, true, 1, NULL},
+      /* a uniform first comparand against an immediate other than zero */
+      {"u2h == 2.0 ? r6 : r8", 0, false,
+       {{U16, 2, N}, {I, 32, N}, {R, 6, N}, {R, 8, N}}, true, 0, NULL},
+      {"u2 == 2.0 ? r6 : r8", 0, false,
+       {{U, 2, N}, {I, 32, N}, {R, 6, N}, {R, 8, N}}, true, 0, NULL},
       /* a uniform first comparand selecting an immediate (fseli32) */
       {"u2 == 0.0 ? 1 : r8", 0, false,
        {{U, 2, N}, {I, 0, N}, {I, 1, N}, {R, 8, N}}, true, 0, NULL},

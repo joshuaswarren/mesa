@@ -575,3 +575,57 @@ TEST_F(AGX3UniformComparands, M5FloatSelectUniformPacksNativeBytes)
          << c.native << " in " << all;
    }
 }
+
+/* The general M5 select takes no source modifiers. A negated or absolute
+ * 16-bit comparand, or a negated or absolute selected minifloat, must not pack
+ * as the unmodified instruction: the select's descriptor refuses it. */
+TEST_F(AGX3UniformComparands, M5FloatSelectRefusesSourceModifiers)
+{
+   for (unsigned shape = 0; shape < 4; ++shape) {
+      std::string plain;
+      for (unsigned modified = 0; modified < 2; ++modified) {
+         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C, MESA_SHADER_COMPUTE);
+         key.dev.chip = AGX_CHIP_G17S;
+         b->shader->max_reg = 127;
+         const agx_index dest = agx_register(2, AGX_SIZE_32);
+         const agx_index t = agx_register(8, AGX_SIZE_32);
+         agx_instr *I;
+         if (shape < 2) {
+            /* r2 = r4h < r6h ? r8 : r10, with -r4h or |r4h| */
+            agx_index a = agx_register(4, AGX_SIZE_16);
+            if (modified)
+               a = shape ? agx_abs(a) : agx_neg(a);
+            I = agx_fcmpsel_to(b, dest, a, agx_register(6, AGX_SIZE_16), t,
+                               agx_register(10, AGX_SIZE_32), AGX_FCOND_LT);
+         } else {
+            /* r2 = r4 < r6 ? r8 : 2.0, with -2.0 or |2.0| */
+            agx_index two = agx_immediate_f(2.0);
+            if (modified)
+               two = shape == 2 ? agx_neg(two) : agx_abs(two);
+            I = agx_fcmpsel_to(b, dest, agx_register(4, AGX_SIZE_32),
+                               agx_register(6, AGX_SIZE_32), t, two,
+                               AGX_FCOND_LT);
+            I->fcmpsel_minifloat_select = true;
+         }
+         struct agx3_fsel32_gpu1_desc d;
+         EXPECT_EQ(agx3_m5_fcmpsel_gpu1_desc(b->shader, I, false, &d),
+                   !modified)
+            << "shape " << shape << " modified " << modified;
+
+         agx_stop(b);
+         util_dynarray bin;
+         util_dynarray_init(&bin, mem);
+         const bool packed = agx3_pack_binary(b->shader, &bin);
+         const uint8_t *p = static_cast<const uint8_t *>(bin.data);
+         const std::string code =
+            packed ? hex(std::vector<uint8_t>(p, p + bin.size), bin.size) : "";
+         util_dynarray_fini(&bin);
+         if (!modified) {
+            EXPECT_TRUE(packed) << "shape " << shape;
+            plain = code;
+         } else if (packed) {
+            EXPECT_NE(code, plain) << "shape " << shape;
+         }
+      }
+   }
+}

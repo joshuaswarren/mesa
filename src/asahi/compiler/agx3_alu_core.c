@@ -6369,9 +6369,11 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
       uniform_form = true;
       break;
    case 1:
+      /* u == #0: the only immediate the native compiler compares a uniform
+       * first comparand against is zero. */
       uniform_form = fself_uniform_cmp0 ||
-                     (d->cmp1_immediate && !imm[2] && !imm[3] &&
-                      d->condition == 0);
+                     (d->cmp1_immediate && d->cmp1 == 0 && !imm[2] &&
+                      !imm[3] && d->condition == 0);
       break;
    case 2:
       uniform_form = !(imm[2] && imm[3]);

@@ -11950,13 +11950,17 @@ agx3_post_ra_hint(agx_index index)
 }
 
 /* A register operand of the general M5 select: a 32-bit register, or a
- * 16-bit one where `half` allows it. Before register allocation (`ssa`) an
- * SSA value of that size stands in for the register. */
+ * 16-bit one where `half` allows it. The select takes no source modifiers, so
+ * a negated or absolute register is refused, not encoded as the plain one.
+ * Before register allocation (`ssa`) an SSA value of that size stands in for
+ * the register. */
 static bool
 agx3_m5_fsel_register(agx_index x, bool ssa, bool half)
 {
+   if (x.abs || x.neg)
+      return false;
    if (ssa && x.type == AGX_INDEX_NORMAL)
-      return !x.memory && !x.abs && !x.neg && agx_channels(x) == 1 &&
+      return !x.memory && agx_channels(x) == 1 &&
              (x.size == AGX_SIZE_32 || (half && x.size == AGX_SIZE_16));
    return agx3_vary_reg32(x) ||
           (half && agx3_src_is_register(x) && !x.memory &&
@@ -11999,9 +12003,12 @@ agx3_m5_fcmpsel_gpu1_desc(const agx_context *ctx, const agx_instr *I,
    for (unsigned i = 0; i < 4; ++i) {
       const agx_index x = I->src[i];
       const bool compared = i < 2;
+      /* Nor does an immediate take a modifier: a minifloat's sign is in its
+       * bits. */
       const bool immediate =
-         compared ? agx3_src_is_zero_imm(x)
-                  : x.type == AGX_INDEX_IMMEDIATE && x.value <= UINT8_MAX;
+         !x.abs && !x.neg &&
+         (compared ? agx3_src_is_zero_imm(x)
+                   : x.type == AGX_INDEX_IMMEDIATE && x.value <= UINT8_MAX);
       if (!immediate && !agx3_m5_fsel_register(x, ssa, compared) &&
           !agx3_m5_fsel_uniform(x, compared))
          return false;
