@@ -760,6 +760,52 @@ TEST_F(Optimizer, G17PPreservesStandaloneSaturate)
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
+/* AGX3B FFMA and FADD take the saturate of their result; FMUL and G18G keep
+ * the standalone saturate. */
+TEST_F(Optimizer, Agx3bFoldsSaturateIntoFfmaAndFadd)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      enum agx_opcode op;
+      bool expect_folded;
+   } cases[] = {
+      {"agx3b_ffma", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA, true},
+      {"agx3b_fadd", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD, true},
+      {"agx3b_fmul", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL, false},
+      {"g18g_ffma", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FFMA, false},
+      {"g18g_fadd", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FADD, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, wx), y = agx_preload(b, wy),
+                z = agx_preload(b, wz);
+      agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = c.op == AGX_OPCODE_FFMA  ? agx_ffma_to(b, value, x, y, z)
+                     : c.op == AGX_OPCODE_FADD ? agx_fadd_to(b, value, x, y)
+                                               : agx_fmul_to(b, value, x, y);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, out, value)->saturate = true;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      unsigned fmovs = 0;
+      agx_foreach_instr_global(b->shader, J)
+         fmovs += J->op == AGX_OPCODE_FADD &&
+                  agx_is_equiv(J->src[1], agx_negzero());
+      EXPECT_EQ(I->saturate, c.expect_folded) << c.name;
+      EXPECT_EQ(fmovs, c.expect_folded ? 0u : 1u) << c.name;
+   }
+}
+
 TEST_F(Optimizer, FsatWithPhi)
 {
    /*

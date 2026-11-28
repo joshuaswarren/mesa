@@ -827,15 +827,19 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
    if (use->src[0].neg || use->src[0].abs)
       return false;
 
-   /* G17P's native saturate is a standalone f32add.ep2 of the value and -0.
+   /* G17P's standalone saturate is an f32add.ep2 of the value and -0.
     * G18G keeps the same rule for its native narrowing saturate.
     * Pulling that modifier into its producer invents saturated forms for
-    * operations such as fmul and transcendental functions. Keep the exact
-    * Apple sequence intact for every producer. */
+    * operations such as fmul and transcendental functions. AGX3B's FFMA and
+    * FADD do have saturated forms, register and immediate alike, so a clamp
+    * of their result folds into them; every other producer keeps the
+    * separate saturate. */
    if (ctx->key &&
        (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&ctx->key->dev)) &&
-       use->saturate)
+       use->saturate &&
+       !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FADD)))
       return false;
 
    /* M5 (AGX3C) encodes reciprocal and reciprocal square root without a
