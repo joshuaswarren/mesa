@@ -444,3 +444,188 @@ TEST_F(AGX3UniformComparands, IntegerSelectUniformWitnessPacksAndRefusesImmSelec
    d.dest_16 = true;
    EXPECT_FALSE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3B, &d, ref, &ref_len));
 }
+
+/* M5 float selects read a uniform in place wherever the M5 select encoder
+ * admits it (test-agx3c-fsel-uniform.c): against zero, as either comparand
+ * (a first one is exchanged when packing), as a selected operand, and in a
+ * tied min/max. */
+TEST_F(AGX3UniformComparands, M5FloatSelectKeepsNativeUniforms)
+{
+   const agx_index u20 = agx_uniform(20, AGX_SIZE_32);
+   for (unsigned shape = 0; shape < 5; ++shape) {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      agx_index r = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index f = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index d = agx_temp(b->shader, AGX_SIZE_32);
+      switch (shape) {
+      case 0: /* u == 0.0 ? t : f */
+         agx_fcmpsel_to(b, d, agx_uniform(156, AGX_SIZE_32), agx_immediate(0),
+                        t, f, AGX_FCOND_EQ);
+         break;
+      case 1: /* r < u ? t : f */
+         agx_fcmpsel_to(b, d, r, u20, t, f, AGX_FCOND_LT);
+         break;
+      case 2: /* u < r ? t : f */
+         agx_fcmpsel_to(b, d, u20, r, t, f, AGX_FCOND_LT);
+         break;
+      case 3: /* r < 0.0 ? u : f */
+         agx_fcmpsel_to(b, d, r, agx_immediate(0), u20, f, AGX_FCOND_LT);
+         break;
+      case 4: /* min(r, u) */
+         agx_fcmpsel_to(b, d, r, u20, r, u20, AGX_FCOND_LTN);
+         break;
+      }
+      agx_unit_test(b, d);
+      agx_lower_uniform_sources(b->shader);
+      EXPECT_EQ(uniform_copies(b->shader), 0u) << shape;
+   }
+}
+
+/* Where all of a select's uniforms cannot be read in place, one that can is
+ * kept and the rest are copied; a modified or 16-bit-result select copies. */
+TEST_F(AGX3UniformComparands, M5FloatSelectCopiesOutsideTheForms)
+{
+   for (unsigned shape = 0; shape < 5; ++shape) {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      const bool half = shape == 3;
+      const enum agx_size size = half ? AGX_SIZE_16 : AGX_SIZE_32;
+      agx_index r = agx_temp(b->shader, size);
+      agx_index t = agx_temp(b->shader, size);
+      agx_index d = agx_temp(b->shader, size);
+      agx_instr *sel = NULL;
+      unsigned copies = 1;
+      switch (shape) {
+      case 0: /* u2 < u4: the second comparand stays, the first is copied */
+         sel = agx_fcmpsel_to(b, d, agx_uniform(2, AGX_SIZE_32),
+                              agx_uniform(4, AGX_SIZE_32), r, t, AGX_FCOND_LT);
+         break;
+      case 1: /* r < t ? u6 : u8: one selected uniform stays */
+         sel = agx_fcmpsel_to(b, d, r, t, agx_uniform(6, AGX_SIZE_32),
+                              agx_uniform(8, AGX_SIZE_32), AGX_FCOND_LT);
+         break;
+      case 2: /* a negated uniform */
+         sel = agx_fcmpsel_to(b, d, r, agx_neg(agx_uniform(4, AGX_SIZE_32)),
+                              r, t, AGX_FCOND_LT);
+         break;
+      case 3: /* a 16-bit result */
+         sel = agx_fcmpsel_to(b, d, r, agx_uniform(4, AGX_SIZE_16), r, t,
+                              AGX_FCOND_LT);
+         break;
+      case 4: /* min(u2, r): a tied min/max keeps all of its uniforms or none */
+         sel = agx_fcmpsel_to(b, d, agx_uniform(2, AGX_SIZE_32), r,
+                              agx_uniform(2, AGX_SIZE_32), r, AGX_FCOND_LTN);
+         break;
+      }
+      agx_unit_test(b, sel->dest[0]);
+      agx_lower_uniform_sources(b->shader);
+      EXPECT_EQ(uniform_copies(b->shader), copies) << shape;
+      if (shape == 0) {
+         EXPECT_EQ(sel->src[0].type, AGX_INDEX_UNIFORM);
+         EXPECT_EQ(sel->src[1].type, AGX_INDEX_NORMAL);
+      }
+      if (shape == 4) {
+         EXPECT_TRUE(agx_is_equiv(sel->src[0], sel->src[2]));
+         EXPECT_EQ(sel->src[0].type, AGX_INDEX_NORMAL);
+      }
+   }
+}
+
+/* The packer emits the M5 native compiler's own uniform-select encodings,
+ * exchanging a uniform first comparand into the second slot. */
+TEST_F(AGX3UniformComparands, M5FloatSelectUniformPacksNativeBytes)
+{
+   struct {
+      bool exchange;
+      uint16_t dest, cmp, sel0, sel1, uniform;
+      bool dest_cache;
+      bool cmp_cache, sel0_discard, sel1_discard, sel1_cache;
+      enum agx_fcond cond;
+      const char *native;
+   } cases[] = {
+      /* r34 = r36 == u74 ? r38 : r34 */
+      {false, 34, 36, 38, 34, 74, true, true, true, true, false, AGX_FCOND_EQ,
+       "12a5674b85260002"},
+      /* the same, written u74 == r36 */
+      {true, 34, 36, 38, 34, 74, true, true, true, true, false, AGX_FCOND_EQ,
+       "12a5674b85260002"},
+      /* r86 = u236 > r28 ? r86 : r24, packed as r28 < u236 */
+      {true, 86, 28, 86, 24, 236, false, true, true, false, true, AGX_FCOND_GT,
+       "b29d976d00980302"},
+   };
+   for (const auto &c : cases) {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C, MESA_SHADER_COMPUTE);
+      key.dev.chip = AGX_CHIP_G17S;
+      b->shader->max_reg = 127;
+      agx_index cmp = agx_register(c.cmp, AGX_SIZE_32);
+      cmp.cache = c.cmp_cache;
+      agx_index s0 = agx_register(c.sel0, AGX_SIZE_32);
+      s0.discard = c.sel0_discard;
+      agx_index s1 = agx_register(c.sel1, AGX_SIZE_32);
+      s1.discard = c.sel1_discard;
+      s1.cache = c.sel1_cache;
+      const agx_index u = agx_uniform(c.uniform, AGX_SIZE_32);
+      agx_instr *I = agx_fcmpsel_to(b, agx_register(c.dest, AGX_SIZE_32),
+                                    c.exchange ? u : cmp, c.exchange ? cmp : u,
+                                    s0, s1, c.cond);
+      I->dest[0].cache = c.dest_cache;
+      const std::vector<uint8_t> code = pack(b);
+      const std::string all = hex(code, code.size());
+      EXPECT_NE(all.find(c.native), std::string::npos)
+         << c.native << " in " << all;
+   }
+}
+
+/* The general M5 select takes no source modifiers. A negated or absolute
+ * 16-bit comparand, or a negated or absolute selected minifloat, must not pack
+ * as the unmodified instruction: the select's descriptor refuses it. */
+TEST_F(AGX3UniformComparands, M5FloatSelectRefusesSourceModifiers)
+{
+   for (unsigned shape = 0; shape < 4; ++shape) {
+      std::string plain;
+      for (unsigned modified = 0; modified < 2; ++modified) {
+         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C, MESA_SHADER_COMPUTE);
+         key.dev.chip = AGX_CHIP_G17S;
+         b->shader->max_reg = 127;
+         const agx_index dest = agx_register(2, AGX_SIZE_32);
+         const agx_index t = agx_register(8, AGX_SIZE_32);
+         agx_instr *I;
+         if (shape < 2) {
+            /* r2 = r4h < r6h ? r8 : r10, with -r4h or |r4h| */
+            agx_index a = agx_register(4, AGX_SIZE_16);
+            if (modified)
+               a = shape ? agx_abs(a) : agx_neg(a);
+            I = agx_fcmpsel_to(b, dest, a, agx_register(6, AGX_SIZE_16), t,
+                               agx_register(10, AGX_SIZE_32), AGX_FCOND_LT);
+         } else {
+            /* r2 = r4 < r6 ? r8 : 2.0, with -2.0 or |2.0| */
+            agx_index two = agx_immediate_f(2.0);
+            if (modified)
+               two = shape == 2 ? agx_neg(two) : agx_abs(two);
+            I = agx_fcmpsel_to(b, dest, agx_register(4, AGX_SIZE_32),
+                               agx_register(6, AGX_SIZE_32), t, two,
+                               AGX_FCOND_LT);
+            I->fcmpsel_minifloat_select = true;
+         }
+         struct agx3_fsel32_gpu1_desc d;
+         EXPECT_EQ(agx3_m5_fcmpsel_gpu1_desc(b->shader, I, false, &d),
+                   !modified)
+            << "shape " << shape << " modified " << modified;
+
+         agx_stop(b);
+         util_dynarray bin;
+         util_dynarray_init(&bin, mem);
+         const bool packed = agx3_pack_binary(b->shader, &bin);
+         const uint8_t *p = static_cast<const uint8_t *>(bin.data);
+         const std::string code =
+            packed ? hex(std::vector<uint8_t>(p, p + bin.size), bin.size) : "";
+         util_dynarray_fini(&bin);
+         if (!modified) {
+            EXPECT_TRUE(packed) << "shape " << shape;
+            plain = code;
+         } else if (packed) {
+            EXPECT_NE(code, plain) << "shape " << shape;
+         }
+      }
+   }
+}

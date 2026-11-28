@@ -1419,6 +1419,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  executable(
+    'aurora-uniform-select',
+    files('tests/aurora_uniform_select.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   # Also no-op shim tests, registered with the shim in ../meson.build.
   g17p_vulkan_bind_tail_state_change = executable(
     'g17p-vulkan-bind-tail-state-change',

@@ -11,6 +11,7 @@
 #include "util/u_debug.h"
 #include "agx3_uniform_alu.h"
 #include "agx3_isel_core.h"
+#include "agx3_alu_core.h"
 
 /*
  * Not all instructions can take uniforms. Memory instructions can take
@@ -791,6 +792,70 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
    }
 }
 
+/* Whether the general M5 float select encodes with the uniform operands in
+ * `keep` read in place and the others copied to registers. The copies of one
+ * uniform are one SSA value, as the lowering below makes them. */
+static bool
+m5_native_fsel_uniforms(const agx_context *ctx, const agx_instr *I,
+                        const bool keep[4])
+{
+   agx_instr candidate = *I;
+   agx_index sources[4];
+   memcpy(sources, I->src, sizeof(sources));
+   candidate.src = sources;
+   for (unsigned i = 0; i < 4; ++i) {
+      if (sources[i].type == AGX_INDEX_UNIFORM && !keep[i]) {
+         agx_index copy = agx_get_index(ctx->alloc + sources[i].value,
+                                        sources[i].size);
+         sources[i] = agx_replace_index(sources[i], copy);
+      }
+   }
+   struct agx3_fsel32_gpu1_desc d;
+   uint8_t bytes[AGX3_ALU_MAX_LENGTH], length;
+   return agx3_m5_fcmpsel_gpu1_desc(ctx, &candidate, true, &d) &&
+          agx3_alu_fcmp_select32_gpu1(&d, bytes, &length);
+}
+
+/* The uniform operands an M5 float select reads in place: every one when
+ * that encodes, otherwise the first one that encodes alone. A tied min/max
+ * keeps all of its uniforms or none, so its compared and selected operands
+ * stay the same value. */
+static void
+m5_fsel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
+                      bool keep[4])
+{
+   memset(keep, 0, 4 * sizeof(*keep));
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || ctx->is_preamble ||
+       I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4)
+      return;
+
+   bool all[4], any = false;
+   for (unsigned i = 0; i < 4; ++i) {
+      all[i] = I->src[i].type == AGX_INDEX_UNIFORM;
+      any |= all[i];
+   }
+   if (!any)
+      return;
+   if (m5_native_fsel_uniforms(ctx, I, all)) {
+      memcpy(keep, all, sizeof(all));
+      return;
+   }
+   if (!I->invert_cond &&
+       (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+       agx_is_equiv(I->src[0], I->src[2]) &&
+       agx_is_equiv(I->src[1], I->src[3]))
+      return;
+   for (unsigned i = 0; i < 4; ++i) {
+      bool one[4] = {false};
+      one[i] = all[i];
+      if (all[i] && m5_native_fsel_uniforms(ctx, I, one)) {
+         keep[i] = true;
+         return;
+      }
+   }
+}
+
 /* A select alternative that equals its value zero-extended to 32 bits. */
 static bool
 agx3_zext_select(agx_index x, const agx_index *widened, unsigned nr_widened,
@@ -974,6 +1039,8 @@ agx_lower_uniform_sources(agx_context *ctx)
          agx3_m5_fcmpsel_uniform_cmp0(I, &m5_fsel_cond, &m5_fsel_swap);
       m5_canonicalize_isel_uniform_cmp(ctx, I);
       agx3_isel_uniforms_kept(ctx, I, keep_isel_uniform);
+      bool keep_m5_fsel_uniform[4];
+      m5_fsel_uniforms_kept(ctx, I, keep_m5_fsel_uniform);
 
       /* An unwitnessed descriptor pair (agx3_tex_uniform_pair_unwitnessed)
        * materializes its uniform operand, keeping the register form. */
@@ -1176,6 +1243,7 @@ agx_lower_uniform_sources(agx_context *ctx)
               !(native_integer || native_m5_float || uniform_imm_compare ||
                 (s < 3 && keep_m5_float_uniform[s]) ||
                 (s < 4 && keep_isel_uniform[s]) ||
+                (s < 4 && keep_m5_fsel_uniform[s]) ||
                 (m5_tex_uniform_pair && (s == 3 || s == 4)) ||
                 (m5_fsel_uniform && s == 0) ||
                 agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,

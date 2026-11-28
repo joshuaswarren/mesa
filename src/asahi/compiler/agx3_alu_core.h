@@ -1099,7 +1099,9 @@ bool agx3_alu_sqrt_step_mod(enum agx_isa_encoding enc, uint16_t dest,
  * G17G 32-bit float compare-select: two registers encode as 14-byte `fseli32`
  * (ep4, f77=76), and one register plus one minifloat encodes as 16-byte
  * `fself32` (ep4, f85=74); two selected immediates are refused. Comparands
- * carry no abs/neg; f11 is the destination-cache hint.
+ * carry no abs/neg; f11 is the destination-cache hint. Forms that read the
+ * uniform file take the shortest endpoint that holds their fields, as the
+ * native compiler does.
  */
 struct agx3_fsel32_gpu1_desc {
    uint16_t dest;
@@ -1108,7 +1110,8 @@ struct agx3_fsel32_gpu1_desc {
    uint16_t cmp0; /* 32-bit register, first comparand */
    bool cmp0_16;
    enum agx3_alu_hint cmp0_hint;
-   /* cmp0 names an aligned 32-bit uniform (fself32 only, see the encoder). */
+   /* cmp0 names a uniform: an aligned 32-bit one, or a 16-bit one with
+    * cmp0_16. See the encoder for the shapes it is admitted in. */
    bool cmp0_uniform;
 
    bool cmp1_immediate; /* the second comparand is an 8-bit minifloat */
@@ -1117,6 +1120,9 @@ struct agx3_fsel32_gpu1_desc {
    /* The second comparand is a 16-bit register, widened by the comparison
     * (f41 = 1). `fseli16` only; see agx3_alu_fcmp_select16_gpu1(). */
    bool cmp1_16;
+   /* cmp1 names a uniform: an aligned 32-bit one, or a 16-bit one with
+    * cmp1_16 (`fseli32`/`fself32` only). */
+   bool cmp1_uniform;
 
    /* sel[0] is taken when the comparison holds. An immediate selected
     * operand is a minifloat and moves the instruction to `fself32`, unless
@@ -1125,6 +1131,9 @@ struct agx3_fsel32_gpu1_desc {
    uint16_t sel[2];
    enum agx3_alu_hint sel_hint[2];
    bool sel_integer;
+   /* A selected operand names an aligned 32-bit uniform (`fseli32` and
+    * `fself32` only). */
+   bool sel_uniform[2];
 
    unsigned condition; /* enum agx_fcond: eq 0, lt 1, gt 2, ge 5, le 6 */
    uint16_t wait_mask;

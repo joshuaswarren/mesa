@@ -11983,6 +11983,136 @@ agx3_post_ra_hint(agx_index index)
           index.cache ? AGX3_ALU_HINT_CACHE : AGX3_ALU_HINT_NONE;
 }
 
+/* A register operand of the general M5 select: a 32-bit register, or a
+ * 16-bit one where `half` allows it. The select takes no source modifiers, so
+ * a negated or absolute register is refused, not encoded as the plain one.
+ * Before register allocation (`ssa`) an SSA value of that size stands in for
+ * the register. */
+static bool
+agx3_m5_fsel_register(agx_index x, bool ssa, bool half)
+{
+   if (x.abs || x.neg)
+      return false;
+   if (ssa && x.type == AGX_INDEX_NORMAL)
+      return !x.memory && agx_channels(x) == 1 &&
+             (x.size == AGX_SIZE_32 || (half && x.size == AGX_SIZE_16));
+   return agx3_vary_reg32(x) ||
+          (half && agx3_src_is_register(x) && !x.memory &&
+           x.size == AGX_SIZE_16 && agx_channels(x) == 1);
+}
+
+/* A uniform operand of the general M5 select: an aligned 32-bit uniform, or
+ * a 16-bit one where `half` allows it (the comparands). */
+static bool
+agx3_m5_fsel_uniform(agx_index x, bool half)
+{
+   return x.type == AGX_INDEX_UNIFORM && !x.memory && !x.abs && !x.neg &&
+          !x.kill && !x.cache && !x.discard && agx_channels(x) == 1 &&
+          x.value < 512 &&
+          ((x.size == AGX_SIZE_32 && !(x.value & 1)) ||
+           (half && x.size == AGX_SIZE_16));
+}
+
+/*
+ * The descriptor of a general M5 32-bit float compare-select, for
+ * agx3_alu_fcmp_select32_gpu1(): registers, small immediates and uniforms in
+ * any slot, canonicalized as the encoder expects (an immediate or a lone
+ * uniform first comparand moves second, reversing the relation). The packer
+ * and agx_lower_uniform_sources() share it, so a uniform operand is kept in
+ * place only when the packer will encode it. With `ssa` the instruction is
+ * still in SSA form: registers then encode as r0 without lifetime hints, which
+ * the encoder admits wherever it admits any register. The wait mask is left
+ * empty.
+ */
+bool
+agx3_m5_fcmpsel_gpu1_desc(const agx_context *ctx, const agx_instr *I,
+                          bool ssa, struct agx3_fsel32_gpu1_desc *d)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_FCMPSEL ||
+       I->nr_dests != 1 || I->nr_srcs != 4 || I->saturate ||
+       !agx3_m5_fsel_register(I->dest[0], ssa, false) ||
+       agx_channels(I->dest[0]) != 1)
+      return false;
+   for (unsigned i = 0; i < 4; ++i) {
+      const agx_index x = I->src[i];
+      const bool compared = i < 2;
+      /* Nor does an immediate take a modifier: a minifloat's sign is in its
+       * bits. */
+      const bool immediate =
+         !x.abs && !x.neg &&
+         (compared ? agx3_src_is_zero_imm(x)
+                   : x.type == AGX_INDEX_IMMEDIATE && x.value <= UINT8_MAX);
+      if (!immediate && !agx3_m5_fsel_register(x, ssa, compared) &&
+          !agx3_m5_fsel_uniform(x, compared))
+         return false;
+   }
+   if (I->src[2].type == AGX_INDEX_IMMEDIATE &&
+       I->src[3].type == AGX_INDEX_IMMEDIATE)
+      return false;
+
+   const bool tied = agx3_fcmpsel_tied_minmax(I);
+   const bool reverse =
+      I->src[0].type == AGX_INDEX_IMMEDIATE ||
+      (!tied && I->src[0].type == AGX_INDEX_UNIFORM &&
+       I->src[1].type != AGX_INDEX_UNIFORM &&
+       I->src[1].type != AGX_INDEX_IMMEDIATE);
+   const agx_index cmp[2] = {I->src[reverse ? 1 : 0], I->src[reverse ? 0 : 1]};
+   unsigned condition = I->fcond;
+   bool swap = I->invert_cond;
+   if (!tied) {
+      if (condition == AGX_FCOND_LTN) {
+         condition = AGX_FCOND_GE;
+         swap = !swap;
+      } else if (condition == AGX_FCOND_GTN) {
+         condition = AGX_FCOND_LE;
+         swap = !swap;
+      }
+   }
+   if (reverse)
+      condition = agx3_fcond_reverse(condition);
+   const agx_index sel[2] = {I->src[swap ? 3 : 2], I->src[swap ? 2 : 3]};
+   /* Generic select immediates are integer bit patterns. Only a
+    * selected operand tied to a compared float carries the
+    * comparison's minifloat encoding (for example a depth clamp).
+    * A fused boolean bit-mask select must retain its raw bits. */
+   const bool tied_float =
+      (agx_is_equiv(I->src[0], I->src[2]) &&
+       agx_is_equiv(I->src[1], I->src[3])) ||
+      (agx_is_equiv(I->src[0], I->src[3]) &&
+       agx_is_equiv(I->src[1], I->src[2]));
+   const agx_index ops[4] = {cmp[0], cmp[1], sel[0], sel[1]};
+   uint16_t value[4];
+   enum agx3_alu_hint hint[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      const bool reg = ops[i].type != AGX_INDEX_IMMEDIATE &&
+                       ops[i].type != AGX_INDEX_UNIFORM;
+      value[i] = ssa && reg ? 0 : ops[i].value;
+      hint[i] = ssa ? AGX3_ALU_HINT_NONE : agx3_post_ra_hint(ops[i]);
+   }
+   *d = (struct agx3_fsel32_gpu1_desc){
+      .dest = ssa ? 0 : I->dest[0].value,
+      .dest_cache = !ssa && I->dest[0].cache,
+      .cmp0 = value[0], .cmp1 = value[1],
+      .cmp0_16 = cmp[0].size == AGX_SIZE_16,
+      .cmp0_uniform = cmp[0].type == AGX_INDEX_UNIFORM,
+      .cmp1_16 = cmp[1].type != AGX_INDEX_IMMEDIATE &&
+                 cmp[1].size == AGX_SIZE_16,
+      .cmp1_immediate = cmp[1].type == AGX_INDEX_IMMEDIATE,
+      .cmp1_uniform = cmp[1].type == AGX_INDEX_UNIFORM,
+      .cmp0_hint = hint[0], .cmp1_hint = hint[1],
+      .sel_immediate = {sel[0].type == AGX_INDEX_IMMEDIATE,
+                        sel[1].type == AGX_INDEX_IMMEDIATE},
+      .sel_integer = !tied_float && !I->fcmpsel_minifloat_select,
+      .sel = {value[2], value[3]},
+      .sel_hint = {hint[2], hint[3]},
+      .sel_uniform = {sel[0].type == AGX_INDEX_UNIFORM,
+                      sel[1].type == AGX_INDEX_UNIFORM},
+      .condition = condition,
+   };
+   return true;
+}
+
 
 /* Loop-head hint.
  *
@@ -18921,67 +19051,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
-         if (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
-             I->op == AGX_OPCODE_FCMPSEL &&
-             I->nr_dests == 1 && I->nr_srcs == 4 && !I->saturate &&
-             agx3_vary_reg32(I->dest[0]) && agx_channels(I->dest[0]) == 1 &&
-             ((agx3_vary_reg32(I->src[0]) || agx3_half_reg(I->src[0])) ||
-              agx3_src_is_zero_imm(I->src[0])) &&
-             ((agx3_vary_reg32(I->src[1]) || agx3_half_reg(I->src[1])) ||
-              agx3_src_is_zero_imm(I->src[1])) &&
-             (agx3_vary_reg32(I->src[2]) ||
-              (I->src[2].type == AGX_INDEX_IMMEDIATE && I->src[2].value <= UINT8_MAX)) &&
-             (agx3_vary_reg32(I->src[3]) ||
-              (I->src[3].type == AGX_INDEX_IMMEDIATE && I->src[3].value <= UINT8_MAX)) &&
-             !(I->src[2].type == AGX_INDEX_IMMEDIATE &&
-               I->src[3].type == AGX_INDEX_IMMEDIATE)) {
-            const bool reverse = I->src[0].type == AGX_INDEX_IMMEDIATE;
-            const agx_index cmp[2] = {I->src[reverse ? 1 : 0], I->src[reverse ? 0 : 1]};
-            unsigned condition = I->fcond;
-            bool swap = I->invert_cond;
-            if (!agx3_fcmpsel_tied_minmax(I)) {
-               if (condition == AGX_FCOND_LTN) {
-                  condition = AGX_FCOND_GE;
-                  swap = !swap;
-               } else if (condition == AGX_FCOND_GTN) {
-                  condition = AGX_FCOND_LE;
-                  swap = !swap;
-               }
-            }
-            if (reverse)
-               condition = agx3_fcond_reverse(condition);
-            const agx_index sel[2] = {I->src[swap ? 3 : 2], I->src[swap ? 2 : 3]};
-            /* Generic select immediates are integer bit patterns. Only a
-             * selected operand tied to a compared float carries the
-             * comparison's minifloat encoding (for example a depth clamp).
-             * A fused boolean bit-mask select must retain its raw bits. */
-            const bool tied_float =
-               (agx_is_equiv(I->src[0], I->src[2]) &&
-                agx_is_equiv(I->src[1], I->src[3])) ||
-               (agx_is_equiv(I->src[0], I->src[3]) &&
-                agx_is_equiv(I->src[1], I->src[2]));
+         struct agx3_fsel32_gpu1_desc m5_fsel;
+         if (enc == AGX_ISA_ENCODING_AGX3C &&
+             agx3_m5_fcmpsel_gpu1_desc(ctx, I, false, &m5_fsel)) {
             for (unsigned i = 0; i < 4; ++i) {
                if (I->src[i].kill || agx_channels(I->src[i]) != 1 ||
                    (I->src[i].cache && I->src[i].discard))
                   AGX3_REFUSE(I);
             }
-            const struct agx3_fsel32_gpu1_desc d = {
-               .dest = I->dest[0].value, .dest_cache = I->dest[0].cache,
-               .cmp0 = cmp[0].value, .cmp1 = cmp[1].value,
-               .cmp0_16 = cmp[0].size == AGX_SIZE_16,
-               .cmp1_16 = cmp[1].type != AGX_INDEX_IMMEDIATE && cmp[1].size == AGX_SIZE_16,
-               .cmp1_immediate = cmp[1].type == AGX_INDEX_IMMEDIATE,
-               .cmp0_hint = agx3_post_ra_hint(cmp[0]),
-               .cmp1_hint = agx3_post_ra_hint(cmp[1]),
-               .sel_immediate = {sel[0].type == AGX_INDEX_IMMEDIATE,
-                                 sel[1].type == AGX_INDEX_IMMEDIATE},
-               .sel_integer = !tied_float && !I->fcmpsel_minifloat_select,
-               .sel = {sel[0].value, sel[1].value},
-               .sel_hint = {agx3_post_ra_hint(sel[0]), agx3_post_ra_hint(sel[1])},
-               .condition = condition, .wait_mask = wait,
-            };
+            m5_fsel.wait_mask = wait;
             uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
-            if (!agx3_alu_fcmp_select32_gpu1(&d, bytes, &len) ||
+            if (!agx3_alu_fcmp_select32_gpu1(&m5_fsel, bytes, &len) ||
                 !agx3_append(emission, bytes, len))
                AGX3_REFUSE(I);
             continue;

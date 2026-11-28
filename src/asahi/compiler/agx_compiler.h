@@ -1463,6 +1463,11 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+/* The general M5 float select's encoder descriptor, as the packer builds it
+ * (agx3_pack_binary.c); `ssa` before register allocation. */
+struct agx3_fsel32_gpu1_desc;
+bool agx3_m5_fcmpsel_gpu1_desc(const agx_context *ctx, const agx_instr *I,
+                               bool ssa, struct agx3_fsel32_gpu1_desc *d);
 /* agx3_pack_binary, packed once more for a G18G vertex shader whose texture
  * reads reach past AGX3_G18G_READ_STAGING_LIMIT, with its outputs above
  * them (agx3_pack_binary.c). */

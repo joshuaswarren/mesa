@@ -1,0 +1,30 @@
+#version 450
+// Float compare-selects against a push-constant (uniform) value, each beside
+// the same comparison on a register that holds the same bits.
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer Data { uint w[]; };
+layout(push_constant) uniform Record { float u; uint record; } pc;
+
+void main()
+{
+   const uint i = pc.record * 16u;
+   const float x = uintBitsToFloat(w[i + 0u]); // pc.u, in a register
+   const float y = uintBitsToFloat(w[i + 1u]);
+   const uint t = w[i + 2u], f = w[i + 3u];
+
+   // uniform == 0.0, either way round, and the register reference
+   w[i + 4u] = pc.u == 0.0 ? t : f;
+   w[i + 5u] = pc.u != 0.0 ? t : f;
+   w[i + 6u] = x == 0.0 ? t : f;
+   w[i + 7u] = x != 0.0 ? t : f;
+   // the uniform as either comparand
+   w[i + 8u] = y < pc.u ? t : f;
+   w[i + 9u] = pc.u < y ? t : f;
+   w[i + 10u] = y < x ? t : f;
+   w[i + 11u] = x < y ? t : f;
+   // the uniform as a selected value, and a min against it
+   w[i + 12u] = y == 0.0 ? floatBitsToUint(pc.u) : f;
+   w[i + 13u] = y == 0.0 ? floatBitsToUint(x) : f;
+   w[i + 14u] = floatBitsToUint(min(y, pc.u));
+   w[i + 15u] = floatBitsToUint(min(y, x));
+}
