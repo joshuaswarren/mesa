@@ -66,16 +66,25 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
-/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+/* Timestamp copies, as hk_record_stamp_copies() received them. Only the
+ * event fixtures allow copies; elsewhere emitting one is a bug. A copy from
+ * address zero is what faults the GPU. */
+static bool allow_copies;
+static unsigned recorded_copies, null_copies;
+
 void
 hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct hk_stamp_copy *copies, unsigned count)
 {
    (void)cmd;
    (void)cs;
-   (void)copies;
-   (void)count;
-   abort();
+   if (!allow_copies)
+      abort();
+   for (unsigned i = 0; i < count; ++i) {
+      recorded_copies++;
+      if (!copies[i].src.addr || copies[i].src.event)
+         null_copies++;
+   }
 }
 
 /* These devices never map memory at a second address, so the real
@@ -112,8 +121,12 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
                          uint32_t size, uint32_t alignment,
                          enum hk_cmd_bo_type type)
 {
-   (void)cmd; (void)uploader; (void)size; (void)alignment; (void)type;
-   abort();
+   (void)cmd; (void)uploader; (void)type;
+   /* A standalone G17P timestamp's scratch store (stamp_carrier_launch()). */
+   return (struct agx_ptr){
+      .cpu = rzalloc_size(test_context, size),
+      .gpu = (uint64_t)++cs_allocs * alignment,
+   };
 }
 
 struct agx_ptr
@@ -1333,6 +1346,217 @@ test_event_retirement_stamping(void)
    }
 }
 
+static struct hk_event
+test_event(uint64_t *status, struct agx_bo *bo, uint32_t handle,
+           uint32_t offset_B)
+{
+   return (struct hk_event){
+      .base.type = VK_OBJECT_TYPE_EVENT,
+      .bo = bo,
+      .ts_handle = handle,
+      .ts_offset_B = offset_B,
+      .addr = bo->va->addr + offset_B,
+      .status = status,
+   };
+}
+
+static void
+set_event(struct hk_cmd_buffer *cmd, struct hk_event *event,
+          VkPipelineStageFlags2 src)
+{
+   const VkMemoryBarrier2 bar = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = src,
+   };
+   const VkDependencyInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &bar,
+   };
+   hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(event),
+                   &info);
+}
+
+static struct agx_timestamp_req
+ts_query(uint32_t q)
+{
+   return (struct agx_timestamp_req){
+      .addr = 0x90000 + 8 * q, .handle = 3, .offset_B = 8 * q};
+}
+
+/* An event's retirement stamp is no timestamp query: a later
+ * vkCmdWriteTimestamp2 never copies it. The copy would read address zero
+ * (the event request carries no address), and a reset of the event could
+ * clear the word before the copy read it. vkCmdCopyQueryPoolResults records
+ * into a query stream (hk_query_command_cs()) that waits for the whole
+ * prefix, query resets included, so the timestamp after the event is
+ * otherwise covered by that stream's end stamp (stamp_covered()). */
+static void
+test_event_stamp_not_copied(void)
+{
+   const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G};
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         for (unsigned control = 0; control < 2; ++control) {
+            test_chip = chips[c];
+            struct hk_cmd_buffer *cmd = new_cmd();
+            hk_cmd_buffer_device(cmd)->dev.params.features |=
+               DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS |
+               (exact ? DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS : 0);
+            allow_copies = true;
+            recorded_copies = null_copies = 0;
+
+            /* vkCmdWriteTimestamp2(q0), vkCmdCopyQueryPoolResults(q0) */
+            hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    ts_query(0));
+            cmd->sync.kind_override = HK_SYNC_ALL;
+            struct hk_cs *copy = hk_query_command_cs(cmd);
+            copy->stats.cmds++;
+            cmd->sync.kind_override = 0;
+
+            uint64_t status = 0;
+            struct agx_va va = {.addr = 0x70000};
+            struct agx_bo bo = {.va = &va};
+            struct hk_event event = test_event(&status, &bo, 61, 40);
+            if (control) {
+               /* The same sequence with a timestamp in place of the event:
+                * the next timestamp copies it, so the fixture reaches the
+                * coalescing path. */
+               hk_sync_write_timestamp(
+                  cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts_query(4));
+               hk_sync_write_timestamp(
+                  cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts_query(5));
+               T("control: a timestamp after a query copy coalesces",
+                 copy->timestamp.end.addr == ts_query(4).addr &&
+                    cmd->sync.stamp_copy_count == 1 &&
+                    cmd->sync.stamp_copies[0].src.addr == ts_query(4).addr);
+               hk_sync_flush_stamp_copies(cmd);
+               T("control: the copy reads the query", recorded_copies == 1 &&
+                                                         !null_copies);
+               continue;
+            }
+
+            set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+            T("event rides on the query copy stream's end stamp",
+              copy->timestamp.end.handle == 61 && !copy->timestamp.end.addr);
+
+            hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    ts_query(5));
+            const bool pending_null =
+               cmd->sync.stamp_copy_count &&
+               !cmd->sync.stamp_copies[0].src.addr;
+            hk_sync_flush_stamp_copies(cmd);
+            struct hk_cs *ts = last_cs(cmd);
+            T("timestamp after a stamped event never copies address zero",
+              !pending_null && null_copies == 0 && recorded_copies == 0);
+            T("timestamp after a stamped event gets a command of its own",
+              ts != copy && ts->type == HK_CS_CDM &&
+                 ts->timestamp.end.addr == ts_query(5).addr &&
+                 !ts->timestamp.end.event);
+
+            /* A second timestamp still copies the first: queries coalesce. */
+            hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    ts_query(6));
+            T("a later timestamp still copies the query stamp",
+              cmd->sync.stamp_copy_count == 1 &&
+                 cmd->sync.stamp_copies[0].src.addr == ts_query(5).addr);
+            hk_sync_flush_stamp_copies(cmd);
+            T("no copy reads address zero",
+              recorded_copies == 1 && !null_copies);
+         }
+      }
+   }
+   allow_copies = false;
+}
+
+/* The kernel publishes a render's timestamps in slot order. An event set
+ * after a timestamp query on the same render rides only on a later slot, so
+ * a host that sees the event set also sees the query. */
+static void
+test_event_after_render_query(void)
+{
+   uint64_t status = 0;
+   struct agx_va va = {.addr = 0x80000};
+   struct agx_bo bo = {.va = &va};
+
+   /* Fragment-end timestamp query (slot 3), then SetEvent: no free later
+    * slot, so a compute stream writes the status after the render. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r = add(cmd, false);
+      hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                              ts_query(1));
+      T("fragment-end query rides on the render",
+        last_cs(cmd) == r && r->timestamp.end.addr == ts_query(1).addr);
+
+      struct hk_event event = test_event(&status, &bo, 62, 48);
+      set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      struct hk_cs *ev = last_cs(cmd);
+      bool in_render = false;
+      for (unsigned i = 0; i < 4; ++i)
+         in_render |= r->oq_stamp[i].handle == 62;
+      T("event after a fragment-end query takes no render slot",
+        !in_render && ev != r && ev->type == HK_CS_CDM &&
+           ev->sync.dep[HK_SYNC_VDM].cut == r &&
+           ev->query_access_untracked);
+   }
+
+   /* Vertex-end timestamp query (slot 1): the event takes fragment start. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r = add(cmd, false);
+      r->timestamp.vtx_end = ts_query(2);
+      struct hk_event event = test_event(&status, &bo, 63, 56);
+      set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      T("event after a vertex-end query takes fragment start",
+        last_cs(cmd) == r && r->oq_stamp[2].handle == 63 &&
+           !r->oq_stamp[0].handle && !r->oq_stamp[1].handle);
+   }
+
+   /* Occlusion availability in fragment start (slot 2): only slot 3 is
+    * later, which the event never takes. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r = add(cmd, false);
+      r->oq_stamp[2] = (struct agx_timestamp_req){.handle = 4, .offset_B = 8};
+      struct hk_event event = test_event(&status, &bo, 64, 64);
+      set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      T("event after fragment-start availability takes no render slot",
+        last_cs(cmd) != r && !r->oq_stamp[0].handle &&
+           !r->oq_stamp[1].handle && !r->oq_stamp[3].handle);
+   }
+
+   /* SetEvent, a fragment-end query, SetEvent again: the second set must not
+    * reuse the event's earlier slot. */
+   {
+      test_chip = AGX_CHIP_G17P;
+      struct hk_cmd_buffer *cmd = new_cmd();
+      hk_cmd_buffer_device(cmd)->dev.params.features |=
+         DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+      struct hk_cs *r = add(cmd, false);
+      struct hk_event event = test_event(&status, &bo, 65, 72);
+      set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      T("first set rides on vertex end",
+        last_cs(cmd) == r && r->oq_stamp[1].handle == 65);
+      hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                              ts_query(3));
+      set_event(cmd, &event, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      struct hk_cs *ev = last_cs(cmd);
+      T("set again after a fragment-end query writes from compute",
+        r->timestamp.end.addr == ts_query(3).addr && ev != r &&
+           ev->type == HK_CS_CDM && ev->sync.dep[HK_SYNC_VDM].cut == r);
+   }
+}
+
 int
 main(void)
 {
@@ -1357,6 +1581,8 @@ main(void)
    test_oq_post_gfx_stamp_kind();
    test_oq_post_gfx_heap_promotion();
    test_event_retirement_stamping();
+   test_event_stamp_not_copied();
+   test_event_after_render_query();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

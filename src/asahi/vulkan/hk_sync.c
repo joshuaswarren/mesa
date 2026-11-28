@@ -2354,6 +2354,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
             hk_sync_flush_stamp_copies(cmd);
          if (st->stamp_copy_count == HK_SYNC_STAMP_COPIES)
             return;
+         assert(!gfx->timestamp.end.event);
          st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
             .dst = req,
             .src = gfx->timestamp.end,
@@ -2438,7 +2439,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
     * stamp waits for is missing from it: copy that stamp instead of
     * recording a command for this one alone. */
    if (tail && st->stamp_copy_count < HK_SYNC_STAMP_COPIES &&
-       stamp_covered(cmd, tail, dep)) {
+       !tail->timestamp.end.event && stamp_covered(cmd, tail, dep)) {
       const unsigned sq = hk_sync_sq(tail);
       st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
          .dst = req,
@@ -2516,23 +2517,41 @@ hk_sync_stamp_event(struct hk_cmd_buffer *cmd, struct agx_timestamp_req req,
 
    if (tail->type == HK_CS_VDM) {
       /* Only use the kernel retirement-written slots (vertex end, fragment
-       * start, vertex start); never fragment end (hk_query_oq.h). */
-      const unsigned order[] = {1, 2, 0};
-      int slot = -1;
-      for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
-         const unsigned s = order[i];
+       * start, vertex start); never fragment end (hk_query_oq.h).
+       *
+       * The kernel publishes a render's timestamps on the host in slot order
+       * (vertex start, vertex end, fragment start, fragment end). A host
+       * polling vkGetEventStatus() may read any query in the event's first
+       * scope once it sees the event set, so the event takes a slot after
+       * every slot already holding a query of this render: a fragment-end
+       * timestamp query rules out all three. The same holds when the event
+       * already rides on this render and is set again. */
+      const bool used[4] = {
+         tail->timestamp.start.handle || tail->oq_stamp[0].handle,
+         tail->timestamp.vtx_end.handle || tail->oq_stamp[1].handle,
+         tail->oq_stamp[2].handle,
+         tail->timestamp.end.handle || tail->oq_stamp[3].handle,
+      };
+      int same = -1, last_query = -1;
+      for (unsigned s = 0; s < ARRAY_SIZE(used); ++s) {
          if (tail->oq_stamp[s].handle == req.handle &&
-             tail->oq_stamp[s].offset_B == req.offset_B) {
-            slot = (int)s;
-            break;
+             tail->oq_stamp[s].offset_B == req.offset_B)
+            same = (int)s;
+         else if (used[s])
+            last_query = (int)s;
+      }
+
+      int slot = -1;
+      if (same >= 0) {
+         slot = same > last_query ? same : -1;
+      } else {
+         const unsigned order[] = {1, 2, 0};
+         for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+            if ((int)order[i] > last_query && !used[order[i]]) {
+               slot = (int)order[i];
+               break;
+            }
          }
-         if (slot >= 0)
-            continue;
-         if ((s == 0 && tail->timestamp.start.handle) ||
-             (s == 1 && tail->timestamp.vtx_end.handle) ||
-             tail->oq_stamp[s].handle)
-            continue;
-         slot = (int)s;
       }
       if (slot < 0)
          return false;
@@ -2550,6 +2569,9 @@ hk_sync_stamp_event(struct hk_cmd_buffer *cmd, struct agx_timestamp_req req,
    }
 
    if (tail->type == HK_CS_CDM) {
+      /* A compute command has a start and an end slot: the event takes the
+       * end, after any start-stamp query, or shares it with an earlier set
+       * of the same event. */
       if (tail->oq_avail_deferred)
          return false;
       if (tail->timestamp.end.handle &&

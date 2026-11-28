@@ -341,6 +341,7 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
       const struct agx_timestamp_req req = {
          .handle = event->ts_handle,
          .offset_B = event->ts_offset_B,
+         .event = true,
       };
       if (hk_sync_stamp_event(cmd, req, src_kinds))
          return;

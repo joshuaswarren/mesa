@@ -182,6 +182,11 @@ struct agx_timestamp_req {
    uint64_t addr;
    uint32_t handle;
    uint32_t offset_B;
+   /* A VkEvent status word set by the retirement timestamp
+    * (hk_sync_stamp_event()), not a timestamp query: it has no address to
+    * read, and a reset of the event can clear it before a copy would read it,
+    * so it is never the source of a timestamp copy. */
+   bool event;
 };
 
 /* A timestamp write satisfied by copying an earlier stamp: the query it
