@@ -93,6 +93,9 @@ struct hk_pack_member {
    uint8_t render_tail[HK_SYNC_NUM_KINDS];
    /* The render subqueue ran work before this command buffer. */
    bool render_ran;
+   /* Pure vkCmdResetQueryPool compute stream (only packs with other
+    * query-reset streams so regular compute packets keep NO_QUERY_ACCESS). */
+   bool query_reset;
 };
 
 struct hk_pack_limits {
