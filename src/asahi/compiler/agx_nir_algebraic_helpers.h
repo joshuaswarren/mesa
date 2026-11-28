@@ -115,6 +115,89 @@ agx_is_multiple_of_16(UNUSED const nir_search_state *state,
 }
 
 static inline bool
+agx_is_multiple_of_32(UNUSED const nir_search_state *state,
+                      const nir_alu_instr *instr, unsigned src,
+                      UNUSED unsigned num_components, const uint8_t *swizzle)
+{
+   return agx_src_low_bits_zero(instr, src, swizzle, 31);
+}
+
+static inline bool
+agx_is_multiple_of_64(UNUSED const nir_search_state *state,
+                      const nir_alu_instr *instr, unsigned src,
+                      UNUSED unsigned num_components, const uint8_t *swizzle)
+{
+   return agx_src_low_bits_zero(instr, src, swizzle, 63);
+}
+
+static inline bool
+agx_is_multiple_of_128(UNUSED const nir_search_state *state,
+                       const nir_alu_instr *instr, unsigned src,
+                       UNUSED unsigned num_components, const uint8_t *swizzle)
+{
+   return agx_src_low_bits_zero(instr, src, swizzle, 127);
+}
+
+static inline bool
+agx_is_multiple_of_256(UNUSED const nir_search_state *state,
+                       const nir_alu_instr *instr, unsigned src,
+                       UNUSED unsigned num_components, const uint8_t *swizzle)
+{
+   return agx_src_low_bits_zero(instr, src, swizzle, 255);
+}
+
+static inline bool
+agx_is_non_byte_mask16(UNUSED const nir_search_state *state,
+                       const nir_alu_instr *instr, unsigned src,
+                       unsigned num_components, const uint8_t *swizzle)
+{
+   for (unsigned i = 0; i < num_components; i++) {
+      nir_scalar s = nir_scalar_chase_movs(
+         nir_get_scalar(instr->src[src].src.ssa, swizzle[i]));
+      if (!nir_scalar_is_const(s))
+         return false;
+      uint64_t m = nir_scalar_as_uint(s) & 0xffff;
+      /* Leave 0xff for the 1-instruction AGX3C AGX_CONVERT_U8_TO_F path. */
+      if (m == 0 || m == 0xff || m == 0xffff)
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_is_shift_1_to_15(UNUSED const nir_search_state *state,
+                     const nir_alu_instr *instr, unsigned src,
+                     unsigned num_components, const uint8_t *swizzle)
+{
+   for (unsigned i = 0; i < num_components; i++) {
+      nir_scalar s = nir_scalar_chase_movs(
+         nir_get_scalar(instr->src[src].src.ssa, swizzle[i]));
+      if (!nir_scalar_is_const(s))
+         return false;
+      uint64_t sh = nir_scalar_as_uint(s);
+      if (sh < 1 || sh > 15)
+         return false;
+   }
+   return true;
+}
+
+static inline bool
+agx_is_top_bits_ubfe16(const nir_alu_instr *instr)
+{
+   if (instr->op != nir_op_ubitfield_extract || instr->def.num_components != 1)
+      return false;
+   nir_scalar off = nir_scalar_chase_movs(
+      nir_get_scalar(instr->src[1].src.ssa, instr->src[1].swizzle[0]));
+   nir_scalar bits = nir_scalar_chase_movs(
+      nir_get_scalar(instr->src[2].src.ssa, instr->src[2].swizzle[0]));
+   if (!nir_scalar_is_const(off) || !nir_scalar_is_const(bits))
+      return false;
+   uint64_t o = nir_scalar_as_uint(off);
+   uint64_t b = nir_scalar_as_uint(bits);
+   return o >= 1 && o <= 15 && b >= 1 && o + b >= 16 && o + b <= 32;
+}
+
+static inline bool
 agx_extract_iand_const(nir_scalar s, nir_scalar *base_out, uint64_t *mask_out)
 {
    s = nir_scalar_chase_movs(s);

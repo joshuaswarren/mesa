@@ -567,4 +567,99 @@ TEST(M5ByteToFloat, AGX3BNormfltLoopKeepsScaleInGpr)
    }
 }
 
+TEST(M5ByteToFloat, NarrowHalfMaskShiftAndUbfeToFloat)
+{
+   /* agx_nir_opt_m5_narrow_to_float narrows u2f32/i2f32 of masked, shifted,
+    * and top-bits ubfe of a zero-extended u16 to 16-bit ALU + u2f32(u16),
+    * while leaving 0xff masks for the 1-instruction U8_TO_F path and rejecting
+    * out-of-range shifts or non-top ubfe. */
+   const uint16_t samples[] = {0x0000, 0x000f, 0x00f0, 0x0f0f, 0x8001, 0xf123, 0xffff};
+   for (unsigned mode = 0; mode < 6; ++mode) {
+      SCOPED_TRACE(mode);
+      for (uint16_t hv : samples) {
+         nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                        &agx_nir_options, "narrow16");
+         nir_def *h = agx_test_load_preamble(&b, 1, 16, 0);
+         nir_def *h32 = nir_u2u32(&b, h);
+         nir_def *expr = NULL;
+         bool use_i2f = (mode & 1) != 0;
+         float expected = 0.0f;
+         switch (mode / 2) {
+         case 0: /* nibble mask 0xf */
+            expr = nir_iand_imm(&b, h32, 0xf);
+            expected = (float)(hv & 0xf);
+            break;
+         case 1: /* shift right by 4 */
+            expr = nir_ushr_imm(&b, h32, 4);
+            expected = (float)(hv >> 4);
+            break;
+         case 2: /* top-bits ubfe(h32, 12, 4) */
+            expr = nir_ubitfield_extract(&b, h32, nir_imm_int(&b, 12), nir_imm_int(&b, 4));
+            expected = (float)(hv >> 12);
+            break;
+         }
+         nir_def *f = use_i2f ? nir_i2f32(&b, expr) : nir_u2f32(&b, expr);
+         nir_store_global(&b, f, nir_imm_int64(&b, 0), .write_mask = 1);
+
+         EXPECT_TRUE(agx_nir_opt_m5_narrow_to_float(b.shader));
+         NIR_PASS(_, b.shader, nir_opt_constant_folding);
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         nir_validate_shader(b.shader, "narrow16");
+
+         /* u2u32 should be dead and conversion should take 16-bit u2f32. */
+         bool found_u2u32 = false, found_u2f32_16 = false;
+         nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+            nir_foreach_instr(instr, blk) {
+               if (instr->type != nir_instr_type_alu)
+                  continue;
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (alu->op == nir_op_u2u32)
+                  found_u2u32 = true;
+               if (alu->op == nir_op_u2f32 && nir_src_bit_size(alu->src[0].src) == 16)
+                  found_u2f32_16 = true;
+            }
+         }
+         EXPECT_FALSE(found_u2u32);
+         EXPECT_TRUE(found_u2f32_16);
+
+         /* Substitute constant h and fold to verify bit-exact result. */
+         b.cursor = nir_before_impl(nir_shader_get_entrypoint(b.shader));
+         nir_def_replace(h, nir_imm_intN_t(&b, hv, 16));
+         NIR_PASS(_, b.shader, nir_opt_constant_folding);
+         NIR_PASS(_, b.shader, nir_opt_dce);
+         nir_intrinsic_instr *st = NULL;
+         nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+            nir_foreach_instr(instr, blk) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_global)
+                  st = nir_instr_as_intrinsic(instr);
+            }
+         }
+         ASSERT_NE(st, nullptr);
+         EXPECT_EQ(nir_src_as_float(st->src[0]), expected);
+         ralloc_free(b.shader);
+      }
+   }
+
+   /* Negative controls: 0xff mask (kept for U8_TO_F), shift >= 16, non-top ubfe. */
+   for (unsigned neg = 0; neg < 3; ++neg) {
+      SCOPED_TRACE(neg);
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options, "narrow16_neg");
+      nir_def *h = agx_test_load_preamble(&b, 1, 16, 0);
+      nir_def *h32 = nir_u2u32(&b, h);
+      nir_def *expr = NULL;
+      if (neg == 0)
+         expr = nir_iand_imm(&b, h32, 0xff);
+      else if (neg == 1)
+         expr = nir_ushr_imm(&b, h32, 16);
+      else
+         expr = nir_ubitfield_extract(&b, h32, nir_imm_int(&b, 4), nir_imm_int(&b, 4));
+      nir_store_global(&b, nir_u2f32(&b, expr), nir_imm_int64(&b, 0), .write_mask = 1);
+      EXPECT_FALSE(agx_nir_opt_m5_narrow_to_float(b.shader));
+      nir_validate_shader(b.shader, "narrow16_neg");
+      ralloc_free(b.shader);
+   }
+}
+
 } // namespace
