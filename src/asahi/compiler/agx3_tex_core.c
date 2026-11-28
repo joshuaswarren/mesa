@@ -1004,7 +1004,16 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
       *len = 0;
       return false;
    }
-   if (!agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len)) {
+   /* AGX3b's 14-byte immediate-descriptor form names coordinate banks 0..60
+    * only. The 20-byte ep4 form carries the full bank field: Apple's linked
+    * pipelines stage at banks 84..152 with it (test_linked_staging_witnesses)
+    * and sparse samples already use it with immediate descriptors. A run of
+    * eight-half samples (a 3x3 PCF kernel on a shadow array) relocates past
+    * bank 60, so take the longer form when the short one cannot name the
+    * bank, as AGX3c's compact forms escalate above. */
+   if (!agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len) &&
+       !(enc == AGX_ISA_ENCODING_AGX3B && ep == 3 &&
+         agx3_bind_compose(enc, AGX3_MN_smp, 4, base, nb, ov, n, out, len))) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
       return false;
@@ -1530,16 +1539,16 @@ agx3_tex_decode_fetch(enum agx_isa_encoding enc, const void *instruction,
  * operand bank 6, not architectural r3. The FLOAT source is a half, while the
  * INTEGER source is the full uint required by texture2d::read. */
 /* PACK_SMPIR publishes a read's sampler operands at half bank + 6, beside the
- * coordinates that read stages at `bank`. A read that shares a shader with an
- * image write stages at bank 16, clear of imgwci's halves 0..14: metal-nt
- * -arch applegpu_g17p publishes a texture2d_array read's layer followed by a
- * write as 1705541600000000f0c00400, a texture2d read's uint level as
- * 1705541600000004f0c00c00, and both for texture2d_array as
- * 170554160010020070c06500 (layer r8), each with SMP f19=16. */
+ * coordinates that read stages at `bank`. Eight-half aligned banks 0..248 keep
+ * consecutive staged samples disjoint (f5 carries the full destination half):
+ * metal-nt -arch applegpu_g17p publishes a texture2d_array read's layer
+ * followed by a write at bank 16 as 1705541600000000f0c00400, a texture2d
+ * read's uint level as 1705541600000004f0c00c00, and both for texture2d_array
+ * as 170554160010020070c06500 (layer r8), each with SMP f19=16. */
 static bool
 sampler_bank_valid(uint16_t bank)
 {
-   return bank == 0 || bank == 16;
+   return (bank & 7) == 0 && bank <= 248;
 }
 
 static bool

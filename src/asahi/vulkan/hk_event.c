@@ -119,6 +119,12 @@ hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs) {
+      if (src_kinds) {
+         /* A host observer polling vkGetEventStatus() may read query results
+          * once this event is set; withhold NO_QUERY_ACCESS so pending
+          * host-published stamps in the first scope land before the write. */
+         cs->query_access_untracked = true;
+      }
       if (host_kinds) {
          hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_visibility_flush(hk_cmd_buffer_device(cmd), cs, true);
@@ -245,6 +251,16 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
       uint8_t init_dst;
       const bool init =
          brl_discard_init_prepare(cmd, &pDependencyInfos[i], &init_dst);
+
+      /* AGX2 has no polling wait; this boundary is an ordering dependency
+       * like a pipeline barrier. Carry it to the next CDM launch (or to the
+       * trailing edge of the open compute stream when it closes). */
+      if (agx_chip_command_stream_generation(dev->dev.chip) ==
+              AGX_CS_GENERATION_AGX2 &&
+          !HK_PERF(dev, FULLCDMBARRIER)) {
+         cmd->state.cs.cdm_barrier_pending = true;
+         cmd->state.cs.cdm_barrier_full_needed = true;
+      }
       hk_sync_barrier(cmd, src_kinds, dst_kinds);
       if (init)
          brl_discard_init_record(cmd, &pDependencyInfos[i], init_dst);

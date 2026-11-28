@@ -2739,6 +2739,9 @@ agx_destroy_context(struct pipe_context *pctx)
    agx_swtnl_destroy(ctx);
    agx_destroy_oq_heap_ctx(ctx);
 
+   for (unsigned i = 0; i < LIBAGX_NUM_PROGRAMS; ++i)
+      agx_g17p_compute_templates_free(&ctx->g17p_precomp_templates[i]);
+
    if (ctx->submit_quarantined) {
       slab_destroy_child(&ctx->transfer_pool);
       slab_destroy_child(&ctx->transfer_pool_unsync);
@@ -3870,8 +3873,8 @@ agx_screen_create(int fd, struct renderonly *ro,
    /* parse driconf configuration now for device specific overrides */
    driParseConfigFiles(config->options, config->options_info,
                        &(driConfigFileParseParams) {
-                          .driverName = "aurora",
-                          .driverNameAlias = "asahi",
+                          .driverName = AGX_DRM_DRIVER_NAME,
+                          .driverNameAlias = AGX_DRM_DRIVER_NAME_LEGACY,
                        });
 
    agx_screen->dev.fd = fd;
@@ -3880,6 +3883,17 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    /* Try to open an AGX device */
    if (!agx_open_device(agx_screen, &agx_screen->dev)) {
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   /* GL on a chip whose row says so runs through zink over Borealis, which
+    * the loader picks for it from the same row; this driver's paths have
+    * not run there (agx_chip_gl_through_zink()). */
+   if (agx_chip_gl_through_zink(agx_screen->dev.chip)) {
+      fprintf(stderr, "Apple %s: GL runs through zink\n",
+              agx_chip_name(agx_screen->dev.chip));
+      agx_close_device(&agx_screen->dev);
       ralloc_free(agx_screen);
       return NULL;
    }

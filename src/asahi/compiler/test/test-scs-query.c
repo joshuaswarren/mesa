@@ -99,6 +99,7 @@ static void compile(unsigned mode,unsigned count,unsigned width,unsigned flags,
   write_file(name,part.binary+part.info.main_offset,part.info.main_size);
   struct agx3_ioto_uniform_range range={.start_halfs=122,.size_halfs=4,.address=0x10000090000ull};
   struct agx3_g17p_graphics_program_desc desc={.program_va=0x10000000000ull,.shader_va=0x10000003000ull,
+   .usc_clusters=2, /* the M5 Pro's lead */
    .uniform_ranges=mode==1?&range:NULL,.uniform_range_count=mode==1,
    .shader_binary_size=part.info.main_size,.nr_gprs=part.info.nr_gprs,
    .scratch_size=MAX2(part.info.scratch_size,part.info.agx3_spectpr_scratch_size),

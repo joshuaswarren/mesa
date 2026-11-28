@@ -26,6 +26,7 @@
 #include "hk_device.h"
 #include "hk_queue.h"
 #include "hk_device_memory.h"
+#include "util/u_atomic.h"
 #include "hk_entrypoints.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "hk_image_layout_core.h"
@@ -535,10 +536,14 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
  * RGBA8 formats and the other R16 formats, respectively; bit 11 selects
  * B10G11R11, whose end-of-tile store keeps its class on M5
  * (agx_rt0_pbe_format); bit 12 admits mipmapped images, whose levels
- * compress as those of colour attachments do. Zero retains the uncompressed
- * diagnostic control. */
+ * compress as those of colour attachments do; bit 13 selects BGRA8 UNORM and
+ * the one- and two-channel 8-bit formats (vkd3d-proton's swapchain and
+ * typeless R8/RG8 UAV targets); bit 14 selects the RG32 and RGBA32 integer
+ * formats, whose image atomics would need 64-bit image atomics that the
+ * device does not expose. Zero retains the uncompressed diagnostic control. B10G11R11 is not compressed whatever the bit says: a compressed
+ * tile of its class reads a NaN field back as zero. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 8191)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 32767)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
@@ -549,14 +554,31 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
     * their view formats: the formats of one channel layout (UNORM, SNORM,
     * UINT, SINT, FLOAT). None of these formats has image atomics, so such an
     * image compresses when hk_can_compress() finds only formats of the
-    * image's channel layout in the list. */
+    * image's channel layout in the list.
+    *
+    * VK_IMAGE_CREATE_ALIAS_BIT, which vkd3d-proton sets on every placed
+    * resource, is admitted under the colour policy's contract: images of
+    * identical creation parameters get the same layout, metadata included.
+    * Gen10 storage stores merge directly into tiles over arbitrary prior
+    * metadata (tests/vulkan_storage_alias.c: every stored or rendered texel
+    * over all 256 metadata byte patterns and random garbage, with or without
+    * an UNDEFINED transition), so brl_barrier_needs_metadata_init() skips
+    * discard metadata fast-clears when hk_chip_supports_compressed_storage_pbe()
+    * holds. */
    const VkImageCreateFlags allowed_flags =
-      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-   const VkBaseInStructure *ext = info->pNext;
-   const bool format_list_only =
-      (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
-      ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
-      !ext->pNext;
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+   /* The chain may hold a format list and a zero-handle external memory
+    * structure (format queries build one); anything shared stays plain. */
+   bool format_list = false, chain_ok = true;
+   vk_foreach_struct_const(stype, ext, info->pNext) {
+      if (stype == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
+         format_list = true;
+      else if (stype != VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
+               ((const VkExternalMemoryImageCreateInfo *)ext)->handleTypes)
+         chain_ok = false;
+   }
 
    /* HAL200/Gen9 storage images stay uncompressed: a shader image store through
     * the Gen9 PBE does not merge into a compressed block or update its
@@ -579,7 +601,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       return false;
 
    if (!hk_chip_supports_compressed_storage_pbe(dev->chip) || plane ||
-       (info->pNext && !format_list_only) ||
+       !chain_ok ||
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
        info->extent.width < 16 || info->extent.height < 16 ||
@@ -628,11 +650,34 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16_SNORM:
    case VK_FORMAT_R16_UINT:
    case VK_FORMAT_R16_SINT: bit = 1024; break;
+   case VK_FORMAT_B8G8R8A8_UNORM: bit = 8192; break;
+   case VK_FORMAT_R8G8_UNORM:
+   case VK_FORMAT_R8G8_SNORM:
+   case VK_FORMAT_R8G8_UINT:
+   case VK_FORMAT_R8G8_SINT:
+   case VK_FORMAT_R8_UNORM:
+   case VK_FORMAT_R8_SNORM:
+   case VK_FORMAT_R8_UINT:
+   case VK_FORMAT_R8_SINT:
+      /* Only as colour attachments too. A storage-only image of one- or
+       * two-byte texels is written by shader stores alone, each merging into
+       * a compressed tile, for little saved bandwidth: BeamNG's
+       * full-resolution R8 compute targets ran about 1.6 % slower
+       * compressed. vkd3d-proton's typeless R8/RG8 render targets are also
+       * end-of-tile stores, which write whole compressed tiles. */
+      if (!(info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+         return false;
+      bit = 8192;
+      break;
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32_SINT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+   case VK_FORMAT_R32G32B32A32_SINT: bit = 16384; break;
    default: return false;
    }
    /* A mutable image's views may be FLOAT when the image is not: the list
     * check in hk_can_compress() keeps them to the image's channel layout. */
-   if ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !format_list_only)
+   if ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !format_list)
       return false;
    return debug_get_option_m5_storage_compression() & bit;
 }
@@ -1279,7 +1324,6 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
    uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
 {
-   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
    VkResult result;
 
    /* Check if the given format info is valid first before returning sparse
@@ -2278,6 +2322,10 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       plane->mem = mem;
       plane->bo_offset_B = bo_offset_B;
       plane->rem = mem_size_B - bo_offset_B;
+      if (!p_atomic_read(&mem->has_image_binding)) {
+         p_atomic_set(&mem->has_image_binding, true);
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      }
    }
 
    return true;

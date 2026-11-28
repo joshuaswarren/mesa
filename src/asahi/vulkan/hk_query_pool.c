@@ -407,7 +407,15 @@ hk_queue_query_available_write(struct hk_cmd_buffer *cmd,
                                struct hk_query_pool *pool, uint32_t query,
                                uint32_t value, bool after_gfx)
 {
+   /* A post-graphics availability stream writes only query memory: classify
+    * it as HK_SYNC_STAMP so application pipeline barriers do not stall later
+    * graphics or compute work behind it, while query commands, timestamps,
+    * and events still order after it (hk_sync.h). */
+   const uint8_t saved_kind = cmd->sync.kind_override;
+   if (after_gfx)
+      cmd->sync.kind_override = HK_SYNC_STAMP;
    hk_queue_write(cmd, hk_query_available_addr(pool, query), value, after_gfx);
+   cmd->sync.kind_override = saved_kind;
    if (!pool->handle || vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -865,16 +873,21 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    perf_debug(cmd, "Reset query pool");
 
    /* The reset runs after every earlier use of the pool and before every
-    * later one: it is a transfer operation (Vulkan 1.3, 17.1) whose result
-    * every later query command on the queue observes without further
-    * synchronization. Zeroing is compute on every generation, so the
-    * ordering is one compute stream everything after waits on. */
+    * later one (Vulkan 1.4, 17.2): its result every later query command on
+    * the queue observes without further synchronization. Zeroing is compute
+    * on every generation.
+    *
+    * Only timestamp writes and query commands use timestamp queries, and both
+    * order themselves after the reset (hk_query_reset_cs()), so nothing else
+    * waits for it. The other query types are written by draws and dispatches
+    * as well: everything after their reset waits on it. */
    if (!queryCount)
       return;
 
-   cmd->sync.kind_override = HK_SYNC_ALL;
+   const bool stamps = pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
+   cmd->sync.kind_override = stamps ? HK_SYNC_QRESET : HK_SYNC_ALL;
    cmd->state.query_reset_recording = true;
-   struct hk_cs *cs = hk_query_command_cs(cmd);
+   struct hk_cs *cs = stamps ? hk_query_reset_cs(cmd) : hk_query_command_cs(cmd);
    if (cs) {
       cmd->sync.has_gpu_query_reset = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
@@ -884,8 +897,11 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    if (!cs)
       return;
 
-   hk_sync_after_stream(cmd, cmd->current_cs.cs ? cmd->current_cs.cs : cs,
-                        HK_SYNC_ALL);
+   struct hk_cs *last = cmd->current_cs.cs ? cmd->current_cs.cs : cs;
+   if (stamps)
+      hk_sync_query_reset_done(cmd, last);
+   else
+      hk_sync_after_stream(cmd, last, HK_SYNC_ALL);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1672,7 +1688,8 @@ hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
        !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS))
       return;
 
-   bool any = cs->timestamp.start.handle || cs->timestamp.end.handle;
+   bool any = cs->timestamp.start.handle || cs->timestamp.end.handle ||
+              cs->timestamp.vtx_end.handle;
    if (!any && cs->type == HK_CS_VDM) {
       for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
          if (cs->oq_stamp[i].handle) {
@@ -1691,6 +1708,9 @@ hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
    hk_query_stamps_note_one_locked(dev, queue, point,
                                    cs->timestamp.end.handle,
                                    cs->timestamp.end.offset_B);
+   hk_query_stamps_note_one_locked(dev, queue, point,
+                                   cs->timestamp.vtx_end.handle,
+                                   cs->timestamp.vtx_end.offset_B);
    if (cs->type == HK_CS_VDM) {
       for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
          hk_query_stamps_note_one_locked(dev, queue, point,

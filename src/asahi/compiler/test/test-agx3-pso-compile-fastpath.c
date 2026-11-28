@@ -1098,6 +1098,108 @@ test_preoptimized_fs_inline_loop_invariant_reassoc(bool blended,
    return ok;
 }
 
+/* Verify that capturing post-agx_optimize_nir NIR via
+ * agx_compile_shader_nir_capture_ex() and compiling a trivial non-ALU epilog
+ * via agx_compile_shader_nir_postopt() produces bit-exact machine code
+ * matching agx_compile_shader_nir_preoptimized(). */
+static bool
+test_postopt_fs_inline_equivalence(void)
+{
+   nir_shader *src = build_test_fs_main(false);
+   nir_shader *ref_src = nir_shader_clone(NULL, src);
+   const nir_shader_compiler_options *src_options = src->options;
+
+   struct agx_shader_key cap_key = g17p_key(true);
+   struct agx_shader_part standalone_part = {0};
+   struct blob pre_preamble_blob;
+   blob_init(&pre_preamble_blob);
+   nir_shader *post_opt_nir = NULL;
+
+   bool ok = agx_compile_shader_nir_capture_ex(
+      src, &cap_key, &standalone_part, &pre_preamble_blob, &post_opt_nir);
+   ralloc_free(src);
+   ok &= post_opt_nir != NULL && pre_preamble_blob.size > 0;
+   /* The capture outlives the compile: it must not keep the compiler's
+    * stack-local per-encoding options. */
+   if (post_opt_nir && post_opt_nir->options != src_options) {
+      fprintf(stderr, "postopt capture kept transient compiler options\n");
+      ok = false;
+   }
+
+   struct agx_shader_part ref_part = {0}, fast_part = {0};
+   if (ok) {
+      struct agx_shader_key ref_key = g17p_key(true);
+      nir_shader *ref_epilog = build_test_epilog(false);
+      inline_and_resolve(ref_src, ref_epilog);
+      ralloc_free(ref_epilog);
+      ok &= agx_compile_shader_nir(ref_src, &ref_key, &ref_part);
+   }
+   ralloc_free(ref_src);
+
+   if (ok) {
+      struct agx_shader_key fast_key = g17p_key(true);
+      nir_shader *fast_epilog = build_test_epilog(false);
+      inline_and_resolve(post_opt_nir, fast_epilog);
+      ralloc_free(fast_epilog);
+      ok &= agx_compile_shader_nir_postopt(post_opt_nir, &fast_key, &fast_part);
+      ok &= ref_part.info.binary_size > 0 &&
+            ref_part.info.binary_size == fast_part.info.binary_size &&
+            memcmp(ref_part.binary, fast_part.binary,
+                   ref_part.info.binary_size) == 0;
+   }
+
+   if (!ok) {
+      fprintf(stderr,
+              "postopt_fs_inline_equivalence failed: ref=%u fast=%u\n",
+              ref_part.info.binary_size, fast_part.info.binary_size);
+   }
+
+   blob_finish(&pre_preamble_blob);
+   free(standalone_part.binary);
+   free(ref_part.binary);
+   free(fast_part.binary);
+   ralloc_free(post_opt_nir);
+   return ok;
+}
+
+/* Verify that nir_opt_fp_math_ctrl early-out still marks IO loads
+ * no_signed_zero and still clears preserve_signed_zero on unused-sign ops. */
+static bool
+test_fp_math_ctrl_fast_paths(void)
+{
+   /* Case 1: shader with no fp_math_ctrl flags and no IO loads. */
+   nir_builder b1 = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "fp_ctrl_none");
+   nir_def *base = nir_load_preamble(&b1, 1, 64, .base = 0);
+   nir_def *id = nir_load_local_invocation_index(&b1);
+   nir_def *v = nir_fadd(&b1, nir_u2f32(&b1, id), nir_imm_float(&b1, 1.0f));
+   nir_store_global(&b1, v, base, .align_mul = 4);
+   bool ok = !nir_opt_fp_math_ctrl(b1.shader);
+   ralloc_free(b1.shader);
+
+   /* Case 2: preserve_signed_zero on fadd whose consumer does not observe -0. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "fp_ctrl_sz_clear");
+   nir_def *in = nir_load_input(&b2, 1, 32, nir_imm_int(&b2, 0),
+                                .base = 0,
+                                .io_semantics = {.location = VARYING_SLOT_VAR0,
+                                                 .num_slots = 1});
+   nir_def *sum = nir_fadd(&b2, in, nir_imm_float(&b2, 2.0f));
+   nir_def_as_alu(sum)->fp_math_ctrl = nir_fp_preserve_signed_zero;
+   nir_def *abs_sum = nir_fabs(&b2, sum);
+   nir_def_as_alu(abs_sum)->fp_math_ctrl = nir_fp_preserve_signed_zero;
+   nir_export_agx(&b2, abs_sum, .base = 0);
+
+   ok &= nir_opt_fp_math_ctrl(b2.shader);
+   ok &= !(nir_def_as_alu(sum)->fp_math_ctrl & nir_fp_preserve_signed_zero);
+   ok &= nir_intrinsic_io_semantics(nir_def_as_intrinsic(in)).no_signed_zero;
+   ralloc_free(b2.shader);
+
+   if (!ok)
+      fprintf(stderr, "fp_math_ctrl_fast_paths failed\n");
+   return ok;
+}
+
 int
 main(void)
 {
@@ -1121,6 +1223,8 @@ main(void)
    ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(true, false);
    ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(false, true);
    ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(true, true);
+   ok &= test_postopt_fs_inline_equivalence();
+   ok &= test_fp_math_ctrl_fast_paths();
    if (!ok)
       return 1;
    puts("agx3_pso_compile_fastpath: PASS");

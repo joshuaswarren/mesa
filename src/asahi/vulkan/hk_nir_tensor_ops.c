@@ -1783,6 +1783,33 @@ build_resample_nearest_3d(const nir_shader *orig, struct tensor_buffer src,
 }
 
 bool
+hk_nir_tensor_op_may_match(const struct nir_shader *orig)
+{
+   if (!orig || orig->info.stage != MESA_SHADER_COMPUTE ||
+       orig->info.workgroup_size_variable || orig->info.shared_size != 0 ||
+       !hk_identity_copy4_supported_local(orig->info.workgroup_size) ||
+       orig->info.num_ssbos != 2 || orig->info.num_images > 0 ||
+       orig->info.num_textures > 0 || orig->info.num_ubos > 0 ||
+       orig->num_uniforms > HK_COMPUTE_OPT_PUSH_BYTES)
+      return false;
+
+   nir_foreach_variable_in_shader(var, orig) {
+      if (var->data.mode &
+          (nir_var_mem_shared | nir_var_image | nir_var_uniform))
+         return false;
+   }
+
+   if (!exec_list_is_singular(&orig->functions))
+      return false;
+
+   const nir_function_impl *impl = nir_shader_get_entrypoint(orig);
+   if (!impl || !acyclic(&impl->body, 8))
+      return false;
+
+   return true;
+}
+
+bool
 hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
                                  struct hk_tensor_op_info *info_out,
                                  struct nir_shader **alt_primary_out,
@@ -1791,6 +1818,9 @@ hk_nir_match_and_build_tensor_op(const struct nir_shader *orig,
    *alt_primary_out = NULL;
    *alt_secondary_out = NULL;
    memset(info_out, 0, sizeof(*info_out));
+
+   if (!hk_nir_tensor_op_may_match(orig))
+      return false;
 
    nir_shader *nir = nir_shader_clone(NULL, orig);
    if (!nir)

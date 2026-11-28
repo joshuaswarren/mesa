@@ -482,6 +482,14 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
 
 /*
+ * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands accept tile buffers of
+ * up to 48 KiB (sample_size_B * utile_width_px * utile_height_px * samples),
+ * instead of 32 KiB. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_TILE_BUFFER_48K ((1ULL) << 46)
+
+/*
  * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
  * independent compute commands of one queue on several firmware compute
  * queues of its context, so that they overlap. Userspace needs no further
@@ -489,6 +497,18 @@ enum drm_asahi_feature {
  * drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS: every fragment pass of a render
+ * command, including partial renders the firmware runs when the tiler heap
+ * fills, starts only after the fragment work its fragment half is ordered
+ * after has completed: the earlier fragment work of its physical queue and
+ * the renders named by its fragment barriers. Userspace may then order a
+ * render's attachment loads and stores against an earlier render with
+ * fragment-stage ordering alone, without a tiling-half wait. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS ((1ULL) << 45)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2

@@ -2613,10 +2613,40 @@ hk_nir_im2col_vec4(const nir_shader *orig)
    return hk_nir_im2col_vec4_with_bound(orig, NULL);
 }
 
+bool
+hk_nir_copy_identity4_may_match(const nir_shader *orig)
+{
+   if (!orig || orig->info.stage != MESA_SHADER_COMPUTE ||
+       orig->info.workgroup_size_variable || orig->info.shared_size != 0 ||
+       !hk_identity_copy4_supported_local(orig->info.workgroup_size) ||
+       (orig->info.num_ssbos != 2 && orig->info.num_ssbos != 3) ||
+       orig->info.num_images > 0 || orig->info.num_textures > 0 ||
+       orig->info.num_ubos > 0)
+      return false;
+
+   nir_foreach_variable_in_shader(var, orig) {
+      if (var->data.mode &
+          (nir_var_mem_shared | nir_var_image | nir_var_uniform))
+         return false;
+   }
+
+   if (!exec_list_is_singular(&orig->functions))
+      return false;
+
+   const nir_function_impl *impl = nir_shader_get_entrypoint(orig);
+   if (!impl || !acyclic(&impl->body, 16))
+      return false;
+
+   return true;
+}
+
 static nir_shader *
 hk_nir_copy_identity4_build(const nir_shader *orig,
                             struct hk_identity_copy4 *info, bool dual_copy)
 {
+   if (!hk_nir_copy_identity4_may_match(orig))
+      return NULL;
+
    nir_shader *nir = nir_shader_clone(NULL, orig);
    nir_opt_constant_folding(nir);
 

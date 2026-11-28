@@ -71,6 +71,9 @@ enum agx_primitive { AGX_PRIMITIVE_POINTS, AGX_PRIMITIVE_LINES,
  AGX_PRIMITIVE_LINE_STRIP, AGX_PRIMITIVE_LINE_LOOP, AGX_PRIMITIVE_TRIANGLES,
  AGX_PRIMITIVE_TRIANGLE_STRIP, AGX_PRIMITIVE_TRIANGLE_FAN };
 enum agx_chip { AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G17P };
+static inline bool agx_chip_native_hal200(enum agx_chip c) { return c == AGX_CHIP_G17P; }
+static inline bool agx_vdm_index_list_direct_is_hal300_inline(enum agx_chip c) { (void)c; return false; }
+#define LIBAGX_ROBUST_INDEX_COALESCE_BLOCK 1024u
 #define AGX_ZERO_PAGE_ADDRESS 0x1000ull
 struct agx_grid { uint count[3]; };
 struct agx_draw { struct agx_grid b; uint64_t index_buffer;
@@ -112,7 +115,7 @@ static void repair_addr(struct poly_heap *h, VkDrawIndexedIndirectCommand *cmd,
   .command=(uintptr_t)cmd,.empty_draw_jump=64,.draw_state_offset=12,.render_state_emitted=1}};
  emissions=0; group=1;
  for(lane=0;lane<32;lane++) {
-  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG in_addr,range,true,0xffff,chip,topology,width);
+  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG in_addr,range,true,0xffff,chip,topology,width,1u);
   else libagx_draw_robust_index(NULL,h,FAILURE_ARG cmd,in_addr,range,true,0xffff,chip,topology,12,1,64,width);
  }
  assert(emissions==1);
@@ -289,6 +292,9 @@ def kernels(revision=None, mutation=None):
     for name, typ in [("available", "uint32_t"), ("copy", "void"),
                       ("clamped_count", "uint32_t"), ("shadow_sizes", "bool")]:
         code += block(h, f"static inline {typ}\nagx_robust_index_{name}(") + "\n"
+    if "libagx_robust_index_coalesce_empty_jump(" in h:
+        code += block(h, "static inline bool\nlibagx_robust_index_cmd_is_empty(") + "\n"
+        code += block(h, "static inline uint64_t\nlibagx_robust_index_coalesce_empty_jump(") + "\n"
     for marker in ["static void\nlibagx_draw_robust_index_impl(",
                    "KERNEL(32)\nlibagx_draw_robust_index(",
                    "KERNEL(32)\nlibagx_draw_robust_index_batch("]:
@@ -301,6 +307,8 @@ def kernels(revision=None, mutation=None):
         code = code.replace("if (topology == AGX_PRIMITIVE_POINTS)", "if (false)")
     code += "#define FAILURE_ARG " + ("status_words," if "printf_buffer" in cl else "") + "\n"
     tests = TESTS
+    if "uint32_t batch_count" not in cl:
+        tests = tests.replace("chip,topology,width,1u);", "chip,topology,width);")
     if "uint32_t restart_index" not in cl:
         # Kernels from before they took the custom primitive restart index.
         code = code.replace(OLD_STUB[0], OLD_STUB[1])

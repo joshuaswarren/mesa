@@ -21,6 +21,19 @@ enum hk_compute_opt_kind {
    HK_COMPUTE_OPT_CANNY_HYSTERESIS_U8 = 1,
    HK_COMPUTE_OPT_CANNY_NMS_U8 = 2,
    HK_COMPUTE_OPT_CANNY_FINALIZE_U8 = 3,
+   HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 = 4,
+};
+
+/* Exact float32 lerp algebra recorded in plan->flags for
+ * HK_COMPUTE_OPT_BILINEAR_RESIZE_BORDER_U8 so the emitted kernel reproduces
+ * the matched shader's rounding bit-for-bit. */
+enum hk_resize_lerp_mode {
+   HK_RESIZE_LERP_ONE_MINUS_ADD_A = 0,
+   HK_RESIZE_LERP_ONE_MINUS_ADD_B = 1,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_A = 2,
+   HK_RESIZE_LERP_ONE_MINUS_FFMA_B = 3,
+   HK_RESIZE_LERP_DIFF_FFMA = 4,
+   HK_RESIZE_LERP_DIFF_ADD = 5,
 };
 
 struct hk_compute_opt_binding {
@@ -39,7 +52,7 @@ struct hk_compute_opt_plan {
    uint32_t orig_wg_size[3];
 
    /* Push-constant byte offsets (all 32-bit fields). */
-   uint16_t pc_off[6];
+   uint16_t pc_off[8];
 
    /* Kernel-specific scalar parameters captured verbatim from matched NIR.
     * - RGBA8_TO_GRAY_U8:    u32[0..2] = (w_r, w_g, w_b), u32[3] = shr
@@ -72,7 +85,8 @@ bool hk_compute_opt_validate_dispatch_core(
    bool alias_free, const struct hk_descriptor_state *desc,
    const struct hk_compute_opt_plan *plan, uint32_t base_x, uint32_t base_y,
    uint32_t base_z, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-   uint32_t *out_groups_x, uint32_t *out_groups_y);
+   uint32_t max_groups_x, uint32_t max_groups_y, uint32_t *out_groups_x,
+   uint32_t *out_groups_y);
 
 bool hk_compute_opt_validate_dispatch(
    const struct hk_device *dev, const struct hk_descriptor_state *desc,

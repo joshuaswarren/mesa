@@ -71,6 +71,14 @@ hk_barrier_local_read_draw_needs_split(bool kept_local_read_barrier,
           !uses_local_read_tile;
 }
 
+
+/* Whether a sync2 dependency declares only local compute-to-compute storage
+ * buffer ordering (no image barriers, no queue-family ownership transfer, no
+ * non-compute stages, no non-storage accesses, no unknown pNext extensions).
+ * Because Vulkan storage access bits also cover storage images, callers must
+ * pair this with stream-level image tracking before narrowing the CDM barrier. */
+bool hk_dependency_is_pure_compute_ssbo(const VkDependencyInfo *dep);
+
 const char *hk_barrier_split_reason_name(enum hk_barrier_split_reason reason);
 
 bool hk_barrier_image_may_alias(VkImageCreateFlags2KHR flags,

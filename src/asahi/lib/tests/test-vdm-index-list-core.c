@@ -23,13 +23,14 @@ static unsigned checks;
 static const enum agx_chip supported_chips[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static const enum agx_chip hal300_chips[] = {
    AGX_CHIP_G17G,
    AGX_CHIP_G17S,
    AGX_CHIP_G17C,
+   AGX_CHIP_G17D,
 };
 
 static const enum agx_chip pre_hal300_chips[] = {
@@ -60,7 +61,8 @@ static bool
 is_hal300(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C ||
+          chip == AGX_CHIP_G17D;
 }
 
 static int

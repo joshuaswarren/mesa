@@ -213,6 +213,14 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
       if (ins->op == AGX_OPCODE_FCMPSEL && s >= 2)
          continue;
 
+      /* AGX3C compare-select has no grounded abs/neg modifier on comparands;
+       * folding a preheader fneg/fabs into a loop select forces
+       * agx_lower_m5_alu_operands() to re-materialize it inside the loop. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && ins->op == AGX_OPCODE_FCMPSEL &&
+          s < 2 && (def->src[0].abs || def->src[0].neg || src.abs || src.neg))
+         continue;
+
       /* We can fold f2f32 into 32-bit instructions, but we can't fold f2f16
        * into 16-bit instructions, since the latter would implicitly promote to
        * a 32-bit instruction which is not exact.
@@ -387,36 +395,53 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * the integer 48, a denormal that reads as 0.0. That zeroed the coverage
  * multiplier of Skia's FillRRectOp (Chromium canvas fillRect and arcs
  * vanished). The constant stays in a register. */
-/* U8_TO_F reads only the low 8 bits of its 16-bit source register. When an
- * unpacked byte lane masks with 0xff before converting to float, drop the
- * mask and convert directly from the raw packed half register. */
+/* Byte-to-float conversions (U8_TO_F, and S8_TO_F on AGX2) read only the low 8
+ * bits of their 16-bit source register. When an unpacked byte lane masks with
+ * 0xff before converting to float, drop the mask and convert directly from the
+ * raw packed half register. */
 static void
 agx_optimizer_convert_u8(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
-   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
-       ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_CONVERT ||
-       I->dest[0].size != AGX_SIZE_32 ||
+   if (!ctx->key || I->op != AGX_OPCODE_CONVERT ||
        I->src[0].type != AGX_INDEX_IMMEDIATE ||
-       (I->src[0].value != AGX_CONVERT_U8_TO_F &&
-        I->src[0].value != AGX_CONVERT_U16_TO_F) ||
        I->src[1].type != AGX_INDEX_NORMAL ||
-       I->src[1].size != AGX_SIZE_16 || I->src[1].abs || I->src[1].neg)
+       I->src[1].size != AGX_SIZE_16 || I->src[1].abs || I->src[1].neg ||
+       I->src[1].memory)
       return;
+
+   const bool is_agx2 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2;
+   const bool is_agx3 =
+      agx_isa_is_agx3(ctx->key->dev.encoding) && !ctx->key->dev.emit_agx3d;
+   if (!is_agx2 && !is_agx3)
+      return;
+
+   const uint32_t mode = I->src[0].value;
+   if (is_agx2) {
+      if (mode != AGX_CONVERT_U8_TO_F && mode != AGX_CONVERT_S8_TO_F)
+         return;
+   } else {
+      if (I->dest[0].size != AGX_SIZE_32 ||
+          (mode != AGX_CONVERT_U8_TO_F && mode != AGX_CONVERT_U16_TO_F))
+         return;
+   }
 
    agx_instr *def = defs[I->src[1].value];
    if (!def || def->op != AGX_OPCODE_BITOP ||
-       def->truth_table != UTIL_LUT2(a & b) ||
+       def->truth_table != UTIL_LUT2(a & b) || def->saturate ||
        def->dest[0].size != AGX_SIZE_16)
       return;
 
    for (unsigned s = 0; s < 2; ++s) {
       agx_index mask = def->src[s];
       agx_index val = def->src[1 - s];
-      if (mask.type == AGX_INDEX_IMMEDIATE && mask.value == 0xff &&
+      const bool mask_ok =
+         is_agx2 ? ((mask.value & 0xff) == 0xff) : (mask.value == 0xff);
+      if (mask.type == AGX_INDEX_IMMEDIATE && mask_ok &&
           val.type == AGX_INDEX_NORMAL && val.size == AGX_SIZE_16 &&
           !val.abs && !val.neg && !val.memory) {
-         I->src[0] = agx_immediate(AGX_CONVERT_U8_TO_F);
-         I->src[1] = val;
+         if (!is_agx2)
+            I->src[0] = agx_immediate(AGX_CONVERT_U8_TO_F);
+         agx_replace_src(I, 1, val);
          return;
       }
    }
@@ -713,7 +738,8 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          I->src[s] = agx_immediate_f(f);
       } else if (value == def->imm) {
          I->src[s] = agx_immediate(value);
-      } else if (value_u16 == def->imm && agx_allows_16bit_immediate(I)) {
+      } else if (value_u16 == def->imm &&
+                 agx_allows_16bit_immediate(I, ctx->key->dev.encoding)) {
          I->src[s] = agx_abs(agx_immediate(value_u16));
       } else if ((I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) &&
                  s == agx_negate_src_index(I)) {

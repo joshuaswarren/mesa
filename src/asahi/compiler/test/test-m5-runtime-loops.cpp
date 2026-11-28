@@ -332,6 +332,52 @@ TEST(M5RuntimeLoops, BudgetRefused)
    ralloc_free(s);
 }
 
+/* load_const and undef instructions are cheap and should not inflate the
+ * unroll instruction budget. */
+TEST(M5RuntimeLoops, ConstAndUndefExcludedFromBudget)
+{
+   nir_builder b = compute_shader("const-undef-budget");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      /* Add many distinct load_const and undef instructions inside the loop
+       * body; they should not count toward the unroll budget. */
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .align_mul = 4);
+      nir_def *u0 = nir_undef(&b, 1, 32);
+      nir_def *u1 = nir_undef(&b, 1, 32);
+      (void)u0;
+      (void)u1;
+      for (unsigned k = 0; k < 24; ++k)
+         (void)nir_imm_int(&b, 0x11 + k);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   /* Keep load_const/undef in place (no DCE) to verify count_unrollable skips
+    * them under a budget (72) that fits factor 4 for the 17 non-const/non-undef
+    * instructions (17 * 4 = 68 <= 72) while refusing even factor 2 if the 26+
+    * const/undef ops are counted ((17 + 26) * 2 = 86 > 72). */
+   unsigned widest = 0;
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 72, &widest));
+   nir_validate_shader(s, "const-undef-budget after");
+   EXPECT_EQ(widest, 4u);
+   EXPECT_EQ(count_loops(s), 2u);
+   ralloc_free(s);
+}
+
 /* while (++i < n) acc += buf[i]: the back-edge value of i is defined in the
  * header, before the exit test. Every copy of the body must advance it. */
 TEST(M5RuntimeLoops, HeaderDefinedBackEdge)
@@ -442,6 +488,111 @@ TEST(M5RuntimeLoops, GuardBounds)
    /* hi - 3 would wrap: never. */
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 2), (uint32_t)INT32_MIN);
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 3), (uint32_t)INT32_MIN + 1);
+}
+
+/* for (i = local_invocation_id.x; i < n; i += 32) acc += buf[i]: a loop
+ * striped over a 32-wide workgroup with a constant bound, which no
+ * invocation runs more than ceil(n / 32) times. With `pc_start` the start is
+ * a push constant instead, which may be negative. */
+static nir_shader *
+striped_loop(uint32_t n, bool pc_start)
+{
+   nir_builder b = compute_shader("striped-loop");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *start =
+      pc_start ? nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32)
+               : nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_store_var(&b, iv, start, 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, nir_imm_int(&b, n)));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 32), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   return b.shader;
+}
+
+/* The iterations per test the pass gives a striped loop at factor 8, or 0
+ * when it leaves the loop as it is. */
+static unsigned
+striped_factor(uint32_t n, bool pc_start = false)
+{
+   nir_shader *s = striped_loop(n, pc_start);
+   unsigned widest = 0;
+   const bool progress = agx_nir_unroll_runtime_loops(s, 8, 320, &widest);
+   nir_validate_shader(s, "striped loop");
+   EXPECT_EQ(count_loops(s), progress ? 2u : 1u);
+   ralloc_free(s);
+   return progress ? widest : 0;
+}
+
+/* for (i = 0; i < n; i += step) acc += buf[i], the step a push constant: a
+ * loop that steps by a runtime value. Returns the iterations per test the
+ * pass gives it at factor 8, or 0 when it leaves the loop as it is. */
+static unsigned
+runtime_step_factor(uint32_t n)
+{
+   nir_builder b = compute_shader("runtime-step-loop");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *step = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, nir_imm_int(&b, n)));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd(&b, i, step), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+   unsigned widest = 0;
+   const bool progress = agx_nir_unroll_runtime_loops(s, 8, 320, &widest);
+   nir_validate_shader(s, "runtime-step loop");
+   ralloc_free(s);
+   return progress ? widest : 0;
+}
+
+TEST(M5RuntimeLoops, TripBoundLimitsFactor)
+{
+   /* At most two iterations, like a halo fill: any main loop could run at
+    * most once, so the loop stays as it is. */
+   EXPECT_EQ(striped_factor(64), 0u);
+   EXPECT_EQ(striped_factor(33), 0u);
+   /* At most 4, 15 and 16 iterations. */
+   EXPECT_EQ(striped_factor(128), 2u);
+   EXPECT_EQ(striped_factor(32 * 15), 4u);
+   EXPECT_EQ(striped_factor(32 * 16), 8u);
+   /* A start that may be negative gives no bound. */
+   EXPECT_EQ(striped_factor(64, true), 8u);
+   /* Neither does a step only known at run time, whatever the bound. */
+   EXPECT_EQ(runtime_step_factor(4096), 8u);
+   EXPECT_EQ(runtime_step_factor(64), 8u);
 }
 
 static nir_intrinsic_instr *
@@ -1420,4 +1571,147 @@ TEST(M5MergeWords, SoftFaultRespectsCheckedOffsets)
    compile_and_count_loads(true, checked_loads, checked_comps);
    EXPECT_EQ(checked_loads, 4u);
    EXPECT_EQ(checked_comps, 1u);
+}
+
+TEST(M5RuntimeLoops, RuntimeStepReductionUnrolls)
+{
+   /* Bottom-tested signed and top-tested unsigned read-only strided reduction
+    * loops unroll by 8; a strided loop that writes memory is left alone. */
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      const bool bottom = (mode == 0);
+      const bool is_unsigned = (mode == 1);
+      const bool has_store = (mode == 2);
+
+      nir_builder b = compute_shader("runtime-step");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "off");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "sum");
+      nir_def *step = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *bound = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+      nir_def *idx = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_float(&b, 0.0f), 1);
+
+      nir_loop *lp = nir_push_loop(&b);
+      {
+         nir_def *off = nir_load_var(&b, iv);
+         if (!bottom) {
+            nir_def *done = is_unsigned ? nir_uge(&b, off, bound) : nir_ige(&b, off, bound);
+            nir_break_if(&b, done);
+         }
+         nir_def *addr = buffer_address(&b, nir_ishl_imm(&b, nir_iadd(&b, off, idx), 2));
+         nir_def *v = nir_load_global(&b, 1, 32, addr,
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .align_mul = 4);
+         if (has_store) {
+            nir_store_global(&b, v, addr, .align_mul = 4);
+         } else {
+            nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), v), 1);
+         }
+         nir_def *next = nir_iadd(&b, off, step);
+         nir_store_var(&b, iv, next, 1);
+         if (bottom) {
+            nir_def *done = is_unsigned ? nir_uge(&b, next, bound) : nir_ige(&b, next, bound);
+            nir_break_if(&b, done);
+         }
+      }
+      nir_pop_loop(&b, lp);
+      nir_store_global(&b, nir_load_var(&b, acc), buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "runtime-step before");
+
+      unsigned widest = 0;
+      const bool progress = agx_nir_unroll_runtime_loops(b.shader, 8, 320, &widest);
+      nir_validate_shader(b.shader, "runtime-step after");
+      if (has_store) {
+         EXPECT_FALSE(progress);
+         EXPECT_EQ(count_loops(b.shader), 1u);
+      } else {
+         EXPECT_TRUE(progress) << "mode " << mode;
+         EXPECT_EQ(widest, 8u) << "mode " << mode;
+         EXPECT_EQ(count_loops(b.shader), 2u) << "mode " << mode;
+         expect_no_undef_header_phis(b.shader);
+      }
+      ralloc_free(b.shader);
+   }
+
+   /* Exhaustive boundary check of signed and unsigned runtime-step guards. */
+   const uint32_t F = 8;
+   static const int32_t s_vals[] = {
+      INT32_MIN, INT32_MIN + 7, INT32_MIN + 8, -100, -1, 0, 1, 7, 8, 9, 320,
+      INT32_MAX / 8, INT32_MAX / 8 + 1, INT32_MAX - 8, INT32_MAX - 1, INT32_MAX,
+   };
+   for (int32_t step : s_vals) {
+      for (int32_t bound : s_vals) {
+         const uint32_t span = (uint32_t)step * F;
+         const bool valid = (step > 0) && (step <= INT32_MAX / (int32_t)F) &&
+                            (bound >= (int32_t)(span + (uint32_t)INT32_MIN));
+         const int32_t g = valid ? (int32_t)((uint32_t)bound - span) : INT32_MIN;
+         for (int32_t iv : s_vals) {
+            if (iv < g) {
+               ASSERT_TRUE(valid);
+               int64_t end = (int64_t)iv + (int64_t)F * (int64_t)step;
+               ASSERT_LT(end, (int64_t)bound);
+               ASSERT_LE(end, (int64_t)INT32_MAX);
+            }
+         }
+      }
+   }
+   static const uint32_t u_vals[] = {
+      0u, 1u, 7u, 8u, 9u, 320u, UINT32_MAX / 8u, UINT32_MAX / 8u + 1u,
+      UINT32_MAX - 8u, UINT32_MAX - 1u, UINT32_MAX,
+   };
+   for (uint32_t step : u_vals) {
+      for (uint32_t bound : u_vals) {
+         const uint32_t span = step * F;
+         const bool valid = (step != 0u) && (step <= UINT32_MAX / F) && (bound >= span);
+         const uint32_t g = valid ? (bound - span) : 0u;
+         for (uint32_t iv : u_vals) {
+            if (iv < g) {
+               ASSERT_TRUE(valid);
+               uint64_t end = (uint64_t)iv + (uint64_t)F * (uint64_t)step;
+               ASSERT_LT(end, (uint64_t)bound);
+               ASSERT_LE(end, (uint64_t)UINT32_MAX);
+            }
+         }
+      }
+   }
+}
+
+TEST(M5RuntimeLoops, SharedStepOverflowSkipsUnroll)
+{
+   /* A stride-32 loop indexing 4-byte shared elements when shared_size == 128
+    * cannot run two in-bounds iterations; skip dead runtime unrolling. When
+    * shared_size == 1024 (room for 8 iterations), unrolling proceeds. */
+   for (unsigned sh_bytes : {128u, 1024u}) {
+      nir_builder b = compute_shader("shared-step-overflow");
+      b.shader->info.shared_size = sh_bytes;
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_store_var(&b, iv, lid, 1);
+
+      nir_loop *lp = nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, iv);
+         nir_break_if(&b, nir_ige(&b, i, n));
+         nir_def *v = nir_load_global(&b, 1, 32, buffer_address(&b, nir_ishl_imm(&b, i, 2)),
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .align_mul = 4);
+         nir_store_shared(&b, v, nir_ishl_imm(&b, i, 2), .write_mask = 1, .align_mul = 4);
+         nir_store_var(&b, iv, nir_iadd_imm(&b, i, 32), 1);
+      }
+      nir_pop_loop(&b, lp);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "shared-step-overflow before");
+
+      const bool progress = agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL);
+      nir_validate_shader(b.shader, "shared-step-overflow after");
+      EXPECT_EQ(progress, sh_bytes > 128u) << "sh_bytes=" << sh_bytes;
+      EXPECT_EQ(count_loops(b.shader), sh_bytes > 128u ? 2u : 1u);
+      ralloc_free(b.shader);
+   }
 }

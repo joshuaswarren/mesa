@@ -364,6 +364,9 @@ agx_batch_init(struct agx_context *ctx,
    batch->seqnum = ++ctx->batches.seqnum;
    batch->g17p_fragment_program = 0;
    batch->vs_root_valid = false;
+   batch->uploaded_attribs = 0;
+   memset(batch->uniforms.attrib_base, 0, sizeof(batch->uniforms.attrib_base));
+   memset(batch->uniforms.attrib_clamp, 0, sizeof(batch->uniforms.attrib_clamp));
    batch->g17p_emrt_heap = 0;
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
@@ -388,6 +391,13 @@ agx_batch_init(struct agx_context *ctx,
       _mesa_hash_table_clear(batch->bo_list.ranges, NULL);
       util_dynarray_clear(&batch->bo_list.range_list);
    }
+   memset(batch->bo_list.recent_bos, 0, sizeof(batch->bo_list.recent_bos));
+   batch->bo_list.recent_bo_next = 0;
+   memset(batch->bo_list.recent_range_bos, 0,
+          sizeof(batch->bo_list.recent_range_bos));
+   memset(batch->bo_list.recent_range_idx, 0,
+          sizeof(batch->bo_list.recent_range_idx));
+   batch->bo_list.recent_range_next = 0;
 
    if (agx_batch_is_compute(batch)) {
       batch->cdm = agx_encoder_allocate(batch, dev);
@@ -812,21 +822,38 @@ agx_batch_note_range(struct agx_batch *batch, struct agx_resource *rsrc,
    if (rsrc->base.b.target != PIPE_BUFFER)
       return;
 
+   for (unsigned i = 0; i < ARRAY_SIZE(batch->bo_list.recent_range_bos); ++i) {
+      if (batch->bo_list.recent_range_bos[i] == rsrc->bo) {
+         struct agx_bo_range *r = util_dynarray_element(
+            &batch->bo_list.range_list, struct agx_bo_range,
+            batch->bo_list.recent_range_idx[i]);
+         r->start = MIN2(r->start, start);
+         r->end = MAX2(r->end, end);
+         return;
+      }
+   }
+
    struct hash_entry *e =
       _mesa_hash_table_search(batch->bo_list.ranges, rsrc->bo);
    if (e) {
+      unsigned idx = (uintptr_t)e->data - 1;
       struct agx_bo_range *r = util_dynarray_element(
-         &batch->bo_list.range_list, struct agx_bo_range,
-         (uintptr_t)e->data - 1);
+         &batch->bo_list.range_list, struct agx_bo_range, idx);
       r->start = MIN2(r->start, start);
       r->end = MAX2(r->end, end);
+      unsigned slot = batch->bo_list.recent_range_next++ & 3u;
+      batch->bo_list.recent_range_bos[slot] = rsrc->bo;
+      batch->bo_list.recent_range_idx[slot] = idx;
    } else {
       struct agx_bo_range r = {start, end};
       util_dynarray_append(&batch->bo_list.range_list, r);
-      _mesa_hash_table_insert(
-         batch->bo_list.ranges, rsrc->bo,
-         (void *)(uintptr_t)util_dynarray_num_elements(
-            &batch->bo_list.range_list, struct agx_bo_range));
+      unsigned count = util_dynarray_num_elements(&batch->bo_list.range_list,
+                                                  struct agx_bo_range);
+      _mesa_hash_table_insert(batch->bo_list.ranges, rsrc->bo,
+                              (void *)(uintptr_t)count);
+      unsigned slot = batch->bo_list.recent_range_next++ & 3u;
+      batch->bo_list.recent_range_bos[slot] = rsrc->bo;
+      batch->bo_list.recent_range_idx[slot] = count - 1;
    }
 }
 
@@ -1032,8 +1059,10 @@ agx_batch_reads_internal(struct agx_batch *batch, struct agx_resource *rsrc,
     * with its own writer (a stencil-only blit renders to it alone), and the
     * BO was just added to this batch, so its writer is a hazard too.
     */
-   agx_flush_writer_except(batch->ctx, rsrc, batch, "Read from another batch",
-                            false);
+   struct agx_batch *writer = agx_writer_get(batch->ctx, rsrc->bo->handle);
+   if (unlikely(writer && writer != batch))
+      agx_flush_writer_except(batch->ctx, rsrc, batch, "Read from another batch",
+                              false);
 
    /* A combined depth/stencil read also retains the separate stencil BO.
     * Its writer may differ after a plane-by-plane blit, so resolve that

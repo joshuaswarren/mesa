@@ -3205,6 +3205,22 @@ hoist_matcher_invariants(nir_shader *s)
    return moved;
 }
 
+static bool
+cf_list_has_any_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return true;
+      if (node->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(node);
+         if (cf_list_has_any_loop(&nif->then_list) ||
+             cf_list_has_any_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
 bool
 hk_nir_match_byte_stencil(const nir_shader *orig_nir,
                           uint32_t set_layout_count,
@@ -3218,26 +3234,21 @@ hk_nir_match_byte_stencil(const nir_shader *orig_nir,
        orig_nir->info.workgroup_size[1] == 0 ||
        orig_nir->info.workgroup_size[2] == 0 ||
        orig_nir->info.ray_queries > 0 ||
-       !exec_list_is_empty(&orig_nir->variables)) {
-      /* Note: orig_nir->variables may contain push_const/system-value vars;
-       * only reject if any shared/image/sampler variable exists. */
-      if (!orig_nir || orig_nir->info.stage != MESA_SHADER_COMPUTE ||
-          orig_nir->info.internal || orig_nir->info.shared_size != 0 ||
-          orig_nir->info.workgroup_size_variable ||
-          orig_nir->info.workgroup_size[0] == 0 ||
-          orig_nir->info.workgroup_size[1] == 0 ||
-          orig_nir->info.workgroup_size[2] == 0 ||
-          orig_nir->info.ray_queries > 0)
-         return false;
+       orig_nir->info.num_images > 0 || orig_nir->info.num_textures > 0 ||
+       orig_nir->info.num_ubos > 0 || orig_nir->info.num_ssbos == 1)
+      return false;
 
-      nir_foreach_variable_in_shader(var, orig_nir) {
-         if (var->data.mode & (nir_var_mem_shared | nir_var_image |
-                               nir_var_uniform))
-            return false;
-      }
+   nir_foreach_variable_in_shader(var, orig_nir) {
+      if (var->data.mode & (nir_var_mem_shared | nir_var_image |
+                            nir_var_uniform))
+         return false;
    }
 
    if (!exec_list_is_singular(&orig_nir->functions))
+      return false;
+
+   const nir_function_impl *orig_impl = nir_shader_get_entrypoint(orig_nir);
+   if (!orig_impl || !cf_list_has_any_loop(&orig_impl->body))
       return false;
 
    /* Canonicalize a scratch clone so we never mutate the caller's NIR. */
@@ -4112,12 +4123,19 @@ stage_rgba8(nir_builder *b, nir_deref_instr *tile, nir_def *index,
 }
 
 static void
-stage_rgba8x4(nir_builder *b, nir_deref_instr *tile, nir_def *index,
-              nir_def *pixels)
+stage_rgba8x4_swizzled(nir_builder *b, nir_deref_instr *tile,
+                       nir_def *sh_row_off, nir_def *col, nir_def *swiz,
+                       nir_def *pixels)
 {
-   for (unsigned p = 0; p < 4; p++)
-      stage_rgba8(b, tile, nir_iadd_imm(b, index, p),
-                  nir_channel(b, pixels, p));
+   /* `col` is a multiple of 4 and `swiz` is 0 or 2, so each pair stays
+    * 16-byte aligned and contiguous in shared memory. */
+   nir_def *idx_lo = nir_iadd(b, sh_row_off, nir_ixor(b, col, swiz));
+   nir_def *idx_hi =
+      nir_iadd(b, sh_row_off, nir_ixor(b, nir_iadd_imm(b, col, 2), swiz));
+   stage_rgba8(b, tile, idx_lo, nir_channel(b, pixels, 0));
+   stage_rgba8(b, tile, nir_iadd_imm(b, idx_lo, 1), nir_channel(b, pixels, 1));
+   stage_rgba8(b, tile, idx_hi, nir_channel(b, pixels, 2));
+   stage_rgba8(b, tile, nir_iadd_imm(b, idx_hi, 1), nir_channel(b, pixels, 3));
 }
 
 static nir_def *
@@ -4138,7 +4156,8 @@ pack_rgba8_sum(nir_builder *b, nir_def *sum,
 
 static nir_def *
 emit_rgba8_edge_1px_stencil(nir_builder *b, nir_deref_instr *tile,
-                            nir_deref_instr *w_base, nir_def *sh_start,
+                            nir_deref_instr *w_base, nir_def *sh_base,
+                            nir_def *col_start, nir_def *swiz,
                             nir_def *n_taps, bool packed,
                             enum hk_byte_stencil_store_conv conv)
 {
@@ -4157,7 +4176,9 @@ emit_rgba8_edge_1px_stencil(nir_builder *b, nir_deref_instr *tile,
       nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
-      nir_def *sample_index = nir_iadd(b, sh_start, i);
+      nir_def *sample_index =
+         swiz ? nir_iadd(b, sh_base, nir_ixor(b, nir_iadd(b, col_start, i), swiz))
+              : nir_iadd(b, sh_base, i);
       nir_def *pixel = packed
                           ? decode_rgba8(b, load_sh_vec4_scalar(b, tile, sample_index))
                           : load_rgba8(b, tile, sample_index);
@@ -4169,44 +4190,62 @@ emit_rgba8_edge_1px_stencil(nir_builder *b, nir_deref_instr *tile,
    return pack_rgba8_sum(b, nir_load_var(b, sum), conv);
 }
 
-/* Feed each input pixel to all the overlapping outputs before moving to the
- * next pixel. The tap order for each individual output is strictly ascending.
- */
+/* Walk decoded RGBA pixels once, distributing each sample to the four
+ * neighboring outputs in strict ascending tap order while carrying the
+ * trailing coefficients from the preceding 4-tap block. */
 static void
-rgba8_accumulate(nir_builder *b, nir_deref_instr *tile, nir_def *first,
-                 nir_def *weights, nir_variable *sums[4])
+rgba8_accumulate_decoded_block(nir_builder *b, nir_def *const pixels[4],
+                               nir_def *prev, nir_def *weights, unsigned count,
+                               unsigned samples, nir_variable *sums[4])
 {
-   unsigned taps = weights->num_components;
-   for (unsigned k = 0; k < taps + 3; k++) {
-      nir_def *pixel = load_rgba8(b, tile, nir_iadd_imm(b, first, k));
-      for (unsigned t = k > 3 ? k - 3 : 0; t < taps && t <= k; t++) {
-         nir_variable *sum = sums[k - t];
-         nir_def *w = nir_channel(b, weights, t);
-         nir_store_var(b, sum, nir_ffma(b, pixel, w, nir_load_var(b, sum)),
-                       0xf);
+   for (unsigned k = 0; k < samples; k++) {
+      nir_def *pixel = pixels[k];
+      for (unsigned p = 0; p < 4; p++) {
+         int t = (int)k - (int)p;
+         if (t >= (int)count)
+            continue;
+
+         nir_def *w =
+            t < 0 ? nir_channel(b, prev, 4 + t) : nir_channel(b, weights, t);
+         nir_store_var(b, sums[p],
+                       nir_ffma(b, pixel, w, nir_load_var(b, sums[p])), 0xf);
       }
    }
 }
 
 static void
-emit_rgba8_sliding_stencil(nir_builder *b, nir_deref_instr *tile,
-                           nir_deref_instr *w_base, nir_deref_instr *w_base_v4,
-                           nir_def *first, nir_def *tap_count,
-                           enum hk_byte_stencil_store_conv conv,
-                           nir_def *out_pixels[4])
+emit_rgba8_horiz_streaming_stencil(nir_builder *b, nir_deref_instr *tile,
+                                   nir_deref_instr *w_base,
+                                   nir_deref_instr *w_base_v4,
+                                   nir_def *sh_row_off, nir_def *lx0,
+                                   nir_def *swiz, nir_def *tap_count,
+                                   enum hk_byte_stencil_store_conv conv,
+                                   nir_def *out_pixels[4])
 {
+   nir_def *n4 = nir_ishr_imm(b, tap_count, 2);
    nir_variable *i4_var =
       nir_local_variable_create(b->impl, glsl_int_type(), "group");
+   nir_variable *trailing =
+      nir_local_variable_create(b->impl, glsl_vec4_type(), "weights");
    nir_variable *sums[4];
    for (unsigned p = 0; p < 4; p++) {
       sums[p] = nir_local_variable_create(b->impl, glsl_vec4_type(), "sum");
       nir_store_var(b, sums[p], nir_imm_zero(b, 4, 32), 0xf);
    }
-   nir_def *n4 = nir_ishr_imm(b, tap_count, 2);
+   /* Before the first tap the inputs are finite bytes and every sum is +0. */
+   nir_store_var(b, trailing, nir_imm_zero(b, 4, 32), 0xf);
    nir_store_var(b, i4_var, nir_imm_int(b, 0), 0x1);
 
-   /* Four taps across four pixels already expose independent work for all
-    * 16 channel accumulators. Another copy increases register pressure. */
+   /* `lx0` and `i4 << 2` are multiples of 4 and `swiz` is 0 or 2, so the
+    * XOR bank swizzle distributes over `+ (i4 << 2)` and hoists out of the
+    * inner tap loop. */
+   nir_def *base_lo = nir_iadd(b, sh_row_off, nir_ixor(b, lx0, swiz));
+   nir_def *base_hi =
+      nir_iadd(b, sh_row_off, nir_ixor(b, nir_iadd_imm(b, lx0, 2), swiz));
+
+   /* Walk each 4-pixel shared group once (two 16-byte loads instead of four),
+    * issuing 24 FMAs against `trailing` before touching the freshly loaded
+    * `wv` so global weight latency is hidden. */
    nir_loop *taps = nir_push_loop(b);
    taps->control = nir_loop_control_dont_unroll;
    {
@@ -4216,25 +4255,52 @@ emit_rgba8_sliding_stencil(nir_builder *b, nir_deref_instr *tile,
       nir_pop_if(b, NULL);
 
       nir_def *wv = load_ssbo_f32x4(b, w_base_v4, i4);
-      rgba8_accumulate(b, tile, nir_iadd(b, first, nir_ishl_imm(b, i4, 2)), wv,
-                       sums);
+      nir_def *step = nir_ishl_imm(b, i4, 2);
+      nir_def *idx_lo = nir_iadd(b, base_lo, step);
+      nir_def *idx_hi = nir_iadd(b, base_hi, step);
+      nir_def *pixels[4] = {
+         load_rgba8(b, tile, idx_lo),
+         load_rgba8(b, tile, nir_iadd_imm(b, idx_lo, 1)),
+         load_rgba8(b, tile, idx_hi),
+         load_rgba8(b, tile, nir_iadd_imm(b, idx_hi, 1)),
+      };
+      rgba8_accumulate_decoded_block(b, pixels, nir_load_var(b, trailing), wv,
+                                     4, 4, sums);
+      nir_store_var(b, trailing, wv, 0xf);
       nir_store_var(b, i4_var, nir_iadd_imm(b, i4, 1), 0x1);
    }
    nir_pop_loop(b, NULL);
 
-   /* The window has odd length, so one or three taps remain. */
-   nir_def *tail = nir_iand_imm(b, tap_count, ~3);
-   nir_def *pos = nir_iadd(b, first, tail);
-   rgba8_accumulate(b, tile, pos, load_ssbo_f32(b, w_base, tail), sums);
+   /* One or three coefficients remain. Only the three-tap tail reaches into
+    * the next 16-byte shared pair (`col_t + 4`, `col_t + 5`). */
+   nir_def *last = nir_iand_imm(b, tap_count, ~3);
+   nir_def *tail_lo = nir_iadd(b, base_lo, last);
+   nir_def *tail_hi = nir_iadd(b, base_hi, last);
+   nir_def *pixels[4] = {
+      load_rgba8(b, tile, tail_lo),
+      load_rgba8(b, tile, nir_iadd_imm(b, tail_lo, 1)),
+      load_rgba8(b, tile, tail_hi),
+      load_rgba8(b, tile, nir_iadd_imm(b, tail_hi, 1)),
+   };
+   nir_def *prev = nir_load_var(b, trailing);
+   nir_def *w0 = load_ssbo_f32(b, w_base, last);
+   rgba8_accumulate_decoded_block(b, pixels, prev, w0, 1, 4, sums);
    nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, tap_count, 2), 0));
    {
-      /* Uniform reads can move to the preamble outside this branch. */
-      nir_def *last = nir_iadd_imm(b, tap_count, -1);
+      nir_def *end = nir_iadd_imm(b, tap_count, -1);
       nir_def *w1 =
-         load_ssbo_f32(b, w_base, nir_umin(b, last, nir_iadd_imm(b, tail, 1)));
-      nir_def *w2 = load_ssbo_f32(b, w_base, last);
-      rgba8_accumulate(b, tile, nir_iadd_imm(b, pos, 1), nir_vec2(b, w1, w2),
-                       sums);
+         load_ssbo_f32(b, w_base, nir_umin(b, end, nir_iadd_imm(b, last, 1)));
+      nir_def *w2 = load_ssbo_f32(b, w_base, end);
+      nir_def *idx_next = nir_iadd_imm(b, tail_lo, 4);
+      nir_def *six[6] = {
+         pixels[0], pixels[1], pixels[2], pixels[3],
+         load_rgba8(b, tile, idx_next),
+         load_rgba8(b, tile, nir_iadd_imm(b, idx_next, 1)),
+      };
+      for (unsigned p = 0; p < 4; p++) {
+         nir_def *sum = nir_ffma(b, six[p + 1], w1, nir_load_var(b, sums[p]));
+         nir_store_var(b, sums[p], nir_ffma(b, six[p + 2], w2, sum), 0xf);
+      }
    }
    nir_pop_if(b, NULL);
 
@@ -4244,8 +4310,9 @@ emit_rgba8_sliding_stencil(nir_builder *b, nir_deref_instr *tile,
 
 /* Horizontal packed-RGBA8 tiled clamped stencil: 32x4 threads (128/WG),
  * 128x4 pixel tile (4 adjacent horizontal pixels/thread), FP16 RGBA shared
- * staging (8 KiB), uniform f32x4 weights, and 16-byte coalesced u32x4 interior
- * loads & stores. */
+ * staging (8 KiB) with XOR 16-byte bank swizzle + 4-row-per-SIMDgroup compute
+ * mapping for bank-conflict-free 16-byte shared reads, uniform f32x4 weights,
+ * and 16-byte coalesced u32x4 interior loads & stores. */
 static void
 build_rgba8_horiz_tiled_kernel(nir_builder *b,
                                const struct hk_byte_stencil_plan *plan,
@@ -4295,11 +4362,12 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
    nir_def *ly = nir_channel(b, lid, 1);
 
    nir_def *tile_x = nir_imul_imm(b, nir_channel(b, wgid, 0), TILE_W);
-   nir_def *gy =
-      nir_iadd(b, nir_imul_imm(b, nir_channel(b, wgid, 1), WG_Y), ly);
+   nir_def *tile_y = nir_imul_imm(b, nir_channel(b, wgid, 1), WG_Y);
+   nir_def *gy = nir_iadd(b, tile_y, ly);
    nir_def *valid_y = nir_ilt(b, gy, height);
    nir_def *row_base = nir_imul(b, gy, stride);
    nir_def *sh_row_off = nir_imul_imm(b, ly, SH_ROW_STRIDE);
+   nir_def *swiz = nir_ishl_imm(b, nir_iand_imm(b, ly, 1), 1);
 
    nir_def *total_k = nir_iadd_imm(b, nir_ishl_imm(b, radius, 1), TILE_W);
    nir_def *x_start = nir_isub(b, tile_x, radius);
@@ -4314,14 +4382,14 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
          nir_def *k0 = nir_ishl_imm(b, tx, 2);
          nir_def *v0 = load_ssbo_u32x4(
             b, src_base_u4, nir_iadd(b, row_base, nir_iadd(b, x_start, k0)));
-         stage_rgba8x4(b, tile, nir_iadd(b, sh_row_off, k0), v0);
+         stage_rgba8x4_swizzled(b, tile, sh_row_off, k0, swiz, v0);
 
          nir_def *k1 = nir_iadd_imm(b, k0, TILE_W);
          nir_push_if(b, nir_ige(b, total_k, nir_iadd_imm(b, k1, 4)));
          {
             nir_def *v1 = load_ssbo_u32x4(
                b, src_base_u4, nir_iadd(b, row_base, nir_iadd(b, x_start, k1)));
-            stage_rgba8x4(b, tile, nir_iadd(b, sh_row_off, k1), v1);
+            stage_rgba8x4_swizzled(b, tile, sh_row_off, k1, swiz, v1);
          }
          nir_push_else(b, NULL);
          {
@@ -4329,15 +4397,15 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
             {
                /* total_k = 128 + 2*radius is even, so at most 2 pixels remain. */
                nir_def *base_g = nir_iadd(b, row_base, nir_iadd(b, x_start, k1));
+               nir_def *idx_rem =
+                  nir_iadd(b, sh_row_off, nir_ixor(b, k1, swiz));
                nir_def *s0 = load_ssbo_u32(b, src_base, base_g);
-               stage_rgba8(b, tile, nir_iadd(b, sh_row_off, k1), s0);
+               stage_rgba8(b, tile, idx_rem, s0);
                nir_push_if(b, nir_ilt(b, nir_iadd_imm(b, k1, 1), total_k));
                {
                   nir_def *s1 =
                      load_ssbo_u32(b, src_base, nir_iadd_imm(b, base_g, 1));
-                  stage_rgba8(b, tile,
-                              nir_iadd(b, sh_row_off, nir_iadd_imm(b, k1, 1)),
-                              s1);
+                  stage_rgba8(b, tile, nir_iadd_imm(b, idx_rem, 1), s1);
                }
                nir_pop_if(b, NULL);
             }
@@ -4364,7 +4432,8 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
             {
                nir_def *px =
                   load_ssbo_u32(b, src_base, nir_iadd(b, row_base, gx));
-               stage_rgba8(b, tile, nir_iadd(b, sh_row_off, k), px);
+               stage_rgba8(b, tile,
+                           nir_iadd(b, sh_row_off, nir_ixor(b, k, swiz)), px);
             }
             nir_pop_if(b, NULL);
 
@@ -4378,9 +4447,22 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
 
    emit_shared_barrier(b);
 
-   nir_push_if(b, valid_y);
+   /* Map each 32-lane SIMDgroup across all 4 rows x 8 horizontal quads
+    * (`ly_c = tx & 3`, `tx_c = (ly << 3) | (tx >> 2)`). Combined with the
+    * `col ^ ((ly_c & 1) << 1)` swizzle, each 16-byte shared load spans all 8
+    * 16-byte bank groups equally (32 banks, 0 conflicts), while each row's 8
+    * lanes still write a contiguous 128-byte cache line to global memory. */
+   nir_def *ly_c = nir_iand_imm(b, tx, 3);
+   nir_def *tx_c = nir_ior(b, nir_ishl_imm(b, ly, 3), nir_ushr_imm(b, tx, 2));
+   nir_def *gy_c = nir_iadd(b, tile_y, ly_c);
+   nir_def *valid_y_c = nir_ilt(b, gy_c, height);
+   nir_def *row_base_c = nir_imul(b, gy_c, stride);
+   nir_def *sh_row_c = nir_imul_imm(b, ly_c, SH_ROW_STRIDE);
+   nir_def *swiz_c = nir_ishl_imm(b, nir_iand_imm(b, ly_c, 1), 1);
+
+   nir_push_if(b, valid_y_c);
    {
-      nir_def *lx0 = nir_ishl_imm(b, tx, 2);
+      nir_def *lx0 = nir_ishl_imm(b, tx_c, 2);
       nir_def *x0 = nir_iadd(b, tile_x, lx0);
       nir_def *max_int_x = nir_isub(b, width, radius);
       nir_def *all_interior = nir_iand(
@@ -4390,10 +4472,10 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
       nir_push_if(b, all_interior);
       {
          nir_def *outs[4];
-         emit_rgba8_sliding_stencil(b, tile, w_base, w_base_v4,
-                                    nir_iadd(b, sh_row_off, lx0), tap_count,
-                                    plan->store_conv, outs);
-         store_ssbo_u32x4(b, dst_base_u4, nir_iadd(b, row_base, x0),
+         emit_rgba8_horiz_streaming_stencil(
+            b, tile, w_base, w_base_v4, sh_row_c, lx0, swiz_c, tap_count,
+            plan->store_conv, outs);
+         store_ssbo_u32x4(b, dst_base_u4, nir_iadd(b, row_base_c, x0),
                           nir_vec(b, outs, 4));
       }
       nir_push_else(b, NULL);
@@ -4417,11 +4499,11 @@ build_rgba8_horiz_tiled_kernel(nir_builder *b,
                   nir_imax(b, nir_imm_int(b, 0), nir_isub(b, xp, radius));
                nir_def *c_max = nir_imin(b, w_m1, nir_iadd(b, xp, radius));
                nir_def *n_taps = nir_iadd_imm(b, nir_isub(b, c_max, c_min), 1);
-               nir_def *sh_start =
-                  nir_iadd(b, sh_row_off, nir_isub(b, c_min, x_start));
+               nir_def *col_start = nir_isub(b, c_min, x_start);
                nir_def *out_px = emit_rgba8_edge_1px_stencil(
-                  b, tile, w_base, sh_start, n_taps, false, plan->store_conv);
-               store_ssbo_u32(b, dst_base, nir_iadd(b, row_base, xp), out_px);
+                  b, tile, w_base, sh_row_c, col_start, swiz_c, n_taps, false,
+                  plan->store_conv);
+               store_ssbo_u32(b, dst_base, nir_iadd(b, row_base_c, xp), out_px);
             }
             nir_pop_if(b, NULL);
 
@@ -4707,7 +4789,8 @@ build_rgba8_vert_tiled_kernel(nir_builder *b,
                   nir_iadd(b, sh_col_off, nir_isub(b, c_min, y_start));
                nir_def *out_px =
                   emit_rgba8_edge_1px_stencil(b, sh_tile_u4, w_base, sh_start,
-                                              n_taps, true, plan->store_conv);
+                                              NULL, NULL, n_taps, true,
+                                              plan->store_conv);
                store_ssbo_u32(
                   b, dst_base, nir_iadd(b, nir_imul(b, yp, stride), gx), out_px);
             }

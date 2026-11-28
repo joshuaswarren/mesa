@@ -74,7 +74,8 @@ agx_upload_vbos(struct agx_batch *batch)
       }
    }
 
-   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; ++i) {
+   const unsigned count = attribs->num_attribs;
+   for (unsigned i = 0; i < count; ++i) {
       unsigned buf = attribs->buffers[i];
       uint64_t addr;
 
@@ -84,6 +85,12 @@ agx_upload_vbos(struct agx_batch *batch)
 
       batch->uniforms.attrib_base[i] = addr;
    }
+
+   for (unsigned i = count; i < batch->uploaded_attribs; ++i) {
+      batch->uniforms.attrib_base[i] = 0;
+      batch->uniforms.attrib_clamp[i] = 0;
+   }
+   batch->uploaded_attribs = count;
 }
 
 void
@@ -91,11 +98,9 @@ agx_upload_uniforms(struct agx_batch *batch,
                     struct agx_compiled_shader *hw_vs)
 {
    struct agx_context *ctx = batch->ctx;
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   size_t root_size = sizeof(struct agx_draw_uniforms);
 
-   struct agx_ptr root_ptr = agx_pool_alloc_aligned(
-      &batch->pool, sizeof(struct agx_draw_uniforms), 16);
-
-   batch->uniforms.tables[AGX_SYSVAL_TABLE_ROOT] = root_ptr.gpu;
    batch->uniforms.sample_mask = ctx->sample_mask;
 
    assert(_mesa_float_to_half(0.5) == 0x3800);
@@ -107,7 +112,58 @@ agx_upload_uniforms(struct agx_batch *batch,
          ? ctx->rast->base.sprite_coord_enable
          : 0;
 
-   if (hw_vs && agx_chip_native_agx3(agx_device(ctx->base.screen)->chip)) {
+   /* Graphics draws without geometry/tessellation read only the pushed prefix
+    * of agx_draw_uniforms unless a shader loads the root table address itself
+    * (root_uniforms_upload_size == UINT16_MAX). On incremental encoders, a
+    * vertex-only update after the first draw reuses the latched fragment
+    * program, so only hw_vs consumes the root upload. When only VS stage
+    * descriptors changed (e.g. a dynamic UBO binding) and none of hw_vs's
+    * pushed root ranges changed since batch->vs_root, reuse the existing root
+    * upload directly. */
+   if (hw_vs && !ctx->gs && !ctx->in_tess && ctx->fs) {
+      const bool vs_only_update =
+         batch->draws > 0 && !agx_chip_hal300_path(dev->chip) &&
+         !(ctx->dirty & ~(AGX_DIRTY_VS | AGX_DIRTY_VERTEX));
+      if (vs_only_update && !(ctx->dirty & AGX_DIRTY_VERTEX) &&
+          batch->vs_root_valid &&
+          batch->uniforms.tables[AGX_SYSVAL_TABLE_ROOT] &&
+          hw_vs->root_uniforms_upload_size != UINT16_MAX) {
+         bool root_changed = false;
+         for (unsigned i = 0; i < hw_vs->push_range_count; ++i) {
+            const struct agx_push_range *push = &hw_vs->push[i];
+            if (push->table != AGX_SYSVAL_TABLE_ROOT)
+               continue;
+
+            assert((size_t)push->offset + push->length * 2 <=
+                   sizeof(batch->uniforms));
+            if (memcmp((const uint8_t *)&batch->vs_root + push->offset,
+                       (const uint8_t *)&batch->uniforms + push->offset,
+                       push->length * 2) != 0) {
+               root_changed = true;
+               break;
+            }
+         }
+         if (!root_changed)
+            return;
+      }
+
+      uint16_t max_upload = hw_vs->root_uniforms_upload_size;
+      if (!vs_only_update) {
+         const struct agx_compiled_shader *fs =
+            (ctx->linked.fs && ctx->linked.fs->inline_blend_fs)
+               ? ctx->linked.fs->inline_blend_fs
+               : ctx->fs;
+         max_upload = MAX2(max_upload, fs->root_uniforms_upload_size);
+      }
+      if (max_upload != UINT16_MAX)
+         root_size = MAX2((size_t)max_upload, 16u);
+   }
+
+   struct agx_ptr root_ptr = agx_pool_alloc_aligned(&batch->pool, root_size, 16);
+
+   batch->uniforms.tables[AGX_SYSVAL_TABLE_ROOT] = root_ptr.gpu;
+
+   if (hw_vs && agx_chip_native_agx3(dev->chip)) {
       /* Keep the old immutable upload for unchanged vertex inputs, including
        * fragment-only root updates. The unconditional native VS update used
        * to cover root inputs not represented by VS dirty bits. Compare the
@@ -130,11 +186,11 @@ agx_upload_uniforms(struct agx_batch *batch,
             }
          }
       }
-      batch->vs_root = batch->uniforms;
+      memcpy(&batch->vs_root, &batch->uniforms, root_size);
       batch->vs_root_valid = true;
    }
 
-   memcpy(root_ptr.cpu, &batch->uniforms, sizeof(batch->uniforms));
+   memcpy(root_ptr.cpu, &batch->uniforms, root_size);
 }
 
 void

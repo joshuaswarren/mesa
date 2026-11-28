@@ -114,9 +114,14 @@ struct hk_render_pack_edges {
     * whether one would end a multisampled instance (head_msaa_end). */
    bool head_open;
    bool head_msaa_end;
+   bool head_non_local_src;
+   bool head_att_available;
+   bool head_att_not_visible;
    bool transitions_overflow;
+   bool head_undef_alias_overflow;
    uint8_t head_dep;
    uint8_t transition_count;
+   uint8_t head_undef_alias_mask;
    uint32_t head_epoch;
    const struct vk_image *transitions[HK_RENDER_PACK_TRANSITIONS];
 
@@ -138,6 +143,9 @@ struct hk_render_pack_edges {
     * tail_next_seq and sync epoch tail_epoch. */
    bool tail_open;
    bool tail_msaa;
+   bool tail_non_local_src;
+   bool tail_att_available;
+   bool tail_att_not_visible;
    uint8_t tail_dep;
    uint32_t tail_epoch, tail_next_seq, tail_seq;
    const struct hk_cs *tail_stream;
@@ -147,6 +155,13 @@ struct hk_render_pack_edges {
     * barriers after it: tail_pass is how it ended. */
    bool tail;
    struct hk_render_pack_pass tail_pass;
+
+   /* Empty suspend/resume fixup command buffer: no control streams, barriers,
+    * events, timestamps, or queries, holding only an empty RESUMING (closing)
+    * or empty SUSPENDING (opening) render pass. */
+   bool empty_resume;
+   bool empty_suspend;
+   struct hk_render_pack_pass empty_pass;
 
    /* Frame anatomy only: why the command buffer has no head or tail, and,
     * as of its latest submission with frame anatomy on, why its tail did
@@ -164,11 +179,15 @@ struct hk_render_pack_edges {
 
 /* Whether `b`, beginning, continues `a` as it ended, as two instances of one
  * command buffer continue (hk_m5_pass_merge_begin()). `ordered`: a recorded
- * dependency between them orders beyond attachment operations. Returns NULL
- * or why not. */
+ * dependency between them orders beyond attachment operations.
+ * `non_local_src`: a recorded barrier between them (or inside an earlier
+ * member of the run) has a graphics first scope outside the attachment stages
+ * (hk_m5_pass_merge_non_local_src()), forbidding a final-pass resolve.
+ * Returns NULL or why not. */
 const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
                                      const struct hk_render_pack_pass *b,
-                                     bool ordered);
+                                     bool ordered, bool non_local_src,
+                                     bool att_visible);
 
 /* What the members a packed run holds so far bring to its next boundary. In
  * one tile pass every member's vertex work may run ahead of every earlier
@@ -178,6 +197,15 @@ const char *hk_render_pack_continues(const struct hk_render_pack_pass *a,
 struct hk_render_pack_run_state {
    /* An ordered dependency inside the run, between members or inside one. */
    bool ordered;
+   /* A barrier inside the run (between members or inside one) has a graphics
+    * first scope outside the attachment stages, forbidding a final resolve. */
+   bool non_local_src;
+   /* A barrier in the run made attachment writes available; any ordered
+    * barrier after it (even with srcAccessMask == 0) chains visibility. */
+   bool att_available;
+   /* An ordered dependency in the run makes attachment writes visible to
+    * later shaders (requires attachment-only layouts and non-aliasable images). */
+   bool att_visible;
    /* A member's shaders write memory other than its attachments. */
    bool writes_memory;
    /* A member draws with a stage that runs ahead of the tile pass
@@ -203,6 +231,18 @@ const char *hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
                                     const struct hk_cs *bs,
                                     const struct hk_cs *first);
 
+/* Whether `post` is a pure driver geometry heap-slot reset stream (no API
+ * compute, no query/timestamp/OQ work, and bound to a non-zero heap slot). */
+bool hk_render_pack_post_is_heap_reset(const struct hk_cs *post);
+
+/* Whether a later member's leading CDM stream `bs_pre` may be hoisted ahead of
+ * earlier members already in `state`. Returns NULL if safe, or a refusal reason. */
+const char *hk_render_pack_pre_cs_refusal(
+   const struct hk_render_pack_run_state *state, const struct hk_cs *bs_pre,
+   unsigned run_post, uint8_t post_heap_slots, bool post_heap_only,
+   uint8_t run_vdm_kinds, const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS],
+   const uint8_t run_post_tail_req[HK_SYNC_NUM_KINDS]);
+
 /* `b` (stream `bs`) joins `run` after `a`, its boundary accepted. */
 void hk_render_pack_run_join(struct hk_render_pack_run_state *run,
                              const struct hk_cmd_buffer *a,
@@ -220,13 +260,46 @@ bool hk_render_pack_array_prefix(const struct util_dynarray *a,
                                  const struct util_dynarray *b,
                                  const struct util_dynarray **longer);
 
+/* Locates the unique VDM stream of `cmd`, optionally bracketed by a single
+ * pre-graphics CDM stream before it and/or a single post-graphics CDM stream
+ * after it. Does not inspect sync/query validity; used by packet init and
+ * end-of-recording edge setup. */
+const struct hk_cs *hk_render_pack_find_vdm(const struct hk_cmd_buffer *cmd,
+                                            const struct hk_cs **pre_out,
+                                            const struct hk_cs **post_out);
+
+/* Like hk_render_pack_member(), also returning optional pre/post CDM streams
+ * belonging to the same pass. When `first` is true, `cmd` starts a packed run
+ * so its leading pre-render CDM stream stays in submission order and may carry
+ * meta/transfer work; later members (`first == false`) must hoist their
+ * pre-render compute ahead of earlier render passes. */
+const struct hk_cs *hk_render_pack_member_streams(
+   const struct hk_cmd_buffer *cmd, bool first, const struct hk_cs **pre_out,
+   const struct hk_cs **post_out);
+
 /* The only stream of `cmd` if it may be a member of a packed run (a render
- * stream with draws and no query, timestamp, event or in-buffer cut), or
- * NULL. */
+ * stream with draws and no query, start timestamp, event or in-buffer
+ * cut), or NULL. */
 const struct hk_cs *hk_render_pack_member(const struct hk_cmd_buffer *cmd);
+
+/* The merged render's timestamps a member's take (bit 0 vertex end, bit 1
+ * fragment end): a run holds at most one member timestamp of each. */
+unsigned hk_render_pack_stamp_slots(const struct hk_cs *cs);
 
 /* Why `cmd` is no member (hk_render_pack_member()), or NULL. */
 const char *hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd);
+const char *hk_render_pack_member_refusal_for(const struct hk_cmd_buffer *cmd,
+                                              bool first);
+
+/* Whether `cmd` is an empty suspend/resume fixup command buffer with no
+ * streams or side effects. */
+bool hk_render_pack_is_empty_fixup(const struct hk_cmd_buffer *cmd,
+                                   bool *is_resume, bool *is_suspend);
+
+/* Whether an empty suspend/resume fixup pass matches `other`'s attachments
+ * and geometry. */
+bool hk_render_pack_fixup_matches(const struct hk_render_pack_pass *fixup,
+                                  const struct hk_render_pack_pass *other);
 
 /* Whether `cmd`'s tail may be written: recorded without SIMULTANEOUS_USE,
  * with room for a stream link at its terminate record. */
