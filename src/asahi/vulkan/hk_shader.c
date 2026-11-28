@@ -2041,25 +2041,74 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
    }
 
-   /* Inline uniform blocks in descriptor buffers may exceed 64 KiB; their full
-    * binding size is a constant in channel 2. Fall back to explicit I/O so
-    * offsets >= AGX_ZERO_PAGE_SIZE are not masked. */
+   /* Inline uniform blocks carry their exact binding size as a constant in
+    * channel 2 and are neither padded to HK_MIN_UBO_ALIGNMENT (64 B) nor
+    * bounded to AGX_ZERO_PAGE_SIZE. Keep them on explicit I/O so byte-exact
+    * bounds checks are preserved. */
    nir_scalar root_bound = nir_scalar_resolved(root->parent.ssa, 2);
-   if (nir_scalar_is_const(root_bound) &&
-       nir_scalar_as_uint(root_bound) > AGX_ZERO_PAGE_SIZE) {
+   if (nir_scalar_is_const(root_bound)) {
       nir_deref_path_finish(&path);
       return false;
    }
 
    /* Preserve constant-offset UBO loads on uniform-DMA-eligible descriptors
-    * for uniform DMA prefetching. */
+    * for uniform DMA prefetching, and verify every deref step so dynamic
+    * array indices cannot wrap 32-bit byte offsets back into bounds. */
    bool const_offset = true;
-   for (unsigned i = 1; const_offset && path.path[i]; ++i) {
+   uint64_t const_off = 0;
+   unsigned dyn_steps = 0;
+   for (unsigned i = 1; path.path[i]; ++i) {
       nir_deref_instr *d = path.path[i];
-      if ((d->deref_type == nir_deref_type_array ||
-           d->deref_type == nir_deref_type_ptr_as_array) &&
-          !nir_src_is_const(d->arr.index))
-         const_offset = false;
+      switch (d->deref_type) {
+      case nir_deref_type_cast:
+         break;
+      case nir_deref_type_struct: {
+         int field_off =
+            glsl_get_struct_field_offset(path.path[i - 1]->type, d->strct.index);
+         if (field_off < 0) {
+            nir_deref_path_finish(&path);
+            return false;
+         }
+         const_off += (uint64_t)field_off;
+         break;
+      }
+      case nir_deref_type_array: {
+         unsigned stride = nir_deref_instr_array_stride(d);
+         if (stride == 0) {
+            nir_deref_path_finish(&path);
+            return false;
+         }
+         if (nir_src_is_const(d->arr.index)) {
+            if (d->arr.in_bounds) {
+               uint64_t cidx = nir_src_as_uint(d->arr.index);
+               if (cidx > (AGX_ZERO_PAGE_SIZE - 1u) / stride) {
+                  nir_deref_path_finish(&path);
+                  return false;
+               }
+               const_off += cidx * stride;
+            } else {
+               int64_t sidx = nir_src_as_int(d->arr.index);
+               if (sidx < 0 ||
+                   (uint64_t)sidx > (AGX_ZERO_PAGE_SIZE - 1u) / stride) {
+                  nir_deref_path_finish(&path);
+                  return false;
+               }
+               const_off += (uint64_t)sidx * stride;
+            }
+         } else {
+            const_offset = false;
+            dyn_steps++;
+         }
+         break;
+      }
+      default:
+         nir_deref_path_finish(&path);
+         return false;
+      }
+   }
+   if (const_off >= AGX_ZERO_PAGE_SIZE || dyn_steps >= 65535) {
+      nir_deref_path_finish(&path);
+      return false;
    }
    if (const_offset &&
        hk_ubo_desc_can_uniform_dma(root->parent.ssa, static_set_mask)) {
@@ -2068,10 +2117,22 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    b->cursor = nir_before_instr(&intr->instr);
+   const uint32_t max_dyn_bytes = AGX_ZERO_PAGE_SIZE - 1u - (uint32_t)const_off;
+   nir_def *no_overflow = NULL;
    nir_def *addr = root->parent.ssa;
-   for (unsigned i = 1; path.path[i]; ++i)
+   for (unsigned i = 1; path.path[i]; ++i) {
+      nir_deref_instr *d = path.path[i];
+      if (d->deref_type == nir_deref_type_array &&
+          !nir_src_is_const(d->arr.index)) {
+         unsigned stride = nir_deref_instr_array_stride(d);
+         uint64_t max_idx = max_dyn_bytes / stride;
+         nir_def *in_range = nir_ule_imm(b, d->arr.index.ssa, max_idx);
+         no_overflow =
+            no_overflow ? nir_iand(b, no_overflow, in_range) : in_range;
+      }
       addr = nir_explicit_io_address_from_deref(
-         b, path.path[i], addr, nir_address_format_64bit_bounded_global);
+         b, d, addr, nir_address_format_64bit_bounded_global);
+   }
    nir_deref_path_finish(&path);
 
    nir_def *base = nir_pack_64_2x32_split(b, nir_channel(b, addr, 0),
@@ -2083,6 +2144,10 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    STATIC_ASSERT(AGX_ZERO_PAGE_SIZE == 65536);
    nir_def *record = nir_iand_imm(b, off, ~63u);
    nir_def *valid = nir_ult(b, record, bound);
+   if (no_overflow)
+      valid = nir_iand(b, no_overflow, valid);
+   if (dyn_steps > 1)
+      valid = nir_iand(b, valid, nir_ult_imm(b, off, AGX_ZERO_PAGE_SIZE));
    const unsigned alignment = MIN2(mul, 64u);
    nir_def *safe = nir_bcsel(b, valid, base,
                              nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
@@ -2099,6 +2164,14 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                 (can_speculate ? ACCESS_CAN_SPECULATE : 0));
    nir_def_replace(&intr->def, value);
    return true;
+}
+
+bool
+hk_lower_aligned_ubo_nir(nir_shader *nir, uint8_t static_set_mask)
+{
+   return nir_shader_intrinsics_pass(nir, hk_lower_aligned_ubo,
+                                     nir_metadata_control_flow,
+                                     &static_set_mask);
 }
 
 struct global_load_lowering {
@@ -4088,9 +4161,7 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
       uint8_t static_set_mask =
          hk_static_set_mask(set_layout_count, set_layouts);
-      NIR_PASS(lowered_buf_io, nir, nir_shader_intrinsics_pass,
-               hk_lower_aligned_ubo, nir_metadata_control_flow,
-               &static_set_mask);
+      NIR_PASS(lowered_buf_io, nir, hk_lower_aligned_ubo_nir, static_set_mask);
    }
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
