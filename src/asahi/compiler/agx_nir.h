@@ -410,7 +410,10 @@ bool agx_nir_lower_cmat(struct nir_shader *s, bool native_f16_accum8,
 bool agx_nir_lower_cmat_sw(struct nir_shader *s);
 bool agx_nir_lower_cmat_calls(struct nir_shader *s);
 bool agx_nir_cmat_supported(struct nir_shader *s);
-bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing);
+bool agx_nir_lower_cmat_workgroup(struct nir_shader *s, unsigned *sg_m_out,
+                                  unsigned *sg_n_out);
+bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing,
+                               unsigned wg_sg_m, unsigned wg_sg_n);
 bool agx_nir_lower_cmat_flexible(struct nir_shader *s, bool *pairing);
 
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,

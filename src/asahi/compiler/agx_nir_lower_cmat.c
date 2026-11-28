@@ -808,11 +808,46 @@ static void
 lower_reduce_2x2(nir_builder *b, nir_cmat_call_instr *call)
 {
    nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
-   const struct cmat_layout *sl =
-      matrix_layout(*glsl_get_cmat_description(nir_src_as_deref(call->params[1])->type));
+   struct glsl_cmat_description sd =
+      *glsl_get_cmat_description(nir_src_as_deref(call->params[1])->type);
+   const struct cmat_layout *sl = matrix_layout(sd);
    const struct cmat_layout *dl =
       matrix_layout(*glsl_get_cmat_description(dst->type));
    uint32_t combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+
+   if (sd.rows == 8) {
+      nir_def *w[4];
+      for (unsigned q = 0; q < 4; ++q) {
+         nir_def *v[8];
+         reduce_elements(b, call->callee,
+                         nir_src_as_deref(call->params[1 + q]),
+                         sl, combined, v);
+         w[q] = v[0];
+      }
+      /* layout_8: element[0] = COL(0), lane = {COL(1), ROW(0), ROW(1), COL(2), ROW(2)}.
+       * After reducing ROW(0) and COL(0), lane bit 1 is redundant; carry dst
+       * ROW(2) in lane bit 1 and dst COL(2) in element bit 0, then permute.
+       */
+      nir_def *lane = nir_load_subgroup_invocation(b);
+      nir_def *row2 = nir_i2b(b, nir_iand_imm(b, lane, 1 << 1));
+      nir_def *pair[2] = {
+         nir_bcsel(b, row2, w[2], w[0]),
+         nir_bcsel(b, row2, w[3], w[1]),
+      };
+      struct cmat_layout quarters = {
+         .element_bits = 1,
+         .element = {COL(2)},
+         .lane = {COL(0), ROW(2), ROW(0), COL(1), ROW(1)},
+      };
+      nir_def *value = permute_matrix(b, nir_vec(b, pair, 2), quarters, dl);
+      nir_def *values[2] = {
+         nir_channel(b, value, 0),
+         nir_channel(b, value, 1),
+      };
+      build_matrix(b, dst, values, 2);
+      return;
+   }
+
    struct cmat_layout quarters = {.element_bits = 3};
    nir_def *w[8];
 
@@ -958,12 +993,14 @@ reduce_2x2_layouts_match(nir_cmat_call_instr *call)
    struct glsl_cmat_description sd = *glsl_get_cmat_description(type);
    struct glsl_cmat_description dd =
       *glsl_get_cmat_description(nir_src_as_deref(call->params[0])->type);
-   if (sd.rows != 16 || dd.rows != 16)
+   if (sd.rows != dd.rows || (sd.rows != 16 && sd.rows != 8))
       return false;
    for (unsigned q = 2; q < 5; ++q) {
       if (nir_src_as_deref(call->params[q])->type != type)
          return false;
    }
+   if (sd.rows == 8)
+      return true;
    const struct cmat_layout *sl = matrix_layout(sd);
    unsigned left = 0;
    for (unsigned i = 0; i < sl->element_bits; ++i)
@@ -1362,7 +1399,8 @@ struct tensor_items {
 static void
 tensor_items(nir_builder *b, struct nir_calc_tensor_info *info,
              struct tensor_fast *fast, struct glsl_cmat_description desc,
-             unsigned pieces, unsigned group, struct tensor_items *it)
+             unsigned pieces, unsigned group, nir_def *wg_row_off,
+             nir_def *wg_col_off, struct tensor_items *it)
 {
    nir_def *lane = nir_load_subgroup_invocation(b);
    nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
@@ -1378,6 +1416,10 @@ tensor_items(nir_builder *b, struct nir_calc_tensor_info *info,
       row = nir_iadd_imm(b, r0, fast->row_offset);
       col = nir_iadd_imm(b, c0, fast->col_offset);
    }
+   if (wg_row_off)
+      row = nir_iadd(b, row, wg_row_off);
+   if (wg_col_off)
+      col = nir_iadd(b, col, wg_col_off);
 
    it->per_piece = desc.rows * desc.cols / 32;
    it->count = pieces * it->per_piece;
@@ -1934,7 +1976,8 @@ tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
                       nir_deref_instr *ptr, nir_deref_instr *clip,
                       struct glsl_cmat_description desc, bool load,
                       nir_def **values, unsigned count, bool paired,
-                      unsigned g, unsigned s)
+                      unsigned g, unsigned s, nir_def *wg_row_off,
+                      nir_def *wg_col_off)
 {
    nir_def *lane = nir_load_subgroup_invocation(b);
    nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
@@ -1957,6 +2000,10 @@ tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
          col = nir_iadd_imm(b, paired_k(b, col), 64 * g + 2 * s);
       else if (paired)
          row = nir_iadd_imm(b, paired_k(b, row), 64 * g + 2 * s);
+      if (wg_row_off)
+         row = nir_iadd(b, row, wg_row_off);
+      if (wg_col_off)
+         col = nir_iadd(b, col, wg_col_off);
 
       info->clipped_if = NULL;
       nir_deref_instr *d = ptr;
@@ -1990,7 +2037,8 @@ tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
  */
 static bool
 lower_tensor_calls(nir_builder *b, nir_cmat_call_instr **calls,
-                   unsigned pieces, bool pairing)
+                   unsigned pieces, bool pairing, unsigned wg_sg_m,
+                   unsigned wg_sg_n)
 {
    nir_cmat_call_instr *call = calls[pieces - 1];
    const bool load = call->op == nir_cmat_call_op_tensor_load;
@@ -2030,12 +2078,29 @@ lower_tensor_calls(nir_builder *b, nir_cmat_call_instr **calls,
 
    /* The shape tests are of the whole matrix; desc is this piece's. */
    struct glsl_cmat_description whole = nir_cmat_call_cmat_desc(call);
+   nir_def *wg_row_off = NULL, *wg_col_off = NULL;
+   nir_if *store_guard = NULL;
+   if (whole.scope == SCOPE_WORKGROUP && (wg_sg_m > 1 || wg_sg_n > 1)) {
+      nir_def *sg = nir_load_subgroup_id(b);
+      nir_def *sg_m_idx = wg_sg_n > 1 ? nir_udiv_imm(b, sg, wg_sg_n) : sg;
+      nir_def *sg_n_idx = wg_sg_n > 1 ? nir_umod_imm(b, sg, wg_sg_n) : nir_imm_int(b, 0);
+      if (whole.use != GLSL_CMAT_USE_B && wg_sg_m > 1)
+         wg_row_off = nir_imul_imm(b, sg_m_idx, whole.rows / wg_sg_m);
+      if (whole.use != GLSL_CMAT_USE_A && wg_sg_n > 1)
+         wg_col_off = nir_imul_imm(b, sg_n_idx, whole.cols / wg_sg_n);
+      if (!load) {
+         if (whole.use == GLSL_CMAT_USE_A && wg_sg_n > 1)
+            store_guard = nir_push_if(b, nir_ieq_imm(b, sg_n_idx, 0));
+         else if (whole.use == GLSL_CMAT_USE_B && wg_sg_m > 1)
+            store_guard = nir_push_if(b, nir_ieq_imm(b, sg_m_idx, 0));
+      }
+   }
    struct tensor_fast fast = {0};
    nir_def *cond = tensor_fast_condition(b, &info, whole, &fast);
    /* A piece of K paired 64 deep has the common case only with its group. */
    if (cond && (paired ? load && pieces == 4 : true)) {
       struct tensor_items it;
-      tensor_items(b, &info, &fast, desc, pieces, g, &it);
+      tensor_items(b, &info, &fast, desc, pieces, g, wg_row_off, wg_col_off, &it);
       nir_def *fast_values[TENSOR_MAX_ELEMENTS], *slow_values[TENSOR_MAX_ELEMENTS];
       memcpy(fast_values, values, sizeof(values));
       memcpy(slow_values, values, sizeof(values));
@@ -2052,7 +2117,8 @@ lower_tensor_calls(nir_builder *b, nir_cmat_call_instr **calls,
          nir_calc_tensor_derefs_init(b, &piece_info, calls[p]);
          piece_paired(calls[p], desc, pairing, &g, &s);
          tensor_generic_access(b, &piece_info, ptr, clips[p], desc, load,
-                               slow_values + p * count, count, paired, g, s);
+                               slow_values + p * count, count, paired, g, s,
+                               wg_row_off, wg_col_off);
       }
       nir_pop_if(b, nif);
       if (load) {
@@ -2066,9 +2132,12 @@ lower_tensor_calls(nir_builder *b, nir_cmat_call_instr **calls,
             nir_calc_tensor_derefs_init(b, &piece_info, calls[p]);
          piece_paired(calls[p], desc, pairing, &g, &s);
          tensor_generic_access(b, &piece_info, ptr, clips[p], desc, load,
-                               values + p * count, count, paired, g, s);
+                               values + p * count, count, paired, g, s,
+                               wg_row_off, wg_col_off);
       }
    }
+   if (store_guard)
+      nir_pop_if(b, store_guard);
 
    if (load) {
       for (unsigned p = 0; p < pieces; ++p) {
@@ -2155,7 +2224,8 @@ paired_piece(nir_cmat_call_instr *call, bool pairing, unsigned *g, unsigned *s,
 }
 
 static bool
-lower_tensor_block(nir_builder *b, nir_block *block, bool pairing)
+lower_tensor_block(nir_builder *b, nir_block *block, bool pairing,
+                   unsigned wg_sg_m, unsigned wg_sg_n)
 {
    struct util_dynarray calls;
    util_dynarray_init(&calls, NULL);
@@ -2200,14 +2270,14 @@ lower_tensor_block(nir_builder *b, nir_block *block, bool pairing)
             }
          }
          if (found == 4) {
-            lower_tensor_calls(b, group, 4, pairing);
+            lower_tensor_calls(b, group, 4, pairing, wg_sg_m, wg_sg_n);
             for (unsigned p = 0; p < 4; ++p)
                done[at[p] - i] = true;
          }
       }
       for (unsigned j = i; j < end; ++j) {
          if (!done[j - i])
-            lower_tensor_calls(b, &list[j], 1, pairing);
+            lower_tensor_calls(b, &list[j], 1, pairing, wg_sg_m, wg_sg_n);
       }
       i = end;
    }
@@ -2217,7 +2287,8 @@ lower_tensor_block(nir_builder *b, nir_block *block, bool pairing)
 }
 
 bool
-agx_nir_lower_cmat_tensor(nir_shader *nir, bool pairing)
+agx_nir_lower_cmat_tensor(nir_shader *nir, bool pairing, unsigned wg_sg_m,
+                          unsigned wg_sg_n)
 {
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
@@ -2226,7 +2297,7 @@ agx_nir_lower_cmat_tensor(nir_shader *nir, bool pairing)
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_create(impl);
    nir_foreach_block_safe(block, impl)
-      progress |= lower_tensor_block(&b, block, pairing);
+      progress |= lower_tensor_block(&b, block, pairing, wg_sg_m, wg_sg_n);
    if (!progress)
       return nir_no_progress(impl);
 
@@ -2265,8 +2336,9 @@ type_needs_split(const struct glsl_type *type, bool *splittable,
    /* 8x8 pieces split every dimension longer than 8. */
    if ((desc.rows > 8 && desc.rows % 8) || (desc.cols > 8 && desc.cols % 8))
       *splittable_8 = false;
-   /* Up to 16x16 needs no split of its own (8x8 pieces still divide it). */
-   if (desc.rows <= 16 && desc.cols <= 16)
+   /* Only square 8x8 and 16x16 matrices need no split of their own. */
+   if ((desc.rows == 8 && desc.cols == 8) ||
+       (desc.rows == 16 && desc.cols == 16))
       return false;
    if (desc.rows % 16 || desc.cols % 16)
       *splittable = false;
@@ -2429,4 +2501,903 @@ agx_nir_lower_cmat_flexible(nir_shader *nir, bool *pairing)
       .k_gran = gran,
    };
    return nir_lower_cooperative_matrix_flexible_dimensions(nir, &args);
+}
+
+/*
+ * Workgroup-scope cooperative matrices (VK_NV_cooperative_matrix2
+ * cooperativeMatrixWorkgroupScope).
+ *
+ * A workgroup of W = workgroup_size / 32 subgroups is arranged as an
+ * (sg_m x sg_n) grid (sg_m * sg_n == W), where subgroup sg has coordinates
+ * (sg_m_idx = sg / sg_n, sg_n_idx = sg % sg_n):
+ *  - Accumulator (M x N): subgroup (sg_m_idx, sg_n_idx) owns the disjoint
+ *    (M / sg_m) x (N / sg_n) sub-matrix at (sg_m_idx * M_sub, sg_n_idx * N_sub).
+ *  - A (M x K): subgroup (sg_m_idx, sg_n_idx) holds (M / sg_m) x K at row
+ *    sg_m_idx * M_sub (replicated across sg_n).
+ *  - B (K x N): subgroup (sg_m_idx, sg_n_idx) holds K x (N / sg_n) at col
+ *    sg_n_idx * N_sub (replicated across sg_m).
+ *
+ * Every cmat_muladd, same-use cmat_convert, elementwise op, tensor_load, and
+ * tensor_store runs locally per subgroup with zero shared memory and zero
+ * barriers. Cross-use cmat_convert, cmat_transpose, and cross-subgroup
+ * cmat_reduce exchange partial tiles through a single shared scratch array.
+ * After this pass, every matrix has SCOPE_SUBGROUP so agx_nir_lower_cmat_flexible,
+ * agx_nir_lower_cmat_tensor (using the original whole workgroup cmat_desc and
+ * (sg_m, sg_n)), agx_nir_lower_cmat_calls, and agx_nir_lower_cmat lower the rest.
+ */
+
+static struct glsl_cmat_description
+wg_sub_desc(struct glsl_cmat_description desc, unsigned sg_m, unsigned sg_n)
+{
+   assert(desc.scope == SCOPE_WORKGROUP);
+   desc.scope = SCOPE_SUBGROUP;
+   if (desc.use != GLSL_CMAT_USE_B) {
+      assert(desc.rows % sg_m == 0);
+      desc.rows /= sg_m;
+   }
+   if (desc.use != GLSL_CMAT_USE_A) {
+      assert(desc.cols % sg_n == 0);
+      desc.cols /= sg_n;
+   }
+   return desc;
+}
+
+static bool
+wg_desc_fits(struct glsl_cmat_description desc, unsigned sg_m, unsigned sg_n,
+             unsigned gran)
+{
+   if (desc.scope != SCOPE_WORKGROUP)
+      return true;
+   unsigned rows = desc.rows, cols = desc.cols;
+   if (desc.use != GLSL_CMAT_USE_B) {
+      if (rows % sg_m)
+         return false;
+      rows /= sg_m;
+   }
+   if (desc.use != GLSL_CMAT_USE_A) {
+      if (cols % sg_n)
+         return false;
+      cols /= sg_n;
+   }
+   return rows >= gran && (rows % gran == 0) &&
+          cols >= gran && (cols % gran == 0);
+}
+
+static bool
+wg_type_collect(const struct glsl_type *type, struct util_dynarray *descs)
+{
+   type = glsl_without_array(type);
+   if (glsl_type_is_struct(type)) {
+      bool found = false;
+      for (unsigned i = 0; i < glsl_get_length(type); ++i)
+         found |= wg_type_collect(glsl_get_struct_field(type, i), descs);
+      return found;
+   }
+   if (!glsl_type_is_cmat(type))
+      return false;
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+   if (desc.scope != SCOPE_WORKGROUP)
+      return false;
+   util_dynarray_append(descs, desc);
+   return true;
+}
+
+static const struct glsl_type *
+wg_remap_type(const struct glsl_type *type, unsigned sg_m, unsigned sg_n)
+{
+   if (glsl_type_is_cmat(type)) {
+      struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+      if (desc.scope != SCOPE_WORKGROUP)
+         return type;
+      return glsl_cmat_type(&((struct glsl_cmat_description){
+         .element_type = desc.element_type,
+         .scope = SCOPE_SUBGROUP,
+         .rows = desc.use != GLSL_CMAT_USE_B ? desc.rows / sg_m : desc.rows,
+         .cols = desc.use != GLSL_CMAT_USE_A ? desc.cols / sg_n : desc.cols,
+         .use = desc.use,
+      }));
+   } else if (glsl_type_is_array(type)) {
+      const struct glsl_type *elem = glsl_get_array_element(type);
+      const struct glsl_type *mapped = wg_remap_type(elem, sg_m, sg_n);
+      if (mapped == elem)
+         return type;
+      return glsl_array_type(mapped, glsl_get_length(type),
+                             glsl_get_explicit_stride(type));
+   } else if (glsl_type_is_struct(type)) {
+      unsigned n = glsl_get_length(type);
+      bool changed = false;
+      STACK_ARRAY(struct glsl_struct_field, fields, n);
+      for (unsigned i = 0; i < n; ++i) {
+         fields[i] = *glsl_get_struct_field_data(type, i);
+         fields[i].type = wg_remap_type(fields[i].type, sg_m, sg_n);
+         changed |= fields[i].type != glsl_get_struct_field_data(type, i)->type;
+      }
+      const struct glsl_type *res = changed
+         ? glsl_struct_type(fields, n, glsl_get_type_name(type),
+                            glsl_struct_type_is_packed(type))
+         : type;
+      STACK_ARRAY_FINISH(fields);
+      return res;
+   }
+   return type;
+}
+
+static void
+wg_sg_coords(nir_builder *b, unsigned sg_m, unsigned sg_n,
+             nir_def **sg_m_idx, nir_def **sg_n_idx)
+{
+   nir_def *sg = nir_load_subgroup_id(b);
+   *sg_m_idx = sg_n > 1 ? nir_udiv_imm(b, sg, sg_n) : sg;
+   *sg_n_idx = sg_n > 1 ? nir_umod_imm(b, sg, sg_n) : nir_imm_int(b, 0);
+}
+
+static void
+wg_slice_offset(nir_builder *b, struct glsl_cmat_description orig,
+                unsigned sg_m, unsigned sg_n,
+                nir_def **row_off, nir_def **col_off)
+{
+   nir_def *sg_m_idx = NULL, *sg_n_idx = NULL;
+   if (sg_m > 1 || sg_n > 1)
+      wg_sg_coords(b, sg_m, sg_n, &sg_m_idx, &sg_n_idx);
+   *row_off = (orig.use != GLSL_CMAT_USE_B && sg_m > 1)
+                 ? nir_imul_imm(b, sg_m_idx, orig.rows / sg_m)
+                 : nir_imm_int(b, 0);
+   *col_off = (orig.use != GLSL_CMAT_USE_A && sg_n > 1)
+                 ? nir_imul_imm(b, sg_n_idx, orig.cols / sg_n)
+                 : nir_imm_int(b, 0);
+}
+
+static nir_if *
+wg_push_store_guard(nir_builder *b, struct glsl_cmat_description orig,
+                    unsigned sg_m, unsigned sg_n)
+{
+   if (orig.use == GLSL_CMAT_USE_A && sg_n > 1) {
+      nir_def *sg_m_idx, *sg_n_idx;
+      wg_sg_coords(b, sg_m, sg_n, &sg_m_idx, &sg_n_idx);
+      return nir_push_if(b, nir_ieq_imm(b, sg_n_idx, 0));
+   }
+   if (orig.use == GLSL_CMAT_USE_B && sg_m > 1) {
+      nir_def *sg_m_idx, *sg_n_idx;
+      wg_sg_coords(b, sg_m, sg_n, &sg_m_idx, &sg_n_idx);
+      return nir_push_if(b, nir_ieq_imm(b, sg_m_idx, 0));
+   }
+   return NULL;
+}
+
+static void
+wg_barrier(nir_builder *b)
+{
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+}
+
+static nir_deref_instr *
+wg_scratch_ptr(nir_builder *b, nir_variable *scratch,
+               enum glsl_base_type elem_type, nir_def *elem_offset)
+{
+   const struct glsl_type *scalar_type = glsl_scalar_type(elem_type);
+   unsigned elem_bytes = glsl_base_type_bit_size(elem_type) / 8;
+   nir_deref_instr *base = nir_build_deref_var(b, scratch);
+   nir_deref_instr *cast = nir_build_deref_cast(
+      b, &base->def, nir_var_mem_shared, scalar_type, elem_bytes);
+   return nir_build_deref_ptr_as_array(
+      b, cast, nir_u2uN(b, elem_offset, cast->def.bit_size));
+}
+
+static bool
+wg_cross_use_needs_exchange(struct glsl_cmat_description dst,
+                            struct glsl_cmat_description src,
+                            unsigned sg_m, unsigned sg_n)
+{
+   if (dst.use == src.use)
+      return false;
+   bool dst_split_m = dst.use != GLSL_CMAT_USE_B && sg_m > 1;
+   bool src_split_m = src.use != GLSL_CMAT_USE_B && sg_m > 1;
+   bool dst_split_n = dst.use != GLSL_CMAT_USE_A && sg_n > 1;
+   bool src_split_n = src.use != GLSL_CMAT_USE_A && sg_n > 1;
+   return dst_split_m != src_split_m || dst_split_n != src_split_n;
+}
+
+static nir_deref_instr *
+wg_offset_cmat_ptr(nir_builder *b, nir_deref_instr *addr_deref,
+                   enum glsl_base_type elem_type, nir_def *stride,
+                   enum glsl_matrix_layout layout,
+                   nir_def *row_off, nir_def *col_off,
+                   nir_def **stride_out)
+{
+   const struct glsl_type *scalar_type = glsl_scalar_type(elem_type);
+   unsigned elem_size = glsl_base_type_bit_size(elem_type) / 8;
+   unsigned deref_bytes_size = glsl_get_explicit_size(addr_deref->type, false);
+   if (!deref_bytes_size) {
+      if (glsl_type_is_vector_or_scalar(addr_deref->type))
+         deref_bytes_size = glsl_get_vector_elements(addr_deref->type) *
+                            (glsl_get_bit_size(addr_deref->type) / 8);
+      else
+         deref_bytes_size = elem_size;
+   }
+   nir_def *stride_elems =
+      deref_bytes_size == elem_size
+         ? stride
+         : nir_udiv_imm(b, nir_imul_imm(b, stride, deref_bytes_size), elem_size);
+   nir_def *major_off = layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR ? row_off : col_off;
+   nir_def *minor_off = layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR ? col_off : row_off;
+   nir_def *elem_off = nir_iadd(b, nir_imul(b, major_off, stride_elems), minor_off);
+
+   nir_deref_instr *ptr = nir_build_deref_cast(
+      b, &addr_deref->def, addr_deref->modes, scalar_type, elem_size);
+   ptr = nir_build_deref_ptr_as_array(
+      b, ptr, nir_u2uN(b, elem_off, ptr->def.bit_size));
+   *stride_out = stride_elems;
+   return ptr;
+}
+
+static bool
+wg_lookup_orig_desc(struct hash_table *orig_descs, nir_src src,
+                    struct glsl_cmat_description *out)
+{
+   nir_deref_instr *deref = nir_src_as_deref(src);
+   if (!deref)
+      return false;
+   struct hash_entry *e = _mesa_hash_table_search(orig_descs, deref);
+   if (!e)
+      return false;
+   *out = *(struct glsl_cmat_description *)e->data;
+   return true;
+}
+
+bool
+agx_nir_lower_cmat_workgroup(nir_shader *nir, unsigned *sg_m_out,
+                             unsigned *sg_n_out)
+{
+   *sg_m_out = 1;
+   *sg_n_out = 1;
+   if (nir->info.stage != MESA_SHADER_COMPUTE ||
+       !nir->info.cs.has_cooperative_matrix ||
+       nir->info.workgroup_size_variable)
+      return false;
+
+   struct util_dynarray descs;
+   util_dynarray_init(&descs, NULL);
+   bool has_wg = false;
+   nir_foreach_variable_in_shader(var, nir)
+      has_wg |= wg_type_collect(var->type, &descs);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl)
+         has_wg |= wg_type_collect(var->type, &descs);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_cmat_length ||
+                   intr->intrinsic == nir_intrinsic_cmat_get_coordinate) {
+                  struct glsl_cmat_description d = nir_intrinsic_cmat_desc(intr);
+                  if (d.scope == SCOPE_WORKGROUP) {
+                     util_dynarray_append(&descs, d);
+                     has_wg = true;
+                  }
+               }
+            }
+         }
+      }
+   }
+   if (!has_wg) {
+      util_dynarray_fini(&descs);
+      return false;
+   }
+
+   uint64_t wg_size = (uint64_t)nir->info.workgroup_size[0] *
+                      nir->info.workgroup_size[1] *
+                      nir->info.workgroup_size[2];
+   if (wg_size < 32 || (wg_size % 32) != 0) {
+      util_dynarray_fini(&descs);
+      return false;
+   }
+   unsigned num_sg = (unsigned)(wg_size / 32);
+
+   bool has_2x2 = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_cmat_call &&
+                nir_instr_as_cmat_call(instr)->op == nir_cmat_call_op_reduce_2x2)
+               has_2x2 = true;
+         }
+      }
+   }
+
+   /* Choose (sg_m, sg_n) with sg_m * sg_n == num_sg: prefer 16x16 tiles,
+    * falling back to 8x8 tiles when needed (e.g. 32x16@128 or 32x32@256).
+    */
+   unsigned best_sg_m = 0, best_sg_n = 0, tile_gran = 0;
+   for (unsigned pass = 0; pass < 2 && !best_sg_m; ++pass) {
+      unsigned gran = pass == 0 ? 16 : 8;
+      if (gran == 8 && has_2x2)
+         continue;
+      unsigned best_diff = UINT32_MAX;
+      for (unsigned m = 1; m <= num_sg; ++m) {
+         if (num_sg % m)
+            continue;
+         unsigned n = num_sg / m;
+         bool ok = true;
+         util_dynarray_foreach(&descs, struct glsl_cmat_description, d) {
+            if (!wg_desc_fits(*d, m, n, gran)) {
+               ok = false;
+               break;
+            }
+         }
+         if (!ok)
+            continue;
+         unsigned diff = m >= n ? m - n : n - m;
+         if (diff < best_diff || (diff == best_diff && m > best_sg_m)) {
+            best_diff = diff;
+            best_sg_m = m;
+            best_sg_n = n;
+            tile_gran = gran;
+         }
+      }
+   }
+   util_dynarray_fini(&descs);
+   if (!best_sg_m)
+      return false;
+
+   unsigned sg_m = best_sg_m, sg_n = best_sg_n;
+   *sg_m_out = sg_m;
+   *sg_n_out = sg_n;
+
+   /* Record original SCOPE_WORKGROUP descriptions for every cmat deref and
+    * compute the maximum shared scratch size needed across the shader.
+    */
+   void *mem_ctx = ralloc_context(NULL);
+   struct hash_table *orig_descs = _mesa_pointer_hash_table_create(mem_ctx);
+   unsigned max_scratch_bytes = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (glsl_type_is_cmat(deref->type)) {
+               const struct glsl_cmat_description *d =
+                  glsl_get_cmat_description(deref->type);
+               if (d->scope == SCOPE_WORKGROUP) {
+                  struct glsl_cmat_description *copy =
+                     ralloc(mem_ctx, struct glsl_cmat_description);
+                  *copy = *d;
+                  _mesa_hash_table_insert(orig_descs, deref, copy);
+               }
+            }
+         }
+      }
+   }
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_cmat_convert) {
+                  struct glsl_cmat_description dst_d, src_d;
+                  if (wg_lookup_orig_desc(orig_descs, intr->src[0], &dst_d) &&
+                      wg_lookup_orig_desc(orig_descs, intr->src[1], &src_d) &&
+                      wg_cross_use_needs_exchange(dst_d, src_d, sg_m, sg_n)) {
+                     unsigned elem_bytes =
+                        MIN2(glsl_base_type_bit_size(dst_d.element_type),
+                             glsl_base_type_bit_size(src_d.element_type)) / 8;
+                     max_scratch_bytes = MAX2(max_scratch_bytes,
+                                              src_d.rows * src_d.cols * elem_bytes);
+                  }
+               } else if (intr->intrinsic == nir_intrinsic_cmat_transpose) {
+                  struct glsl_cmat_description src_d;
+                  if (wg_lookup_orig_desc(orig_descs, intr->src[1], &src_d) &&
+                      (sg_m > 1 || sg_n > 1)) {
+                     unsigned elem_bytes =
+                        glsl_base_type_bit_size(src_d.element_type) / 8;
+                     max_scratch_bytes = MAX2(max_scratch_bytes,
+                                              src_d.rows * src_d.cols * elem_bytes);
+                  }
+               }
+            } else if (instr->type == nir_instr_type_cmat_call) {
+               nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+               if (call->op == nir_cmat_call_op_reduce) {
+                  struct glsl_cmat_description dst_d, src_d;
+                  if (wg_lookup_orig_desc(orig_descs, call->params[0], &dst_d) &&
+                      wg_lookup_orig_desc(orig_descs, call->params[1], &src_d)) {
+                     nir_cmat_reduce flags = nir_cmat_call_reduce_flags(call);
+                     unsigned elem_bytes =
+                        glsl_base_type_bit_size(dst_d.element_type) / 8;
+                     if ((flags & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+                         (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) {
+                        if (num_sg > 1)
+                           max_scratch_bytes = MAX2(max_scratch_bytes,
+                                                    num_sg * elem_bytes);
+                     } else if ((flags & NIR_CMAT_REDUCE_ROW) && sg_n > 1) {
+                        unsigned full = dst_d.rows * sg_n * tile_gran * elem_bytes;
+                        unsigned bytes = full <= 8192 ? full
+                                                      : dst_d.rows * sg_n * elem_bytes;
+                        max_scratch_bytes = MAX2(max_scratch_bytes, bytes);
+                     } else if ((flags & NIR_CMAT_REDUCE_COLUMN) && sg_m > 1) {
+                        unsigned full = dst_d.cols * sg_m * tile_gran * elem_bytes;
+                        unsigned bytes = full <= 8192 ? full
+                                                      : dst_d.cols * sg_m * elem_bytes;
+                        max_scratch_bytes = MAX2(max_scratch_bytes, bytes);
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+
+   nir_variable *scratch = NULL;
+   if (max_scratch_bytes > 0) {
+      unsigned dwords = DIV_ROUND_UP(max_scratch_bytes, 4);
+      scratch = nir_variable_create(
+         nir, nir_var_mem_shared,
+         glsl_array_type(glsl_uint_type(), dwords, 4), "cmat_wg_scratch");
+   }
+
+   /* Rewrite all SCOPE_WORKGROUP variable and deref types to SCOPE_SUBGROUP. */
+   nir_foreach_variable_in_shader(var, nir)
+      var->type = wg_remap_type(var->type, sg_m, sg_n);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl)
+         var->type = wg_remap_type(var->type, sg_m, sg_n);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_deref) {
+               nir_deref_instr *deref = nir_instr_as_deref(instr);
+               deref->type = wg_remap_type(deref->type, sg_m, sg_n);
+            }
+         }
+      }
+   }
+
+   /* Lower instructions operating on SCOPE_WORKGROUP matrices. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            b.cursor = nir_before_instr(instr);
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_cmat_length: {
+                  struct glsl_cmat_description d = nir_intrinsic_cmat_desc(intr);
+                  if (d.scope == SCOPE_WORKGROUP)
+                     nir_intrinsic_set_cmat_desc(intr, wg_sub_desc(d, sg_m, sg_n));
+                  break;
+               }
+               case nir_intrinsic_cmat_get_coordinate: {
+                  struct glsl_cmat_description d = nir_intrinsic_cmat_desc(intr);
+                  if (d.scope == SCOPE_WORKGROUP) {
+                     nir_intrinsic_set_cmat_desc(intr, wg_sub_desc(d, sg_m, sg_n));
+                     if (sg_m > 1 || sg_n > 1) {
+                        b.cursor = nir_after_instr(instr);
+                        nir_def *row_off, *col_off;
+                        wg_slice_offset(&b, d, sg_m, sg_n, &row_off, &col_off);
+                        nir_def *shifted = nir_iadd(&b, &intr->def,
+                                                    nir_vec2(&b, row_off, col_off));
+                        nir_def_rewrite_uses_after(&intr->def, shifted);
+                     }
+                  }
+                  break;
+               }
+               case nir_intrinsic_cmat_load:
+               case nir_intrinsic_cmat_store: {
+                  const bool is_load = intr->intrinsic == nir_intrinsic_cmat_load;
+                  struct glsl_cmat_description orig;
+                  if (!wg_lookup_orig_desc(orig_descs, intr->src[!is_load], &orig))
+                     break;
+                  if (sg_m == 1 && sg_n == 1)
+                     break;
+                  nir_def *row_off, *col_off;
+                  wg_slice_offset(&b, orig, sg_m, sg_n, &row_off, &col_off);
+                  nir_def *stride_elems = NULL;
+                  nir_deref_instr *ptr = wg_offset_cmat_ptr(
+                     &b, nir_src_as_deref(intr->src[is_load]),
+                     orig.element_type, intr->src[2].ssa,
+                     nir_intrinsic_matrix_layout(intr),
+                     row_off, col_off, &stride_elems);
+                  if (is_load) {
+                     nir_src_rewrite(&intr->src[1], &ptr->def);
+                     nir_src_rewrite(&intr->src[2], stride_elems);
+                  } else {
+                     nir_if *guard = wg_push_store_guard(&b, orig, sg_m, sg_n);
+                     nir_cmat_store(&b, &ptr->def, intr->src[1].ssa, stride_elems,
+                                    .matrix_layout = nir_intrinsic_matrix_layout(intr));
+                     if (guard)
+                        nir_pop_if(&b, guard);
+                     nir_instr_remove(instr);
+                  }
+                  break;
+               }
+               case nir_intrinsic_cmat_convert: {
+                  struct glsl_cmat_description dst_orig, src_orig;
+                  if (!wg_lookup_orig_desc(orig_descs, intr->src[0], &dst_orig) ||
+                      !wg_lookup_orig_desc(orig_descs, intr->src[1], &src_orig))
+                     break;
+                  if (!wg_cross_use_needs_exchange(dst_orig, src_orig, sg_m, sg_n))
+                     break;
+                  unsigned dst_bits = glsl_base_type_bit_size(dst_orig.element_type);
+                  unsigned src_bits = glsl_base_type_bit_size(src_orig.element_type);
+                  bool conv_before = dst_orig.element_type != src_orig.element_type &&
+                                     dst_bits < src_bits;
+                  bool conv_after = dst_orig.element_type != src_orig.element_type &&
+                                    !conv_before;
+                  enum glsl_base_type xfer_type =
+                     conv_before ? dst_orig.element_type : src_orig.element_type;
+
+                  nir_deref_instr *src_deref = nir_src_as_deref(intr->src[1]);
+                  nir_deref_instr *dst_deref = nir_src_as_deref(intr->src[0]);
+                  nir_deref_instr *store_deref = src_deref;
+                  if (conv_before) {
+                     struct glsl_cmat_description tmp_d =
+                        wg_sub_desc(src_orig, sg_m, sg_n);
+                     tmp_d.element_type = xfer_type;
+                     nir_variable *tmp = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tmp_d), "cmat_wg_conv_pre");
+                     store_deref = nir_build_deref_var(&b, tmp);
+                     nir_cmat_convert(
+                        &b, &store_deref->def, &src_deref->def,
+                        .saturate = nir_intrinsic_saturate(intr),
+                        .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                        .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+                  }
+
+                  nir_def *s_row, *s_col, *d_row, *d_col;
+                  wg_slice_offset(&b, src_orig, sg_m, sg_n, &s_row, &s_col);
+                  wg_slice_offset(&b, dst_orig, sg_m, sg_n, &d_row, &d_col);
+                  nir_def *stride = nir_imm_int(&b, src_orig.cols);
+                  nir_def *s_off = nir_iadd(&b, nir_imul(&b, s_row, stride), s_col);
+                  nir_def *d_off = nir_iadd(&b, nir_imul(&b, d_row, stride), d_col);
+
+                  nir_if *guard = wg_push_store_guard(&b, src_orig, sg_m, sg_n);
+                  nir_deref_instr *s_ptr =
+                     wg_scratch_ptr(&b, scratch, xfer_type, s_off);
+                  nir_cmat_store(&b, &s_ptr->def, &store_deref->def, stride,
+                                 .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                  if (guard)
+                     nir_pop_if(&b, guard);
+                  wg_barrier(&b);
+
+                  nir_deref_instr *load_deref = dst_deref;
+                  if (conv_after) {
+                     struct glsl_cmat_description tmp_d =
+                        wg_sub_desc(dst_orig, sg_m, sg_n);
+                     tmp_d.element_type = xfer_type;
+                     nir_variable *tmp = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tmp_d), "cmat_wg_conv_post");
+                     load_deref = nir_build_deref_var(&b, tmp);
+                  }
+                  nir_deref_instr *d_ptr =
+                     wg_scratch_ptr(&b, scratch, xfer_type, d_off);
+                  nir_cmat_load(&b, &load_deref->def, &d_ptr->def, stride,
+                                .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                  wg_barrier(&b);
+                  if (conv_after) {
+                     nir_cmat_convert(
+                        &b, &dst_deref->def, &load_deref->def,
+                        .saturate = nir_intrinsic_saturate(intr),
+                        .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                        .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+                  }
+                  nir_instr_remove(instr);
+                  break;
+               }
+               case nir_intrinsic_cmat_transpose: {
+                  struct glsl_cmat_description dst_orig, src_orig;
+                  if (!wg_lookup_orig_desc(orig_descs, intr->src[0], &dst_orig) ||
+                      !wg_lookup_orig_desc(orig_descs, intr->src[1], &src_orig))
+                     break;
+                  if (sg_m == 1 && sg_n == 1)
+                     break;
+                  unsigned dst_bits = glsl_base_type_bit_size(dst_orig.element_type);
+                  unsigned src_bits = glsl_base_type_bit_size(src_orig.element_type);
+                  bool conv_before = dst_orig.element_type != src_orig.element_type &&
+                                     dst_bits < src_bits;
+                  bool conv_after = dst_orig.element_type != src_orig.element_type &&
+                                    !conv_before;
+                  enum glsl_base_type xfer_type =
+                     conv_before ? dst_orig.element_type : src_orig.element_type;
+
+                  nir_deref_instr *src_deref = nir_src_as_deref(intr->src[1]);
+                  nir_deref_instr *dst_deref = nir_src_as_deref(intr->src[0]);
+                  nir_deref_instr *store_deref = src_deref;
+                  if (conv_before) {
+                     struct glsl_cmat_description tmp_d =
+                        wg_sub_desc(src_orig, sg_m, sg_n);
+                     tmp_d.element_type = xfer_type;
+                     nir_variable *tmp = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tmp_d), "cmat_wg_trans_pre");
+                     store_deref = nir_build_deref_var(&b, tmp);
+                     nir_cmat_convert(
+                        &b, &store_deref->def, &src_deref->def,
+                        .saturate = nir_intrinsic_saturate(intr),
+                        .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                        .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+                  }
+
+                  nir_def *s_row, *s_col, *d_row, *d_col;
+                  wg_slice_offset(&b, src_orig, sg_m, sg_n, &s_row, &s_col);
+                  wg_slice_offset(&b, dst_orig, sg_m, sg_n, &d_row, &d_col);
+                  nir_def *stride = nir_imm_int(&b, src_orig.cols);
+                  nir_def *s_off = nir_iadd(&b, nir_imul(&b, s_row, stride), s_col);
+                  nir_def *d_off = nir_iadd(&b, nir_imul(&b, d_col, stride), d_row);
+
+                  nir_if *guard = wg_push_store_guard(&b, src_orig, sg_m, sg_n);
+                  nir_deref_instr *s_ptr =
+                     wg_scratch_ptr(&b, scratch, xfer_type, s_off);
+                  nir_cmat_store(&b, &s_ptr->def, &store_deref->def, stride,
+                                 .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                  if (guard)
+                     nir_pop_if(&b, guard);
+                  wg_barrier(&b);
+
+                  nir_deref_instr *load_deref = dst_deref;
+                  if (conv_after) {
+                     struct glsl_cmat_description tmp_d =
+                        wg_sub_desc(dst_orig, sg_m, sg_n);
+                     tmp_d.element_type = xfer_type;
+                     nir_variable *tmp = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tmp_d), "cmat_wg_trans_post");
+                     load_deref = nir_build_deref_var(&b, tmp);
+                  }
+                  nir_deref_instr *d_ptr =
+                     wg_scratch_ptr(&b, scratch, xfer_type, d_off);
+                  nir_cmat_load(&b, &load_deref->def, &d_ptr->def, stride,
+                                .matrix_layout = GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
+                  wg_barrier(&b);
+                  if (conv_after) {
+                     nir_cmat_convert(
+                        &b, &dst_deref->def, &load_deref->def,
+                        .saturate = nir_intrinsic_saturate(intr),
+                        .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                        .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+                  }
+                  nir_instr_remove(instr);
+                  break;
+               }
+               default:
+                  break;
+               }
+            } else if (instr->type == nir_instr_type_cmat_call) {
+               nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+               if (call->op == nir_cmat_call_op_per_element_op) {
+                  struct glsl_cmat_description src_orig;
+                  if (!wg_lookup_orig_desc(orig_descs, call->params[3], &src_orig))
+                     continue;
+                  if (sg_m == 1 && sg_n == 1)
+                     continue;
+                  nir_def *row_off, *col_off;
+                  wg_slice_offset(&b, src_orig, sg_m, sg_n, &row_off, &col_off);
+                  nir_src_rewrite(&call->params[1],
+                                  nir_iadd(&b, call->params[1].ssa, row_off));
+                  nir_src_rewrite(&call->params[2],
+                                  nir_iadd(&b, call->params[2].ssa, col_off));
+               } else if (call->op == nir_cmat_call_op_reduce) {
+                  struct glsl_cmat_description dst_orig, src_orig;
+                  if (!wg_lookup_orig_desc(orig_descs, call->params[0], &dst_orig) ||
+                      !wg_lookup_orig_desc(orig_descs, call->params[1], &src_orig))
+                     continue;
+                  nir_cmat_reduce flags = nir_cmat_call_reduce_flags(call);
+                  bool red_row = flags & NIR_CMAT_REDUCE_ROW;
+                  bool red_col = flags & NIR_CMAT_REDUCE_COLUMN;
+                  if (!red_row && !red_col)
+                     continue;
+                  if (red_row && red_col) {
+                     if (num_sg == 1)
+                        continue;
+                     struct glsl_cmat_description tile_d = {
+                        .element_type = dst_orig.element_type,
+                        .scope = SCOPE_SUBGROUP,
+                        .rows = tile_gran,
+                        .cols = tile_gran,
+                        .use = dst_orig.use,
+                     };
+                     nir_variable *local_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tile_d), "cmat_wg_red_all");
+                     nir_deref_instr *local_d = nir_build_deref_var(&b, local_v);
+                     nir_cmat_call_instr *lred = nir_cmat_call_instr_create(
+                        nir, nir_cmat_call_op_reduce, call->callee);
+                     lred->params[0] = nir_src_for_ssa(&local_d->def);
+                     lred->params[1] = call->params[1];
+                     lred->const_index[0] = flags;
+                     nir_builder_instr_insert(&b, &lred->instr);
+
+                     unsigned bits = glsl_base_type_bit_size(dst_orig.element_type);
+                     nir_def *val = nir_cmat_extract(&b, bits, &local_d->def,
+                                                     nir_imm_int(&b, 0));
+                     nir_if *lane0 = nir_push_if(
+                        &b, nir_ieq_imm(&b, nir_load_subgroup_invocation(&b), 0));
+                     nir_deref_instr *wptr = wg_scratch_ptr(
+                        &b, scratch, dst_orig.element_type,
+                        nir_load_subgroup_id(&b));
+                     nir_store_deref(&b, wptr, val, 1);
+                     nir_pop_if(&b, lane0);
+                     wg_barrier(&b);
+
+                     nir_variable *acc_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&tile_d), "cmat_wg_red_acc");
+                     nir_deref_instr *acc_d = nir_build_deref_var(&b, acc_v);
+                     nir_deref_instr *r0 = wg_scratch_ptr(
+                        &b, scratch, dst_orig.element_type, nir_imm_int(&b, 0));
+                     nir_cmat_construct(&b, &acc_d->def, nir_load_deref(&b, r0));
+                     for (unsigned k = 1; k < num_sg; ++k) {
+                        nir_variable *pk_v = nir_local_variable_create(
+                           impl, glsl_cmat_type(&tile_d), "cmat_wg_red_pk");
+                        nir_deref_instr *pk_d = nir_build_deref_var(&b, pk_v);
+                        nir_deref_instr *rk = wg_scratch_ptr(
+                           &b, scratch, dst_orig.element_type, nir_imm_int(&b, k));
+                        nir_cmat_construct(&b, &pk_d->def, nir_load_deref(&b, rk));
+                        nir_cmat_call_instr *fin = nir_cmat_call_instr_create(
+                           nir, nir_cmat_call_op_reduce_finish, call->callee);
+                        fin->params[0] = nir_src_for_ssa(&acc_d->def);
+                        fin->params[1] = nir_src_for_ssa(&acc_d->def);
+                        fin->params[2] = nir_src_for_ssa(&pk_d->def);
+                        fin->const_index[0] = flags;
+                        nir_builder_instr_insert(&b, &fin->instr);
+                     }
+                     wg_barrier(&b);
+                     nir_def *tot = nir_cmat_extract(&b, bits, &acc_d->def,
+                                                     nir_imm_int(&b, 0));
+                     nir_cmat_construct(&b, call->params[0].ssa, tot);
+                     nir_instr_remove(instr);
+                  } else if (red_row && sg_n > 1) {
+                     unsigned m_sub = dst_orig.rows / sg_m;
+                     unsigned elem_bytes =
+                        glsl_base_type_bit_size(dst_orig.element_type) / 8;
+                     bool stride0 =
+                        dst_orig.rows * sg_n * tile_gran * elem_bytes > 8192;
+                     unsigned slot_elems = stride0 ? m_sub : m_sub * tile_gran;
+
+                     struct glsl_cmat_description local_d_desc = {
+                        .element_type = dst_orig.element_type,
+                        .scope = SCOPE_SUBGROUP,
+                        .rows = m_sub,
+                        .cols = tile_gran,
+                        .use = dst_orig.use,
+                     };
+                     nir_variable *local_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&local_d_desc), "cmat_wg_red_row");
+                     nir_deref_instr *local_d = nir_build_deref_var(&b, local_v);
+                     nir_cmat_call_instr *lred = nir_cmat_call_instr_create(
+                        nir, nir_cmat_call_op_reduce, call->callee);
+                     lred->params[0] = nir_src_for_ssa(&local_d->def);
+                     lred->params[1] = call->params[1];
+                     lred->const_index[0] = flags;
+                     nir_builder_instr_insert(&b, &lred->instr);
+
+                     nir_def *sg_m_idx, *sg_n_idx;
+                     wg_sg_coords(&b, sg_m, sg_n, &sg_m_idx, &sg_n_idx);
+                     nir_def *my_slot = nir_imul_imm(
+                        &b, nir_iadd(&b, nir_imul_imm(&b, sg_m_idx, sg_n), sg_n_idx),
+                        slot_elems);
+                     nir_deref_instr *sptr = wg_scratch_ptr(
+                        &b, scratch, dst_orig.element_type, my_slot);
+                     nir_cmat_store(&b, &sptr->def, &local_d->def,
+                                    nir_imm_int(&b, stride0 ? 0 : m_sub),
+                                    .matrix_layout = GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
+                     wg_barrier(&b);
+
+                     struct glsl_cmat_description dst_sub_d =
+                        wg_sub_desc(dst_orig, sg_m, sg_n);
+                     nir_deref_instr *dst_deref = nir_src_as_deref(call->params[0]);
+                     nir_variable *acc_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&dst_sub_d), "cmat_wg_row_acc");
+                     nir_deref_instr *acc_d = nir_build_deref_var(&b, acc_v);
+                     for (unsigned k = 0; k < sg_n; ++k) {
+                        nir_def *k_slot = nir_imul_imm(
+                           &b, nir_iadd_imm(&b, nir_imul_imm(&b, sg_m_idx, sg_n), k),
+                           slot_elems);
+                        nir_deref_instr *rptr = wg_scratch_ptr(
+                           &b, scratch, dst_orig.element_type, k_slot);
+                        if (k == 0) {
+                           nir_cmat_load(&b, &acc_d->def, &rptr->def,
+                                         nir_imm_int(&b, 0),
+                                         .matrix_layout = GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
+                        } else {
+                           nir_variable *pk_v = nir_local_variable_create(
+                              impl, glsl_cmat_type(&dst_sub_d), "cmat_wg_row_pk");
+                           nir_deref_instr *pk_d = nir_build_deref_var(&b, pk_v);
+                           nir_cmat_load(&b, &pk_d->def, &rptr->def,
+                                         nir_imm_int(&b, 0),
+                                         .matrix_layout = GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
+                           nir_deref_instr *out_d =
+                              (k == sg_n - 1) ? dst_deref : acc_d;
+                           nir_cmat_call_instr *fin = nir_cmat_call_instr_create(
+                              nir, nir_cmat_call_op_reduce_finish, call->callee);
+                           fin->params[0] = nir_src_for_ssa(&out_d->def);
+                           fin->params[1] = nir_src_for_ssa(&acc_d->def);
+                           fin->params[2] = nir_src_for_ssa(&pk_d->def);
+                           fin->const_index[0] = flags;
+                           nir_builder_instr_insert(&b, &fin->instr);
+                        }
+                     }
+                     wg_barrier(&b);
+                     nir_instr_remove(instr);
+                  } else if (red_col && sg_m > 1) {
+                     unsigned n_sub = dst_orig.cols / sg_n;
+                     unsigned elem_bytes =
+                        glsl_base_type_bit_size(dst_orig.element_type) / 8;
+                     bool stride0 =
+                        dst_orig.cols * sg_m * tile_gran * elem_bytes > 8192;
+                     unsigned slot_elems = stride0 ? n_sub : n_sub * tile_gran;
+
+                     struct glsl_cmat_description local_d_desc = {
+                        .element_type = dst_orig.element_type,
+                        .scope = SCOPE_SUBGROUP,
+                        .rows = tile_gran,
+                        .cols = n_sub,
+                        .use = dst_orig.use,
+                     };
+                     nir_variable *local_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&local_d_desc), "cmat_wg_red_col");
+                     nir_deref_instr *local_d = nir_build_deref_var(&b, local_v);
+                     nir_cmat_call_instr *lred = nir_cmat_call_instr_create(
+                        nir, nir_cmat_call_op_reduce, call->callee);
+                     lred->params[0] = nir_src_for_ssa(&local_d->def);
+                     lred->params[1] = call->params[1];
+                     lred->const_index[0] = flags;
+                     nir_builder_instr_insert(&b, &lred->instr);
+
+                     nir_def *sg_m_idx, *sg_n_idx;
+                     wg_sg_coords(&b, sg_m, sg_n, &sg_m_idx, &sg_n_idx);
+                     nir_def *my_slot = nir_imul_imm(
+                        &b, nir_iadd(&b, nir_imul_imm(&b, sg_m_idx, sg_n), sg_n_idx),
+                        slot_elems);
+                     nir_deref_instr *sptr = wg_scratch_ptr(
+                        &b, scratch, dst_orig.element_type, my_slot);
+                     nir_cmat_store(&b, &sptr->def, &local_d->def,
+                                    nir_imm_int(&b, stride0 ? 0 : n_sub),
+                                    .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                     wg_barrier(&b);
+
+                     struct glsl_cmat_description dst_sub_d =
+                        wg_sub_desc(dst_orig, sg_m, sg_n);
+                     nir_deref_instr *dst_deref = nir_src_as_deref(call->params[0]);
+                     nir_variable *acc_v = nir_local_variable_create(
+                        impl, glsl_cmat_type(&dst_sub_d), "cmat_wg_col_acc");
+                     nir_deref_instr *acc_d = nir_build_deref_var(&b, acc_v);
+                     for (unsigned k = 0; k < sg_m; ++k) {
+                        nir_def *k_slot = nir_imul_imm(
+                           &b, nir_iadd_imm(&b, sg_n_idx, k * sg_n), slot_elems);
+                        nir_deref_instr *rptr = wg_scratch_ptr(
+                           &b, scratch, dst_orig.element_type, k_slot);
+                        if (k == 0) {
+                           nir_cmat_load(&b, &acc_d->def, &rptr->def,
+                                         nir_imm_int(&b, 0),
+                                         .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                        } else {
+                           nir_variable *pk_v = nir_local_variable_create(
+                              impl, glsl_cmat_type(&dst_sub_d), "cmat_wg_col_pk");
+                           nir_deref_instr *pk_d = nir_build_deref_var(&b, pk_v);
+                           nir_cmat_load(&b, &pk_d->def, &rptr->def,
+                                         nir_imm_int(&b, 0),
+                                         .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+                           nir_deref_instr *out_d =
+                              (k == sg_m - 1) ? dst_deref : acc_d;
+                           nir_cmat_call_instr *fin = nir_cmat_call_instr_create(
+                              nir, nir_cmat_call_op_reduce_finish, call->callee);
+                           fin->params[0] = nir_src_for_ssa(&out_d->def);
+                           fin->params[1] = nir_src_for_ssa(&acc_d->def);
+                           fin->params[2] = nir_src_for_ssa(&pk_d->def);
+                           fin->const_index[0] = flags;
+                           nir_builder_instr_insert(&b, &fin->instr);
+                        }
+                     }
+                     wg_barrier(&b);
+                     nir_instr_remove(instr);
+                  }
+               }
+            }
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+
+   ralloc_free(mem_ctx);
+   return true;
 }

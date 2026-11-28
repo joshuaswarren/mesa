@@ -502,6 +502,8 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
     * which the rest of the lowering must then see. The pieces of a matrix
     * may pair K 64 deep, which the tensor loads then take. */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
+      unsigned wg_sg_m = 1, wg_sg_n = 1;
+      NIR_PASS(_, nir, agx_nir_lower_cmat_workgroup, &wg_sg_m, &wg_sg_n);
       bool split = false, pairing = false;
       NIR_PASS(split, nir, agx_nir_lower_cmat_flexible, &pairing);
       if (split) {
@@ -510,7 +512,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
          NIR_PASS(_, nir, nir_remove_dead_variables,
                   nir_var_function_temp | nir_var_shader_temp, NULL);
       }
-      NIR_PASS(_, nir, agx_nir_lower_cmat_tensor, pairing);
+      NIR_PASS(_, nir, agx_nir_lower_cmat_tensor, pairing, wg_sg_m, wg_sg_n);
    }
 
    /* Then, before anything else lowers the shader: the functions of matrix
