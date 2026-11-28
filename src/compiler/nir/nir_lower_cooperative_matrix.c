@@ -845,6 +845,36 @@ split_cmat_load_store(nir_builder *b,
    return true;
 }
 
+
+static bool
+split_cmat_call_reduce_finish(nir_builder *b,
+                              nir_cmat_call_instr *call,
+                              struct split_info *info)
+{
+   nir_instr *instr = &call->instr;
+   struct split_mat *dst_split = find_call_split(info->split_mats, call, 0);
+   struct split_mat *x_split = find_call_split(info->split_mats, call, 1);
+   struct split_mat *y_split = find_call_split(info->split_mats, call, 2);
+   if (!dst_split)
+      return false;
+
+   assert(x_split && y_split);
+   unsigned splits = get_num_splits(dst_split);
+   if (splits <= 1)
+      return false;
+
+   for (unsigned i = 0; i < splits; i++) {
+      nir_deref_instr *dst_deref = recreate_derefs(b, &call->params[0], dst_split->split_vars[i]);
+      nir_deref_instr *x_deref = recreate_derefs(b, &call->params[1], x_split->split_vars[i]);
+      nir_deref_instr *y_deref = recreate_derefs(b, &call->params[2], y_split->split_vars[i]);
+      b->cursor = nir_before_instr(instr);
+      call_reduce_finish(b, call, nir_cmat_call_reduce_flags(call),
+                         &dst_deref->def, &x_deref->def, &y_deref->def);
+   }
+   nir_instr_remove(instr);
+   return true;
+}
+
 static bool
 split_cmat_call_per_element_op(nir_builder *b,
                                nir_cmat_call_instr *call,
@@ -867,10 +897,13 @@ split_cmat_call_per_element_op(nir_builder *b,
       nir_deref_instr *dst_deref = recreate_derefs(b, &call->params[0], dst_split->split_vars[i]);
       nir_deref_instr *src_deref = recreate_derefs(b, &call->params[3], src_split->split_vars[i]);
       struct glsl_cmat_description cmat_desc = *glsl_get_cmat_description(src_split->split_vars[0]->type);
+      b->cursor = nir_before_instr(instr);
+      nir_def *row_off = nir_iadd_imm(b, call->params[1].ssa, cmat_desc.rows * r);
+      nir_def *col_off = nir_iadd_imm(b, call->params[2].ssa, cmat_desc.cols * c);
       nir_cmat_call_instr *new_call = nir_cmat_call_instr_create(b->shader, nir_cmat_call_op_per_element_op, call->callee);
       new_call->params[0] = nir_src_for_ssa(&dst_deref->def);
-      new_call->params[1] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.rows * r));
-      new_call->params[2] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.cols * c));
+      new_call->params[1] = nir_src_for_ssa(row_off);
+      new_call->params[2] = nir_src_for_ssa(col_off);
       new_call->params[3] = nir_src_for_ssa(&src_deref->def);
 
       for (unsigned j = 4; j < call->num_params; j++) {
@@ -1009,6 +1042,9 @@ split_matrix_impl(nir_function_impl *impl, struct split_info *info)
             switch (cmat_call->op) {
             case nir_cmat_call_op_reduce:
                progress |= split_cmat_call_reduce(&b, impl, cmat_call, info);
+               break;
+            case nir_cmat_call_op_reduce_finish:
+               progress |= split_cmat_call_reduce_finish(&b, cmat_call, info);
                break;
             case nir_cmat_call_op_per_element_op:
                progress |= split_cmat_call_per_element_op(&b, cmat_call, info);
