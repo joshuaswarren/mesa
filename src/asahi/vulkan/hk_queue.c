@@ -65,6 +65,8 @@
 #include "layout.h"
 #include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
+#include "vk_fence.h"
+#include "vk_semaphore.h"
 #include "vk_sync.h"
 
 /* Signal scope includes all earlier commands on this Vulkan queue. A DRM
@@ -135,6 +137,9 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
    if (submit->wait_count)
       queue->drm.empty_wait_point = queue->drm.timeline_value;
 
+   /* The signals also cover these waits, which no ordinal names. */
+   hk_gpu_waits_forget_waits(dev, submit->wait_count, submit->waits);
+   hk_gpu_waits_forget_signals(dev, submit->signal_count, submit->signals);
    return queue_signal_timeline(dev, queue, submit);
 }
 
@@ -1446,6 +1451,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
 {
    const struct hk_sync_queue old = queue->sync;
    memset(&queue->sync, 0, sizeof(queue->sync));
+   queue->gpu_wait_generation++;
    queue->sync.exact_prior = old.exact_prior;
    queue->sync.serialize = old.serialize;
    queue->sync.stage_overlap = old.stage_overlap;
@@ -1911,7 +1917,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                         struct agx_bo *const *extra_bos,
                         unsigned extra_bo_count,
                         struct hk_queue_done_cache *done_cache,
-                        bool *untouched)
+                        bool allow_gpu_waits, bool *untouched)
 {
    struct hk_queue_done_cache local_cache = {0};
    if (!done_cache)
@@ -2146,6 +2152,17 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
 
+   /* Same-queue binary waits become prior floors (hk_gpu_waits.h). Only while
+    * every earlier submission stayed on the primary kernel queue with exact
+    * ordinals continuing from the signal: not across a kernel queue
+    * replacement, not after a sibling kernel queue has run, not on a split
+    * submission, and not behind a prepended command (sparse flush or
+    * timestamp carrier). */
+   const bool gpu_waits_ok = queue->sync.exact_prior && !queue->sib.used;
+   const bool gpu_waits =
+      gpu_waits_ok && allow_gpu_waits && !replaced && !prepend_cdm;
+   uint64_t wait_floor[HK_SYNC_NUM_SQ] = {0};
+
    /* At most one wait on the queue's own timeline: the kernel refuses two
     * points of one timeline in a submission. own_wait is its index. */
    int own_wait = -1;
@@ -2196,6 +2213,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
          if (skip)
             continue;
+      } else if (hk_gpu_waits_take(dev, gpu_waits ? queue : NULL,
+                                   submit->waits[i].sync, wait_floor)) {
+         /* Without gpu_waits this only consumes the wait's record. */
+         continue;
       }
 
       asahi_fill_sync(&syncs[wait_count++], submit->waits[i].sync,
@@ -2319,11 +2340,15 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       wait_count > 0 &&
       !(dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
    bool tail_raised = false;
-   if (resolve && !hk_sync_resolve_submit_ex(queue,
+   memcpy(queue->sync.wait_floor, wait_floor, sizeof(wait_floor));
+   const bool sync_ok = !resolve || hk_sync_resolve_submit_ex(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, prepend_cdm,
                           chain_first, completed, queue->sync_resolved.data,
-                          &tail_raised)) {
+                          &tail_raised);
+   if (!sync_ok) {
+      memset(queue->sync.wait_floor, 0, sizeof(queue->sync.wait_floor));
+      hk_gpu_waits_forget_signals(dev, submit->signal_count, submit->signals);
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -2338,9 +2363,12 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    uint16_t flush_barrier[HK_SYNC_NUM_SQ] = {DRM_ASAHI_BARRIER_NONE,
                                              DRM_ASAHI_BARRIER_NONE};
    uint64_t flush_prior[HK_SYNC_NUM_SQ] = {0, 0};
-   if (host_flush &&
-       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds, prior_base,
-                                  sq_count, flush_barrier, flush_prior)) {
+   const bool flush_ok = !host_flush ||
+      hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds, prior_base,
+                                sq_count, flush_barrier, flush_prior);
+   memset(queue->sync.wait_floor, 0, sizeof(queue->sync.wait_floor));
+   if (!flush_ok) {
+      hk_gpu_waits_forget_signals(dev, submit->signal_count, submit->signals);
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -2357,7 +2385,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !prepend_cdm && !unlikely(anatomy) &&
-       !extra_bo_count && !hk_sibling_packed_atomic_busy(dev, queue, done_cache) &&
+       !extra_bo_count && !wait_floor[HK_SYNC_VDM] && !wait_floor[HK_SYNC_CDM] &&
+       !hk_sibling_packed_atomic_busy(dev, queue, done_cache) &&
        !(host_flush &&
          hk_host_flush_names_earlier(flush_barrier, flush_prior, prior_base)) &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
@@ -2955,6 +2984,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(anatomy))
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
+   /* Its binary signals now stand for this queue's ordinals. The record is
+    * written before the kernel or queue_signal_timeline can make a payload
+    * visible, so no waiter sees the payload without it; a failed submission
+    * forgets it again. Submissions of one queue are serialized, so no wait
+    * of this queue can take the record in between. */
+   hk_gpu_waits_note_signals(dev, queue, gpu_waits_ok && !sib_target,
+                             submit->signal_count, submit->signals);
+
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
       if (unlikely(anatomy))
@@ -2984,6 +3021,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (sib_target) {
          queue->sib.used = true;
          queue->sib.last_point = queue->drm.timeline_value;
+         queue->gpu_wait_generation++;
       } else if (packed_atomics) {
          queue->sib.packed_atomic_point = queue->drm.timeline_value;
       }
@@ -2996,6 +3034,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (result == VK_SUCCESS)
          result = signal_result;
    }
+
+   if (result != VK_SUCCESS)
+      hk_gpu_waits_forget_signals(dev, submit->signal_count, submit->signals);
 
    util_dynarray_fini(&payload);
 
@@ -8423,7 +8464,8 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
 static VkResult
 queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
-                     struct vk_queue_submit *submit, bool *untouched)
+                     struct vk_queue_submit *submit, bool allow_gpu_waits,
+                     bool *untouched)
 {
    /* Render packing first: it also writes back the tails of command
     * buffers an earlier submission packed (hk_render_pack_runs()). */
@@ -8439,7 +8481,7 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
        submit->image_bind_count || submit->image_opaque_bind_count ||
        !hk_pack_runs_enabled(dev))
       return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
-                                     NULL, untouched);
+                                     NULL, allow_gpu_waits, untouched);
 
    struct hk_queue_done_cache done_cache = {0};
 
@@ -8458,7 +8500,8 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
    const uint64_t prev_pt = queue->drm.timeline_value;
    if (!have_runs) {
       VkResult result = queue_submit_recordings(dev, queue, submit, original,
-                                                NULL, 0, &done_cache, untouched);
+                                                NULL, 0, &done_cache,
+                                                allow_gpu_waits, untouched);
       if (result == VK_SUCCESS && runs.loop_count >= 2 && runs.cb_hash != 0 &&
           queue->drm.timeline_value > prev_pt)
          hk_pack_obs_arm(queue, runs.cb_hash, submit->command_buffer_count,
@@ -8473,7 +8516,8 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
                                              util_dynarray_begin(runs.extra_bos),
                                              util_dynarray_num_elements(
                                                 runs.extra_bos, struct agx_bo *),
-                                             &done_cache, untouched);
+                                             &done_cache, allow_gpu_waits,
+                                             untouched);
    if (result == VK_SUCCESS && runs.loop_count >= 2 && runs.cb_hash != 0 &&
        queue->drm.timeline_value > prev_pt)
       hk_pack_obs_arm(queue, runs.cb_hash, submit->command_buffer_count,
@@ -8488,7 +8532,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit, bool *untouched)
 {
    if (submit->command_buffer_count <= 1)
-      return queue_submit_segment(dev, queue, submit, untouched);
+      return queue_submit_segment(dev, queue, submit, true, untouched);
    bool needs_split = false;
    for (unsigned i = 1; i < submit->command_buffer_count; ++i) {
       const struct hk_cmd_buffer *cmd =
@@ -8499,7 +8543,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
    }
    if (!needs_split)
-      return queue_submit_segment(dev, queue, submit, untouched);
+      return queue_submit_segment(dev, queue, submit, true, untouched);
 
    *untouched = true;
    unsigned start = 0;
@@ -8526,11 +8570,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
 
       bool seg_untouched = false;
-      VkResult result = queue_submit_segment(dev, queue, &seg, &seg_untouched);
+      VkResult result =
+         queue_submit_segment(dev, queue, &seg, false, &seg_untouched);
       if (start > 0 || !seg_untouched)
          *untouched = false;
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         hk_gpu_waits_forget_signals(dev, submit->signal_count,
+                                     submit->signals);
          return result;
+      }
       start = end;
    }
 
@@ -8692,8 +8740,11 @@ hk_DestroySemaphore(VkDevice _device, VkSemaphore semaphore,
                     const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
-   if (semaphore != VK_NULL_HANDLE)
+   if (semaphore != VK_NULL_HANDLE) {
       hk_device_quiesce_lost_submissions(dev);
+      VK_FROM_HANDLE(vk_semaphore, sem, semaphore);
+      hk_gpu_waits_forget_destroyed(dev, &sem->permanent, sem->temporary);
+   }
    vk_common_DestroySemaphore(_device, semaphore, pAllocator);
 }
 
@@ -8702,8 +8753,11 @@ hk_DestroyFence(VkDevice _device, VkFence fence,
                 const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
-   if (fence != VK_NULL_HANDLE)
+   if (fence != VK_NULL_HANDLE) {
       hk_device_quiesce_lost_submissions(dev);
+      VK_FROM_HANDLE(vk_fence, vkf, fence);
+      hk_gpu_waits_forget_destroyed(dev, &vkf->permanent, vkf->temporary);
+   }
    vk_common_DestroyFence(_device, fence, pAllocator);
 }
 

@@ -83,6 +83,8 @@ struct hk_physical_device {
    struct drm_asahi_queue_limits queue_limits;
 
    struct vk_sync_type syncobj_sync_type;
+   /* syncobj_sync_type's original operations, see hk_gpu_waits.h. */
+   struct vk_sync_type syncobj_base_type;
    const struct vk_sync_type *sync_types[2];
 
    simple_mtx_t debug_compile_lock;

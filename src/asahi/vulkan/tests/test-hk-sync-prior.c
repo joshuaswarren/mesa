@@ -3512,6 +3512,75 @@ main(void)
       T("signalled_value ignores equal point",
         p_atomic_read(&mq->drm.signalled_value) == 12);
    }
+   /* Same-queue semaphore waits (hk_gpu_waits.h): a wait floor makes every
+    * command of the submission wait through the signalling submission's
+    * ordinals, on both subqueues, whatever its own dependencies; it never
+    * lowers a later in-submission wait, applies to a deferred host flush,
+    * and is not carried to the next submission. */
+   {
+      struct hk_queue *q = new_queue(true);
+      struct hk_cmd_buffer *first = new_cmd();
+      add(first, false);
+      add(first, true);
+      add(first, false);
+      T("floor: producer resolves", submit(q, first));
+      T("floor: producer ordinals",
+        q->sync.submitted[HK_SYNC_VDM] == 2 && q->sync.submitted[HK_SYNC_CDM] == 1);
+      const uint64_t floor_vdm = q->sync.submitted[HK_SYNC_VDM];
+      const uint64_t floor_cdm = q->sync.submitted[HK_SYNC_CDM];
+
+      struct hk_cmd_buffer *mid = new_cmd();
+      add(mid, true);
+      T("floor: middle resolves", submit(q, mid));
+
+      struct hk_cmd_buffer *c = new_cmd();
+      struct hk_cs *r = add(c, false);
+      struct hk_cs *k = add(c, true);
+      hk_sync_barrier(c, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+      struct hk_cs *r2 = add(c, false);
+      q->sync.wait_floor[HK_SYNC_VDM] = floor_vdm;
+      q->sync.wait_floor[HK_SYNC_CDM] = floor_cdm;
+      T("floor: consumer resolves", submit(q, c));
+      memset(q->sync.wait_floor, 0, sizeof(q->sync.wait_floor));
+
+      T("floor: render waits through the producer",
+        r->sync.prior[HK_SYNC_VDM] >= floor_vdm &&
+        r->sync.prior[HK_SYNC_CDM] >= floor_cdm &&
+        r->sync.prior_ta[HK_SYNC_VDM] >= floor_vdm &&
+        r->sync.prior_ta[HK_SYNC_CDM] >= floor_cdm);
+      T("floor: compute waits through the producer",
+        k->sync.prior[HK_SYNC_VDM] >= floor_vdm &&
+        k->sync.prior[HK_SYNC_CDM] >= floor_cdm);
+      T("floor: in-submission wait kept",
+        r2->sync.barrier[HK_SYNC_CDM] == 1 &&
+        r2->sync.prior[HK_SYNC_VDM] >= floor_vdm);
+
+      /* Deferred host flush on a barrier-only submission also respects
+       * wait_floor when no stream ran on either subqueue. */
+      uint16_t fb[HK_SYNC_NUM_SQ];
+      uint64_t fp[HK_SYNC_NUM_SQ];
+      const uint32_t zero_count[HK_SYNC_NUM_SQ] = {0, 0};
+      const uint64_t base_now[HK_SYNC_NUM_SQ] = {
+         q->sync.submitted[HK_SYNC_VDM], q->sync.submitted[HK_SYNC_CDM],
+      };
+      q->sync.wait_floor[HK_SYNC_VDM] = floor_vdm;
+      q->sync.wait_floor[HK_SYNC_CDM] = floor_cdm;
+      T("floor: host flush prefix resolves",
+        hk_sync_host_flush_prefix(&q->sync, 0, base_now, zero_count, fb, fp));
+      memset(q->sync.wait_floor, 0, sizeof(q->sync.wait_floor));
+      T("floor: host flush respects wait_floor",
+        fb[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+        fb[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        fp[HK_SYNC_VDM] >= floor_vdm && fp[HK_SYNC_CDM] >= floor_cdm);
+
+      struct hk_cmd_buffer *next = new_cmd();
+      struct hk_cs *n = add(next, true);
+      T("floor: next resolves", submit(q, next));
+      T("floor: not carried to the next submission",
+        n->sync.prior[HK_SYNC_VDM] == 0 && n->sync.prior[HK_SYNC_CDM] == 0 &&
+        n->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+        n->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+   }
    test_vertex_image_bloom();
    /* Forgetting a singleton render pass (such as an absorbed deferred-clear
     * VDM render) drops its pass footprint instead of rebinding it to an

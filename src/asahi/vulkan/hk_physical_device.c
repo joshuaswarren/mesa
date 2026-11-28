@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "hk_gpu_waits.h"
 #include "hk_physical_device.h"
 
 #include "asahi/compiler/agx_compile.h"
@@ -2496,6 +2497,21 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    unsigned st_idx = 0;
    pdev->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
+   /* Same-queue binary semaphore waits ordered on the GPU (hk_gpu_waits.h)
+    * need to see every change of a payload. */
+   pdev->syncobj_base_type = pdev->syncobj_sync_type;
+   if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) &&
+       !pdev->dev.is_virtio && pdev->syncobj_sync_type.features) {
+      hk_gpu_waits_wrap_type(&pdev->syncobj_sync_type,
+                             &pdev->syncobj_base_type);
+      /* Everything that handles a drm_syncobj payload directly recognises
+       * the type with vk_sync_type_is_drm_syncobj(). Should the wrapper ever
+       * break that, keep the original type (hk_gpu_waits then stays off). */
+      if (!vk_sync_type_is_drm_syncobj(&pdev->syncobj_sync_type)) {
+         assert(!"wrapped sync type lost its drm_syncobj identity");
+         pdev->syncobj_sync_type = pdev->syncobj_base_type;
+      }
+   }
    pdev->sync_types[st_idx++] = &pdev->syncobj_sync_type;
    pdev->sync_types[st_idx++] = NULL;
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
