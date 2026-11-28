@@ -51,17 +51,27 @@ do_copy(agx_builder *b, const struct agx_copy *copy)
                       ? agx_memory_register(copy->dest, copy->src.size)
                       : agx_register(copy->dest, copy->src.size);
 
-   if (copy->dest_mem && copy->src.memory) {
-      /* Memory-memory copies need to be lowered to memory-register and
-       * register-memory, using a reserved scratch register. Keep AGX3's r1
-       * available for a full-width divergent-shuffle index when required.
+   const bool via_scratch =
+      copy->dest_mem && (copy->src.memory ||
+                         copy->src.type == AGX_INDEX_IMMEDIATE ||
+                         copy->src.type == AGX_INDEX_UNIFORM);
+
+   if (via_scratch) {
+      /* Memory is written from a register only. Memory-memory copies, and
+       * immediate or uniform phi sources of spilled phis (agx_spill.c), are
+       * lowered to a register write and a register-memory copy, using a
+       * reserved scratch register. Keep AGX3's r1 available for a full-width
+       * divergent-shuffle index when required.
        */
       const bool agx3_shuffle =
          b->shader->any_quad_divergent_shuffle &&
          b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
       agx_index scratch_reg =
          agx_register(agx3_shuffle ? 4 : 2, copy->src.size);
-      agx_mov_to(b, scratch_reg, copy->src);
+      if (copy->src.type == AGX_INDEX_IMMEDIATE)
+         agx_mov_imm_to(b, scratch_reg, copy->src.value);
+      else
+         agx_mov_to(b, scratch_reg, copy->src);
       agx_mov_to(b, dst, scratch_reg);
    } else if (copy->src.type == AGX_INDEX_IMMEDIATE) {
       agx_mov_imm_to(b, dst, copy->src.value);

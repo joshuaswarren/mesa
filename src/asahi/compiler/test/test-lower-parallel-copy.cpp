@@ -434,3 +434,36 @@ TEST_F(LowerParallelCopy, HighSlotMemory64AndSwap)
       agx_mov_to(b, agx_memory_register(4096, AGX_SIZE_32), temp2);
    });
 }
+
+/* Memory is written from a register only, so an immediate or uniform copied to
+ * memory (a spilled phi's constant source) goes through the scratch register
+ * of memory-memory copies. A 64-bit uniform is copied a word at a time.
+ */
+TEST_F(LowerParallelCopy, ImmediateAndUniformToMemory)
+{
+   agx_index imm = agx_immediate(7);
+   imm.size = AGX_SIZE_32;
+
+   struct agx_copy test[] = {
+      {.dest = 4, .dest_mem = true, .src = imm},
+      {.dest = 8, .dest_mem = true, .src = agx_uniform(6, AGX_SIZE_32)},
+      {.dest = 12, .dest_mem = true, .src = agx_uniform(20, AGX_SIZE_64)},
+      {.dest = 17, .dest_mem = true, .src = agx_uniform(9, AGX_SIZE_16)},
+   };
+
+   CASE(test, {
+      agx_index scratch = agx_register(2, AGX_SIZE_32);
+
+      agx_mov_imm_to(b, scratch, 7);
+      agx_mov_to(b, agx_memory_register(4, AGX_SIZE_32), scratch);
+      agx_mov_to(b, scratch, agx_uniform(6, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(8, AGX_SIZE_32), scratch);
+      agx_mov_to(b, scratch, agx_uniform(20, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(12, AGX_SIZE_32), scratch);
+      agx_mov_to(b, scratch, agx_uniform(22, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(14, AGX_SIZE_32), scratch);
+      agx_mov_to(b, agx_register(2, AGX_SIZE_16), agx_uniform(9, AGX_SIZE_16));
+      agx_mov_to(b, agx_memory_register(17, AGX_SIZE_16),
+                 agx_register(2, AGX_SIZE_16));
+   });
+}
