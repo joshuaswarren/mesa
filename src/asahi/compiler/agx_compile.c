@@ -20502,6 +20502,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       if (key->is_helper)
          regs = MIN2(regs, 32);
 
+      if (is_agx3 && nir->info.shared_size > 0) {
+         bool shared_fold = false;
+         NIR_PASS(shared_fold, nir, agx_nir_opt_shared_byte_offsets);
+         if (shared_fold) {
+            post_opt_progress = true;
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
       if (is_agx3)
          NIR_PASS(post_opt_progress, nir,
                   agx_nir_reassociate_loop_invariant_eq);
