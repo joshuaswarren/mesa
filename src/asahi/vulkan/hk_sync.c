@@ -263,10 +263,14 @@ pass_footprints_commit(struct hk_cmd_buffer *cmd)
 
 static void
 records_replace_stream(struct hk_cmd_buffer *cmd, struct hk_cs *from,
-                       struct hk_cs *to)
+                       struct hk_cs *to, bool drop_singleton)
 {
    util_dynarray_foreach(&cmd->sync_pass_records, struct hk_sync_pass_record,
                          rec) {
+      if (drop_singleton && rec->first == from && rec->last == from) {
+         rec->first = rec->last = NULL;
+         continue;
+      }
       if (rec->first == from)
          rec->first = to;
       if (rec->last == from)
@@ -1850,7 +1854,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
               (!prev || prev->sync.seq < st->pass_tile_first->sync.seq)) {
       st->pass_tile_last = st->pass_tile_first;
    }
-   records_replace_stream(cmd, cs, prev);
+   records_replace_stream(cmd, cs, prev, true);
 
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
       replace_pointer(&it->sync.dep[sq].cut, cs, prev);
@@ -1954,7 +1958,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->pass_heap_last[sq], from, into);
    for (unsigned hs = 0; hs < HK_HEAP_SLOTS; ++hs)
       replace_pointer(&st->last_heap_slot[hs][sq], from, into);
-   records_replace_stream(cmd, from, into);
+   records_replace_stream(cmd, from, into, false);
    xfer_replace_stream(st, from, into);
 
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
