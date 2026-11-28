@@ -6288,7 +6288,9 @@ agx3_gpu1_tied_minmax(const struct agx3_fsel32_gpu1_desc *d, bool half)
    return (d->condition == 3 || d->condition == 7) &&
           !d->cmp1_immediate && !d->sel_immediate[0] &&
           !d->sel_immediate[1] && d->cmp0_16 == half && d->cmp1_16 == half &&
-          d->cmp0 == d->sel[0] && d->cmp1 == d->sel[1];
+          d->cmp0 == d->sel[0] && d->cmp1 == d->sel[1] &&
+          d->cmp0_uniform == d->sel_uniform[0] &&
+          d->cmp1_uniform == d->sel_uniform[1];
 }
 
 bool
@@ -6324,50 +6326,110 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
    if (d->sel_immediate[0] && d->sel_immediate[1] && !d->sel_integer)
       return false;
 
+   const uint16_t src[4] = {d->cmp0, d->cmp1, d->sel[0], d->sel[1]};
+   const bool imm[4] = {false, d->cmp1_immediate, d->sel_immediate[0],
+                        d->sel_immediate[1]};
+   const bool uniform[4] = {d->cmp0_uniform, d->cmp1_uniform,
+                            d->sel_uniform[0], d->sel_uniform[1]};
+   const enum agx3_alu_hint hints[4] = {d->cmp0_hint, d->cmp1_hint,
+                                        d->sel_hint[0], d->sel_hint[1]};
+   const bool half[4] = {d->cmp0_16, d->cmp1_16, false, false};
+   const bool fself = !d->sel_integer && (imm[2] || imm[3]);
+   const unsigned uniforms = uniform[0] | uniform[1] << 1 |
+                             uniform[2] << 2 | uniform[3] << 3;
+
    /* Native G17G fragments compare a uniform against a register
     * and select a minifloat or a register: fself32 with f19 = the uniform
     * half and f25 = 3, conditions 5 and 6, no lifetime hints on the
     * uniform (16 Minecraft terrain/entity witnesses, asserted in the M5
-    * instruction test). Only that shape is admitted. */
-   if (d->cmp0_uniform &&
-       (d->cmp0_16 || (d->cmp0 & 1) || d->cmp0 >= 256 ||
-        d->cmp0_hint != AGX3_ALU_HINT_NONE || d->cmp1_immediate ||
-        d->cmp1_16 || d->sel_integer || !d->sel_immediate[0] ||
-        d->sel_immediate[1] || (d->condition != 5 && d->condition != 6)))
+    * instruction test). */
+   const bool fself_uniform_cmp0 =
+      uniforms == 1 && !d->cmp0_16 && d->cmp0 < 256 && !d->cmp1_immediate &&
+      !d->cmp1_16 &&
+      !d->sel_integer && d->sel_immediate[0] && !d->sel_immediate[1] &&
+      (d->condition == 5 || d->condition == 6);
+
+   /* The M5 native compiler reads the uniform file from every operand slot.
+    * Its fragment and compute programs carry these uniforms, beside registers
+    * or immediates in the other slots (encodings in
+    * test-agx3c-fsel-uniform.c):
+    *
+    *   fseli32  r op u  ? r : r   f40 = 3, f34; a 16- or 32-bit uniform
+    *   fseli32  r op r  ? u : r   f57 = 3, f51; also r op #0 ? u : r
+    *   fseli32  r op r  ? r : u   f71 = 3, f65; also r op r ? # : u
+    *   fseli32  r op #0 ? u : u   two distinct uniforms
+    *   fseli32  r op u  ? u : r,  r op u ? r : u, also as a tied min/max
+    *   fseli32  u == #0 ? r : r   f23 = 3, f17
+    *   fself32  r op u  ? # : r,  r op u ? r : #,  r op # ? # : u
+    *
+    * Other uniform combinations are refused. */
+   bool uniform_form;
+   switch (uniforms) {
+   case 0:
+      uniform_form = true;
+      break;
+   case 1:
+      uniform_form = fself_uniform_cmp0 ||
+                     (d->cmp1_immediate && !imm[2] && !imm[3] &&
+                      d->condition == 0);
+      break;
+   case 2:
+      uniform_form = !(imm[2] && imm[3]);
+      break;
+   case 8:
+      uniform_form = !fself || d->cmp1_immediate;
+      break;
+   case 12:
+      uniform_form = d->cmp1_immediate;
+      break;
+   case 4: case 6: case 10:
+      uniform_form = !fself;
+      break;
+   default:
+      uniform_form = false;
+      break;
+   }
+   /* Beside a uniform elsewhere the first comparand is a 32-bit register. */
+   if (!uniform_form || (uniforms > 1 && d->cmp0_16))
       return false;
 
-   const uint16_t src[4] = {d->cmp0, d->cmp1, d->sel[0], d->sel[1]};
-   const bool imm[4] = {false, d->cmp1_immediate, d->sel_immediate[0],
-                        d->sel_immediate[1]};
-   const enum agx3_alu_hint hints[4] = {d->cmp0_hint, d->cmp1_hint,
-                                        d->sel_hint[0], d->sel_hint[1]};
-   const bool half[4] = {d->cmp0_16, d->cmp1_16, false, false};
    for (unsigned i = 0; i < 4; ++i) {
+      if (uniform[i]) {
+         /* Uniform operands carry no lifetime hints; a 32-bit one is an
+          * aligned pair of halves. */
+         if (imm[i] || src[i] >= 512 || (!half[i] && (src[i] & 1)) ||
+             hints[i] != AGX3_ALU_HINT_NONE)
+            return false;
+         continue;
+      }
       if (src[i] >= 256 || (!imm[i] && !half[i] && (src[i] & 1)) ||
           (unsigned)hints[i] > AGX3_ALU_HINT_CACHE ||
           (imm[i] && hints[i] != AGX3_ALU_HINT_NONE))
          return false;
    }
 
-
-   const bool fself = !d->sel_integer && (imm[2] || imm[3]);
    const unsigned o2 = fself ? 2 : 0;
    const unsigned o5 = fself ? 5 : 0;
    const unsigned o8 = fself ? 8 : 0;
+   /* An operand's kind: 1 an immediate, 2 a register, 3 a uniform. Its
+    * value field follows the same order, starting at the immediate. */
+   unsigned kind[4];
+   for (unsigned i = 0; i < 4; ++i)
+      kind[i] = uniform[i] ? 3 : imm[i] ? 1 : 2;
    const struct agx3_field_kv base[] = {
-      {9, 2}, {10, 2}, {23 + o2, d->cmp0_uniform ? 3 : 2},
+      {9, 2}, {10, 2}, {23 + o2, kind[0]},
       {24 + o2, d->cmp0_16 ? 1 : 2},
-      {40 + o2, imm[1] ? 1 : 2}, {41 + o2, d->cmp1_16 ? 1 : 2},
-      {57 + o2, imm[2] ? 1 : 2}, {58 + o2, 2},
-      {71 + o5, imm[3] ? 1 : 2}, {72 + o5, 2},
+      {40 + o2, kind[1]}, {41 + o2, d->cmp1_16 ? 1 : 2},
+      {57 + o2, kind[2]}, {58 + o2, 2},
+      {71 + o5, kind[3]}, {72 + o5, 2},
       {76 + o8, 3}, {77 + o8, fself ? 74 : 76},
    };
    struct agx3_field_kv fields[23] = {
       {2, d->dest}, {11, d->dest_cache},
-      {(d->cmp0_uniform ? 17 : 16) + o2, src[0]},
-      {(imm[1] ? 32 : 33) + o2, src[1]},
-      {(imm[2] ? 49 : 50) + o2, src[2]},
-      {(imm[3] ? 63 : 64) + o5, src[3]},
+      {15 + kind[0] - 1 + o2, src[0]},
+      {32 + kind[1] - 1 + o2, src[1]},
+      {49 + kind[2] - 1 + o2, src[2]},
+      {63 + kind[3] - 1 + o5, src[3]},
       {86 + o8, d->condition},
    };
    const uint16_t cache[] = {25 + o2, 42 + o2, 59 + o2, 73 + o5};
@@ -6389,14 +6451,15 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
        agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli32, 0, base, 12,
                         fields, n, out, len))
       return true;
-   /* The uniform-comparand witnesses use the compact fself32 endpoints
-    * (8 and 10 bytes): take the shortest that holds the fields. */
-   if (d->cmp0_uniform) {
+   /* The uniform witnesses use the compact endpoints (6 to 10 bytes):
+    * take the shortest that holds the fields. */
+   if (uniforms) {
       uint8_t best[AGX3_ALU_MAX_LENGTH], best_len = 0;
       for (unsigned ep = 0; ep < 8; ++ep) {
          uint8_t bytes[AGX3_ALU_MAX_LENGTH], size;
-         if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fself32, ep, base,
-                               12, fields, n, bytes, &size) &&
+         if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
+                               fself ? AGX3_MN_fself32 : AGX3_MN_fseli32, ep,
+                               base, 12, fields, n, bytes, &size) &&
              (!best_len || size < best_len)) {
             memcpy(best, bytes, size);
             best_len = size;
@@ -6607,7 +6670,8 @@ agx3_alu_fcmp_select16_gpu1(const struct agx3_fsel32_gpu1_desc *d,
                             uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    if (!d || !out || !len || d->dest >= 256 || (d->wait_mask & ~0xffu) ||
-       d->cmp0_uniform ||
+       d->cmp0_uniform || d->cmp1_uniform || d->sel_uniform[0] ||
+       d->sel_uniform[1] ||
        (d->condition != 0 && d->condition != 1 && d->condition != 2 &&
         d->condition != 5 && d->condition != 6 &&
         !agx3_gpu1_tied_minmax(d, true)))

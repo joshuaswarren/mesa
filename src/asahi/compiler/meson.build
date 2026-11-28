@@ -427,6 +427,25 @@ if with_tests
   )
 
   test(
+    'agx3c_fsel_uniform',
+    executable(
+      'agx3c_fsel_uniform_test',
+      files(
+        'agx3_alu_core.c',
+        'agx3_falu_mod_core.c',
+        'agx3_binder.c',
+        'agx3_pack.c',
+        'test/test-agx3c-fsel-uniform.c',
+      ),
+      link_with : [libagx3_compose],
+      c_args : [c_msvc_compat_args, no_override_init_args, '-UNDEBUG'],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_g17p_producers',
     executable(
       'agx3_g17p_producers_test',
