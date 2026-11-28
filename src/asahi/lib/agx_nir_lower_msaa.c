@@ -1213,6 +1213,9 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
             const unsigned flags = nir_intrinsic_infos[intr->intrinsic].flags;
             if (!(flags & NIR_INTRINSIC_CAN_ELIMINATE))
                return false;
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+               return false;
             if (flags & NIR_INTRINSIC_QUADGROUP) {
                has_derivatives = true;
                continue;
@@ -1543,6 +1546,9 @@ agx_nir_unroll_g17p_samples_groups(nir_shader *shader, unsigned nr_samples,
             const unsigned flags = nir_intrinsic_infos[intr->intrinsic].flags;
             if (!(flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
                 (flags & (NIR_INTRINSIC_QUADGROUP | NIR_INTRINSIC_SUBGROUP)))
+               return false;
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
                return false;
             continue;
          }

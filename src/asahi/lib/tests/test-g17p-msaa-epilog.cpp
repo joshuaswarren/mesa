@@ -1907,4 +1907,32 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadSampleGroupsIneligible)
          s, 4, AGX_ISA_ENCODING_AGX3B));
       ralloc_free(s);
    }
+   /* Volatile memory loads carry NIR_INTRINSIC_CAN_ELIMINATE but must not be
+    * collapsed across equivalent samples by either PIXINFO grouping or
+    * software sample equivalence. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "local-read volatile load");
+      b.shader->info.fs.uses_sample_shading = true;
+      b.shader->info.fs.uses_fbfetch_output = true;
+      nir_def *src = nir_load_local_pixel_agx(
+         &b, 4, 16, nir_imm_intN_t(&b, 0xff, 16), .base = 0,
+         .format = PIPE_FORMAT_R8_UNORM);
+      nir_def *vol = nir_load_global(
+         &b, 1, 32, nir_imm_int64(&b, 0x1000), .access = ACCESS_VOLATILE,
+         .align_mul = 4);
+      nir_def *scale = nir_f2f16(&b, vol);
+      nir_def *out = nir_fmul(&b, src, nir_vec4(&b, scale, scale, scale, scale));
+      nir_store_local_pixel_agx(&b, out, nir_imm_intN_t(&b, 0xff, 16),
+                                nir_undef(&b, 2, 16), .base = 0,
+                                .write_mask = 0xf,
+                                .format = PIPE_FORMAT_R8_UNORM);
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, 1, 0, 0xf, false);
+      ASSERT_TRUE(agx_nir_lower_to_per_sample(b.shader));
+      EXPECT_FALSE(agx_nir_unroll_g17p_samples_groups(
+         b.shader, 4, AGX_ISA_ENCODING_AGX3B));
+      EXPECT_FALSE(agx_nir_unroll_g17p_samples_equiv(b.shader, 4, &layout));
+      ralloc_free(b.shader);
+   }
 }
