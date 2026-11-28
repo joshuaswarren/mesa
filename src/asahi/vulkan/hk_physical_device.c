@@ -440,9 +440,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics =
-         instance->drirc.misc.enable_vertex_pipeline_stores_atomics ||
-         agx_chip_g17_m5(dev->chip),
+      .vertexPipelineStoresAndAtomics = true,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -1371,8 +1369,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxComputeSharedMemorySize = HK_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
-      .maxComputeWorkGroupSize = {
-         1024, 1024, agx_chip_g17_m5(dev->chip) ? 1024 : 64},
+      /* The CDM local size is three 32-bit words and local invocation IDs are
+       * three 16-bit components, so no axis is narrower than the invocation
+       * limit. */
+      .maxComputeWorkGroupSize = {1024, 1024, 1024},
       .subPixelPrecisionBits = 8,
       .subTexelPrecisionBits = 8,
       .mipmapPrecisionBits = 8,
