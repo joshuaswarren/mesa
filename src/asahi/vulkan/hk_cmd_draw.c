@@ -8496,6 +8496,17 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       shader = dev->null_fs;
    }
 
+   /* A shader compiled without image-view minLod emulation is replaced by its
+    * emulating twin once the device has created a view with minLod > base. */
+   if (shader && unlikely(shader->min_lod_source) &&
+       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
+      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+      if (twin)
+         shader = twin;
+      else
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    /* A shader compiled without custom-border emulation is replaced by its
     * emulating twin once the device has created a sampler that needs it. */
    if (shader && unlikely(shader->border_source) &&
@@ -8515,6 +8526,11 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       cmd->state.gfx.border_free_stages |= BITFIELD_BIT(stage);
    else
       cmd->state.gfx.border_free_stages &= ~BITFIELD_BIT(stage);
+
+   if (shader && shader->min_lod_source)
+      cmd->state.gfx.min_lod_free_stages |= BITFIELD_BIT(stage);
+   else
+      cmd->state.gfx.min_lod_free_stages &= ~BITFIELD_BIT(stage);
 
    /* Any direct stage replacement (shader objects, meta restore, or an
     * internal passthrough GS) invalidates the common runtime's redundant
@@ -16481,8 +16497,13 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (gfx->shaders[MESA_SHADER_FRAGMENT] == NULL)
       hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_FRAGMENT, NULL);
 
-   /* The device may have created its first sampler that needs custom-border
-    * emulation since these shaders were bound. */
+   /* The device may have created its first view with minLod > base or its first
+    * sampler that needs custom-border emulation since these shaders were bound. */
+   if (unlikely(gfx->min_lod_free_stages) &&
+       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
+      u_foreach_bit(stage, gfx->min_lod_free_stages)
+         hk_cmd_bind_graphics_shader(cmd, stage, gfx->shaders[stage]);
+   }
    if (unlikely(gfx->border_free_stages) &&
        p_atomic_read(&hk_device_physical(dev)->border_emulation)) {
       u_foreach_bit(stage, gfx->border_free_stages)
