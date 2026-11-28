@@ -1814,9 +1814,10 @@ TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpWideWindow)
    EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G17P, 0), 8u);
    EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G17P, AGX3B_NUM_REGS / 2),
              1u);
-   const unsigned m5_loads = compute_loads_before_first_use(AGX_CHIP_G17S, 0);
-   EXPECT_GE(m5_loads, 2u);
-   EXPECT_LE(m5_loads, 4u);
+   /* M5 compute loops with occupancy headroom also take the wide window,
+    * while falling back when headroom inside the occupancy step is exhausted. */
+   EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G17S, 0), 8u);
+   EXPECT_LE(compute_loads_before_first_use(AGX_CHIP_G17S, 45), 4u);
 }
 
 TEST(AGX3VisionOpts, Agx3bDeviceLoadWindowAfterRegisterAllocation)
