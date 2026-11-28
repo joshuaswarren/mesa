@@ -1017,6 +1017,12 @@ struct asahi_blitter {
    void *g17p_block_mip_cs;
    void *g17p_block_mip_sampler;
 
+   /* HAL200/AGX3B buffer-to-image upload compute shaders:
+    * - g17p_block_buf2img_cs[format_slot][partial]: 32x32 imgwblk uploads
+    * - g17p_tiled_buf2img_cs[log2_block_B][log2_per_thread]: Morton uploads */
+   void *g17p_block_buf2img_cs[3][2];
+   void *g17p_tiled_buf2img_cs[5][3];
+
    /* [filter] */
    void *sampler[2];
 
@@ -2082,6 +2088,24 @@ bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
                          unsigned last_layer);
+
+enum pipe_format agx_g17p_block_buf2img_format(enum pipe_format format);
+
+bool agx_g17p_block_buf2img_aligned(const struct pipe_box *box, uint32_t mip_w,
+                                    uint32_t mip_h);
+
+bool agx_g17p_tiled_buf2img_plan(const struct ail_layout *layout,
+                                 unsigned level, const struct pipe_box *box,
+                                 unsigned buffer_offset, unsigned row_stride,
+                                 unsigned layer_stride, uint32_t groups[3],
+                                 uint32_t *per_thread_out);
+
+void agx_image_copy_buffer(struct pipe_context *pctx,
+                           struct pipe_resource *dst,
+                           struct pipe_resource *src, unsigned buffer_offset,
+                           unsigned buffer_stride,
+                           unsigned buffer_layer_stride, unsigned level,
+                           const struct pipe_box *box);
 
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,

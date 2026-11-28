@@ -30,6 +30,7 @@
 #include "util/macros.h"
 #include "util/ralloc.h"
 #include "util/u_math.h"
+#include "util/u_inlines.h"
 #include "util/box.h"
 #include "util/u_sampler.h"
 #include "util/u_surface.h"
@@ -2327,4 +2328,765 @@ agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
    return native ||
           util_gen_mipmap(pctx, prsc, format, base_level, last_level,
                           first_layer, last_layer, PIPE_TEX_FILTER_LINEAR);
+}
+
+#define AGX_G17P_BUF2IMG_TILE 32
+#define AGX_G17P_TILED_UPLOAD_PER_THREAD 4u
+
+struct agx_g17p_block_buf2img_params {
+   uint32_t src_lo;
+   uint32_t src_hi;
+   uint32_t src_stride_B;
+   uint32_t tile_x0;
+   uint32_t tile_y0;
+   uint32_t box_x;
+   uint32_t box_y;
+   uint32_t box_w;
+   uint32_t box_h;
+   uint32_t mip_w;
+   uint32_t mip_h;
+   uint32_t pad;
+};
+static_assert(sizeof(struct agx_g17p_block_buf2img_params) == 48,
+              "G17P block buf2img parameters are tightly packed");
+
+#define block_b2i_param(b, field)                                              \
+   nir_load_ubo(                                                               \
+      b, 1, 32, nir_imm_int(b, 0),                                             \
+      nir_imm_int(b, offsetof(struct agx_g17p_block_buf2img_params, field)),   \
+      .align_mul = 4, .range = ~0)
+
+#define block_b2i_param64(b, field)                                            \
+   nir_pack_64_2x32_split(b, block_b2i_param(b, field##_lo),                   \
+                          block_b2i_param(b, field##_hi))
+
+struct agx_g17p_tiled_buf2img_params {
+   uint32_t src_lo;
+   uint32_t src_hi;
+   uint32_t dst_lo;
+   uint32_t dst_hi;
+   uint32_t src_stride_B;
+   uint32_t tiles_per_row;
+   uint32_t tile_w_log2;
+   uint32_t tile_h_log2;
+   uint32_t tile_x0;
+   uint32_t tile_y0;
+   uint32_t x0;
+   uint32_t y0;
+   uint32_t width;
+   uint32_t height;
+   uint32_t pad[2];
+};
+static_assert(sizeof(struct agx_g17p_tiled_buf2img_params) == 64,
+              "G17P tiled buf2img parameters are tightly packed");
+
+#define tiled_b2i_param(b, field)                                              \
+   nir_load_ubo(                                                               \
+      b, 1, 32, nir_imm_int(b, 0),                                             \
+      nir_imm_int(b, offsetof(struct agx_g17p_tiled_buf2img_params, field)),   \
+      .align_mul = 4, .range = ~0)
+
+#define tiled_b2i_param64(b, field)                                            \
+   nir_pack_64_2x32_split(b, tiled_b2i_param(b, field##_lo),                   \
+                          tiled_b2i_param(b, field##_hi))
+
+static int
+agx_g17p_block_buf2img_slot(enum pipe_format format,
+                            enum pipe_format *pbe_out,
+                            enum pipe_format *tex_out)
+{
+   if (util_format_is_depth_or_stencil(format) ||
+       util_format_is_compressed(format))
+      return -1;
+
+   /* agx3_tile_store_explicit() admits 8-bit 1/4-channel stores (imgwblk
+    * lane_class 3 -> UNORM8 PBE) and 32-bit 1-channel stores (lane_class 2
+    * -> R32_UINT PBE). The shader packs raw source bytes directly into the
+    * imageblock with I8/I32 and partial tiles read untouched texels via UINT. */
+   int slot = -1;
+   enum pipe_format pbe = PIPE_FORMAT_NONE;
+   enum pipe_format tex = PIPE_FORMAT_NONE;
+   switch (ail_pixel_format[format].channels) {
+   case AGX_CHANNELS_R8:
+      slot = 0;
+      pbe = PIPE_FORMAT_R8_UNORM;
+      tex = PIPE_FORMAT_R8_UINT;
+      break;
+   case AGX_CHANNELS_R8G8B8A8:
+      slot = 1;
+      pbe = PIPE_FORMAT_R8G8B8A8_UNORM;
+      tex = PIPE_FORMAT_R8G8B8A8_UINT;
+      break;
+   case AGX_CHANNELS_R32:
+      slot = 2;
+      pbe = PIPE_FORMAT_R32_UINT;
+      tex = PIPE_FORMAT_R32_UINT;
+      break;
+   default:
+      return -1;
+   }
+
+   if (util_format_get_blocksize(format) != util_format_get_blocksize(pbe) ||
+       !ail_formats_compatible(format, pbe) ||
+       !ail_formats_compatible(format, tex) ||
+       ail_pixel_format[pbe].renderable == PIPE_FORMAT_NONE ||
+       ail_pixel_format[tex].renderable == PIPE_FORMAT_NONE)
+      return -1;
+
+   if (pbe_out)
+      *pbe_out = pbe;
+   if (tex_out)
+      *tex_out = tex;
+   return slot;
+}
+
+enum pipe_format
+agx_g17p_block_buf2img_format(enum pipe_format format)
+{
+   enum pipe_format pbe = PIPE_FORMAT_NONE;
+   return agx_g17p_block_buf2img_slot(format, &pbe, NULL) >= 0 ? pbe
+                                                               : PIPE_FORMAT_NONE;
+}
+
+bool
+agx_g17p_block_buf2img_aligned(const struct pipe_box *box, uint32_t mip_w,
+                               uint32_t mip_h)
+{
+   return (box->x & (AGX_G17P_BUF2IMG_TILE - 1)) == 0 &&
+          (box->y & (AGX_G17P_BUF2IMG_TILE - 1)) == 0 &&
+          ((box->width & (AGX_G17P_BUF2IMG_TILE - 1)) == 0 ||
+           (uint32_t)(box->x + box->width) == mip_w) &&
+          ((box->height & (AGX_G17P_BUF2IMG_TILE - 1)) == 0 ||
+           (uint32_t)(box->y + box->height) == mip_h);
+}
+
+static nir_def *
+agx_g17p_block_buf2img_unpack(nir_builder *b, enum pipe_format view_format,
+                              nir_def *raw)
+{
+   switch (view_format) {
+   case PIPE_FORMAT_R8_UINT:
+      return nir_u2u16(b, raw);
+   case PIPE_FORMAT_R8G8B8A8_UINT: {
+      nir_def *b0 = nir_u2u16(b, nir_iand_imm(b, raw, 0xff));
+      nir_def *b1 = nir_u2u16(b, nir_iand_imm(b, nir_ushr_imm(b, raw, 8), 0xff));
+      nir_def *b2 = nir_u2u16(b, nir_iand_imm(b, nir_ushr_imm(b, raw, 16), 0xff));
+      nir_def *b3 = nir_u2u16(b, nir_ushr_imm(b, raw, 24));
+      return nir_vec4(b, b0, b1, b2, b3);
+   }
+   default:
+      return raw;
+   }
+}
+
+/* HAL200/AGX3B compressed buffer-to-image upload through the compressed PBE.
+ * Each 32x32 workgroup loads one tile of raw bytes from the source buffer
+ * (preserving untouched pixels via txf when partial), writes them to its
+ * imageblock, and thread (0,0) commits the compressed tile with imgwblk. */
+static void *
+agx_g17p_block_buf2img_compute_shader(struct pipe_context *pctx,
+                                      enum pipe_format view_format,
+                                      bool partial)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, pctx->screen->nir_options[MESA_SHADER_COMPUTE],
+      partial ? "agx-g17p-block-b2i-partial" : "agx-g17p-block-b2i");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = AGX_G17P_BUF2IMG_TILE;
+   b->shader->info.workgroup_size[1] = AGX_G17P_BUF2IMG_TILE;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.num_ubos = 1;
+   b->shader->info.num_images = 1;
+   BITSET_SET(b->shader->info.images_used, 0);
+   if (partial) {
+      b->shader->info.num_textures = 1;
+      BITSET_SET(b->shader->info.textures_used, 0);
+      BITSET_SET(b->shader->info.textures_used_by_txf, 0);
+   }
+
+   const unsigned block_B = util_format_get_blocksize(view_format);
+   const struct util_format_description *fdesc =
+      util_format_description(view_format);
+   const unsigned comps = fdesc->nr_channels;
+   const unsigned ch_bits = fdesc->channel[0].size;
+   const unsigned tib_bits = MAX2(ch_bits, 16u);
+   const unsigned load_comps = ch_bits == 8 ? 1u : comps;
+   const unsigned load_bits = ch_bits == 8 ? block_B * 8u : ch_bits;
+
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
+   nir_def *tile_x =
+      nir_iadd(b, nir_channel(b, wg, 0), block_b2i_param(b, tile_x0));
+   nir_def *tile_y =
+      nir_iadd(b, nir_channel(b, wg, 1), block_b2i_param(b, tile_y0));
+   nir_def *px = nir_ior(b, nir_ishl_imm(b, tile_x, 5), nir_channel(b, lid, 0));
+   nir_def *py = nir_ior(b, nir_ishl_imm(b, tile_y, 5), nir_channel(b, lid, 1));
+
+   nir_def *rx = nir_isub(b, px, block_b2i_param(b, box_x));
+   nir_def *ry = nir_isub(b, py, block_b2i_param(b, box_y));
+   nir_def *in_box = nir_iand(b, nir_ult(b, rx, block_b2i_param(b, box_w)),
+                              nir_ult(b, ry, block_b2i_param(b, box_h)));
+
+   nir_def *val;
+   if (!partial) {
+      nir_def *raw_in;
+      nir_def *raw_zero = nir_imm_zero(b, load_comps, load_bits);
+      nir_push_if(b, in_box);
+      {
+         nir_def *off =
+            nir_iadd(b, nir_imul(b, ry, block_b2i_param(b, src_stride_B)),
+                     nir_imul_imm(b, rx, block_B));
+         raw_in = nir_load_global(
+            b, load_comps, load_bits,
+            nir_iadd(b, block_b2i_param64(b, src), nir_u2u64(b, off)),
+            .align_mul = block_B,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+      }
+      nir_pop_if(b, NULL);
+      nir_def *raw = nir_if_phi(b, raw_in, raw_zero);
+      val = agx_g17p_block_buf2img_unpack(b, view_format, raw);
+   } else {
+      nir_def *val_in, *val_out;
+      nir_push_if(b, in_box);
+      {
+         nir_def *off =
+            nir_iadd(b, nir_imul(b, ry, block_b2i_param(b, src_stride_B)),
+                     nir_imul_imm(b, rx, block_B));
+         nir_def *raw = nir_load_global(
+            b, load_comps, load_bits,
+            nir_iadd(b, block_b2i_param64(b, src), nir_u2u64(b, off)),
+            .align_mul = block_B,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         val_in = agx_g17p_block_buf2img_unpack(b, view_format, raw);
+      }
+      nir_push_else(b, NULL);
+      {
+         nir_def *in_mip =
+            nir_iand(b, nir_ult(b, px, block_b2i_param(b, mip_w)),
+                     nir_ult(b, py, block_b2i_param(b, mip_h)));
+         nir_def *tex_val;
+         nir_def *zero = nir_imm_zero(b, comps, tib_bits);
+         nir_push_if(b, in_mip);
+         {
+            nir_def *texel = nir_txf(
+               b, nir_vec2(b, px, py), .lod = nir_imm_int(b, 0),
+               .texture_index = 0, .dim = GLSL_SAMPLER_DIM_2D,
+               .dest_type = nir_type_uint32,
+               .backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP);
+            texel = nir_trim_vector(b, texel, comps);
+            tex_val = tib_bits == 16 ? nir_u2u16(b, texel) : texel;
+         }
+         nir_pop_if(b, NULL);
+         val_out = nir_if_phi(b, tex_val, zero);
+      }
+      nir_pop_if(b, NULL);
+      val = nir_if_phi(b, val_in, val_out);
+   }
+
+   const enum pipe_format isa_format = ail_pixel_format[view_format].renderable;
+   nir_store_local_pixel_agx(b, val, nir_imm_intN_t(b, 1, 16),
+                             nir_u2u16(b, lid), .base = 0,
+                             .write_mask = BITFIELD_MASK(comps),
+                             .format = isa_format, .explicit_coord = true);
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
+
+   nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
+   {
+      nir_image_store_block_agx(b, nir_imm_int(b, 0), nir_imm_int(b, 0),
+                                nir_vec2(b, px, py), .format = isa_format,
+                                .image_dim = GLSL_SAMPLER_DIM_2D,
+                                .image_array = false, .explicit_coord = true);
+   }
+   nir_pop_if(b, NULL);
+   b->shader->info.cs.image_block_size_per_thread_agx = block_B;
+
+   return pipe_shader_from_nir(pctx, b->shader);
+}
+
+/* HAL200/AGX3 uncompressed GPU-tiled buffer-to-image upload in Morton order,
+ * matching Borealis's hk_g17p_build_tiled_upload(). Writes 64 consecutive
+ * Morton elements per run (coalesced 128B+ stores) directly into tiled memory. */
+static void *
+agx_g17p_tiled_buf2img_compute_shader(struct pipe_context *pctx,
+                                      unsigned block_B, unsigned per_thread)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, pctx->screen->nir_options[MESA_SHADER_COMPUTE],
+      "agx-g17p-tiled-b2i");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = 64;
+   b->shader->info.workgroup_size[1] = 1;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.num_ubos = 1;
+
+   const unsigned bits = MIN2(block_B, 4u) * 8u;
+   const unsigned comps = MAX2(block_B / 4u, 1u);
+   const unsigned align_B = MIN2(block_B, 4u);
+
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *twl = tiled_b2i_param(b, tile_w_log2);
+   nir_def *thl = tiled_b2i_param(b, tile_h_log2);
+   nir_def *tile_x =
+      nir_iadd(b, tiled_b2i_param(b, tile_x0), nir_channel(b, wg, 1));
+   nir_def *tile_y =
+      nir_iadd(b, tiled_b2i_param(b, tile_y0), nir_channel(b, wg, 2));
+   nir_def *tile_el = nir_ishl(
+      b,
+      nir_iadd(b, nir_imul(b, tile_y, tiled_b2i_param(b, tiles_per_row)),
+               tile_x),
+      nir_iadd(b, twl, thl));
+   nir_def *origin_x = nir_ishl(b, tile_x, twl);
+   nir_def *origin_y = nir_ishl(b, tile_y, thl);
+   nir_def *lane_x = agx_nir_compact_bits_8(b, lid);
+   nir_def *lane_y = agx_nir_compact_bits_8(b, nir_ushr_imm(b, lid, 1));
+   nir_def *x0 = tiled_b2i_param(b, x0);
+   nir_def *y0 = tiled_b2i_param(b, y0);
+   nir_def *width = tiled_b2i_param(b, width);
+   nir_def *height = tiled_b2i_param(b, height);
+   nir_def *pitch = tiled_b2i_param(b, src_stride_B);
+   nir_def *src = tiled_b2i_param64(b, src);
+   nir_def *dst = tiled_b2i_param64(b, dst);
+
+   for (unsigned j = 0; j < per_thread; ++j) {
+      nir_def *run = nir_iadd_imm(
+         b, nir_imul_imm(b, nir_channel(b, wg, 0), per_thread), j);
+      nir_def *m = nir_ior(b, nir_ishl_imm(b, run, 6), lid);
+      nir_def *x = nir_ior(
+         b, origin_x,
+         nir_ior(b, nir_ishl_imm(b, agx_nir_compact_bits_8(b, run), 3),
+                 lane_x));
+      nir_def *y = nir_ior(
+         b, origin_y,
+         nir_ior(b,
+                 nir_ishl_imm(
+                    b, agx_nir_compact_bits_8(b, nir_ushr_imm(b, run, 1)), 3),
+                 lane_y));
+      nir_def *rx = nir_isub(b, x, x0);
+      nir_def *ry = nir_isub(b, y, y0);
+      nir_push_if(b, nir_iand(b, nir_ult(b, rx, width), nir_ult(b, ry, height)));
+      {
+         nir_def *src_off =
+            nir_iadd(b, nir_imul(b, ry, pitch), nir_imul_imm(b, rx, block_B));
+         nir_def *data = nir_load_global(
+            b, comps, bits, nir_iadd(b, src, nir_u2u64(b, src_off)),
+            .align_mul = align_B,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         nir_def *dst_off =
+            nir_imul_imm(b, nir_iadd(b, tile_el, m), block_B);
+         nir_store_global(b, data, nir_iadd(b, dst, nir_u2u64(b, dst_off)),
+                          .align_mul = align_B);
+      }
+      nir_pop_if(b, NULL);
+   }
+
+   return pipe_shader_from_nir(pctx, b->shader);
+}
+
+bool
+agx_g17p_tiled_buf2img_plan(const struct ail_layout *layout, unsigned level,
+                            const struct pipe_box *box, unsigned buffer_offset,
+                            unsigned row_stride, unsigned layer_stride,
+                            uint32_t groups[3], uint32_t *per_thread_out)
+{
+   if (layout->tiling != AIL_TILING_GPU || level >= layout->levels ||
+       ail_is_level_logically_compressed(layout, level) ||
+       util_format_is_depth_or_stencil(layout->format))
+      return false;
+
+   const unsigned block_B = util_format_get_blocksize(layout->format);
+   if (!util_is_power_of_two_nonzero(block_B) || block_B > 16u)
+      return false;
+
+   const unsigned align_B = MIN2(block_B, 4u);
+   if (((buffer_offset | row_stride | layer_stride) & (align_B - 1u)) != 0)
+      return false;
+
+   const unsigned bw = util_format_get_blockwidth(layout->format);
+   const unsigned bh = util_format_get_blockheight(layout->format);
+   if (box->x < 0 || box->y < 0 || box->z < 0 || box->width <= 0 ||
+       box->height <= 0 || box->depth <= 0 || (box->x % bw) != 0 ||
+       (box->y % bh) != 0)
+      return false;
+
+   const uint32_t x0_el = (uint32_t)box->x / bw;
+   const uint32_t y0_el = (uint32_t)box->y / bh;
+   const uint32_t w_el = DIV_ROUND_UP((uint32_t)box->width, bw);
+   const uint32_t h_el = DIV_ROUND_UP((uint32_t)box->height, bh);
+   if (!w_el || !h_el)
+      return false;
+
+   const struct ail_tile tile = layout->tilesize_el[level];
+   struct agx_tile_address_config cfg;
+   if (!agx_tile_address_config_init(layout->stride_el[level], tile.width_el,
+                                     tile.height_el, &cfg))
+      return false;
+
+   const uint32_t twl = cfg.tile_width_log2;
+   const uint32_t thl = cfg.tile_height_log2;
+   const uint32_t area_log2 = twl + thl;
+   if ((twl != thl && twl != thl + 1u) || area_log2 < 6u || twl > 7u ||
+       thl > 7u)
+      return false;
+
+   const uint32_t per_thread =
+      MIN2(AGX_G17P_TILED_UPLOAD_PER_THREAD, 1u << (area_log2 - 6u));
+   const uint32_t tx0 = x0_el >> twl;
+   const uint32_t ty0 = y0_el >> thl;
+   const uint64_t x1 = (uint64_t)x0_el + w_el - 1u;
+   const uint64_t y1 = (uint64_t)y0_el + h_el - 1u;
+   groups[0] = 1u << (area_log2 - 6u - util_logbase2(per_thread));
+   groups[1] = (uint32_t)((x1 >> twl) - tx0 + 1u);
+   groups[2] = (uint32_t)((y1 >> thl) - ty0 + 1u);
+   if (groups[0] > 65535u || groups[1] > 65535u || groups[2] > 65535u)
+      return false;
+
+   const uint64_t src_span =
+      (uint64_t)(h_el - 1u) * row_stride + (uint64_t)w_el * block_B;
+   const uint64_t dst_end =
+      (((uint64_t)(y1 >> thl) * cfg.tiles_per_row + (x1 >> twl) + 1u)
+       << area_log2) *
+      block_B;
+   if (src_span > UINT32_MAX || dst_end > UINT32_MAX)
+      return false;
+
+   *per_thread_out = per_thread;
+   return true;
+}
+
+static bool
+agx_image_copy_buffer_block(struct pipe_context *pctx,
+                            struct agx_resource *dst_rsrc,
+                            struct agx_resource *src_rsrc,
+                            unsigned buffer_offset, unsigned row_stride,
+                            unsigned layer_stride, unsigned level,
+                            const struct pipe_box *box)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   struct pipe_resource *dst = &dst_rsrc->base.b;
+   const struct ail_layout *layout = &dst_rsrc->layout;
+
+   if (!hk_g17p_block_mip_supported(dev->chip) || dst->nr_samples > 1 ||
+       dst_rsrc->separate_stencil || layout->tiling != AIL_TILING_GPU ||
+       !layout->compressed || level >= layout->levels ||
+       !ail_is_level_logically_compressed(layout, level))
+      return false;
+
+   switch (dst->target) {
+   case PIPE_TEXTURE_2D:
+   case PIPE_TEXTURE_2D_ARRAY:
+   case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      break;
+   default:
+      return false;
+   }
+
+   enum pipe_format pbe_format = PIPE_FORMAT_NONE;
+   enum pipe_format tex_format = PIPE_FORMAT_NONE;
+   const int slot =
+      agx_g17p_block_buf2img_slot(dst->format, &pbe_format, &tex_format);
+   if (slot < 0)
+      return false;
+
+   const uint32_t mip_w = u_minify(dst->width0, level);
+   const uint32_t mip_h = u_minify(dst->height0, level);
+   if (box->x < 0 || box->y < 0 || box->z < 0 || box->width <= 0 ||
+       box->height <= 0 || box->depth <= 0 ||
+       (uint32_t)box->x + (uint32_t)box->width > mip_w ||
+       (uint32_t)box->y + (uint32_t)box->height > mip_h ||
+       (unsigned)box->z + (unsigned)box->depth > dst->array_size)
+      return false;
+
+   const unsigned block_B = util_format_get_blocksize(pbe_format);
+   if (((buffer_offset | row_stride | layer_stride) & (block_B - 1u)) != 0)
+      return false;
+
+   const uint64_t slice_span = (uint64_t)(box->height - 1) * row_stride +
+                               (uint64_t)box->width * block_B;
+   if (slice_span > UINT32_MAX)
+      return false;
+
+   const bool aligned = agx_g17p_block_buf2img_aligned(box, mip_w, mip_h);
+   const bool partial = !aligned && agx_resource_valid(dst_rsrc, level);
+
+   void **cs_slot = &ctx->compute_blitter.g17p_block_buf2img_cs[slot][partial];
+   if (!*cs_slot) {
+      *cs_slot =
+         agx_g17p_block_buf2img_compute_shader(pctx, tex_format, partial);
+      if (!*cs_slot)
+         return false;
+   }
+
+   const uint32_t tx0 = (uint32_t)box->x / AGX_G17P_BUF2IMG_TILE;
+   const uint32_t ty0 = (uint32_t)box->y / AGX_G17P_BUF2IMG_TILE;
+   const uint32_t tx1 =
+      ((uint32_t)box->x + (uint32_t)box->width - 1u) / AGX_G17P_BUF2IMG_TILE;
+   const uint32_t ty1 =
+      ((uint32_t)box->y + (uint32_t)box->height - 1u) / AGX_G17P_BUF2IMG_TILE;
+   const struct pipe_grid_info grid = {
+      .block = {AGX_G17P_BUF2IMG_TILE, AGX_G17P_BUF2IMG_TILE, 1},
+      .grid = {tx1 - tx0 + 1u, ty1 - ty0 + 1u, 1},
+   };
+
+   asahi_compute_save(ctx);
+   struct agx_query *cs_invocations =
+      ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS];
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = NULL;
+
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   agx_batch_reads(batch, src_rsrc);
+   agx_batch_writes(batch, dst_rsrc, level);
+
+   pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, 1,
+                             &ctx->compute_blitter.sampler[0]);
+   pctx->bind_compute_state(pctx, *cs_slot);
+
+   const uint64_t base_src = agx_map_gpu(src_rsrc) + buffer_offset;
+   for (unsigned z = 0; z < (unsigned)box->depth; ++z) {
+      if (unlikely(ctx->batch != batch)) {
+         batch = agx_get_compute_batch(ctx);
+         agx_batch_init_state(batch);
+         agx_batch_reads(batch, src_rsrc);
+         agx_batch_writes(batch, dst_rsrc, level);
+      }
+
+      const unsigned layer = (unsigned)box->z + z;
+      const uint64_t slice_src = base_src + (uint64_t)z * layer_stride;
+      const struct agx_g17p_block_buf2img_params params = {
+         .src_lo = (uint32_t)slice_src,
+         .src_hi = (uint32_t)(slice_src >> 32),
+         .src_stride_B = row_stride,
+         .tile_x0 = tx0,
+         .tile_y0 = ty0,
+         .box_x = (uint32_t)box->x,
+         .box_y = (uint32_t)box->y,
+         .box_w = (uint32_t)box->width,
+         .box_h = (uint32_t)box->height,
+         .mip_w = mip_w,
+         .mip_h = mip_h,
+      };
+      const struct pipe_constant_buffer cb = {
+         .buffer_size = sizeof(params),
+         .user_buffer = &params,
+      };
+      pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, 0, &cb);
+
+      if (partial) {
+         struct pipe_sampler_view templ;
+         u_sampler_view_default_template(&templ, dst, tex_format);
+         templ.target = PIPE_TEXTURE_2D;
+         templ.u.tex.first_level = level;
+         templ.u.tex.last_level = level;
+         templ.u.tex.first_layer = layer;
+         templ.u.tex.last_layer = layer;
+         struct pipe_sampler_view *view =
+            pctx->create_sampler_view(pctx, dst, &templ);
+         pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &view);
+         pctx->sampler_view_release(pctx, view);
+      }
+
+      const struct pipe_image_view image = {
+         .resource = dst,
+         .access = PIPE_IMAGE_ACCESS_WRITE | PIPE_IMAGE_ACCESS_DRIVER_INTERNAL,
+         .shader_access = PIPE_IMAGE_ACCESS_WRITE,
+         .format = pbe_format,
+         .u.tex.level = level,
+         .u.tex.first_layer = layer,
+         .u.tex.last_layer = layer,
+         .u.tex.single_layer_view = true,
+      };
+      pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &image);
+      pctx->launch_grid(pctx, &grid);
+   }
+
+   pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+   if (partial && !ctx->compute_blitter.saved_sampler_view)
+      pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+   if (!ctx->compute_blitter.saved_num_sampler_states)
+      pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, 0, NULL);
+
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = cs_invocations;
+   asahi_compute_restore(ctx);
+   return true;
+}
+
+static bool
+agx_image_copy_buffer_tiled(struct pipe_context *pctx,
+                            struct agx_resource *dst_rsrc,
+                            struct agx_resource *src_rsrc,
+                            unsigned buffer_offset, unsigned row_stride,
+                            unsigned layer_stride, unsigned level,
+                            const struct pipe_box *box)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   struct pipe_resource *dst = &dst_rsrc->base.b;
+   const struct ail_layout *layout = &dst_rsrc->layout;
+
+   if (!agx_chip_native_agx3(dev->chip) || dst->nr_samples > 1 ||
+       dst_rsrc->separate_stencil)
+      return false;
+
+   uint32_t groups[3] = {0};
+   uint32_t per_thread = 0;
+   if (!agx_g17p_tiled_buf2img_plan(layout, level, box, buffer_offset,
+                                    row_stride, layer_stride, groups,
+                                    &per_thread))
+      return false;
+
+   const unsigned block_B = util_format_get_blocksize(dst->format);
+   const unsigned block_slot = util_logbase2(block_B);
+   const unsigned pt_slot = util_logbase2(per_thread);
+   void **cs_slot =
+      &ctx->compute_blitter.g17p_tiled_buf2img_cs[block_slot][pt_slot];
+   if (!*cs_slot) {
+      *cs_slot =
+         agx_g17p_tiled_buf2img_compute_shader(pctx, block_B, per_thread);
+      if (!*cs_slot)
+         return false;
+   }
+
+   const unsigned bw = util_format_get_blockwidth(dst->format);
+   const unsigned bh = util_format_get_blockheight(dst->format);
+   const uint32_t x0_el = (uint32_t)box->x / bw;
+   const uint32_t y0_el = (uint32_t)box->y / bh;
+   const uint32_t w_el = DIV_ROUND_UP((uint32_t)box->width, bw);
+   const uint32_t h_el = DIV_ROUND_UP((uint32_t)box->height, bh);
+
+   const struct ail_tile tile = layout->tilesize_el[level];
+   struct agx_tile_address_config cfg;
+   ASSERTED const bool cfg_ok = agx_tile_address_config_init(
+      layout->stride_el[level], tile.width_el, tile.height_el, &cfg);
+   assert(cfg_ok);
+
+   const struct pipe_grid_info grid = {
+      .block = {64, 1, 1},
+      .grid = {groups[0], groups[1], groups[2]},
+   };
+
+   asahi_compute_save(ctx);
+   struct agx_query *cs_invocations =
+      ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS];
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = NULL;
+
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   agx_batch_reads(batch, src_rsrc);
+   agx_batch_writes(batch, dst_rsrc, level);
+
+   pctx->bind_compute_state(pctx, *cs_slot);
+
+   const uint64_t base_src = agx_map_gpu(src_rsrc) + buffer_offset;
+   const uint64_t base_dst = dst_rsrc->bo->va->addr;
+   for (unsigned z = 0; z < (unsigned)box->depth; ++z) {
+      if (unlikely(ctx->batch != batch)) {
+         batch = agx_get_compute_batch(ctx);
+         agx_batch_init_state(batch);
+         agx_batch_reads(batch, src_rsrc);
+         agx_batch_writes(batch, dst_rsrc, level);
+      }
+
+      const uint64_t slice_src = base_src + (uint64_t)z * layer_stride;
+      const uint64_t slice_dst =
+         base_dst + ail_get_layer_level_B(layout, (unsigned)box->z + z, level);
+      const struct agx_g17p_tiled_buf2img_params params = {
+         .src_lo = (uint32_t)slice_src,
+         .src_hi = (uint32_t)(slice_src >> 32),
+         .dst_lo = (uint32_t)slice_dst,
+         .dst_hi = (uint32_t)(slice_dst >> 32),
+         .src_stride_B = row_stride,
+         .tiles_per_row = cfg.tiles_per_row,
+         .tile_w_log2 = cfg.tile_width_log2,
+         .tile_h_log2 = cfg.tile_height_log2,
+         .tile_x0 = x0_el >> cfg.tile_width_log2,
+         .tile_y0 = y0_el >> cfg.tile_height_log2,
+         .x0 = x0_el,
+         .y0 = y0_el,
+         .width = w_el,
+         .height = h_el,
+      };
+      const struct pipe_constant_buffer cb = {
+         .buffer_size = sizeof(params),
+         .user_buffer = &params,
+      };
+      pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, 0, &cb);
+      pctx->launch_grid(pctx, &grid);
+   }
+
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = cs_invocations;
+   asahi_compute_restore(ctx);
+   return true;
+}
+
+void
+agx_image_copy_buffer(struct pipe_context *pctx, struct pipe_resource *dst,
+                      struct pipe_resource *src, unsigned buffer_offset,
+                      unsigned buffer_stride, unsigned buffer_layer_stride,
+                      unsigned level, const struct pipe_box *box)
+{
+   if (box->width <= 0 || box->height <= 0 || box->depth <= 0)
+      return;
+
+   const bool to_image = dst->target != PIPE_BUFFER;
+   struct pipe_resource *img = to_image ? dst : src;
+   struct pipe_resource *buf = to_image ? src : dst;
+   const enum pipe_format format = img->format;
+   const unsigned blocksize = util_format_get_blocksize(format);
+   const unsigned nblocksx = util_format_get_nblocksx(format, box->width);
+   const unsigned nblocksy = util_format_get_nblocksy(format, box->height);
+   const unsigned row_stride =
+      buffer_stride ? buffer_stride : nblocksx * blocksize;
+   const unsigned layer_stride =
+      buffer_layer_stride ? buffer_layer_stride : nblocksy * row_stride;
+
+   const uint64_t copy_bytes = (uint64_t)(box->depth - 1) * layer_stride +
+                               (uint64_t)(nblocksy - 1) * row_stride +
+                               (uint64_t)nblocksx * blocksize;
+   if (buffer_offset >= buf->width0 ||
+       copy_bytes > (uint64_t)buf->width0 - buffer_offset)
+      return;
+
+   if (to_image) {
+      struct agx_resource *dst_rsrc = agx_resource(dst);
+      struct agx_resource *src_rsrc = agx_resource(src);
+      if (agx_image_copy_buffer_block(pctx, dst_rsrc, src_rsrc, buffer_offset,
+                                      row_stride, layer_stride, level, box))
+         return;
+
+      if (agx_image_copy_buffer_tiled(pctx, dst_rsrc, src_rsrc, buffer_offset,
+                                      row_stride, layer_stride, level, box))
+         return;
+
+      struct pipe_transfer *xfer = NULL;
+      const void *map = pipe_buffer_map_range(
+         pctx, src, buffer_offset, (unsigned)copy_bytes, PIPE_MAP_READ, &xfer);
+      if (!map)
+         return;
+
+      pctx->texture_subdata(pctx, dst, level, 0, box, map, row_stride,
+                            layer_stride);
+      pipe_buffer_unmap(pctx, xfer);
+      return;
+   }
+
+   struct pipe_transfer *src_xfer = NULL;
+   struct pipe_transfer *dst_xfer = NULL;
+   const void *src_map =
+      pctx->texture_map(pctx, src, level, PIPE_MAP_READ, box, &src_xfer);
+   if (!src_map)
+      return;
+
+   void *dst_map = pipe_buffer_map_range(
+      pctx, dst, buffer_offset, (unsigned)copy_bytes,
+      PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE, &dst_xfer);
+   if (dst_map) {
+      util_copy_box(dst_map, format, row_stride, layer_stride, 0, 0, 0,
+                    box->width, box->height, box->depth, src_map,
+                    src_xfer->stride, src_xfer->layer_stride, 0, 0, 0);
+      pipe_buffer_unmap(pctx, dst_xfer);
+   }
+   pctx->texture_unmap(pctx, src_xfer);
 }

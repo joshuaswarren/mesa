@@ -228,9 +228,16 @@ TEST(SpillSlots, LargeSpillFrameHonorsLaunchCeiling)
    };
 
    const Case cases[] = {
-      /* AGX2 stays strictly capped at AGX2_MAX_SPILL_SLOTS (4096 B). */
+      /* AGX2 defaults to AGX2_MAX_SPILL_SLOTS (4096 B) when max_scratch_B is
+       * unset or explicitly capped at 4 KiB, and admits up to 16 KiB when the
+       * driver sets max_scratch_B (e.g. Vulkan GS raster replays). */
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, MESA_SHADER_COMPUTE, 0, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, MESA_SHADER_VERTEX,
+       AGX3_G17P_MAX_SPILL_B, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, MESA_SHADER_VERTEX,
+       2u * AGX_NUM_MODELED_REGS, true},
       {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, MESA_SHADER_COMPUTE,
-       AGX3_G17P_MAX_COMPUTE_SPILL_B, false},
+       2u * AGX_NUM_MODELED_REGS, true},
       /* Graphics with the default or legacy launch limits is capped at 4 KiB. */
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_VERTEX, 0, false},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_FRAGMENT,
@@ -397,8 +404,8 @@ TEST(SpillSlots, HighSlotEncodeRoundTripAGX3AndAGX2)
    }
 
    /* Verify AGX2 stack_store/stack_load immediate packing handles offsets
-    * >= 4096 bytes cleanly (16-bit immediate field) even though AGX2 RA itself
-    * stays bounded at AGX2_MAX_SPILL_SLOTS (4096 B). */
+    * >= 4096 bytes cleanly (16-bit immediate field) up to the modeled
+    * spill-slot ceiling. */
    for (unsigned tps_half : {2048u, 8190u}) {
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
@@ -755,4 +762,32 @@ TEST_F(Agx3SpillConstantPhi, Agx3bFoldsAndAgx2OrPreambleUnchanged)
    ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(out)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(out)->imm, 1u);
+}
+
+TEST(SpillSlots, Agx2SpillBoundHonorsImmediateOffsetCeiling)
+{
+   /* AGX2 stack_load/stack_store immediate byte offsets are 16-bit (< 64 KiB).
+    * When NIR scratch (spill_base_B) already consumes >= 64 KiB, RA_MEM must
+    * fail closed instead of emitting an out-of-range stack immediate. */
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   key.dev.chip = AGX_CHIP_G13G;
+   key.has_scratch = true;
+   key.max_scratch_B = 2u * AGX_NUM_MODELED_REGS;
+   struct agx_shader_info out = {};
+   b->shader->key = &key;
+   b->shader->out = &out;
+   b->shader->stage = MESA_SHADER_VERTEX;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_VERTEX;
+   b->shader->spill_base_B = 0x10000u;
+
+   build_live_rcp_chain(b, 200);
+
+   agx_ra(b->shader);
+   EXPECT_TRUE(b->shader->ra_failed);
+   EXPECT_TRUE(b->shader->ra_mem_exhausted);
+   ralloc_free(mem);
 }

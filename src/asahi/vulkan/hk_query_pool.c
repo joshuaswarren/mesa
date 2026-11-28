@@ -639,6 +639,11 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
    hk_note_query_access(cmd, pool, first_index, num_queries);
+   if (!set_available && !vk_command_buffer_has_error(&cmd->vk) &&
+       cmd->current_cs.cs) {
+      cmd->current_cs.cs->stats.query_reset_dispatches++;
+      cmd->current_cs.cs->stats.query_reset_queries += num_queries;
+   }
 }
 
 static void

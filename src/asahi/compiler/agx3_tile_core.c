@@ -261,6 +261,48 @@ wait_overrides(enum agx_isa_encoding enc, uint16_t wait_mask,
    return n;
 }
 
+/*
+ * PIXINFO: the sample groups of the fragment's pixel for the W16 SR39 coverage
+ * word in half `src`, as one 16-bit word in half `dest`, on scoreboard slot
+ * `slot`. f9=2 f10=1 select the 16-bit result and f51=2 the register source,
+ * the form LLDCol's sample mask takes; f35/f37/f38/f52/f66 are those of the
+ * tile accesses beside it, with f56=0x100 and f67=1. The wait field is the
+ * ordinary mask (f18..f23 for slots 1..6).
+ */
+bool
+agx3_pixinfo(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+             uint8_t slot, uint16_t wait_mask,
+             uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len)
+{
+   if (out == NULL || len == NULL)
+      return false;
+   memset(out, 0, AGX3_TILE_MAX_LENGTH);
+   *len = 0;
+
+   if (!is_b(enc) || dest >= 192 || src >= 192 || slot < 1 || slot > 6 ||
+       (wait_mask & ~0x3fu))
+      return false;
+
+   const struct agx3_field_kv base[] = {
+      KV(9, 2),  KV(10, 1), KV(35, 9),     KV(37, 7),  KV(38, 1),
+      KV(51, 2), KV(52, 1), KV(56, 0x100), KV(66, 1), KV(67, 1),
+   };
+   struct agx3_field_kv ov[3 + 6];
+   unsigned n = 0;
+   ov[n++] = (struct agx3_field_kv)KV(2, dest);
+   ov[n++] = (struct agx3_field_kv)KV(12, slot);
+   ov[n++] = (struct agx3_field_kv)KV(44, src);
+   n = wait_overrides(enc, wait_mask, ov, n);
+   if (!agx3_bind_compose(enc, AGX3_MN_pixinfo, 0, base,
+                          AGX_MRT_ARRAY_SIZE(base), ov, n, out, len) ||
+       *len != 14) {
+      memset(out, 0, AGX3_TILE_MAX_LENGTH);
+      *len = 0;
+      return false;
+   }
+   return true;
+}
+
 bool
 agx3_tile_store(enum agx_isa_encoding enc, uint16_t data,
                 enum agx3_tile_width width, uint8_t chan_mask,

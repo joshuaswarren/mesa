@@ -209,14 +209,20 @@ struct hk_cmd_pending;
 struct hk_queue;
 void hk_cmd_pending_init(struct hk_device *dev);
 VkResult hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
-                               struct agx_bo *const *extra_bos,
-                               unsigned extra_bo_count,
-                               struct hk_cmd_pending **out);
+                              struct agx_bo *const *extra_bos,
+                              unsigned extra_bo_count,
+                              struct hk_queue *reap_queue,
+                              bool *reap_done_valid, uint64_t *reap_done,
+                              bool already_reaped,
+                              struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);
 void hk_cmd_pending_retain_lost(struct hk_device *dev,
                                 struct hk_cmd_buffer *cmd);
+void hk_cmd_pending_reap_cached(struct hk_device *dev,
+                                const struct hk_queue *cached_queue,
+                                bool *cached_valid, uint64_t *cached_done);
 void hk_cmd_pending_reap(struct hk_device *dev);
 void hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue);
 void hk_cmd_pending_finish(struct hk_device *dev);

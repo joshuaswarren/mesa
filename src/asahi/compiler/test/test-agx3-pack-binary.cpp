@@ -19884,3 +19884,78 @@ TEST_F(AGX3PackBinary, G17PComputeDeviceStoreSetsCoherentPolicy)
       }
    }
 }
+
+/* PIXINFO composes the destination half, the coverage half, the scoreboard
+ * slot and the incoming wait mask into their fields and nothing else. */
+TEST(AGX3PixInfo, ComposesSampleGroupFields)
+{
+   const struct {
+      uint16_t dest, src;
+      uint8_t slot;
+      uint16_t wait;
+   } cases[] = {
+      {2, 1, 6, 0}, {26, 8, 6, 1}, {12, 8, 6, 1}, {190, 191, 1, 0x21},
+   };
+   for (const auto &c : cases) {
+      uint8_t bytes[AGX3_TILE_MAX_LENGTH];
+      uint8_t len = 0;
+      ASSERT_TRUE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, c.dest, c.src, c.slot,
+                               c.wait, bytes, &len));
+      ASSERT_EQ(len, 14u);
+      uint64_t f[AGX3_MAX_FIELDS];
+      ASSERT_GE(agx3_decode(&agx3b_table, bytes, len, AGX3_MN_pixinfo, f), 0);
+      EXPECT_EQ(f[2], c.dest);
+      EXPECT_EQ(f[44], c.src);
+      EXPECT_EQ(f[12], c.slot);
+      for (unsigned i = 0; i < 6; ++i)
+         EXPECT_EQ(f[18 + i], (c.wait >> i) & 1u) << "wait slot " << i + 1;
+      /* A 16-bit result from a register source. */
+      EXPECT_EQ(f[9], 2u);
+      EXPECT_EQ(f[10], 1u);
+      EXPECT_EQ(f[51], 2u);
+      EXPECT_EQ(f[56], 0x100u);
+   }
+
+   uint8_t bytes[AGX3_TILE_MAX_LENGTH];
+   uint8_t len = 0;
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3C, 2, 1, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 0, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 7, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 192, 1, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 192, 6, 0, bytes, &len));
+   EXPECT_FALSE(agx3_pixinfo(AGX_ISA_ENCODING_AGX3B, 2, 1, 6, 0x40, bytes, &len));
+   EXPECT_EQ(len, 0u);
+}
+
+/* A sample-groups tile load packs as PIXINFO of its coverage register on the
+ * tile-read slot, and is refused where PIXINFO has no form. */
+TEST_F(AGX3PackBinary, SampleGroupsLoadPacksAsPixinfo)
+{
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_instr *I = agx_ld_tile_to(b, agx_register(2, AGX_SIZE_16),
+                                    agx_register(1, AGX_SIZE_16), agx_null(),
+                                    AGX_FORMAT_I16, 1, 0, false, 0);
+      I->sample_groups = true;
+      agx_stop(b);
+      const std::vector<uint8_t> code = pack(b);
+      ASSERT_GE(code.size(), 14u);
+      uint64_t f[AGX3_MAX_FIELDS];
+      ASSERT_GE(agx3_decode(&agx3b_table, code.data(), 14, AGX3_MN_pixinfo, f),
+                0);
+      EXPECT_EQ(f[2], 2u);
+      EXPECT_EQ(f[44], 1u);
+      EXPECT_EQ(f[12], 6u);
+   }
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_instr *I = agx_ld_tile_to(b, agx_register(2, AGX_SIZE_16),
+                                    agx_register(1, AGX_SIZE_16), agx_null(),
+                                    AGX_FORMAT_I16, 1, 0, false, 0);
+      I->sample_groups = true;
+      agx_stop(b);
+      EXPECT_TRUE(pack(b, false).empty());
+   }
+}

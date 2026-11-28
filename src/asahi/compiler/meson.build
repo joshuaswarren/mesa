@@ -796,6 +796,7 @@ if with_tests
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-spill-repeat-pair.cpp',
+         'test/test-spill-phi-sources.cpp',
          'test/test-agx-register-cache.cpp',
          'test/test-agx3c-collect-split.cpp',
          'test/test-opt-licm.cpp',

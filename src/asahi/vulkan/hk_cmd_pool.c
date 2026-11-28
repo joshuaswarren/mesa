@@ -803,23 +803,54 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
 /* A queue's submissions are in timeline order, and a reached timeline point
  * means every timeline signal up to it has happened. Check the queue's
  * submissions oldest first and stop at the first one past the reached point.
- * The point only skips the wait: each submission's own syncobjs are still
- * read before its memory is released. Fences on the timeline can signal out
- * of order, so an unfinished submission can hold back finished ones behind
- * it; once it has done so for a while, a few of them are also polled on each
- * reap. Finished work behind several long-running submissions stays pinned
- * until those finish. Called with cmd_pending_lock held.
+ * When the kernel's VM status mirror is mapped and clean (0), a single-chunk
+ * submission whose point is reached completed without error and can be reaped
+ * without per-syncobj ExportSyncFile + SYNC_IOC_FILE_INFO + close syscalls.
+ * Multi-chunk submissions, lost devices, and non-zero mirror words fall back
+ * to per-syncobj polling. Fences on the timeline can signal out of order, so
+ * an unfinished submission can hold back finished ones behind it; once it has
+ * done so for a while, a few of them are also polled on each reap. Finished
+ * work behind several long-running submissions stays pinned until those
+ * finish. Called with cmd_pending_lock held.
  */
 static void
 hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
-                          struct list_head *ready)
+                          struct list_head *ready,
+                          const struct hk_queue *cached_queue,
+                          bool *cached_valid, uint64_t *cached_done)
 {
-   uint64_t reached = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &reached, 1))
-      reached = 0;
-
    struct hk_cmd_pending *oldest =
       list_first_entry(&queue->cmd_pending, struct hk_cmd_pending, link);
+   struct hk_cmd_pending *newest =
+      list_last_entry(&queue->cmd_pending, struct hk_cmd_pending, link);
+
+   uint64_t reached = p_atomic_read(&queue->drm.signalled_value);
+   if (cached_queue == queue && cached_valid && *cached_valid) {
+      reached = MAX2(reached, *cached_done);
+   } else if (reached < newest->point) {
+      uint64_t queried = 0;
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &queried, 1) == 0) {
+         hk_queue_note_signalled(queue, queried);
+         reached = MAX2(reached, queried);
+         if (cached_queue == queue && cached_valid && cached_done) {
+            *cached_done = reached;
+            *cached_valid = true;
+         }
+      }
+   }
+
+   /* The kernel stores any sticky VM error into vm_status_mirror before
+    * signalling that job's fence (hk_init_vm_status_mirror()). An acquire load
+    * after observing the reached timeline point guarantees every single-chunk
+    * submission up to `reached` completed without error, avoiding three
+    * syscalls (ExportSyncFile + SYNC_IOC_FILE_INFO + close) per retired
+    * submission. Any non-zero error word, lost device, or multi-chunk
+    * submission falls back to per-syncobj polling. */
+   const bool vm_clean =
+      dev->vm_status_mirror.word != NULL &&
+      !vk_device_is_lost_no_report(&dev->vk) &&
+      __atomic_load_n(dev->vm_status_mirror.word, __ATOMIC_ACQUIRE) == 0;
+
    if (oldest->point <= reached)
       queue->cmd_stalled = 0;
    else if (queue->cmd_stalled < HK_CMD_STALL_REAPS)
@@ -834,7 +865,12 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
       if (!signalled && !polls)
          break;
 
-      switch (hk_cmd_pending_poll(dev, p, !signalled)) {
+      const enum hk_cmd_pending_state state =
+         (signalled && vm_clean && p->chunks == 1 && p->attempted == 1)
+            ? HK_PENDING_SUCCEEDED
+            : hk_cmd_pending_poll(dev, p, !signalled);
+
+      switch (state) {
       case HK_PENDING_BUSY:
          if (!signalled)
             polls--;
@@ -860,7 +896,9 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
 }
 
 void
-hk_cmd_pending_reap(struct hk_device *dev)
+hk_cmd_pending_reap_cached(struct hk_device *dev,
+                           const struct hk_queue *cached_queue,
+                           bool *cached_valid, uint64_t *cached_done)
 {
    /* Meta command pools can be destroyed during device-init failure. Skip the
     * device lock when no driver-owned pending submissions are active. */
@@ -873,7 +911,8 @@ hk_cmd_pending_reap(struct hk_device *dev)
    simple_mtx_lock(&dev->cmd_pending_lock);
    list_for_each_entry_safe(struct hk_queue, queue, &dev->cmd_pending_queues,
                             cmd_link)
-      hk_cmd_pending_reap_queue(dev, queue, &ready);
+      hk_cmd_pending_reap_queue(dev, queue, &ready, cached_queue, cached_valid,
+                                cached_done);
    simple_mtx_unlock(&dev->cmd_pending_lock);
 
    /* Releasing a span takes vdm.lock; never do it under the pending lock. */
@@ -883,13 +922,22 @@ hk_cmd_pending_reap(struct hk_device *dev)
    }
 }
 
+void
+hk_cmd_pending_reap(struct hk_device *dev)
+{
+   hk_cmd_pending_reap_cached(dev, NULL, NULL, NULL);
+}
+
 VkResult
 hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
                      struct agx_bo *const *extra_bos, unsigned extra_bo_count,
+                     struct hk_queue *reap_queue, bool *reap_done_valid,
+                     uint64_t *reap_done, bool already_reaped,
                      struct hk_cmd_pending **out)
 {
    *out = NULL;
-   hk_cmd_pending_reap(dev);
+   if (!already_reaped)
+      hk_cmd_pending_reap_cached(dev, reap_queue, reap_done_valid, reap_done);
 
    size_t count = extra_bo_count;
    if (count > (SIZE_MAX - sizeof(struct hk_cmd_pending)) /

@@ -230,6 +230,14 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 uint32_t
 hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage)
 {
+   /* AGX2 allocates helper-backed scratch lazily via agx_scratch (up to
+    * 512 KiB/thread) and encodes 16-bit immediate stack byte offsets. Admit
+    * the register allocator's modeled spill capacity (16 KiB) so
+    * descriptor-heavy GS raster replays do not exhaust 4 KiB.
+    */
+   if (!agx_chip_agx3_path(dev->chip))
+      return 2u * AGX_NUM_MODELED_REGS;
+
    /* HAL300 hardware vertex programs publish their linked TPS footprint in
     * render resources. This includes the vertex replay of a geometry shader.
     */
@@ -6549,7 +6557,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nir->info.stage == MESA_SHADER_TESS_CTRL;
    uint32_t max_scratch_B = AGX3_G17P_MAX_SPILL_B;
    if (!nir->info.internal) {
-      if (cdm_stage && agx_chip_native_agx3(dev->dev.chip))
+      if (!agx_chip_agx3_path(dev->dev.chip))
+         max_scratch_B = 2u * AGX_NUM_MODELED_REGS;
+      else if (cdm_stage && agx_chip_native_agx3(dev->dev.chip))
          max_scratch_B = AGX3_G17P_MAX_COMPUTE_SPILL_B;
       else if (cdm_stage && agx_chip_g17_m5(dev->dev.chip))
          max_scratch_B = 1u << 16;
