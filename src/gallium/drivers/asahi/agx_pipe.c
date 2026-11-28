@@ -3046,6 +3046,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->blit = agx_blit;
    if (screen->caps.generate_mipmap)
       pctx->generate_mipmap = agx_generate_mipmap;
+   if (agx_chip_native_agx3(agx_device(screen)->chip))
+      pctx->image_copy_buffer = agx_image_copy_buffer;
    pctx->flush_resource = agx_flush_resource;
 
    pctx->buffer_map = u_transfer_helper_transfer_map;
