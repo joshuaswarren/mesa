@@ -153,6 +153,8 @@ stage_of(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+static unsigned m5_dispatches;
+
 /* The VS and TCS launches. */
 void
 hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
@@ -163,6 +165,19 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    (void)local_size;
    if (grid.count[0])
       launch(cs, cur_draw, stage_of(cmd, cs));
+}
+
+void
+hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                      struct hk_shader *s, struct agx_grid grid,
+                      struct agx_workgroup local_size)
+{
+   (void)s;
+   (void)local_size;
+   if (grid.count[0]) {
+      m5_dispatches++;
+      launch(cs, cur_draw, stage_of(cmd, cs));
+   }
 }
 
 /* The precompiled kernels, through the pre-graphics getter as the driver's
@@ -484,18 +499,43 @@ main(void)
    hk_tess_batch_reset(cmd);
    T("reset", cmd->tess_batch.draws == 0 && !cmd->tess_batch.stages[0]);
 
+   /* M5 HAL300 path routes VS/TCS through hk_dispatch_m5_native() and produces
+    * the same stage-major batched stream with five strong flushes. */
+   struct hk_cmd_buffer *m5_cmd = new_cmd();
+   hk_cmd_buffer_device(m5_cmd)->dev.chip = AGX_CHIP_G17S;
+   struct hk_cs *m5_pre = open_pre_gfx(m5_cmd);
+   m5_dispatches = 0;
+   for (unsigned d = 0; d < 3; ++d)
+      record_draw(m5_cmd, d, 0);
+   hk_tess_batch_flush(m5_cmd);
+   n = decode(m5_pre, r, MAX_RECORDS, &link_ok);
+   T("M5 3 draws: routes VS/TCS via hk_dispatch_m5_native", m5_dispatches == 6);
+   T("M5 3 draws: stage-major", stage_major(r, n, 0, 3, 0));
+   T("M5 3 draws: 5 barriers", count(r, n, STRONG) == 5 && count(r, n, WEAK) == 0);
+   T("M5 3 draws: stats", m5_pre->stats.cmds == 15 && m5_cmd->tess_batch.draws == 0);
+   hk_tess_batch_reset(m5_cmd);
+
    /* Which draws may join a batch. */
    struct agx_draw direct = {.b = agx_3d(3, 1, 1)};
    struct agx_draw indirect = {.b = agx_grid_indirect(0x10000)};
-   T("batchable: direct", hk_tess_batchable(AGX_CHIP_G17P, direct, false, false));
+   T("batchable: direct (HAL200)",
+     hk_tess_batchable(AGX_CHIP_G17P, direct, false, false));
+   T("batchable: direct (M5 G17S)",
+     hk_tess_batchable(AGX_CHIP_G17S, direct, false, false));
+   T("batchable: direct (M5 G17G)",
+     hk_tess_batchable(AGX_CHIP_G17G, direct, false, false));
    T("batchable: not indirect",
-     !hk_tess_batchable(AGX_CHIP_G17P, indirect, false, false));
+     !hk_tess_batchable(AGX_CHIP_G17P, indirect, false, false) &&
+     !hk_tess_batchable(AGX_CHIP_G17S, indirect, false, false));
    T("batchable: not with a geometry shader",
-     !hk_tess_batchable(AGX_CHIP_G17P, direct, true, false));
+     !hk_tess_batchable(AGX_CHIP_G17P, direct, true, false) &&
+     !hk_tess_batchable(AGX_CHIP_G17S, direct, true, false));
    T("batchable: not with queries counting",
-     !hk_tess_batchable(AGX_CHIP_G17P, direct, false, true));
+     !hk_tess_batchable(AGX_CHIP_G17P, direct, false, true) &&
+     !hk_tess_batchable(AGX_CHIP_G17S, direct, false, true));
    T("batchable: not on other chips",
-     !hk_tess_batchable(AGX_CHIP_G13G, direct, false, false));
+     !hk_tess_batchable(AGX_CHIP_G13G, direct, false, false) &&
+     !hk_tess_batchable(AGX_CHIP_G18G, direct, false, false));
 
    for (unsigned i = 0; i < nchunks; ++i)
       free(chunks[i]);
@@ -524,6 +564,13 @@ hk_reserve_scratch_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+void
+hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd)
 {
    (void)cmd;
    abort();

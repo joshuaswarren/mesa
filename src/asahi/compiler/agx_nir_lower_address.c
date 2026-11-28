@@ -305,6 +305,399 @@ existing_index_multiple(nir_intrinsic_instr *access, nir_scalar index,
    return false;
 }
 
+static bool
+block_is_lone_break(const nir_block *block)
+{
+   const nir_instr *last = nir_block_last_instr((nir_block *)block);
+   return last && last == nir_block_first_instr((nir_block *)block) &&
+          last->type == nir_instr_type_jump &&
+          nir_instr_as_jump(last)->type == nir_jump_break;
+}
+
+static bool
+cf_list_is_lone_break(const struct exec_list *list)
+{
+   if (!exec_list_is_singular(list))
+      return false;
+   const nir_cf_node *node =
+      exec_node_data(nir_cf_node, exec_list_get_head_const(list), node);
+   return node->type == nir_cf_node_block &&
+          block_is_lone_break(nir_cf_node_as_block(node));
+}
+
+static bool
+cf_list_is_empty_block(const struct exec_list *list)
+{
+   if (!exec_list_is_singular(list))
+      return false;
+   const nir_cf_node *node =
+      exec_node_data(nir_cf_node, exec_list_get_head_const(list), node);
+   return node->type == nir_cf_node_block &&
+          exec_list_is_empty(&nir_cf_node_as_block(node)->instr_list);
+}
+
+static bool
+scalars_equal(nir_scalar a, nir_scalar b)
+{
+   a = nir_scalar_chase_movs(a);
+   b = nir_scalar_chase_movs(b);
+   return a.def == b.def && a.comp == b.comp;
+}
+
+/* Match `bcsel(uge(N, K), iadd(N, -M), 0)` or `bcsel(ult(N, K), 0, iadd(N, -M))`
+ * with `0 < M <= K`: when N >= K, N - M does not underflow and is at most
+ * UINT32_MAX - M; when N < K, the result is 0. */
+static bool
+u32_limit_upper_bound(nir_scalar limit, uint32_t *max_out)
+{
+   limit = nir_scalar_chase_movs(limit);
+   if (limit.def->bit_size != 32)
+      return false;
+
+   if (nir_scalar_is_const(limit)) {
+      *max_out = (uint32_t)nir_scalar_as_uint(limit);
+      return true;
+   }
+
+   if (!nir_scalar_is_alu(limit))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(limit);
+   if (op == nir_op_iand) {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar k = nir_scalar_chase_alu_src(limit, i);
+         if (nir_scalar_is_const(k)) {
+            *max_out = (uint32_t)nir_scalar_as_uint(k);
+            return true;
+         }
+      }
+      return false;
+   }
+
+   if (op == nir_op_ushr) {
+      nir_scalar s = nir_scalar_chase_alu_src(limit, 1);
+      if (nir_scalar_is_const(s)) {
+         unsigned sh = (unsigned)nir_scalar_as_uint(s) & 31u;
+         if (sh > 0) {
+            *max_out = UINT32_MAX >> sh;
+            return true;
+         }
+      }
+      return false;
+   }
+
+   if (op == nir_op_usub_sat) {
+      nir_scalar m = nir_scalar_chase_alu_src(limit, 1);
+      if (nir_scalar_is_const(m)) {
+         *max_out = UINT32_MAX - (uint32_t)nir_scalar_as_uint(m);
+         return true;
+      }
+      return false;
+   }
+
+   if (op != nir_op_bcsel)
+      return false;
+
+   nir_scalar cond = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 0));
+   nir_scalar tval = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 1));
+   nir_scalar fval = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 2));
+   if (!nir_scalar_is_alu(cond))
+      return false;
+
+   nir_op cop = nir_scalar_alu_op(cond);
+   nir_scalar adj, zero;
+   if (cop == nir_op_uge) {
+      adj = tval;
+      zero = fval;
+   } else if (cop == nir_op_ult) {
+      adj = fval;
+      zero = tval;
+   } else {
+      return false;
+   }
+
+   if (!nir_scalar_is_const(zero) || nir_scalar_as_uint(zero) != 0)
+      return false;
+
+   nir_scalar n_cmp = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
+   nir_scalar k_cmp = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1));
+   if (n_cmp.def->bit_size != 32 || !nir_scalar_is_const(k_cmp) ||
+       !nir_scalar_is_alu(adj) || nir_scalar_alu_op(adj) != nir_op_iadd)
+      return false;
+
+   const uint32_t k_val = (uint32_t)nir_scalar_as_uint(k_cmp);
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_scalar add_n = nir_scalar_chase_alu_src(adj, i);
+      nir_scalar add_c = nir_scalar_chase_alu_src(adj, 1 - i);
+      if (!scalars_equal(add_n, n_cmp) || !nir_scalar_is_const(add_c))
+         continue;
+      const int64_t add_signed = nir_scalar_as_int(add_c);
+      if (add_signed < 0) {
+         const uint64_t m_val = (uint64_t)(-add_signed);
+         if (m_val > 0 && m_val <= k_val) {
+            *max_out = UINT32_MAX - (uint32_t)m_val;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+s32_limit_upper_bound(nir_scalar limit, int32_t *max_out)
+{
+   limit = nir_scalar_chase_movs(limit);
+   if (limit.def->bit_size != 32)
+      return false;
+
+   if (nir_scalar_is_const(limit)) {
+      *max_out = (int32_t)nir_scalar_as_int(limit);
+      return true;
+   }
+
+   if (!nir_scalar_is_alu(limit))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(limit);
+   if (op == nir_op_ishr) {
+      nir_scalar s = nir_scalar_chase_alu_src(limit, 1);
+      if (nir_scalar_is_const(s)) {
+         unsigned sh = (unsigned)nir_scalar_as_uint(s) & 31u;
+         if (sh > 0) {
+            *max_out = INT32_MAX >> sh;
+            return true;
+         }
+      }
+      return false;
+   }
+
+   if (op == nir_op_ushr) {
+      nir_scalar s = nir_scalar_chase_alu_src(limit, 1);
+      if (nir_scalar_is_const(s)) {
+         unsigned sh = (unsigned)nir_scalar_as_uint(s) & 31u;
+         if (sh > 0) {
+            *max_out = (int32_t)(UINT32_MAX >> sh);
+            return true;
+         }
+      }
+      return false;
+   }
+
+   if (op != nir_op_bcsel)
+      return false;
+
+   nir_scalar cond = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 0));
+   nir_scalar tval = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 1));
+   nir_scalar fval = nir_scalar_chase_movs(nir_scalar_chase_alu_src(limit, 2));
+   if (!nir_scalar_is_alu(cond))
+      return false;
+
+   nir_op cop = nir_scalar_alu_op(cond);
+   nir_scalar adj, minv;
+   if (cop == nir_op_ige) {
+      adj = tval;
+      minv = fval;
+   } else if (cop == nir_op_ilt) {
+      adj = fval;
+      minv = tval;
+   } else {
+      return false;
+   }
+
+   if (!nir_scalar_is_const(minv) || nir_scalar_as_int(minv) != INT32_MIN)
+      return false;
+
+   nir_scalar n_cmp = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
+   nir_scalar k_cmp = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1));
+   if (n_cmp.def->bit_size != 32 || !nir_scalar_is_const(k_cmp) ||
+       !nir_scalar_is_alu(adj) || nir_scalar_alu_op(adj) != nir_op_iadd)
+      return false;
+
+   const int64_t k_bound = nir_scalar_as_int(k_cmp);
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_scalar add_n = nir_scalar_chase_alu_src(adj, i);
+      nir_scalar add_c = nir_scalar_chase_alu_src(adj, 1 - i);
+      if (!scalars_equal(add_n, n_cmp) || !nir_scalar_is_const(add_c))
+         continue;
+      const int64_t add_signed = nir_scalar_as_int(add_c);
+      if (add_signed < 0) {
+         const int64_t m_val = -add_signed;
+         if (m_val > 0 && k_bound >= (int64_t)INT32_MIN + m_val) {
+            *max_out = (int32_t)((int64_t)INT32_MAX - m_val);
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+loop_iv_nonneg_step(nir_loop *loop, nir_scalar rest, uint32_t *step_out)
+{
+   nir_block *header = nir_loop_first_block(loop);
+   nir_instr *def_instr = nir_def_instr(rest.def);
+   if (def_instr->type != nir_instr_type_phi || def_instr->block != header)
+      return false;
+
+   nir_phi_instr *phi = nir_instr_as_phi(def_instr);
+   if (exec_list_length(&phi->srcs) != 2)
+      return false;
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
+   nir_block *latch = nir_loop_last_block(loop);
+   nir_phi_src *init_src = nir_phi_get_src_from_block(phi, pre);
+   nir_phi_src *back_src = nir_phi_get_src_from_block(phi, latch);
+   if (!init_src || !back_src)
+      return false;
+
+   nir_scalar init =
+      nir_scalar_chase_movs(nir_get_scalar(init_src->src.ssa, rest.comp));
+   if (!nir_scalar_is_const(init) || nir_scalar_as_int(init) < 0)
+      return false;
+
+   nir_scalar back =
+      nir_scalar_chase_movs(nir_get_scalar(back_src->src.ssa, rest.comp));
+   if (!nir_scalar_is_alu(back) || nir_scalar_alu_op(back) != nir_op_iadd)
+      return false;
+
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_scalar s_iv = nir_scalar_chase_alu_src(back, i);
+      nir_scalar s_step = nir_scalar_chase_alu_src(back, 1 - i);
+      if (scalars_equal(s_iv, rest) && nir_scalar_is_const(s_step)) {
+         int64_t st = nir_scalar_as_int(s_step);
+         if (st > 0 && st <= INT32_MAX) {
+            *step_out = (uint32_t)st;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* Prove that `(uint32_t)rest + uc` cannot wrap modulo 2^32 at `access`, so
+ * `zext(rest + uc) * scale == zext(rest) * scale + uc * scale` holds even for
+ * full 4 GiB (`UINT32_MAX`) buffer ranges without sign-extending `rest`. */
+static bool
+u32_add_no_wrap(const struct lower_address_options *options,
+                nir_intrinsic_instr *access, nir_scalar add_scalar,
+                nir_scalar rest, uint32_t uc)
+{
+   if (uc == 0)
+      return true;
+
+   if (options->checked_offsets)
+      return false;
+
+   if (nir_def_as_alu(add_scalar.def)->no_unsigned_wrap)
+      return true;
+
+   uint32_t max_rest = 0;
+   if (u32_limit_upper_bound(rest, &max_rest) && max_rest <= UINT32_MAX - uc)
+      return true;
+
+   /* Narrow unsigned extensions (u8/u16 -> u32) cannot wrap when adding small c. */
+   if (nir_scalar_is_alu(rest) && nir_scalar_alu_op(rest) == nir_op_u2u32) {
+      nir_scalar narrow = nir_scalar_chase_alu_src(rest, 0);
+      if (narrow.def->bit_size < 32 &&
+          BITFIELD_MASK(narrow.def->bit_size) <= UINT32_MAX - uc)
+         return true;
+   }
+
+   /* Low zero bits from a constant left shift cannot carry out of bit 31. */
+   if (nir_scalar_is_alu(rest) && nir_scalar_alu_op(rest) == nir_op_ishl) {
+      nir_scalar sh = nir_scalar_chase_alu_src(rest, 1);
+      if (nir_scalar_is_const(sh)) {
+         unsigned s = (unsigned)nir_scalar_as_uint(sh) & 31u;
+         if (s > 0 && uc < (1u << s))
+            return true;
+      }
+   }
+
+   /* Walk enclosing loops looking for a top-tested exit guard that bounds
+    * `rest` below a limit guaranteeing `rest + uc <= UINT32_MAX`. */
+   for (nir_cf_node *node = access->instr.block->cf_node.parent; node;
+        node = node->parent) {
+      if (node->type != nir_cf_node_loop)
+         continue;
+
+      nir_loop *loop = nir_cf_node_as_loop(node);
+      nir_block *header = nir_loop_first_block(loop);
+      if (access->instr.block == header)
+         continue;
+
+      nir_cf_node *first = nir_cf_node_next(&header->cf_node);
+      if (!first || first->type != nir_cf_node_if)
+         continue;
+
+      nir_if *nif = nir_cf_node_as_if(first);
+      bool break_in_then;
+      if (cf_list_is_lone_break(&nif->then_list) &&
+          cf_list_is_empty_block(&nif->else_list))
+         break_in_then = true;
+      else if (cf_list_is_lone_break(&nif->else_list) &&
+               cf_list_is_empty_block(&nif->then_list))
+         break_in_then = false;
+      else
+         continue;
+
+      /* Ensure `access` is not inside the break `if` itself. */
+      bool in_break_if = false;
+      for (nir_cf_node *p = &access->instr.block->cf_node; p && p != node;
+           p = p->parent) {
+         if (p == &nif->cf_node) {
+            in_break_if = true;
+            break;
+         }
+      }
+      if (in_break_if)
+         continue;
+
+      nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+      bool neg = false;
+      while (nir_scalar_is_alu(cond) && nir_scalar_alu_op(cond) == nir_op_inot) {
+         neg = !neg;
+         cond = nir_scalar_chase_alu_src(cond, 0);
+      }
+      if (!nir_scalar_is_alu(cond))
+         continue;
+
+      /* `continue_on_true`: loop body runs when `cond` is true. */
+      const bool continue_on_true = (break_in_then == neg);
+      const nir_op cop = nir_scalar_alu_op(cond);
+      nir_scalar lhs = nir_scalar_chase_alu_src(cond, 0);
+      nir_scalar rhs = nir_scalar_chase_alu_src(cond, 1);
+
+      /* Check unsigned `rest < limit`. */
+      bool is_ult = (continue_on_true && cop == nir_op_ult) ||
+                    (!continue_on_true && cop == nir_op_uge);
+      if (is_ult && scalars_equal(lhs, rest)) {
+         uint32_t max_limit = 0;
+         if (u32_limit_upper_bound(rhs, &max_limit)) {
+            if (max_limit == 0 || uc <= UINT32_MAX - (max_limit - 1u))
+               return true;
+         }
+      }
+
+      /* Check signed non-negative IV `0 <= rest < limit`. */
+      bool is_ilt = (continue_on_true && cop == nir_op_ilt) ||
+                    (!continue_on_true && cop == nir_op_ige);
+      if (is_ilt && scalars_equal(lhs, rest)) {
+         uint32_t step = 0;
+         int32_t max_s32 = 0;
+         if (loop_iv_nonneg_step(loop, rest, &step) &&
+             s32_limit_upper_bound(rhs, &max_s32)) {
+            if (max_s32 <= 0)
+               return true;
+            const int64_t max_rest = (int64_t)max_s32 - 1;
+            if (max_rest + (int64_t)step <= INT32_MAX &&
+                max_rest + (int64_t)uc <= INT32_MAX)
+               return true;
+         }
+      }
+   }
+
+   return false;
+}
+
 /* AGX3C loads and stores add a signed 16-bit byte offset after scaling the
  * index, so a constant addend in the index -- a struct member or a constant
  * array element -- needs no ALU. The split must not change any valid address:
@@ -313,7 +706,8 @@ existing_index_multiple(nir_intrinsic_instr *access, nir_scalar index,
  *   overflows, which no valid signed index does.
  * - A zero-extended index gives zext(x + c) = zext(x) + c only if x + c does
  *   not wrap. An amul sum x is nonnegative and below 2^31 for a valid access,
- *   so this holds for c >= 0. Any other x may be negative (a reversed index
+ *   so this holds for c >= 0; likewise when u32_add_no_wrap() proves x + c
+ *   cannot wrap 32-bit unsigned. Any other x may be negative (a reversed index
  *   N - i folds to c + -i), so leave it alone.
  * - An array index i + c scaled by amul is, for a valid access, nonnegative
  *   and below 2^31 / stride, so as signed integers (i + c) * stride equals
@@ -327,9 +721,9 @@ existing_index_multiple(nir_intrinsic_instr *access, nir_scalar index,
  * The same bounds let a power-of-two stride move into the index scale.
  */
 static void
-fold_byte_offset(nir_builder *b, nir_intrinsic_instr *access,
-                 struct match *match, unsigned format_shift,
-                 unsigned max_shift)
+fold_byte_offset(nir_builder *b, const struct lower_address_options *options,
+                 nir_intrinsic_instr *access, struct match *match,
+                 unsigned format_shift, unsigned max_shift)
 {
    if (match->offset.def == NULL)
       return;
@@ -351,7 +745,10 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *access,
             continue;
 
          const int64_t c = nir_scalar_as_int(k);
-         if (!sign_extend && (c < 0 || !is_amul_sum(rest, 0)))
+         if (!sign_extend &&
+             (c < 0 || (!is_amul_sum(rest, 0) &&
+                        !u32_add_no_wrap(options, access, offset, rest,
+                                         (uint32_t)c))))
             return;
 
          byte_offset = c * (INT64_C(1) << scale);
@@ -569,7 +966,7 @@ matched:
    if (options->byte_offsets && !shift_must_match &&
        intr->intrinsic != nir_intrinsic_global_atomic &&
        intr->intrinsic != nir_intrinsic_global_atomic_swap) {
-      fold_byte_offset(b, intr, &match, format_shift, max_shift);
+      fold_byte_offset(b, options, intr, &match, format_shift, max_shift);
 
       /* A constant added to the base, as to a pointer before it is indexed
        * ((p + 16) + i): the byte offset adds it after the index in the same

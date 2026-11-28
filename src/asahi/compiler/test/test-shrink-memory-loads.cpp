@@ -78,7 +78,7 @@ TEST_F(ShrinkMemoryLoadsTest, TrimsTrailingUnusedScalarAluChannels)
                                               nir_channel(&b, ld_gc, 0))));
    nir_store_global(&b, s_gc, addr, .write_mask = 1, .align_mul = 4);
 
-   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader));
+   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader, false));
 
    EXPECT_EQ(find_intrinsic(b.shader, nir_intrinsic_load_ubo)->def.num_components, 3u);
    EXPECT_EQ(find_intrinsic(b.shader, nir_intrinsic_load_ssbo)->def.num_components, 2u);
@@ -137,7 +137,7 @@ TEST_F(ShrinkMemoryLoadsTest, SkipsVectorPackingAndNonAluUses)
                     nir_iadd_imm(&b, addr, 112), .write_mask = 1,
                     .align_mul = 4);
 
-   EXPECT_FALSE(agx_nir_shrink_memory_loads(b.shader));
+   EXPECT_FALSE(agx_nir_shrink_memory_loads(b.shader, false));
 
    ralloc_free(b.shader);
 }
@@ -214,7 +214,7 @@ TEST_F(ShrinkMemoryLoadsTest, TrimsLoweredAgxLoadsAndSkipsPackedWords)
                         nir_u2f32(&b, nir_channel(&b, ld_w8, 0)))));
    nir_store_global(&b, sum, base, .write_mask = 1, .align_mul = 4);
 
-   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader));
+   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader, false));
    EXPECT_EQ(nir_def_as_intrinsic(ld_agx)->def.num_components, 3u);
    EXPECT_EQ(nir_def_as_intrinsic(ld_const)->def.num_components, 1u);
    EXPECT_EQ(nir_def_as_intrinsic(ld_packed)->def.num_components, 4u);
@@ -247,7 +247,7 @@ TEST_F(ShrinkMemoryLoadsTest, SkipsDivergentVec4ToVec3Shrink)
                     nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, gid, 2))),
                     .write_mask = 1, .align_mul = 4);
 
-   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader));
+   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader, false));
    EXPECT_EQ(nir_def_as_intrinsic(ld_xyz)->def.num_components, 4u);
    EXPECT_EQ(nir_def_as_intrinsic(ld_xy)->def.num_components, 2u);
 
@@ -288,9 +288,107 @@ TEST_F(ShrinkMemoryLoadsTest, PreservesSharedAddressLoadWidthForCse)
    nir_def *phi = nir_if_phi(&b, res_then, res_else);
    nir_store_global(&b, phi, base, .write_mask = 1, .align_mul = 4);
 
-   EXPECT_FALSE(agx_nir_shrink_memory_loads(b.shader));
+   EXPECT_FALSE(agx_nir_shrink_memory_loads(b.shader, false));
    EXPECT_EQ(nir_def_as_intrinsic(ld_then)->def.num_components, 4u);
    EXPECT_EQ(nir_def_as_intrinsic(ld_else)->def.num_components, 4u);
 
    ralloc_free(b.shader);
+}
+
+TEST_F(ShrinkMemoryLoadsTest, TrimsLeadingUnusedChannelsWithByteOffset)
+{
+   nir_builder b = make_cs("trim_leading");
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *idx = nir_load_local_invocation_index(&b);
+
+   /* Only .z of a divergent vec4: becomes one element 8 bytes further on. */
+   nir_def *ld = nir_load_agx(&b, 4, 32, addr, idx, .base = 2,
+                              .format = PIPE_FORMAT_R32_UINT);
+   nir_def *v = nir_iadd_imm(&b, nir_channel(&b, ld, 2), 1);
+   nir_store_global(&b, v, addr, .write_mask = 1, .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader, true));
+   nir_validate_shader(b.shader, "after leading trim");
+
+   nir_intrinsic_instr *load =
+      find_intrinsic(b.shader, nir_intrinsic_load_agx);
+   ASSERT_NE(load, nullptr);
+   EXPECT_EQ(load->def.num_components, 1);
+   EXPECT_EQ(nir_intrinsic_base(load),
+             2u | (8u << AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT));
+}
+
+TEST_F(ShrinkMemoryLoadsTest, KeepsLeadingChannelsWithoutByteOffsets)
+{
+   nir_builder b = make_cs("keep_leading");
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *idx = nir_load_local_invocation_index(&b);
+
+   nir_def *ld = nir_load_agx(&b, 4, 32, addr, idx, .base = 2,
+                              .format = PIPE_FORMAT_R32_UINT);
+   nir_def *v = nir_iadd(&b, nir_channel(&b, ld, 1), nir_channel(&b, ld, 3));
+   nir_store_global(&b, v, addr, .write_mask = 1, .align_mul = 4);
+
+   agx_nir_shrink_memory_loads(b.shader, false);
+
+   nir_intrinsic_instr *load =
+      find_intrinsic(b.shader, nir_intrinsic_load_agx);
+   ASSERT_NE(load, nullptr);
+   EXPECT_EQ(load->def.num_components, 4);
+   EXPECT_EQ(nir_intrinsic_base(load), 2u);
+}
+
+TEST_F(ShrinkMemoryLoadsTest, TrimsLeadingAndTrailingChannels)
+{
+   nir_builder b = make_cs("trim_both");
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *idx = nir_load_local_invocation_index(&b);
+
+   /* .y and .z of a vec4 at byte offset 16: a vec2 at byte offset 20. */
+   nir_def *ld = nir_load_agx(&b, 4, 32, addr, idx,
+                              .base = 2u | (16u << AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT),
+                              .format = PIPE_FORMAT_R32_UINT);
+   nir_def *v = nir_iadd(&b, nir_channel(&b, ld, 1), nir_channel(&b, ld, 2));
+   nir_store_global(&b, v, addr, .write_mask = 1, .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_shrink_memory_loads(b.shader, true));
+   nir_validate_shader(b.shader, "after leading and trailing trim");
+
+   nir_intrinsic_instr *load =
+      find_intrinsic(b.shader, nir_intrinsic_load_agx);
+   ASSERT_NE(load, nullptr);
+   EXPECT_EQ(load->def.num_components, 2);
+   EXPECT_EQ(nir_intrinsic_base(load),
+             2u | (20u << AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT));
+}
+
+TEST_F(ShrinkMemoryLoadsTest, KeepsLeadingChannelsOfSharedAddressLoads)
+{
+   nir_builder b = make_cs("keep_shared_leading");
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *idx = nir_load_local_invocation_index(&b);
+
+   /* Two loads of one address: one reads .z, the other .x and .w. */
+   nir_def *a = nir_load_agx(&b, 4, 32, addr, idx, .base = 2,
+                             .format = PIPE_FORMAT_R32_UINT);
+   nir_def *c = nir_load_agx(&b, 4, 32, addr, idx, .base = 2,
+                             .format = PIPE_FORMAT_R32_UINT);
+   nir_def *v = nir_iadd(&b, nir_channel(&b, a, 2),
+                         nir_iadd(&b, nir_channel(&b, c, 0),
+                                  nir_channel(&b, c, 3)));
+   nir_store_global(&b, v, addr, .write_mask = 1, .align_mul = 4);
+
+   agx_nir_shrink_memory_loads(b.shader, true);
+
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_agx)
+               EXPECT_EQ(nir_intrinsic_base(intr), 2u);
+         }
+      }
+   }
 }

@@ -665,6 +665,11 @@ typedef struct {
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
+   /* Tile stores a multisample reload background has left before it releases
+    * the colour class (agx_background_holds_colour); -1 once it is known not
+    * to hold it. */
+   int background_stores_left;
+
    /* G17P depth/stencil writes not yet emitted. Every sample's write shares
     * one class-1 transaction, released after the last. */
    unsigned zs_writes_left;
@@ -1121,14 +1126,16 @@ enum agx_cursor_option {
 /* The stages whose AGX3 samples take an explicit level the vertex way: the
  * packer's vertex_explicit_lod (agx3_pack_binary.c), which also lets an array
  * comparison keep an immediate level (agx_optimizer_inline_imm). A G17P mesh
- * program is VDM-launched like a vertex program. */
+ * program and M5 mesh/task programs are VDM-launched like vertex programs. */
 static inline bool
 agx3_vertex_explicit_lod_stage(mesa_shader_stage stage,
                                enum agx_isa_encoding enc)
 {
    return stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY ||
           stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL ||
-          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH);
+          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH) ||
+          (enc == AGX_ISA_ENCODING_AGX3C &&
+           (stage == MESA_SHADER_MESH || stage == MESA_SHADER_TASK));
 }
 
 typedef struct {
@@ -1503,7 +1510,7 @@ agx_validate_ra(UNUSED agx_context *ctx)
 #endif
 
 enum agx_size agx_split_width(const agx_instr *I);
-bool agx_allows_16bit_immediate(agx_instr *I);
+bool agx_allows_16bit_immediate(agx_instr *I, enum agx_isa_encoding enc);
 unsigned agx_negate_src_index(agx_instr *I);
 
 static inline bool
@@ -1679,6 +1686,7 @@ void agx_lower_agx3_half_converts(agx_context *ctx);
 void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
+void agx_lower_m5_alu_operands(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);
 
 struct agx_cycle_estimate {

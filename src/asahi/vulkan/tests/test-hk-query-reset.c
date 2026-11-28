@@ -50,6 +50,13 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
    abort();
 }
 
+void
+hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
 struct agx_ptr
 hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {

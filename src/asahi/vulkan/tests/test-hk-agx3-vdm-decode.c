@@ -32,7 +32,7 @@ static unsigned checks;
 static const enum agx_chip targets[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static bool
@@ -592,7 +592,8 @@ test_honeykrisp_bridge(void)
             (t & 1) ? UINT32_MAX : UINT32_C(8),
       };
       const bool hal300 = chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-                          chip == AGX_CHIP_G17C;
+                          chip == AGX_CHIP_G17C ||
+                          chip == AGX_CHIP_G17D;
       if (hal300) {
          template_info.pre_hal300_flag_group_nonzero = false;
          template_info.pre_hal300_flag_bit_4 = false;
@@ -766,7 +767,7 @@ test_rejection(void)
       CHECK(record_is_cleared(&record));
    }
 
-   for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17C; ++chip) {
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17D; ++chip) {
       bool supported = false;
       for (unsigned t = 0; t < sizeof(targets) / sizeof(targets[0]); ++t)
          supported |= chip == targets[t];
@@ -808,7 +809,7 @@ test_rejection(void)
       CHECK(record_is_cleared(&record));
    }
 
-   for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17C; ++chip) {
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17D; ++chip) {
       bool supported = false;
       for (unsigned t = 0; t < sizeof(targets) / sizeof(targets[0]); ++t)
          supported |= chip == targets[t];

@@ -135,6 +135,38 @@ check_mip_split(void)
    EXPECT(!hk_g17p_mip_level_through_pbe(256, 256),
           "512x512 level 1 should take compute");
    EXPECT(!hk_g17p_mip_level_through_pbe(1, 1), "1x1 should take compute");
+
+   /* Exact 2x2 compressed levels stay in compute via compressed block-mip on
+    * HAL200/AGX3B (G17P and G16G) at all sizes, while odd levels and AGX2
+    * keep the raw-compute render-pass crossover. */
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 1280, 720, 640, 360),
+          "G17P exact 2x2 640x360 should use compute block-mip");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 2560, 1440, 1280, 720),
+          "G17P exact 2x2 1280x720 should use compute block-mip");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 2048, 2048, 1024, 1024),
+          "G17P exact 2x2 1024x1024 should use compute block-mip");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 3840, 2160, 1920, 1080),
+          "G17P exact 2x2 1920x1080 should use compute block-mip");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 4096, 4096, 2048, 2048),
+          "G17P exact 2x2 2048x2048 should use compute block-mip");
+   EXPECT(hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 1281, 720, 640, 360),
+          "G17P odd 640x360 should keep render pass");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G17P, 961, 540, 480, 270),
+          "G17P odd 480x270 below crossover should use raw compute");
+
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G16G, 2048, 2048, 1024, 1024),
+          "G16G exact 2x2 1024x1024 should use compute block-mip");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G16G, 4096, 4096, 2048, 2048),
+          "G16G exact 2x2 2048x2048 should use compute block-mip");
+   EXPECT(hk_compressed_mip_level_through_pbe(AGX_CHIP_G16G, 2049, 2048, 1024, 1024),
+          "G16G odd 1024x1024 should keep render pass");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G16G, 2561, 1440, 1280, 720),
+          "G16G odd 1280x720 below classic crossover should use raw compute");
+
+   EXPECT(hk_compressed_mip_level_through_pbe(AGX_CHIP_G14G, 2048, 2048, 1024, 1024),
+          "AGX2 1024x1024 without block-mip should keep render pass");
+   EXPECT(!hk_compressed_mip_level_through_pbe(AGX_CHIP_G14G, 1280, 720, 640, 360),
+          "AGX2 640x360 below classic crossover should use raw compute");
 }
 
 /* A layer owns a complete metadata miptree, including 3D Z slots whose

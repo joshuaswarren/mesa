@@ -61,6 +61,15 @@ plain_use(const agx_instr *I)
    case AGX_OPCODE_PHI:
    case AGX_OPCODE_EXPORT:
       return false;
+   case AGX_OPCODE_IF_FCMP:
+   case AGX_OPCODE_IF_ICMP:
+   case AGX_OPCODE_ELSE_FCMP:
+   case AGX_OPCODE_ELSE_ICMP:
+   case AGX_OPCODE_WHILE_FCMP:
+   case AGX_OPCODE_WHILE_ICMP:
+   case AGX_OPCODE_BREAK_IF_FCMP:
+   case AGX_OPCODE_BREAK_IF_ICMP:
+      return true;
    default:
       return agx_opcodes_info[I->op].schedule_class == AGX_SCHEDULE_CLASS_NONE;
    }

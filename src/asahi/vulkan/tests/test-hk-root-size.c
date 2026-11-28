@@ -239,10 +239,23 @@ int main(void)
          ralloc_free(b.shader);
       }
 
-      /* Reject wg sizes outside <= 256 multiples of 32. */
+      /* Accept <= 1024 multiples of 32 (512/1024 qualify for small-grid split
+       * while coalescing itself still caps at <= 256), and reject non-multiples
+       * of 32 or > 1024 / 0. */
+      const uint16_t split_wgs[][3] = {
+         {320, 1, 1}, {512, 1, 1}, {1024, 1, 1},
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(split_wgs); ++i) {
+         b = builder();
+         b.shader->info.internal = false;
+         b.shader->info.workgroup_size[0] = split_wgs[i][0];
+         b.shader->info.workgroup_size[1] = split_wgs[i][1];
+         b.shader->info.workgroup_size[2] = split_wgs[i][2];
+         assert(hk_nir_can_coalesce_workgroup(b.shader));
+         ralloc_free(b.shader);
+      }
       const uint16_t bad_wgs[][3] = {
-         {16, 1, 1}, {48, 1, 1}, {80, 1, 1}, {320, 1, 1}, {512, 1, 1},
-         {1024, 1, 1}, {0, 1, 1},
+         {16, 1, 1}, {48, 1, 1}, {80, 1, 1}, {1056, 1, 1}, {0, 1, 1},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(bad_wgs); ++i) {
          b = builder();
@@ -272,10 +285,24 @@ int main(void)
          ralloc_free(b.shader);
       }
 
-      /* Reject barrier, local_id, wg_id, num_wg, ballot, inverse_ballot,
+      /* Accept load_num_workgroups (API group_count_addr on direct dispatches)
+       * and load_workgroup_size (constant-folded API local size). */
+      {
+         b = builder();
+         b.shader->info.internal = false;
+         b.shader->info.workgroup_size[0] = 64;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+         nir_load_num_workgroups(&b);
+         nir_load_workgroup_size(&b);
+         assert(hk_nir_can_coalesce_workgroup(b.shader));
+         ralloc_free(b.shader);
+      }
+
+      /* Reject barrier, local_id, wg_id, ballot, inverse_ballot,
        * shuffle_up_intel, read_invocation, elect, shared, scs_thread_index_agx,
        * enter_query_agx. */
-      for (unsigned mode = 0; mode < 12; ++mode) {
+      for (unsigned mode = 0; mode < 11; ++mode) {
          b = builder();
          b.shader->info.internal = false;
          b.shader->info.workgroup_size[0] = 32;
@@ -288,21 +315,19 @@ int main(void)
          else if (mode == 2)
             nir_load_workgroup_id(&b);
          else if (mode == 3)
-            nir_load_num_workgroups(&b);
-         else if (mode == 4)
             nir_ballot(&b, 1, 32, nir_imm_true(&b));
-         else if (mode == 5)
+         else if (mode == 4)
             nir_inverse_ballot(&b, nir_imm_int(&b, 1));
-         else if (mode == 6)
+         else if (mode == 5)
             nir_shuffle_up_intel(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
                                  nir_imm_int(&b, 1));
-         else if (mode == 7)
+         else if (mode == 6)
             nir_read_invocation(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0));
-         else if (mode == 8)
+         else if (mode == 7)
             nir_elect(&b, 1);
-         else if (mode == 9)
+         else if (mode == 8)
             nir_load_shared(&b, 1, 32, nir_imm_int(&b, 0), .align_mul = 4);
-         else if (mode == 10)
+         else if (mode == 9)
             nir_load_scs_thread_index_agx(&b);
          else
             nir_enter_query_agx(&b, .base = 0);
@@ -346,10 +371,31 @@ int main(void)
       assert(!hk_coalesce_workgroup_size(wg32, gsmall, 1024, out) &&
              out[0] == 32 && out[1] == 1 && out[2] == 1);
 
-      /* Prime group count along all axes cannot divide by 2 -> unchanged. */
+      /* Large prime group counts coalesce via bounded partial-edge steps
+       * (<= 6.25% inactive edge lanes), while small prime grids whose edge
+       * padding would exceed 6.25% stay uncoalesced. */
       const uint32_t gprime[3] = {32 * 997, 991, 1};
-      assert(!hk_coalesce_workgroup_size(wg32, gprime, 1024, out) &&
+      assert(hk_coalesce_workgroup_size(wg32, gprime, 1024, out) &&
+             (uint64_t)out[0] * out[1] * out[2] == 256u && out[2] == 1);
+      const uint32_t gprime_small[3] = {32 * 13, 13, 1};
+      assert(!hk_coalesce_workgroup_size(wg32, gprime_small, 1024, out) &&
              out[0] == 32 && out[1] == 1 && out[2] == 1);
+
+      /* Real odd-tiled 2D grids (1512x984 at 8x8 -> 16x16, 760x496 at 8x8 ->
+       * 16x16 after Pass 1 takes Y to 16 and Pass 2 takes X to 16). */
+      const uint16_t wg8x8[3] = {8, 8, 1};
+      const uint32_t g_odd_2d[3] = {1512, 984, 1};
+      assert(hk_coalesce_workgroup_size(wg8x8, g_odd_2d, 1024, out) &&
+             out[0] == 16 && out[1] == 16 && out[2] == 1);
+      const uint32_t g_half_odd[3] = {760, 496, 1};
+      assert(hk_coalesce_workgroup_size(wg8x8, g_half_odd, 1024, out) &&
+             out[0] == 16 && out[1] == 16 && out[2] == 1);
+      /* Asymmetric odd grid: X has only 13 groups (doubling wastes 1/13 = 7.7%
+       * > 6.25%), while Y has 301 groups (doubling to 8 wastes 3/301 = 1.0% <=
+       * 6.25% with 13 * 38 = 494 >= 256 WGs) -> coalesces along Y only. */
+      const uint32_t g_asym_odd[3] = {32 * 13, 301, 1};
+      assert(hk_coalesce_workgroup_size(wg32, g_asym_odd, 1024, out) &&
+             out[0] == 32 && out[1] == 8 && out[2] == 1);
 
       /* max_wg_threads cap (128) respected. */
       assert(hk_coalesce_workgroup_size(wg32, g118m, 128, out) &&
@@ -449,6 +495,36 @@ int main(void)
                                             out));
       assert(!hk_coalesce_workgroup_size_ex(wg32, g118m, axis_bad, 1024, 256,
                                             256, out));
+
+      /* Small-grid workgroup splitting for wide multi-core GPUs (e.g. 40 cores,
+       * min_workgroups = 80). */
+      const uint32_t g4096[3] = {4096, 1, 1};
+      const uint32_t g4032[3] = {4032, 1, 1};
+      const uint16_t wg512[3] = {512, 1, 1};
+      const uint16_t wg1024[3] = {1024, 1, 1};
+      assert(hk_split_workgroup_size_ex(wg128, g4096, 80, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      assert(hk_split_workgroup_size_ex(wg256, g4096, 80, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      assert(hk_split_workgroup_size_ex(wg512, g4096, 80, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      assert(hk_split_workgroup_size_ex(wg1024, g4096, 80, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      assert(hk_split_workgroup_size_ex(wg64, g4032, 80, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      const uint32_t g6400[3] = {6400, 1, 1};
+      assert(!hk_split_workgroup_size_ex(wg64, g6400, 80, out) &&
+             out[0] == 64 && out[1] == 1 && out[2] == 1);
+      assert(!hk_split_workgroup_size_ex(wg32, g4096, 200, out) &&
+             out[0] == 32 && out[1] == 1 && out[2] == 1);
+      const uint16_t wg32x4[3] = {32, 4, 1};
+      const uint32_t g2d_small[3] = {320, 20, 1}; /* 50 WGs < 80 -> 100 WGs */
+      assert(hk_split_workgroup_size_ex(wg32x4, g2d_small, 80, out) &&
+             out[0] == 32 && out[1] == 2 && out[2] == 1);
+      const uint16_t wg32x3[3] = {32, 3, 1};
+      const uint32_t g2d_odd[3] = {320, 15, 1};
+      assert(!hk_split_workgroup_size_ex(wg32x3, g2d_odd, 80, out) &&
+             out[0] == 32 && out[1] == 3 && out[2] == 1);
 
       /* Capability table: enabled on G17P and M5 (G17G, G17S, G17C); other
        * parts stay off until per-generation same-machine A/B + CTS rows

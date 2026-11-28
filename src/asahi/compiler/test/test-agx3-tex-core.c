@@ -1358,6 +1358,51 @@ test_copy_witnesses(void)
    return 0;
 }
 
+/* AGX3B's 14-byte immediate-descriptor SMP names coordinate banks 0..60. A
+ * relocated sample beyond that (the ninth tap of a 3x3 PCF kernel on a
+ * shadow array lands on bank 64) takes the 20-byte form, which names the
+ * bank and keeps every other field of the short form. */
+static int
+test_sample_upper_coordinate_banks(void)
+{
+   for (unsigned variant = 0; variant < 4; ++variant) {
+      const bool shadow = variant & 1, array = variant & 2;
+      struct agx3_tex_sample_desc d = {
+         .dest = 0, .coord = 60, .width = AGX3_TEX_W32,
+         .mask = shadow ? 1 : 15, .lod = AGX3_TEX_LOD_AUTO, .slot = 1,
+         .wait_mask = 1u << 5, .final = true, .sample_group_end = true,
+         .shadow = shadow, .array = array, .array_layer = array ? 44 : 0,
+         .sampler = 1, .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
+      };
+      uint8_t short_form[AGX3_TEX_MAX_LENGTH], long_form[AGX3_TEX_MAX_LENGTH];
+      uint8_t short_len = 0, long_len = 0;
+      uint64_t short_fields[AGX3_MAX_FIELDS], long_fields[AGX3_MAX_FIELDS];
+      CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &d, short_form,
+                                   &short_len));
+      CHECK(short_len == 14);
+      CHECK(agx3_decode(&agx3b_table, short_form, short_len, AGX3_MN_smp,
+                        short_fields) >= 0);
+      CHECK(short_fields[19] == 60);
+
+      for (unsigned coord = 64; coord <= 252; coord += 4) {
+         d.coord = coord;
+         CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &d, long_form,
+                                      &long_len));
+         CHECK(long_len == 20);
+         CHECK(agx3_decode(&agx3b_table, long_form, long_len, AGX3_MN_smp,
+                           long_fields) >= 0);
+         CHECK(long_fields[19] == coord);
+         /* Destination, slot, mask, dimension, layer, comparison, sampler
+          * and wait fields are unchanged by the longer form. */
+         static const unsigned same[] = {2, 10, 12, 26, 31, 62 + 5, 75, 76,
+                                         77, 123, 143, 147};
+         for (unsigned i = 0; i < sizeof(same) / sizeof(same[0]); ++i)
+            CHECK(long_fields[same[i]] == short_fields[same[i]]);
+      }
+   }
+   return 0;
+}
+
 static int
 test_sample_fail_closed(void)
 {
@@ -2224,6 +2269,59 @@ test_fetch_lod(void)
    CHECK(!agx3_tex_stage_typed_lod(AGX_ISA_ENCODING_AGX3B, 4, 2, 0, false,
                                    true, (enum agx3_tex_level_kind)4, b,
                                    &len));
+
+   /* Relocatable 8-half banks 0..248 on AGX3B carry bank + 6 in f5 for both
+    * scalar typed LOD and combined array layer + LOD staging. */
+   uint64_t f0[AGX3_MAX_FIELDS], fb[AGX3_MAX_FIELDS];
+   CHECK(agx3_decode(&agx3b_table, float_level, sizeof(float_level),
+                     AGX3_MN_pack_smpir, f0) >= 0);
+   CHECK(f0[5] == 6);
+   static const uint16_t banks[] = {0, 8, 16, 64, 248};
+   for (unsigned i = 0; i < sizeof(banks) / sizeof(banks[0]); ++i) {
+      CHECK(agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, banks[i], 6, 1,
+                                        0, false, true, AGX3_TEX_LEVEL_FLOAT,
+                                        b, &len));
+      CHECK(len == 12 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_pack_smpir, fb) >= 0);
+      CHECK(fb[5] == banks[i] + 6);
+      fb[5] = f0[5];
+      CHECK(memcmp(fb, f0, sizeof(f0)) == 0);
+
+      CHECK(agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, banks[i], 8, 9,
+                                        1, 0, false, true, false, true, b,
+                                        &len));
+      CHECK(len == 12 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_pack_smpir, fb) >= 0);
+      CHECK(fb[5] == banks[i] + 6);
+   }
+   CHECK(!agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, 4, 6, 1, 0, false,
+                                      true, AGX3_TEX_LEVEL_FLOAT, b, &len));
+   CHECK(!agx3_tex_stage_typed_lod_at(AGX_ISA_ENCODING_AGX3B, 256, 6, 1, 0,
+                                      false, true, AGX3_TEX_LEVEL_FLOAT, b,
+                                      &len));
+   CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, 4, 8, 9, 1, 0,
+                                      false, true, false, true, b, &len));
+   CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3B, 256, 8, 9, 1, 0,
+                                      false, true, false, true, b, &len));
+
+   /* Long ep4 escalation for register-LOD / register-bias samples past bank 60. */
+   for (unsigned m = 0; m < 2; ++m) {
+      struct agx3_tex_sample_desc sd = {
+         .dest = 8,
+         .coord = 64,
+         .width = AGX3_TEX_W32,
+         .mask = 15,
+         .lod = m ? AGX3_TEX_LOD_BIAS_REGISTER : AGX3_TEX_LOD_REGISTER,
+         .slot = 1,
+         .wait_mask = 1,
+         .final = true,
+         .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
+      };
+      CHECK(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &sd, b, &len));
+      CHECK(len == 20 &&
+            agx3_decode(&agx3b_table, b, len, AGX3_MN_smp, fb) >= 0);
+      CHECK(fb[19] == 64);
+   }
    return 0;
 }
 
@@ -4573,7 +4671,8 @@ main(void)
        test_staging_source_lifetime() || test_exact_witnesses() ||
        test_supported_axes() || test_fail_closed() ||
        test_sample_witnesses() || test_copy_witnesses() ||
-       test_sample_fail_closed() || test_array_fetch() || test_3d_fetch() ||
+       test_sample_fail_closed() || test_sample_upper_coordinate_banks() ||
+       test_array_fetch() || test_3d_fetch() ||
        test_bindless_operand_kinds() || test_indexed_sample_witnesses() ||
        test_sample_mask_domain() || test_indexed_fetch_native() ||
        test_gradient_and_register_bias() ||

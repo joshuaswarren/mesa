@@ -6,6 +6,7 @@
 #pragma once
 
 #include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "vulkan/vulkan_core.h"
 
 #include <stdbool.h>
@@ -266,6 +267,33 @@ hk_mip_level_through_pbe(enum agx_chip chip, uint32_t width, uint32_t height)
          ? HK_CLASSIC_MIP_PBE_MIN_TEXELS
          : HK_G17P_MIP_PBE_MIN_TEXELS;
    return (uint64_t)width * height >= min_texels;
+}
+
+/* Whether the chip supports generating exact 2x2 compressed mip levels in
+ * compute via an imageblock store and compressed PBE block store. */
+static inline bool
+hk_g17p_block_mip_supported(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) &&
+          agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
+}
+
+/* Whether a compressed mip blit level should fall back to a render pass
+ * instead of compute. Exact 2x2 levels on chips with compressed block-mip
+ * store compressed tiles directly through the PBE in compute, avoiding
+ * render-pass overhead and render/compute queue handoffs at all sizes;
+ * odd levels and chips without block-mip fall back to a render pass at
+ * the raw-compute crossover so large levels stay compressed. */
+static inline bool
+hk_compressed_mip_level_through_pbe(enum agx_chip chip, uint32_t src_width,
+                                    uint32_t src_height, uint32_t width,
+                                    uint32_t height)
+{
+   if (hk_g17p_block_mip_supported(chip) &&
+       src_width == (uint64_t)width * 2 &&
+       src_height == (uint64_t)height * 2)
+      return false;
+   return hk_mip_level_through_pbe(chip, width, height);
 }
 
 /* The 16x16 metadata tiles of one compressed level, as libagx_fast_clear

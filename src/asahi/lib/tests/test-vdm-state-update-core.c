@@ -22,7 +22,7 @@ static unsigned checks;
 static const enum agx_chip supported_chips[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static const enum agx_chip unsupported_chips[] = {
@@ -139,6 +139,7 @@ check_template_witnesses(void)
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
+      AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0;
@@ -388,7 +389,8 @@ check_native_draw_template_producer(void)
         ++target) {
       const enum agx_chip chip = supported_chips[target];
       const bool hal300 = chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-                          chip == AGX_CHIP_G17C;
+                          chip == AGX_CHIP_G17C ||
+                          chip == AGX_CHIP_G17D;
       struct agx_vdm_state_update first_path[6];
 
       for (unsigned selector = 0; selector < 6; ++selector) {

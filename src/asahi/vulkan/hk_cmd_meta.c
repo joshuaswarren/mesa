@@ -267,6 +267,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_active &= ~BITFIELD_BIT(0);
    }
    desc->non_push_generation++;
+   desc->non_dynbuf_generation++;
 
    /* Nested meta operations end in the reverse order they begin, so this
     * save is the last one stacked. */
@@ -372,6 +373,7 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_G17P_BLOCK_MIP,
    HK_META_OBJECT_KEY_AGX3_GEN10_MIP,
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
+   HK_META_OBJECT_KEY_G17P_BUFFER_COPY_PBE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
    HK_META_OBJECT_KEY_AGX3_COMPRESSED_BUF2IMG,
    HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
@@ -2268,15 +2270,20 @@ hk_compressed_mip_blit_supported(const struct hk_device *dev,
                                                  info->filter, true))
          return false;
 
-      /* Marking a level's tiles uncompressed needs all of its texels, and
-       * large compressed levels are cheaper stored compressed by a pass */
+      /* Marking a level's tiles uncompressed or writing whole compressed
+       * 32x32 tiles needs all of its texels. Large compressed levels that
+       * cannot take the compressed compute block-mip path fall back to a
+       * render pass so they stay compressed. */
       const uint32_t level = region->dstSubresource.mipLevel;
       const uint32_t width = u_minify(dst->vk.extent.width, level);
       const uint32_t height = u_minify(dst->vk.extent.height, level);
+      const uint32_t src_width = (uint32_t)region->srcOffsets[1].x;
+      const uint32_t src_height = (uint32_t)region->srcOffsets[1].y;
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_mip_level_through_pbe(chip, width, height)))
+           hk_compressed_mip_level_through_pbe(chip, src_width, src_height,
+                                               width, height)))
          return false;
    }
    return true;
@@ -2668,14 +2675,6 @@ struct hk_g17p_block_mip_key {
    enum hk_meta_object_key_type key_type;
 };
 
-static bool
-hk_g17p_block_mip_supported(const struct hk_device *dev)
-{
-   const enum agx_chip chip = dev->dev.chip;
-   return agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) &&
-          agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
-}
-
 static nir_shader *
 build_g17p_block_mip_shader(void)
 {
@@ -2928,7 +2927,7 @@ hk_compressed_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       /* An exact 2x level that stays compressed takes the compressed PBE,
        * where the PBE compresses it; the raw writes below leave it
        * uncompressed. */
-      if (exact_2x2 && metadata && hk_g17p_block_mip_supported(dev)) {
+      if (exact_2x2 && metadata && hk_g17p_block_mip_supported(dev->dev.chip)) {
          hk_g17p_block_mip_region(cmd, src, dst, info, region);
          continue;
       }
@@ -4121,6 +4120,228 @@ hk_copy_batch_add(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch,
    batch->groups += groups;
 }
 
+static bool
+hk_g17p_buffer_pbe_supported(const struct hk_device *dev,
+                             const struct hk_buffer *buffer,
+                             uint64_t address, uint64_t offset,
+                             uint64_t size, uint64_t min_size,
+                             struct hk_native_pbe_descriptor *pbe)
+{
+   const struct hk_physical_device *pdev =
+      (const struct hk_physical_device *)dev->vk.physical;
+   if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
+       size < min_size || ((address | offset | size) & 15) ||
+       !address || size > UINT64_MAX - address ||
+       size / 16 > pdev->vk.properties.maxTexelBufferElements)
+      return false;
+
+   /* Match CreateBufferView's ordinary RGBA32_UINT linear PBE. Let the
+    * existing codec prove address, stride and dimension representability. */
+   struct AGX_PBE semantic = {
+      AGX_PBE_header,
+      .dimension = AGX_TEXTURE_DIMENSION_2D,
+      .layout = AGX_LAYOUT_LINEAR,
+      .channels = AGX_CHANNELS_R32G32B32A32,
+      .type = AGX_TEXTURE_TYPE_UINT,
+      .swizzle_r = 0, .swizzle_g = 1, .swizzle_b = 2, .swizzle_a = 3,
+      .buffer = address,
+      .width = AGX_TEXTURE_BUFFER_WIDTH,
+      .height = DIV_ROUND_UP(size / 16, AGX_TEXTURE_BUFFER_WIDTH),
+      .stride = AGX_TEXTURE_BUFFER_WIDTH * 16 - 4,
+      .layers = 1,
+      .levels = 1,
+   };
+   const unsigned generation = agx_chip_descriptor_generation(dev->dev.chip);
+   if (!hk_pack_native_pbe(generation, pbe, &semantic))
+      return false;
+
+   /* The last stored texel must stay in the codec's supported address domain
+    * too; size and address were already checked for alignment and overflow. */
+   semantic.buffer = address + size - 16;
+   struct hk_native_pbe_descriptor last;
+   return hk_pack_native_pbe(generation, &last, &semantic);
+}
+
+/* Separate minimum transfer sizes for AGX3/M5 PBE buffer policies.
+ *
+ * Fill is write-only and wins once the destination fills most of SLC
+ * (>= 32 MiB) on G17P and M5. Copy touches both source and destination
+ * (2 * size) and is gated by AGX_CAP_PBE_QUEUED_BUFFER_COPY: >= 32 MiB
+ * (64 MiB combined) strictly exceeds SLC and wins on chips whose queued PBE
+ * buffer copies do not serialize (G17C: +11.5% at d=8, parity at d=1/4,
+ * avoiding the 24-28 MiB SLC-edge regression), while G17P stays on the
+ * batched compute copy path (-2.27% / -7.14% at d=4/8) and other M5 SKUs
+ * stay off until measured on hardware. */
+#define HK_G17P_FILL_PBE_MIN_SIZE (32u << 20)
+#define HK_G17P_COPY_PBE_MIN_SIZE (32u << 20)
+
+/* Large buffer-to-buffer copies whose combined source+destination working set
+ * exceeds SLC benefit from writing the destination through a linear
+ * RGBA32_UINT PBE storage texel buffer: PBE stores bypass L2 write-allocate
+ * / RFO traffic, leaving more cache capacity for source reads and overlapping
+ * copies. */
+static void
+hk_g17p_copy_buffer_pbe(struct hk_cmd_buffer *cmd, uint64_t src_addr,
+                        VkBuffer dst_buffer, uint64_t dst_addr,
+                        VkDeviceSize dst_offset, VkDeviceSize size,
+                        const struct hk_native_pbe_descriptor *expected)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const uint32_t key = HK_META_OBJECT_KEY_G17P_BUFFER_COPY_PBE;
+   const VkDescriptorSetLayoutBinding binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+   };
+   const VkDescriptorSetLayoutCreateInfo desc_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      .bindingCount = 1,
+      .pBindings = &binding,
+   };
+   const struct {
+      uint64_t src_addr;
+      uint32_t elements;
+      uint32_t pad;
+   } push = {src_addr, size / 16, 0};
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(push),
+   };
+   VkPipelineLayout layout;
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, &desc_info, &push_range,
+      &key, sizeof(key), &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+
+   VkPipeline pipeline = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+   if (pipeline == VK_NULL_HANDLE) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, NULL, "hk-meta-copy-buffer-pbe");
+      b.shader->info.workgroup_size[0] = 256;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      nir_variable *image = nir_variable_create(
+         b.shader, nir_var_image,
+         glsl_image_type(GLSL_SAMPLER_DIM_BUF, false, GLSL_TYPE_UINT), "dest");
+      image->data.descriptor_set = 0;
+      image->data.binding = 0;
+      image->data.image.format = PIPE_FORMAT_R32G32B32A32_UINT;
+      image->data.access = ACCESS_NON_READABLE;
+      nir_def *index = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *src = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0));
+      nir_def *elements = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+      nir_push_if(&b, nir_ult(&b, index, elements));
+      nir_def *addr = nir_iadd(&b, src, nir_ishl_imm(&b, nir_u2u64(&b, index), 4));
+      nir_def *val =
+         nir_load_global(&b, 4, 32, addr, .align_mul = 16, .align_offset = 0);
+      nir_image_deref_store(
+         &b, &nir_build_deref_var(&b, image)->def, nir_pad_vec4(&b, index),
+         nir_imm_int(&b, 0), val, nir_imm_int(&b, 0),
+         .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
+         .format = PIPE_FORMAT_R32G32B32A32_UINT, .src_type = nir_type_uint32);
+      nir_pop_if(&b, NULL);
+
+      const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+         .nir = b.shader,
+      };
+      const VkComputePipelineCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = &nir_info,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pName = "main",
+         },
+         .layout = layout,
+      };
+      result = vk_meta_create_compute_pipeline(
+         &dev->vk, &dev->meta, &info, &key, sizeof(key), &pipeline);
+      ralloc_free(b.shader);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+   }
+
+   const VkBufferViewCreateInfo view_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+      .buffer = dst_buffer,
+      .format = VK_FORMAT_R32G32B32A32_UINT,
+      .offset = dst_offset,
+      .range = size,
+   };
+   VkBufferView view;
+   result = vk_meta_create_buffer_view(&cmd->vk, &dev->meta, &view_info, &view);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+
+   VK_FROM_HANDLE(hk_buffer_view, native_view, view);
+   if (memcmp(&native_view->pbe, expected, sizeof(*expected)) != 0) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      return;
+   }
+
+   const VkWriteDescriptorSet write = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstBinding = 0,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+      .pTexelBufferView = &view,
+   };
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer cb = vk_command_buffer_to_handle(&cmd->vk);
+   disp->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   disp->CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                 layout, 0, 1, &write);
+   disp->CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                          0, sizeof(push), &push);
+   disp->CmdDispatch(cb, DIV_ROUND_UP(push.elements, 256), 1, 1);
+
+   if (cmd->current_cs.cs) {
+      hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                dst_addr, size);
+   }
+}
+
+static void
+hk_xfer_copybuffer2_range(struct hk_cmd_buffer *cmd,
+                          struct hk_copy_batch *batch,
+                          struct hk_buffer *src_buffer,
+                          struct hk_buffer *dst_buffer,
+                          VkBuffer dst_handle,
+                          uint64_t src, uint64_t dst,
+                          VkDeviceSize dst_offset, VkDeviceSize size)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (src_buffer->sparse_map) {
+      hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst, size);
+      return;
+   }
+
+   struct hk_native_pbe_descriptor pbe;
+   if (agx_chip_has_cap(dev->dev.chip, AGX_CAP_PBE_QUEUED_BUFFER_COPY) &&
+       src && (src & 15) == 0 && size <= UINT64_MAX - src &&
+       hk_g17p_buffer_pbe_supported(dev, dst_buffer, dst, dst_offset,
+                                    size, HK_G17P_COPY_PBE_MIN_SIZE, &pbe) &&
+       (dst + size <= src || src + size <= dst)) {
+      hk_copy_batch_flush(cmd, batch);
+      hk_g17p_copy_buffer_pbe(cmd, src, dst_handle, dst, dst_offset, size,
+                              &pbe);
+      return;
+   }
+
+   hk_copy_batch_add(cmd, batch, src, dst, size);
+}
+
 static void
 hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
@@ -4128,13 +4349,14 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    if (agx_chip_native_or_m5(dev->dev.chip)) {
+      VK_FROM_HANDLE(hk_buffer, src_buffer, info->srcBuffer);
+      VK_FROM_HANDLE(hk_buffer, dst_buffer, info->dstBuffer);
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_copy_batch batch = {0};
       /* Retain the aligned 16-byte bulk path even when the original
        * region has a scalar tail, as hk_cmd_copy does for libagx. */
       for (unsigned i = 0; i < info->regionCount; i++) {
-         VK_FROM_HANDLE(hk_buffer, src_buffer, info->srcBuffer);
          VkBufferCopy2 region = info->pRegions[i];
          uint64_t src = hk_buffer_address_rw(src_buffer, region.srcOffset);
          uint64_t dst = vk_meta_buffer_address(
@@ -4143,19 +4365,17 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
              (region.size & 15) != 0) {
             const VkDeviceSize tail = region.size & 15;
             region.size -= tail;
-            if (src_buffer->sparse_map)
-               hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst,
-                                          region.size);
-            else
-               hk_copy_batch_add(cmd, &batch, src, dst, region.size);
+            hk_xfer_copybuffer2_range(cmd, &batch, src_buffer, dst_buffer,
+                                      info->dstBuffer, src, dst,
+                                      region.dstOffset, region.size);
             src += region.size;
             dst += region.size;
+            region.dstOffset += region.size;
             region.size = tail;
          }
-         if (src_buffer->sparse_map)
-            hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst, region.size);
-         else
-            hk_copy_batch_add(cmd, &batch, src, dst, region.size);
+         hk_xfer_copybuffer2_range(cmd, &batch, src_buffer, dst_buffer,
+                                   info->dstBuffer, src, dst,
+                                   region.dstOffset, region.size);
       }
       hk_copy_batch_flush(cmd, &batch);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -6274,6 +6494,316 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
 }
 
+static bool
+hk_ail_layouts_identical_gpu(const struct ail_layout *a,
+                             const struct ail_layout *b)
+{
+   if (a->tiling != AIL_TILING_GPU || b->tiling != AIL_TILING_GPU ||
+       a->compressed != b->compressed || a->format != b->format ||
+       a->width_px != b->width_px || a->height_px != b->height_px ||
+       a->depth_px != b->depth_px || a->sample_count_sa != b->sample_count_sa ||
+       a->levels != b->levels || a->size_B == 0 || a->size_B != b->size_B ||
+       a->layer_stride_B != b->layer_stride_B ||
+       a->metadata_offset_B != b->metadata_offset_B ||
+       a->compression_layer_stride_B != b->compression_layer_stride_B ||
+       a->page_aligned_layers != b->page_aligned_layers)
+      return false;
+
+   for (unsigned l = 0; l < a->levels; ++l) {
+      if (a->level_offsets_B[l] != b->level_offsets_B[l] ||
+          a->stride_el[l] != b->stride_el[l] ||
+          a->tilesize_el[l].width_el != b->tilesize_el[l].width_el ||
+          a->tilesize_el[l].height_el != b->tilesize_el[l].height_el)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * Fast 128-bit raw compute copy for identical GPU-tiled images (AGX3 / M5).
+ *
+ * When source and destination have byte-identical AIL layouts (including
+ * compressed color targets, compressed/uncompressed D32S8 depth+stencil, and
+ * uncompressed MSAA images) and the copy covers whole planes or whole
+ * single-mip layers, copy the tiled body (and compression metadata) directly
+ * with 128-bit uvec4 compute loads/stores via hk_copy_batch — avoiding
+ * decompress+recompress or multi-pass graphics render passes.
+ */
+static bool
+hk_agx3_copy_identical_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
+                             struct hk_image *dst,
+                             const VkCopyImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_chip_native_or_m5(dev->dev.chip) || info->regionCount == 0 ||
+       src->vk.format != dst->vk.format ||
+       src->vk.image_type != dst->vk.image_type ||
+       src->vk.samples != dst->vk.samples ||
+       src->vk.mip_levels != dst->vk.mip_levels ||
+       src->vk.array_layers != dst->vk.array_layers ||
+       src->plane_count != dst->plane_count ||
+       src->vk.extent.width != dst->vk.extent.width ||
+       src->vk.extent.height != dst->vk.extent.height ||
+       src->vk.extent.depth != dst->vk.extent.depth ||
+       (src->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
+       (dst->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
+       !hk_g17p_transfer_src_layout_supported(info->srcImageLayout) ||
+       !hk_g17p_transfer_dst_layout_supported(info->dstImageLayout))
+      return false;
+
+   /* Graphics-stage PBE imageStore writes to compressed storage images stay in
+    * the PBE/compression coherency domain and race with out-of-band raw device
+    * loads. Compressed MSAA images also achieve high hardware compression
+    * ratios where copying the full uncompressed backing store transfers far
+    * more DRAM traffic than the compressed meta path. */
+   const VkImageUsageFlags all_usage =
+      src->vk.usage | dst->vk.usage |
+      src->vk.stencil_usage | dst->vk.stencil_usage;
+   const bool disallow_compressed =
+      (all_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0 ||
+      src->vk.samples > VK_SAMPLE_COUNT_1_BIT;
+
+   /* Single-mip whole-plane or whole-layer copies, or full multi-mip all-layer
+    * copies. Keep the staging span array small and stack-allocated. */
+   struct raw_span {
+      uint64_t src_addr;
+      uint64_t dst_addr;
+      uint64_t size;
+      uint8_t plane;
+   };
+   struct raw_span spans[32];
+   unsigned span_count = 0;
+
+   if (src->vk.mip_levels == 1) {
+      for (uint32_t r = 0; r < info->regionCount; ++r) {
+         const VkImageCopy2 *region = &info->pRegions[r];
+         if (region->srcSubresource.aspectMask !=
+                region->dstSubresource.aspectMask ||
+             region->srcSubresource.mipLevel != 0 ||
+             region->dstSubresource.mipLevel != 0 ||
+             region->srcOffset.x != 0 || region->srcOffset.y != 0 ||
+             region->srcOffset.z != 0 || region->dstOffset.x != 0 ||
+             region->dstOffset.y != 0 || region->dstOffset.z != 0 ||
+             region->extent.width != src->vk.extent.width ||
+             region->extent.height != src->vk.extent.height ||
+             region->extent.depth != src->vk.extent.depth)
+            return false;
+
+         const uint32_t src_layers = vk_image_subresource_layer_count(
+            &src->vk, &region->srcSubresource);
+         const uint32_t dst_layers = vk_image_subresource_layer_count(
+            &dst->vk, &region->dstSubresource);
+         if (src_layers == 0 || src_layers != dst_layers ||
+             region->srcSubresource.baseArrayLayer + src_layers >
+                src->vk.array_layers ||
+             region->dstSubresource.baseArrayLayer + dst_layers >
+                dst->vk.array_layers)
+            return false;
+
+         struct hk_g17p_copy_aspect_plan aspects;
+         if (!hk_g17p_copy_aspect_plan(region->srcSubresource.aspectMask,
+                                       region->dstSubresource.aspectMask,
+                                       &aspects))
+            return false;
+
+         const bool whole_plane =
+            region->srcSubresource.baseArrayLayer == 0 &&
+            region->dstSubresource.baseArrayLayer == 0 &&
+            src_layers == src->vk.array_layers;
+
+         for (unsigned a = 0; a < aspects.count; ++a) {
+            const uint8_t p = hk_image_aspects_to_plane(src, aspects.src[a]);
+            if (p >= src->plane_count ||
+                p != hk_image_aspects_to_plane(dst, aspects.dst[a]))
+               return false;
+
+            const struct ail_layout *sl = &src->planes[p].layout;
+            const struct ail_layout *dl = &dst->planes[p].layout;
+            if (!hk_ail_layouts_identical_gpu(sl, dl))
+               return false;
+            if (sl->compressed && disallow_compressed)
+               return false;
+
+            const uint64_t src_base = hk_image_base_address(src, p);
+            const uint64_t dst_base = hk_image_base_address(dst, p);
+            if (!src_base || !dst_base)
+               return false;
+
+            if (whole_plane) {
+               if (span_count >= ARRAY_SIZE(spans))
+                  return false;
+               spans[span_count++] = (struct raw_span){
+                  .src_addr = src_base,
+                  .dst_addr = dst_base,
+                  .size = sl->size_B,
+                  .plane = p,
+               };
+            } else {
+               if (src->vk.image_type != VK_IMAGE_TYPE_2D ||
+                   !sl->layer_stride_B)
+                  return false;
+               const uint64_t body_size =
+                  (uint64_t)src_layers * sl->layer_stride_B;
+               const uint64_t src_body =
+                  src_base + (uint64_t)region->srcSubresource.baseArrayLayer *
+                                sl->layer_stride_B;
+               const uint64_t dst_body =
+                  dst_base + (uint64_t)region->dstSubresource.baseArrayLayer *
+                                sl->layer_stride_B;
+               if (span_count + (sl->compressed ? 2u : 1u) > ARRAY_SIZE(spans))
+                  return false;
+               spans[span_count++] = (struct raw_span){
+                  .src_addr = src_body,
+                  .dst_addr = dst_body,
+                  .size = body_size,
+                  .plane = p,
+               };
+               if (sl->compressed) {
+                  if (!sl->compression_layer_stride_B)
+                     return false;
+                  const uint64_t meta_size =
+                     (uint64_t)src_layers * sl->compression_layer_stride_B;
+                  const uint64_t src_meta =
+                     src_base + sl->metadata_offset_B +
+                     (uint64_t)region->srcSubresource.baseArrayLayer *
+                        sl->compression_layer_stride_B;
+                  const uint64_t dst_meta =
+                     dst_base + sl->metadata_offset_B +
+                     (uint64_t)region->dstSubresource.baseArrayLayer *
+                        sl->compression_layer_stride_B;
+                  spans[span_count++] = (struct raw_span){
+                     .src_addr = src_meta,
+                     .dst_addr = dst_meta,
+                     .size = meta_size,
+                     .plane = p,
+                  };
+               }
+            }
+         }
+      }
+   } else {
+      if (src->vk.mip_levels > 31)
+         return false;
+      uint32_t mip_mask[3] = {0};
+      for (uint32_t r = 0; r < info->regionCount; ++r) {
+         const VkImageCopy2 *region = &info->pRegions[r];
+         const uint32_t level = region->srcSubresource.mipLevel;
+         if (region->srcSubresource.aspectMask !=
+                region->dstSubresource.aspectMask ||
+             level != region->dstSubresource.mipLevel ||
+             level >= src->vk.mip_levels ||
+             region->srcSubresource.baseArrayLayer != 0 ||
+             region->dstSubresource.baseArrayLayer != 0 ||
+             region->srcOffset.x != 0 || region->srcOffset.y != 0 ||
+             region->srcOffset.z != 0 || region->dstOffset.x != 0 ||
+             region->dstOffset.y != 0 || region->dstOffset.z != 0)
+            return false;
+
+         const VkExtent3D mip_ext = vk_image_mip_level_extent(&src->vk, level);
+         if (region->extent.width != mip_ext.width ||
+             region->extent.height != mip_ext.height ||
+             region->extent.depth != mip_ext.depth)
+            return false;
+
+         const uint32_t src_layers = vk_image_subresource_layer_count(
+            &src->vk, &region->srcSubresource);
+         const uint32_t dst_layers = vk_image_subresource_layer_count(
+            &dst->vk, &region->dstSubresource);
+         if (src_layers != src->vk.array_layers ||
+             dst_layers != dst->vk.array_layers)
+            return false;
+
+         struct hk_g17p_copy_aspect_plan aspects;
+         if (!hk_g17p_copy_aspect_plan(region->srcSubresource.aspectMask,
+                                       region->dstSubresource.aspectMask,
+                                       &aspects))
+            return false;
+
+         for (unsigned a = 0; a < aspects.count; ++a) {
+            const uint8_t p = hk_image_aspects_to_plane(src, aspects.src[a]);
+            if (p >= src->plane_count || p >= ARRAY_SIZE(mip_mask) ||
+                p != hk_image_aspects_to_plane(dst, aspects.dst[a]))
+               return false;
+            mip_mask[p] |= BITFIELD_BIT(level);
+         }
+      }
+
+      const uint32_t full_mask = BITFIELD_MASK(src->vk.mip_levels);
+      for (unsigned p = 0; p < src->plane_count; ++p) {
+         if (!mip_mask[p])
+            continue;
+         if (mip_mask[p] != full_mask)
+            return false;
+         const struct ail_layout *sl = &src->planes[p].layout;
+         const struct ail_layout *dl = &dst->planes[p].layout;
+         if (!hk_ail_layouts_identical_gpu(sl, dl))
+            return false;
+         if (sl->compressed && disallow_compressed)
+            return false;
+         const uint64_t src_base = hk_image_base_address(src, p);
+         const uint64_t dst_base = hk_image_base_address(dst, p);
+         if (!src_base || !dst_base || span_count >= ARRAY_SIZE(spans))
+            return false;
+         spans[span_count++] = (struct raw_span){
+            .src_addr = src_base,
+            .dst_addr = dst_base,
+            .size = sl->size_B,
+            .plane = p,
+         };
+      }
+   }
+
+   if (span_count == 0)
+      return false;
+
+   /* Reject any partial VA overlap between sources and destinations. */
+   for (unsigned i = 0; i < span_count; ++i) {
+      for (unsigned j = 0; j < span_count; ++j) {
+         if (spans[i].src_addr == spans[j].dst_addr &&
+             spans[i].size == spans[j].size && i == j)
+            continue;
+         if (spans[i].src_addr < spans[j].dst_addr + spans[j].size &&
+             spans[j].dst_addr < spans[i].src_addr + spans[i].size)
+            return false;
+      }
+   }
+
+   struct hk_meta_save save;
+   hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   struct hk_copy_batch batch = {0};
+   uint8_t touched_planes = 0;
+   for (unsigned i = 0; i < span_count; ++i) {
+      if (spans[i].src_addr == spans[i].dst_addr)
+         continue;
+      /* Large full-plane spans (e.g. D32 16 MiB + S8 4 MiB) saturate the GPU
+       * on their own; flushing them individually uses the single-region 128-bit
+       * copy kernel and avoids hk_copy_batch's max_groups * count wasted
+       * threads across mismatched plane sizes. */
+      if (spans[i].size >= (1u << 20)) {
+         hk_copy_batch_flush(cmd, &batch);
+         vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, spans[i].src_addr,
+                                       spans[i].dst_addr, spans[i].size);
+      } else {
+         hk_copy_batch_add(cmd, &batch, spans[i].src_addr, spans[i].dst_addr,
+                           spans[i].size);
+      }
+      touched_planes |= BITFIELD_BIT(spans[i].plane);
+   }
+   hk_copy_batch_flush(cmd, &batch);
+   if (cmd->current_cs.cs) {
+      u_foreach_bit(p, touched_planes) {
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(src, p),
+                                   src->planes[p].layout.size_B);
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   hk_image_base_address(dst, p),
+                                   dst->planes[p].layout.size_B);
+      }
+   }
+   hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   return true;
+}
+
 static void
 hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
@@ -6282,6 +6812,10 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, src_image, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(hk_image, dst_image, pCopyImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (hk_agx3_copy_identical_image(cmd, src_image, dst_image, pCopyImageInfo))
+      return;
+
    /* VkCmdCopyImage preserves the source bits; compatible source and
     * destination formats do not imply a format conversion.  The element
     * planner checks their block sizes, so prefer the raw tiled copier for
@@ -6521,48 +7055,6 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
    disp->CmdDispatch(cb, DIV_ROUND_UP(push.elements, 64), 1, 1);
 }
 
-static bool
-hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
-                                  const struct hk_buffer *buffer,
-                                  uint64_t address, uint64_t offset,
-                                  uint64_t size,
-                                  struct hk_native_pbe_descriptor *pbe)
-{
-   const struct hk_physical_device *pdev =
-      (const struct hk_physical_device *)dev->vk.physical;
-   if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
-       size < (64u << 20) || ((address | offset | size) & 15) ||
-       !address || size > UINT64_MAX - address ||
-       size / 16 > pdev->vk.properties.maxTexelBufferElements)
-      return false;
-
-   /* Match CreateBufferView's ordinary RGBA32_UINT linear PBE. Let the
-    * existing codec prove address, stride and dimension representability. */
-   struct AGX_PBE semantic = {
-      AGX_PBE_header,
-      .dimension = AGX_TEXTURE_DIMENSION_2D,
-      .layout = AGX_LAYOUT_LINEAR,
-      .channels = AGX_CHANNELS_R32G32B32A32,
-      .type = AGX_TEXTURE_TYPE_UINT,
-      .swizzle_r = 0, .swizzle_g = 1, .swizzle_b = 2, .swizzle_a = 3,
-      .buffer = address,
-      .width = AGX_TEXTURE_BUFFER_WIDTH,
-      .height = DIV_ROUND_UP(size / 16, AGX_TEXTURE_BUFFER_WIDTH),
-      .stride = AGX_TEXTURE_BUFFER_WIDTH * 16 - 4,
-      .layers = 1,
-      .levels = 1,
-   };
-   const unsigned generation = agx_chip_descriptor_generation(dev->dev.chip);
-   if (!hk_pack_native_pbe(generation, pbe, &semantic))
-      return false;
-
-   /* The last stored texel must stay in the codec's supported address domain
-    * too; size and address were already checked for alignment and overflow. */
-   semantic.buffer = address + size - 16;
-   struct hk_native_pbe_descriptor last;
-   return hk_pack_native_pbe(generation, &last, &semantic);
-}
-
 static void
 hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
                  VkDeviceSize dstOffset, VkDeviceSize dstRange, uint32_t data)
@@ -6580,8 +7072,8 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_native_pbe_descriptor pbe;
-      if (hk_g17p_fill_buffer_pbe_supported(dev, buffer, address, dstOffset,
-                                           size, &pbe))
+      if (hk_g17p_buffer_pbe_supported(dev, buffer, address, dstOffset,
+                                       size, HK_G17P_FILL_PBE_MIN_SIZE, &pbe))
          hk_g17p_fill_buffer_pbe(cmd, dstBuffer, dstOffset, size, data, &pbe);
       else
          vk_meta_fill_buffer_addr(&cmd->vk, &dev->meta, address, size, data);
@@ -6714,6 +7206,9 @@ hk_CmdResolveImage2(VkCommandBuffer commandBuffer,
                     const VkResolveImageInfo2 *pResolveImageInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (hk_try_fold_msaa_resolve(cmd, pResolveImageInfo))
+      return;
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */

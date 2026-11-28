@@ -749,6 +749,69 @@ check_vs(struct pipe_context *pctx)
    draw(pctx);
    CHECK(ctx->perf.vs_emits == 1 && ctx->perf.draws == 1);
    pctx->destroy_query(pctx, occlusion);
+
+   if (native_agx3) {
+      /* Verify HAL200 compute Ioto loader template caching for both
+       * precompiled clear_buffer dispatches and API compute dispatches. */
+      struct agx_device *dev = agx_device(pctx->screen);
+      const unsigned saved_debug = dev->debug;
+      struct pipe_resource *cbuf =
+         pipe_buffer_create(pctx->screen, PIPE_BIND_SHADER_BUFFER,
+                            PIPE_USAGE_DEFAULT, 4096u);
+      CHECK(cbuf);
+      const uint32_t fill_val[4] = {0x11223344u, 0x55667788u, 0x99aabbcdu,
+                                    0xdeadbeefu};
+      const unsigned precomp_before = ctx->g17p_precomp_templates_generated;
+      dev->debug |= AGX_DBG_VERIFY;
+      for (unsigned k = 0; k < 16; ++k) {
+         pctx->clear_buffer(pctx, cbuf, 0, 4096u, fill_val, sizeof(fill_val));
+         pctx->flush(pctx, NULL, 0);
+      }
+      CHECK(ctx->g17p_precomp_templates_generated > precomp_before &&
+            ctx->g17p_precomp_templates_generated <= precomp_before + 3);
+
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "cs-tpl");
+      cb.shader->info.workgroup_size[0] = 32;
+      cb.shader->info.workgroup_size[1] = 1;
+      cb.shader->info.workgroup_size[2] = 1;
+      cb.shader->info.num_ssbos = 1;
+      nir_def *gid = nir_channel(&cb, nir_load_global_invocation_id(&cb, 32), 0);
+      nir_store_ssbo(&cb, gid, nir_imm_int(&cb, 0),
+                     nir_ishl_imm(&cb, gid, 2), .write_mask = 0x1,
+                     .align_mul = 4);
+      struct pipe_compute_state cs_state = {
+         .ir_type = PIPE_SHADER_IR_NIR,
+         .prog = cb.shader,
+      };
+      void *cs_cso = pctx->create_compute_state(pctx, &cs_state);
+      CHECK(cs_cso);
+      pctx->bind_compute_state(pctx, cs_cso);
+      struct pipe_shader_buffer sb = {
+         .buffer = cbuf,
+         .buffer_offset = 0,
+         .buffer_size = 4096u,
+      };
+      pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, 0, 1, &sb, 0x1);
+      struct pipe_grid_info grid = {
+         .block = {32, 1, 1},
+         .grid = {4, 1, 1},
+      };
+      for (unsigned k = 0; k < 16; ++k) {
+         pctx->launch_grid(pctx, &grid);
+         pctx->flush(pctx, NULL, 0);
+      }
+      struct agx_uncompiled_shader *cs_so = cs_cso;
+      CHECK(cs_so->cached_cs[0] != NULL);
+      CHECK(cs_so->cached_cs[0]->g17p_compute_templates_generated >= 1 &&
+            cs_so->cached_cs[0]->g17p_compute_templates_generated <= 3);
+      dev->debug = saved_debug;
+      pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, 0, 1, NULL, 0);
+      pctx->bind_compute_state(pctx, NULL);
+      pctx->delete_compute_state(pctx, cs_cso);
+      pipe_resource_reference(&cbuf, NULL);
+   }
+
    finish_draw(pctx, &s);
    return true;
 }

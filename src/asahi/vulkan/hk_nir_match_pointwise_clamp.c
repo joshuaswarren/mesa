@@ -397,7 +397,11 @@ hk_nir_match_pointwise_clamp(const nir_shader *shader,
        shader->info.workgroup_size_variable ||
        !shader->info.workgroup_size[0] ||
        shader->info.workgroup_size[1] != 1 ||
-       shader->info.workgroup_size[2] != 1)
+       shader->info.workgroup_size[2] != 1 ||
+       shader->info.shared_size != 0 ||
+       shader->info.num_images > 0 ||
+       shader->info.num_textures > 0 ||
+       shader->info.num_ubos > 0)
       return false;
 
    nir_function_impl *impl = NULL;
@@ -5615,6 +5619,7 @@ emit_gemm_cmat_store_fast(nir_builder *b, const struct hk_nir_gemm_output *info,
                           unsigned n_m_tiles, unsigned n_n_tiles,
                           nir_def *n, nir_def *bias_mode,
                           nir_def *wg_row, nir_def *c_row0, nir_def *c_col0,
+                          nir_def *row_stride,
                           nir_def *acc[4][4])
 {
    const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
@@ -5667,7 +5672,9 @@ emit_gemm_cmat_store_fast(nir_builder *b, const struct hk_nir_gemm_output *info,
    /* Process one M-tile row at a time so acc[mi] and temporary writeback/dual
     * registers die immediately, keeping peak GPRs <= 104 (1024t occupancy). */
    for (unsigned mi = 0; mi < n_m_tiles; ++mi) {
-      nir_def *c_row = mi ? nir_iadd_imm(b, c_row0, 8 * mi) : c_row0;
+      nir_def *c_row = mi ? (row_stride ? nir_iadd(b, c_row0, nir_imul_imm(b, row_stride, mi))
+                                        : nir_iadd_imm(b, c_row0, 8 * mi))
+                          : c_row0;
       nir_def *c_idx = nir_iadd(b, nir_imul(b, c_row, n), c_col0);
 
       nir_def *rb_v2 = NULL;
@@ -6984,6 +6991,924 @@ dw_a_load2(nir_builder *b, uint32_t va_off, uint32_t total_push_bytes,
                           .align_mul = 8, .access = read);
 }
 
+/* One-shot preload before k_lp for fused im2col expand -> DW -> project
+ * (C_mid == 32, exp_k <= 28): loops 4 chunks of 32 halo pixels, stages 32 x 28
+ * (3.5 KiB) im2col ONCE into sh_exp_v4 (writing coalesced im2_dst), runs 32x32
+ * f32matmad8x8 into a_sh_v2 (12.5 KiB: ch 0..15 in [0..799], ch 16..31 in
+ * [800..1599]), and writes C_exp in 128-byte coalesced bursts. Total shmem = 16.0 KiB. */
+static void
+emit_cmat_exp_dw_a_preload(nir_builder *b,
+                           const struct hk_nir_dw_a_cfg *cfg,
+                           uint32_t dw_off, uint32_t exp_off, uint32_t k_off,
+                           uint32_t total_push_bytes,
+                           nir_deref_instr *sh_exp_v2,
+                           nir_deref_instr *sh_exp_v4,
+                           nir_deref_instr *a_sh_v2,
+                           nir_deref_instr *a_sh_v4,
+                           nir_def *y0, nir_def *x0, nir_def *wg_col,
+                           nir_def *zero_i, nir_def *zero_f,
+                           nir_def *zero_v2, nir_def *zero_v4,
+                           struct hk_nir_loop_binding_list *lb_list)
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *in_wh = dw_push(b, dw_off + offsetof(struct hk_dw_a_push, in_wh),
+                            total_push_bytes);
+   nir_def *in_w = nir_iand_imm(b, in_wh, 0xffff);
+   nir_def *in_h = nir_ushr_imm(b, in_wh, 16);
+   nir_def *exp_k = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_k), total_push_bytes);
+
+   /* Single-pass im2col + 32x32 f32matmad8x8 expand across 4 chunks of 32 halo pixels. */
+   nir_def *c_mid = dw_push(b, k_off, total_push_bytes);
+   nir_def *exp_flags = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, flags), total_push_bytes);
+   nir_def *has_exp_bias = nir_ine_imm(
+      b, nir_iand_imm(b, exp_flags, HK_EXP_DW_A_FLAG_HAS_BIAS), 0);
+   nir_def *do_im2_base = nir_iand(
+      b, nir_ieq_imm(b, wg_col, 0),
+      nir_ieq_imm(b, nir_iand_imm(b, exp_flags, HK_EXP_DW_A_FLAG_SKIP_IM2_DST), 0));
+   nir_def *do_exp_c = nir_iand(
+      b, nir_ieq_imm(b, wg_col, 0),
+      nir_ieq_imm(b, nir_iand_imm(b, exp_flags, HK_EXP_DW_A_FLAG_SKIP_EXP_C), 0));
+   nir_def *n_ks = nir_ushr_imm(b, nir_iadd_imm(b, exp_k, 7), 3);
+
+   /* Hoist loop-invariant im2col geometry & base VAs outside ck_lp / it_lp. */
+   nir_def *iw_ih = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_iw_ih), total_push_bytes);
+   nir_def *im2_iw = nir_iand_imm(b, iw_ih, 0xffff);
+   nir_def *im2_ih = nir_ushr_imm(b, iw_ih, 16);
+   nir_def *im2_kw = nir_iand_imm(
+      b, dw_push(b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_kw_kh),
+                 total_push_bytes), 0xffff);
+   nir_def *step_sh = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_step_sh), total_push_bytes);
+   nir_def *im2_step = nir_iand_imm(b, step_sh, 0xffff);
+   nir_def *im2_sh = nir_ushr_imm(b, step_sh, 16);
+   nir_def *pad_xy = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_pad_xy), total_push_bytes);
+   nir_def *im2_px = nir_iand_imm(b, pad_xy, 0xffff);
+   nir_def *im2_py = nir_ushr_imm(b, pad_xy, 16);
+   nir_def *kw_mp = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_kw_m_prime), total_push_bytes);
+   nir_def *tx_sh = dw_push(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, tiles_x_udiv_sh), total_push_bytes);
+   struct hk_nir_fast_udiv kw_div =
+      im2col_a_push_udiv(b, im2_kw, kw_mp, tx_sh, 8);
+   nir_def *src_va = dual_push_u64(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_a_va_lo), total_push_bytes);
+   nir_def *im2_dst_va = dual_push_u64(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, im2_dst_va_lo), total_push_bytes);
+
+   nir_def *sg_e = nir_load_subgroup_id(b);
+   nir_def *lane_e = nir_load_subgroup_invocation(b);
+   nir_def *row8_e = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane_e, 1), 3),
+                                nir_iand_imm(b, nir_ushr_imm(b, lane_e, 2), 4));
+   nir_def *col8_e = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane_e, 1), 1),
+                                nir_iand_imm(b, nir_ushr_imm(b, lane_e, 1), 4));
+   nir_def *e_sg_row = nir_ishl_imm(b, nir_ushr_imm(b, sg_e, 1), 4);
+   nir_def *e_sg_col = nir_ishl_imm(b, nir_iand_imm(b, sg_e, 1), 4);
+   nir_def *e_row_base = nir_iadd(b, e_sg_row, row8_e);
+   nir_def *e_col_base = nir_iadd(b, e_sg_col, col8_e);
+   nir_def *bank_off = nir_bcsel(
+      b, nir_ine_imm(b, nir_iand_imm(b, sg_e, 1), 0),
+      nir_imm_int(b, 800), zero_i);
+   nir_def *col2_e0 = nir_ushr_imm(b, col8_e, 1);
+
+   nir_loop *ck_lp = nir_push_loop(b);
+   ck_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ck_pre = nir_cf_node_as_block(nir_cf_node_prev(&ck_lp->cf_node));
+   nir_block *ck_hdr = nir_loop_first_block(ck_lp);
+   nir_phi_instr *ck_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ck_phi->instr, &ck_phi->def, 1, 32);
+   nir_phi_instr_add_src(ck_phi, ck_pre, zero_i);
+   nir_def *ck_v = &ck_phi->def;
+   nir_if *ck_done = nir_push_if(b, nir_ige_imm(b, ck_v, 4));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ck_done);
+
+   nir_def *p_base = nir_ishl_imm(b, ck_v, 5);
+
+   /* Load 32 x 28 (224 vec4s) im2col rows into sh_exp_v4 (3.5 KiB). */
+   {
+      nir_loop *it_lp = nir_push_loop(b);
+      it_lp->control = nir_loop_control_dont_unroll;
+      nir_block *it_pre = nir_cf_node_as_block(nir_cf_node_prev(&it_lp->cf_node));
+      nir_block *it_hdr = nir_loop_first_block(it_lp);
+      nir_phi_instr *it_phi = nir_phi_instr_create(b->shader);
+      nir_def_init(&it_phi->instr, &it_phi->def, 1, 32);
+      nir_phi_instr_add_src(it_phi, it_pre, zero_i);
+      nir_def *it_v = &it_phi->def;
+      nir_if *it_done = nir_push_if(b, nir_ige_imm(b, it_v, 2));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, it_done);
+
+      nir_def *idx = nir_iadd(b, lid, nir_ishl_imm(b, it_v, 7));
+      nir_if *idx_if = nir_push_if(b, nir_ult_imm(b, idx, 224));
+      {
+         /* Exact floor(idx / 7) for idx in [0..223]: (idx * 9363) >> 16. */
+         nir_def *r_cur = nir_ushr_imm(b, nir_imul_imm(b, idx, 9363), 16);
+         nir_def *c4_ld = nir_isub(b, idx, nir_imul_imm(b, r_cur, 7));
+         nir_def *p = nir_iadd(b, p_base, r_cur);
+         nir_def *kk0 = nir_ishl_imm(b, c4_ld, 2);
+         nir_def *hy = nir_ushr_imm(b, nir_imul_imm(b, p, 205), 11);
+         nir_def *hx = nir_isub(b, p, nir_imul_imm(b, hy, 10));
+         nir_def *gy = nir_iadd_imm(b, nir_iadd(b, y0, hy), -1);
+         nir_def *gx = nir_iadd_imm(b, nir_iadd(b, x0, hx), -1);
+         nir_def *px_ok = nir_iand(
+            b, nir_iand(b, nir_ult_imm(b, p, 100), nir_ult(b, kk0, exp_k)),
+            nir_iand(b, nir_ult(b, gy, in_h), nir_ult(b, gx, in_w)));
+         nir_def *av_ld = NULL;
+         nir_if *im_if = nir_push_if(b, px_ok);
+         {
+            nir_def *ky = NULL, *kx = NULL;
+            hk_nir_fast_udivmod(b, &kw_div, kk0, &ky, &kx);
+            nir_def *y_base = nir_isub(b, nir_imul(b, gy, im2_sh), im2_py);
+            nir_def *x_base = nir_isub(b, nir_imul(b, gx, im2_step), im2_px);
+
+            nir_def *xs[4];
+            for (unsigned j = 0; j < 4; ++j) {
+               nir_def *kk_j = j ? nir_iadd_imm(b, kk0, j) : kk0;
+               nir_def *sy = nir_iadd(b, y_base, ky);
+               nir_def *sx = nir_iadd(b, x_base, kx);
+               nir_def *in_b = nir_iand(
+                  b, j ? nir_ult(b, kk_j, exp_k) : nir_imm_true(b),
+                  nir_iand(b, nir_ult(b, sy, im2_ih), nir_ult(b, sx, im2_iw)));
+               nir_def *xv_ld = NULL;
+               nir_if *ib_if = nir_push_if(b, in_b);
+               {
+                  nir_def *s_idx = nir_iadd(b, nir_imul(b, sy, im2_iw), sx);
+                  xv_ld = nir_load_global(
+                     b, 1, 32, nir_iadd(b, src_va, nir_ishl_imm(b, nir_u2u64(b, s_idx), 2)),
+                     .align_mul = 4, .access = read);
+               }
+               nir_push_else(b, ib_if);
+               nir_pop_if(b, ib_if);
+               xs[j] = nir_if_phi(b, xv_ld, zero_f);
+               if (j < 3) {
+                  nir_def *kx_n = nir_iadd_imm(b, kx, 1);
+                  nir_def *wrap = nir_ieq(b, kx_n, im2_kw);
+                  kx = nir_bcsel(b, wrap, zero_i, kx_n);
+                  ky = nir_iadd(b, ky, nir_b2i32(b, wrap));
+               }
+            }
+            av_ld = nir_vec(b, xs, 4);
+
+            nir_def *is_int = nir_iand(
+               b, nir_ult_imm(b, nir_iadd_imm(b, hy, -1), 8),
+               nir_ult_imm(b, nir_iadd_imm(b, hx, -1), 8));
+            nir_if *wim2_if = nir_push_if(b, nir_iand(b, do_im2_base, is_int));
+            {
+               nir_def *px_idx = nir_iadd(b, nir_imul(b, gy, in_w), gx);
+               nir_def *d_base = nir_iadd(b, nir_imul(b, px_idx, exp_k), kk0);
+               nir_if *f4_if = nir_push_if(b, nir_ult(b, nir_iadd_imm(b, kk0, 3), exp_k));
+               {
+                  nir_store_global(
+                     b, av_ld, nir_iadd(b, im2_dst_va, nir_ishl_imm(b, nir_u2u64(b, d_base), 2)),
+                     .align_mul = 4, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+               }
+               nir_push_else(b, f4_if);
+               {
+                  for (unsigned j = 0; j < 3; ++j) {
+                     nir_if *j_if = j ? nir_push_if(b, nir_ult(b, nir_iadd_imm(b, kk0, j), exp_k)) : NULL;
+                     nir_def *dj = j ? nir_iadd_imm(b, d_base, j) : d_base;
+                     nir_store_global(
+                        b, xs[j], nir_iadd(b, im2_dst_va, nir_ishl_imm(b, nir_u2u64(b, dj), 2)),
+                        .align_mul = 4, .write_mask = 1, .access = ACCESS_NON_READABLE);
+                     if (j_if)
+                        nir_pop_if(b, j_if);
+                  }
+               }
+               nir_pop_if(b, f4_if);
+            }
+            nir_pop_if(b, wim2_if);
+         }
+         nir_push_else(b, im_if);
+         nir_pop_if(b, im_if);
+         nir_def *av = nir_if_phi(b, av_ld, zero_v4);
+         nir_store_deref(b, nir_build_deref_array(b, sh_exp_v4, idx), av, 0xf);
+      }
+      nir_pop_if(b, idx_if);
+
+      nir_block *it_back = nir_cursor_current_block(b->cursor);
+      nir_phi_instr_add_src(it_phi, it_back, nir_iadd_imm(b, it_v, 1));
+      nir_instr_insert(nir_before_block(it_hdr), &it_phi->instr);
+      nir_pop_loop(b, it_lp);
+   }
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+
+   /* 32 x 32 hardware f32matmad8x8 (2x2 SGs, 2x2 accs/SG) reading sh_exp_v2. */
+   nir_def *exp_b_va = dual_push_u64(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_b_va_lo), total_push_bytes);
+   nir_loop *ks_lp = nir_push_loop(b);
+   hk_nir_loop_binding_add(lb_list, ks_lp, HK_PACK_LOOP_PARAM_GEMM_K);
+   ks_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ks_pre = nir_cf_node_as_block(nir_cf_node_prev(&ks_lp->cf_node));
+   nir_block *ks_hdr = nir_loop_first_block(ks_lp);
+   nir_phi_instr *ks_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ks_phi->instr, &ks_phi->def, 1, 32);
+   nir_phi_instr_add_src(ks_phi, ks_pre, zero_i);
+   nir_phi_instr *ea_phi[2][2] = {{0}};
+   for (unsigned mi = 0; mi < 2; ++mi) {
+      for (unsigned t = 0; t < 2; ++t) {
+         ea_phi[mi][t] = nir_phi_instr_create(b->shader);
+         nir_def_init(&ea_phi[mi][t]->instr, &ea_phi[mi][t]->def, 2, 32);
+         nir_phi_instr_add_src(ea_phi[mi][t], ks_pre, zero_v2);
+      }
+   }
+   nir_def *ks_v = &ks_phi->def;
+   nir_if *ks_done = nir_push_if(b, nir_ige(b, ks_v, n_ks));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ks_done);
+
+   nir_def *bk = nir_iadd(b, nir_ishl_imm(b, ks_v, 3), row8_e);
+   nir_def *bv_ld[2] = {0}, *bv[2] = {0};
+   nir_if *b_if = nir_push_if(b, nir_ult(b, bk, exp_k));
+   {
+      nir_def *b_base = nir_iadd(b, nir_imul(b, bk, c_mid), e_col_base);
+      for (unsigned t = 0; t < 2; ++t) {
+         nir_def *bi = t ? nir_iadd_imm(b, b_base, 8) : b_base;
+         bv_ld[t] = nir_load_global(
+            b, 2, 32, nir_iadd(b, exp_b_va, nir_ishl_imm(b, nir_u2u64(b, bi), 2)),
+            .align_mul = 8, .access = read);
+      }
+   }
+   nir_push_else(b, b_if);
+   nir_pop_if(b, b_if);
+   for (unsigned t = 0; t < 2; ++t)
+      bv[t] = nir_if_phi(b, bv_ld[t], zero_v2);
+
+   nir_def *k_col2 = nir_iadd(b, nir_ishl_imm(b, ks_v, 2), col2_e0);
+   nir_def *ea_nxt[2][2] = {{0}};
+   for (unsigned mi = 0; mi < 2; ++mi) {
+      nir_def *r_m = mi ? nir_iadd_imm(b, e_row_base, 8) : e_row_base;
+      nir_def *left_ld = NULL;
+      nir_if *l_if = nir_push_if(b, nir_ult_imm(b, k_col2, 14));
+      {
+         nir_def *sh_a = nir_iadd(b, nir_imul_imm(b, r_m, 14), k_col2);
+         left_ld = nir_load_deref(b, nir_build_deref_array(b, sh_exp_v2, sh_a));
+      }
+      nir_push_else(b, l_if);
+      nir_pop_if(b, l_if);
+      nir_def *left = nir_if_phi(b, left_ld, zero_v2);
+      for (unsigned t = 0; t < 2; ++t) {
+         ea_nxt[mi][t] = nir_cmat_muladd_agx(b, left, bv[t], &ea_phi[mi][t]->def,
+            .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+      }
+   }
+
+   nir_block *ks_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(ks_phi, ks_back, nir_iadd_imm(b, ks_v, 1));
+   nir_instr_insert(nir_before_block(ks_hdr), &ks_phi->instr);
+   for (unsigned mi = 0; mi < 2; ++mi) {
+      for (unsigned t = 0; t < 2; ++t) {
+         nir_phi_instr_add_src(ea_phi[mi][t], ks_back, ea_nxt[mi][t]);
+         nir_instr_insert(nir_before_block(ks_hdr), &ea_phi[mi][t]->instr);
+      }
+   }
+   nir_pop_loop(b, ks_lp);
+
+   /* Drain 32 x 32 into a_sh_v2[bank_off + (p << 3) | col2] with bias + clamp + border zero. */
+   for (unsigned t = 0; t < 2; ++t) {
+      nir_def *col_e = t ? nir_iadd_imm(b, e_col_base, 8) : e_col_base;
+      nir_def *col2_e = t ? nir_iadd_imm(b, col2_e0, 4) : col2_e0;
+      nir_def *eb_ld = NULL;
+      nir_if *eb_if = nir_push_if(b, has_exp_bias);
+      {
+         nir_def *eb_va = dual_push_u64(
+            b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_bias_va_lo), total_push_bytes);
+         eb_ld = nir_load_global(
+            b, 2, 32, nir_iadd(b, eb_va, nir_ishl_imm(b, nir_u2u64(b, col_e), 2)),
+            .align_mul = 8, .access = read);
+      }
+      nir_push_else(b, eb_if);
+      nir_pop_if(b, eb_if);
+      nir_def *eb_v2 = nir_if_phi(b, eb_ld, zero_v2);
+
+      for (unsigned mi = 0; mi < 2; ++mi) {
+         nir_def *r_d = mi ? nir_iadd_imm(b, e_row_base, 8) : e_row_base;
+         nir_def *p = nir_iadd(b, p_base, r_d);
+         nir_if *p_ok = nir_push_if(b, nir_ult_imm(b, p, 100));
+         {
+            nir_def *hy = nir_ushr_imm(b, nir_imul_imm(b, p, 205), 11);
+            nir_def *hx = nir_isub(b, p, nir_imul_imm(b, hy, 10));
+            nir_def *gy = nir_iadd_imm(b, nir_iadd(b, y0, hy), -1);
+            nir_def *gx = nir_iadd_imm(b, nir_iadd(b, x0, hx), -1);
+            nir_def *in_ok = nir_iand(b, nir_ult(b, gy, in_h), nir_ult(b, gx, in_w));
+            nir_def *v = &ea_phi[mi][t]->def;
+            nir_def *vb = nir_bcsel(b, has_exp_bias, nir_fadd(b, v, eb_v2), v);
+            if (cfg->has_exp_epilogue)
+               vb = apply_clamp_epilogue(b, vb, &cfg->exp_epilogue);
+            nir_def *v_out = nir_bcsel(b, in_ok, vb, zero_v2);
+            nir_def *sh2 = nir_iadd(b, bank_off, nir_ior(b, nir_ishl_imm(b, p, 3), col2_e));
+            nir_store_deref(b, nir_build_deref_array(b, a_sh_v2, sh2), v_out, 3);
+         }
+         nir_pop_if(b, p_ok);
+      }
+   }
+
+   nir_if *ckn_if = nir_push_if(b, nir_ult_imm(b, ck_v, 3));
+   {
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_modes = nir_var_mem_shared,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL);
+   }
+   nir_pop_if(b, ckn_if);
+
+   nir_block *ck_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(ck_phi, ck_back, nir_iadd_imm(b, ck_v, 1));
+   nir_instr_insert(nir_before_block(ck_hdr), &ck_phi->instr);
+   nir_pop_loop(b, ck_lp);
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+
+   /* Coalesced 128-byte full-cacheline writeback of C_exp (64 pixels x 32 ch)
+    * directly from a_sh_v4 (8 consecutive threads write one 32-float pixel). */
+   nir_if *wc_pre_if = nir_push_if(b, do_exp_c);
+   {
+      nir_def *c_exp_va = dual_push_u64(
+         b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo), total_push_bytes);
+      nir_def *c_mid4 = nir_ushr_imm(b, c_mid, 2);
+      nir_def *c8 = nir_iand_imm(b, lid, 7);
+      nir_def *r16 = nir_ushr_imm(b, lid, 3);
+      nir_def *bank_v4 = nir_bcsel(b, nir_ige_imm(b, c8, 4), nir_imm_int(b, 400), zero_i);
+      nir_def *c4_in = nir_iand_imm(b, c8, 3);
+      for (unsigned it = 0; it < 4; ++it) {
+         nir_def *r = it ? nir_iadd_imm(b, r16, 16 * it) : r16;
+         nir_def *ty = nir_ushr_imm(b, r, 3);
+         nir_def *tx = nir_iand_imm(b, r, 7);
+         nir_def *p = nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, ty, 1), 10),
+                                  nir_iadd_imm(b, tx, 1));
+         nir_def *sh_c = nir_iadd(b, bank_v4, nir_iadd(b, nir_ishl_imm(b, p, 2), c4_in));
+         nir_def *ev = nir_load_deref(b, nir_build_deref_array(b, a_sh_v4, sh_c));
+         nir_def *px = nir_iadd(b, nir_imul(b, nir_iadd(b, y0, ty), in_w), nir_iadd(b, x0, tx));
+         nir_def *off_c = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px, c_mid4), c8)), 4);
+         nir_store_global(b, ev, nir_iadd(b, c_exp_va, off_c),
+                          .align_mul = 16, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+      }
+   }
+   nir_pop_if(b, wc_pre_if);
+}
+
+/* Per-k_step 3x3 stride-1 DW conv reading precomputed im2col-expand outputs from
+ * a_sh_v4[0..399] (k_base==0) or a_sh_v4[400..799] (k_base==16) into registers
+ * val0/val1, then storing XOR-swizzled val0/val1 back into a_sh_v4[0..255]. */
+static void
+emit_cmat_exp_dw_a_store_sh(nir_builder *b,
+                            const struct hk_nir_dw_a_cfg *cfg,
+                            uint32_t dw_off, uint32_t k_off,
+                            uint32_t total_push_bytes,
+                            nir_deref_instr *a_sh_v4,
+                            nir_def *y0, nir_def *x0,
+                            nir_def *k_base, nir_def *wg_col,
+                            nir_def *zero_i, nir_def *zero_f)
+{
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *c4 = nir_iand_imm(b, lid, 3);
+   nir_def *r0 = nir_ushr_imm(b, lid, 2);
+   nir_def *ch4 = nir_iadd(b, nir_ushr_imm(b, k_base, 2), c4);
+   nir_def *c_mid = dw_push(b, k_off, total_push_bytes);
+   nir_def *c_mid4 = nir_ushr_imm(b, c_mid, 2);
+   nir_def *in_wh = dw_push(b, dw_off + offsetof(struct hk_dw_a_push, in_wh),
+                            total_push_bytes);
+   nir_def *in_w = nir_iand_imm(b, in_wh, 0xffff);
+
+   nir_def *src_off_v4 =
+      nir_bcsel(b, nir_ieq_imm(b, k_base, 0), zero_i, nir_imm_int(b, 400));
+   nir_def *ty0 = nir_ushr_imm(b, r0, 3);
+   nir_def *tx0 = nir_iand_imm(b, r0, 7);
+   nir_def *ty1 = nir_iadd_imm(b, ty0, 4);
+
+   nir_loop *ky_lp = nir_push_loop(b);
+   ky_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ky_pre = nir_cf_node_as_block(nir_cf_node_prev(&ky_lp->cf_node));
+   nir_block *ky_hdr = nir_loop_first_block(ky_lp);
+
+   nir_phi_instr *ky_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
+   nir_phi_instr_add_src(ky_phi, ky_pre, zero_i);
+
+   nir_phi_instr *a0_phi[4], *a1_phi[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      a0_phi[c] = nir_phi_instr_create(b->shader);
+      nir_def_init(&a0_phi[c]->instr, &a0_phi[c]->def, 1, 32);
+      nir_phi_instr_add_src(a0_phi[c], ky_pre, zero_f);
+      a1_phi[c] = nir_phi_instr_create(b->shader);
+      nir_def_init(&a1_phi[c]->instr, &a1_phi[c]->def, 1, 32);
+      nir_phi_instr_add_src(a1_phi[c], ky_pre, zero_f);
+   }
+
+   nir_def *ky_v = &ky_phi->def;
+   nir_if *ky_done = nir_push_if(b, nir_ige_imm(b, ky_v, 3));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ky_done);
+
+   nir_def *wt_tap = nir_iadd(b, nir_imul(b, nir_imul_imm(b, ky_v, 3), c_mid4), ch4);
+   nir_def *sh_r0 = nir_iadd(
+      b, src_off_v4,
+      nir_iadd(b, nir_ishl_imm(b, nir_iadd(b, nir_imul_imm(b, nir_iadd(b, ty0, ky_v), 10), tx0), 2), c4));
+   nir_def *sh_r1 = nir_iadd(
+      b, src_off_v4,
+      nir_iadd(b, nir_ishl_imm(b, nir_iadd(b, nir_imul_imm(b, nir_iadd(b, ty1, ky_v), 10), tx0), 2), c4));
+
+   nir_def *a0_c[4], *a1_c[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      a0_c[c] = &a0_phi[c]->def;
+      a1_c[c] = &a1_phi[c]->def;
+   }
+   for (unsigned kx = 0; kx < 3; ++kx) {
+      nir_def *wt_i = kx ? nir_iadd(b, wt_tap, nir_imul_imm(b, c_mid4, kx)) : wt_tap;
+      nir_def *wv = dw_a_load4_ordered(
+         b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo), total_push_bytes, wt_i);
+      nir_def *x0_v = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, kx ? nir_iadd_imm(b, sh_r0, 4 * kx) : sh_r0));
+      for (unsigned c = 0; c < 4; ++c)
+         a0_c[c] = dw_a_fma1(b, a0_c[c], nir_channel(b, x0_v, c), nir_channel(b, wv, c), cfg);
+      nir_def *x1_v = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, kx ? nir_iadd_imm(b, sh_r1, 4 * kx) : sh_r1));
+      for (unsigned c = 0; c < 4; ++c)
+         a1_c[c] = dw_a_fma1(b, a1_c[c], nir_channel(b, x1_v, c), nir_channel(b, wv, c), cfg);
+   }
+
+   nir_block *ky_back = nir_loop_last_block(ky_lp);
+   nir_phi_instr_add_src(ky_phi, ky_back, nir_iadd_imm(b, ky_v, 1));
+   nir_instr_insert(nir_before_block(ky_hdr), &ky_phi->instr);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_phi_instr_add_src(a0_phi[c], ky_back, a0_c[c]);
+      nir_instr_insert(nir_before_block(ky_hdr), &a0_phi[c]->instr);
+      nir_phi_instr_add_src(a1_phi[c], ky_back, a1_c[c]);
+      nir_instr_insert(nir_before_block(ky_hdr), &a1_phi[c]->instr);
+   }
+   nir_pop_loop(b, ky_lp);
+
+   nir_def *v0_s[4], *v1_s[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      v0_s[c] = &a0_phi[c]->def;
+      v1_s[c] = &a1_phi[c]->def;
+   }
+   nir_def *val0 = nir_vec(b, v0_s, 4);
+   nir_def *val1 = nir_vec(b, v1_s, 4);
+
+   nir_def *dw_flags = nir_ushr_imm(
+      b, dw_push(b, dw_off + offsetof(struct hk_dw_a_push, pad_flags), total_push_bytes), 16);
+   nir_def *v0_b = NULL, *v1_b = NULL;
+   nir_if *db_if = nir_push_if(
+      b, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_BIAS), 0));
+   {
+      nir_def *bv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, bias_va_lo),
+                               total_push_bytes, ch4);
+      b->fp_math_ctrl = cfg->bias_fadd_fp_ctrl;
+      v0_b = nir_fadd(b, val0, bv);
+      v1_b = nir_fadd(b, val1, bv);
+      b->fp_math_ctrl = 0;
+   }
+   nir_push_else(b, db_if);
+   nir_pop_if(b, db_if);
+   val0 = nir_if_phi(b, v0_b, val0);
+   val1 = nir_if_phi(b, v1_b, val1);
+
+   if (cfg->has_epilogue) {
+      val0 = apply_clamp_epilogue(b, val0, &cfg->epilogue);
+      val1 = apply_clamp_epilogue(b, val1, &cfg->epilogue);
+   }
+
+   /* Wait for all threads to finish reading a_sh_v4[0..399] before overwriting
+    * a_sh_v4[0..255] with the XOR-swizzled DW outputs. On k_base != 0, DW read
+    * a_sh_v4[400..799] (disjoint). */
+   nir_if *b0_if = nir_push_if(b, nir_ieq_imm(b, k_base, 0));
+   {
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_modes = nir_var_mem_shared,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL);
+   }
+   nir_pop_if(b, b0_if);
+
+   nir_def *sh_0 = nir_ior(b, nir_ishl_imm(b, r0, 2),
+                           nir_ixor(b, c4, nir_iand_imm(b, r0, 3)));
+   nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, sh_0), val0, 0xf);
+   nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, nir_iadd_imm(b, sh_0, 128)), val1, 0xf);
+
+   nir_def *wg0 = nir_ieq_imm(b, wg_col, 0);
+   nir_def *px0 = nir_iadd(b, nir_imul(b, nir_iadd(b, y0, ty0), in_w), nir_iadd(b, x0, tx0));
+   nir_def *px1 = nir_iadd(b, nir_imul(b, nir_iadd(b, y0, ty1), in_w), nir_iadd(b, x0, tx0));
+   nir_def *out_off0 = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px0, c_mid4), ch4)), 4);
+   nir_def *out_off1 = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px1, c_mid4), ch4)), 4);
+   nir_if *d1_if = nir_push_if(
+      b, nir_iand(b, wg0, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_DST1), 0)));
+   {
+      nir_def *d1_va = dual_push_u64(b, dw_off + offsetof(struct hk_dw_a_push, dst1_va_lo),
+                                     total_push_bytes);
+      nir_store_global(b, val0, nir_iadd(b, d1_va, out_off0),
+                       .align_mul = 16, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+      nir_store_global(b, val1, nir_iadd(b, d1_va, out_off1),
+                       .align_mul = 16, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+   }
+   nir_pop_if(b, d1_if);
+   nir_if *d2_if = nir_push_if(
+      b, nir_iand(b, wg0, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_DST2), 0)));
+   {
+      nir_def *d2_va = dual_push_u64(b, dw_off + offsetof(struct hk_dw_a_push, dst2_va_lo),
+                                     total_push_bytes);
+      nir_store_global(b, val0, nir_iadd(b, d2_va, out_off0),
+                       .align_mul = 16, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+      nir_store_global(b, val1, nir_iadd(b, d2_va, out_off1),
+                       .align_mul = 16, .write_mask = 0xf, .access = ACCESS_NON_READABLE);
+   }
+   nir_pop_if(b, d2_if);
+}
+
+/* Preload 10x10 halo tile of 1x1 expand input exp_A (100 pixels x exp_k,
+ * exp_k <= 24, exp_k % 8 == 0) ONCE before k_lp into sh_exp_v4[0..599]
+ * (stride 6 vec4s = 24 floats per pixel, 9.375 KiB) with coalesced vec4 loads. */
+static void
+emit_cmat_exp1x1_dw_a_preload(nir_builder *b,
+                              uint32_t dw_off, uint32_t exp_off,
+                              uint32_t total_push_bytes,
+                              nir_deref_instr *sh_exp_v4,
+                              nir_def *y0, nir_def *x0,
+                              nir_def *zero_v4)
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   nir_def *in_wh = dw_push(b, dw_off + offsetof(struct hk_dw_a_push, in_wh),
+                            total_push_bytes);
+   nir_def *in_w = nir_iand_imm(b, in_wh, 0xffff);
+   nir_def *in_h = nir_ushr_imm(b, in_wh, 16);
+   nir_def *exp_k = dw_push(b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_k),
+                            total_push_bytes);
+   nir_def *exp_k4 = nir_ushr_imm(b, exp_k, 2);
+   nir_def *exp_a_va = dual_push_u64(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_a_va_lo), total_push_bytes);
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+
+   for (unsigned it = 0; it < 5; ++it) {
+      nir_def *idx = it ? nir_iadd_imm(b, lid, (int32_t)(128u * it)) : lid;
+      nir_if *idx_if = (it == 4) ? nir_push_if(b, nir_ult_imm(b, idx, 600)) : NULL;
+      {
+         /* Exact for 0 <= idx < 600: floor(idx / 6) = (idx * 10923) >> 16. */
+         nir_def *p = nir_ushr_imm(b, nir_imul_imm(b, idx, 10923), 16);
+         nir_def *c4 = nir_isub(b, idx, nir_imul_imm(b, p, 6));
+         nir_def *hy = nir_ushr_imm(b, nir_imul_imm(b, p, 205), 11);
+         nir_def *hx = nir_isub(b, p, nir_imul_imm(b, hy, 10));
+         nir_def *gy = nir_iadd_imm(b, nir_iadd(b, y0, hy), -1);
+         nir_def *gx = nir_iadd_imm(b, nir_iadd(b, x0, hx), -1);
+         nir_def *valid = nir_iand(
+            b, nir_ult(b, c4, exp_k4),
+            nir_iand(b, nir_ult(b, gy, in_h), nir_ult(b, gx, in_w)));
+         nir_def *av_ld = NULL;
+         nir_if *v_if = nir_push_if(b, valid);
+         {
+            nir_def *px = nir_iadd(b, nir_imul(b, gy, in_w), gx);
+            nir_def *a_off = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px, exp_k4), c4)), 4);
+            av_ld = nir_load_global(b, 4, 32, nir_iadd(b, exp_a_va, a_off),
+                                    .align_mul = 16, .access = read);
+         }
+         nir_push_else(b, v_if);
+         nir_pop_if(b, v_if);
+         nir_def *av = nir_if_phi(b, av_ld, zero_v4);
+         nir_store_deref(b, nir_build_deref_array(b, sh_exp_v4, idx), av, 0xf);
+      }
+      if (idx_if)
+         nir_pop_if(b, idx_if);
+   }
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+}
+
+/* Per-k_lp-iteration 1x1 Expand (10x10 halo x 16 ch) -> 3x3 s=1 DW for 1x1
+ * exp_dw_a. Reads preloaded exp_A from sh_exp_v2[0..1199] (stride 12 vec2s/px)
+ * and loads exp_B once per ks-slice across all 4 pixel chunks (32+32+32+4).
+ * Writes 100x16 expand outputs into a_sh_v2[0..799] (6.25 KiB), coalesced
+ * C_exp writeback, then 3x3 s=1 DW into XOR-swizzled a_sh_v4[0..255] + dw_dst. */
+static void
+emit_cmat_exp1x1_dw_a_store_sh(nir_builder *b,
+                               const struct hk_nir_dw_a_cfg *cfg,
+                               uint32_t dw_off, uint32_t exp_off,
+                               uint32_t k_off, uint32_t total_push_bytes,
+                               nir_deref_instr *sh_exp_v2,
+                               nir_deref_instr *a_sh_v2,
+                               nir_deref_instr *a_sh_v4,
+                               nir_def *y0, nir_def *x0,
+                               nir_def *k_base, nir_def *wg_col,
+                               nir_def *zero_i, nir_def *zero_f,
+                               nir_def *zero_v2,
+                               struct hk_nir_loop_binding_list *lb_list)
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   nir_def *in_wh = dw_push(b, dw_off + offsetof(struct hk_dw_a_push, in_wh),
+                            total_push_bytes);
+   nir_def *in_w = nir_iand_imm(b, in_wh, 0xffff);
+   nir_def *in_h = nir_ushr_imm(b, in_wh, 16);
+   nir_def *c_mid = dw_push(b, k_off, total_push_bytes);
+   nir_def *exp_k = dw_push(b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_k),
+                            total_push_bytes);
+   nir_def *exp_flags = dw_push(b, exp_off + offsetof(struct hk_exp_dw_a_push, flags),
+                                total_push_bytes);
+   nir_def *has_exp_bias =
+      nir_ine_imm(b, nir_iand_imm(b, exp_flags, HK_EXP_DW_A_FLAG_HAS_BIAS), 0);
+   nir_def *wg0 = nir_ieq_imm(b, wg_col, 0);
+   nir_def *do_exp_c = nir_iand(
+      b, wg0, nir_ieq_imm(b, nir_iand_imm(b, exp_flags, HK_EXP_DW_A_FLAG_SKIP_EXP_C), 0));
+
+   nir_def *sg = nir_load_subgroup_id(b);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *row8 = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 3),
+                              nir_iand_imm(b, nir_ushr_imm(b, lane, 2), 4));
+   nir_def *col8 = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 1),
+                              nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 4));
+   nir_def *col2_e0 = nir_ushr_imm(b, col8, 1);
+   nir_def *b_col0 = nir_iadd(b, k_base, col8);
+   nir_def *sg_row = nir_iadd(b, nir_ishl_imm(b, sg, 3), row8);
+
+   nir_def *eb_v2[2] = {zero_v2, zero_v2};
+   {
+      nir_def *eb_ld[2] = {NULL, NULL};
+      nir_if *eb_if = nir_push_if(b, has_exp_bias);
+      {
+         nir_def *eb_va = dual_push_u64(
+            b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_bias_va_lo), total_push_bytes);
+         for (unsigned t = 0; t < 2; ++t) {
+            nir_def *col_e = t ? nir_iadd_imm(b, b_col0, 8) : b_col0;
+            eb_ld[t] = nir_load_global(
+               b, 2, 32, nir_iadd(b, eb_va, nir_ishl_imm(b, nir_u2u64(b, col_e), 2)),
+               .align_mul = 8, .access = read);
+         }
+      }
+      nir_push_else(b, eb_if);
+      nir_pop_if(b, eb_if);
+      for (unsigned t = 0; t < 2; ++t)
+         eb_v2[t] = nir_if_phi(b, eb_ld[t], zero_v2);
+   }
+
+   nir_def *exp_b_va = dual_push_u64(
+      b, exp_off + offsetof(struct hk_exp_dw_a_push, exp_b_va_lo), total_push_bytes);
+   nir_def *n_ks = nir_ushr_imm(b, exp_k, 3);
+
+   /* Step 1: Outer ks_lp loads exp_B[8x16] ONCE per ks-slice and reuses it
+    * across all 4 chunks of 32 pixels reading preloaded sh_exp_v2[0..1199]. */
+   nir_def *sh_p_base[4];
+   for (unsigned ck = 0; ck < 4; ++ck) {
+      nir_def *p = ck ? nir_iadd_imm(b, sg_row, (int32_t)(32u * ck)) : sg_row;
+      if (ck == 3)
+         p = nir_umin(b, p, nir_imm_int(b, 99));
+      sh_p_base[ck] = nir_iadd(b, nir_imul_imm(b, p, 12), col2_e0);
+   }
+
+   nir_loop *ks_lp = nir_push_loop(b);
+   hk_nir_loop_binding_add(lb_list, ks_lp, HK_PACK_LOOP_PARAM_GEMM_K);
+   ks_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ks_pre = nir_cf_node_as_block(nir_cf_node_prev(&ks_lp->cf_node));
+   nir_block *ks_hdr = nir_loop_first_block(ks_lp);
+   nir_phi_instr *ks_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ks_phi->instr, &ks_phi->def, 1, 32);
+   nir_phi_instr_add_src(ks_phi, ks_pre, zero_i);
+   nir_phi_instr *ea_phi[4][2] = {{0}};
+   for (unsigned ck = 0; ck < 4; ++ck) {
+      for (unsigned t = 0; t < 2; ++t) {
+         ea_phi[ck][t] = nir_phi_instr_create(b->shader);
+         nir_def_init(&ea_phi[ck][t]->instr, &ea_phi[ck][t]->def, 2, 32);
+         nir_phi_instr_add_src(ea_phi[ck][t], ks_pre, zero_v2);
+      }
+   }
+   nir_def *ks_v = &ks_phi->def;
+   nir_if *ks_done = nir_push_if(b, nir_ige(b, ks_v, n_ks));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ks_done);
+
+   nir_def *bk = nir_iadd(b, nir_ishl_imm(b, ks_v, 3), row8);
+   nir_def *b_base = nir_iadd(b, nir_imul(b, bk, c_mid), b_col0);
+   nir_def *bv[2];
+   for (unsigned t = 0; t < 2; ++t) {
+      nir_def *bi = t ? nir_iadd_imm(b, b_base, 8) : b_base;
+      bv[t] = nir_load_global(
+         b, 2, 32, nir_iadd(b, exp_b_va, nir_ishl_imm(b, nir_u2u64(b, bi), 2)),
+         .align_mul = 8, .access = read);
+   }
+
+   nir_def *ks_off2 = nir_ishl_imm(b, ks_v, 2);
+   nir_def *ea_nxt[4][2];
+   for (unsigned ck = 0; ck < 4; ++ck) {
+      nir_def *left = nir_load_deref(
+         b, nir_build_deref_array(b, sh_exp_v2, nir_iadd(b, sh_p_base[ck], ks_off2)));
+      for (unsigned t = 0; t < 2; ++t) {
+         ea_nxt[ck][t] = nir_cmat_muladd_agx(b, left, bv[t], &ea_phi[ck][t]->def,
+            .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+      }
+   }
+
+   nir_block *ks_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(ks_phi, ks_back, nir_iadd_imm(b, ks_v, 1));
+   nir_instr_insert(nir_before_block(ks_hdr), &ks_phi->instr);
+   for (unsigned ck = 0; ck < 4; ++ck) {
+      for (unsigned t = 0; t < 2; ++t) {
+         nir_phi_instr_add_src(ea_phi[ck][t], ks_back, ea_nxt[ck][t]);
+         nir_instr_insert(nir_before_block(ks_hdr), &ea_phi[ck][t]->instr);
+      }
+   }
+   nir_pop_loop(b, ks_lp);
+
+   for (unsigned ck = 0; ck < 4; ++ck) {
+      nir_def *p = ck ? nir_iadd_imm(b, sg_row, (int32_t)(32u * ck)) : sg_row;
+      nir_if *p_ok = (ck == 3) ? nir_push_if(b, nir_ult_imm(b, p, 100)) : NULL;
+      {
+         nir_def *hy = nir_ushr_imm(b, nir_imul_imm(b, p, 205), 11);
+         nir_def *hx = nir_isub(b, p, nir_imul_imm(b, hy, 10));
+         nir_def *gy = nir_iadd_imm(b, nir_iadd(b, y0, hy), -1);
+         nir_def *gx = nir_iadd_imm(b, nir_iadd(b, x0, hx), -1);
+         nir_def *in_ok = nir_iand(b, nir_ult(b, gy, in_h), nir_ult(b, gx, in_w));
+         for (unsigned t = 0; t < 2; ++t) {
+            nir_def *v = &ea_phi[ck][t]->def;
+            nir_def *vb = nir_bcsel(b, has_exp_bias, nir_fadd(b, v, eb_v2[t]), v);
+            if (cfg->has_exp_epilogue)
+               vb = apply_clamp_epilogue(b, vb, &cfg->exp_epilogue);
+            nir_def *v_out = nir_bcsel(b, in_ok, vb, zero_v2);
+            nir_def *col2_e = t ? nir_iadd_imm(b, col2_e0, 4) : col2_e0;
+            nir_def *sh2 = nir_ior(b, nir_ishl_imm(b, p, 3), col2_e);
+            nir_store_deref(b, nir_build_deref_array(b, a_sh_v2, sh2), v_out, 3);
+         }
+      }
+      if (p_ok)
+         nir_pop_if(b, p_ok);
+   }
+
+   /* Barrier #1: all 100x16 expand outputs are ready in a_sh_v4[0..399]. */
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+
+   /* Step 2: Coalesced C_exp writeback + 3x3 s=1 DW from a_sh_v4[0..399]. */
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *c4 = nir_iand_imm(b, lid, 3);
+   nir_def *r0 = nir_ushr_imm(b, lid, 2);
+   nir_def *ch4 = nir_iadd(b, nir_ushr_imm(b, k_base, 2), c4);
+   nir_def *c_mid4 = nir_ushr_imm(b, c_mid, 2);
+   nir_def *ty0 = nir_ushr_imm(b, r0, 3);
+   nir_def *tx0 = nir_iand_imm(b, r0, 7);
+   nir_def *ty1 = nir_iadd_imm(b, ty0, 4);
+   nir_def *px0 = nir_iadd(b, nir_imul(b, nir_iadd(b, y0, ty0), in_w), nir_iadd(b, x0, tx0));
+   nir_def *px1 = nir_iadd(b, nir_imul(b, nir_iadd(b, y0, ty1), in_w), nir_iadd(b, x0, tx0));
+   nir_def *out_off0 = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px0, c_mid4), ch4)), 4);
+   nir_def *out_off1 = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, nir_imul(b, px1, c_mid4), ch4)), 4);
+
+   nir_if *wc_if = nir_push_if(b, do_exp_c);
+   {
+      nir_def *c_exp_va = dual_push_u64(
+         b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo), total_push_bytes);
+      nir_def *p0 = nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, ty0, 1), 10),
+                                nir_iadd_imm(b, tx0, 1));
+      nir_def *p1 = nir_iadd(b, nir_imul_imm(b, nir_iadd_imm(b, ty1, 1), 10),
+                                nir_iadd_imm(b, tx0, 1));
+      nir_def *ev0 = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, nir_ior(b, nir_ishl_imm(b, p0, 2), c4)));
+      nir_def *ev1 = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, nir_ior(b, nir_ishl_imm(b, p1, 2), c4)));
+      nir_store_global(b, ev0, nir_iadd(b, c_exp_va, out_off0),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+      nir_store_global(b, ev1, nir_iadd(b, c_exp_va, out_off1),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+   }
+   nir_pop_if(b, wc_if);
+
+   nir_loop *ky_lp = nir_push_loop(b);
+   ky_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ky_pre = nir_cf_node_as_block(nir_cf_node_prev(&ky_lp->cf_node));
+   nir_block *ky_hdr = nir_loop_first_block(ky_lp);
+   nir_phi_instr *ky_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
+   nir_phi_instr_add_src(ky_phi, ky_pre, zero_i);
+   nir_phi_instr *a0_phi[4], *a1_phi[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      a0_phi[c] = nir_phi_instr_create(b->shader);
+      nir_def_init(&a0_phi[c]->instr, &a0_phi[c]->def, 1, 32);
+      nir_phi_instr_add_src(a0_phi[c], ky_pre, zero_f);
+      a1_phi[c] = nir_phi_instr_create(b->shader);
+      nir_def_init(&a1_phi[c]->instr, &a1_phi[c]->def, 1, 32);
+      nir_phi_instr_add_src(a1_phi[c], ky_pre, zero_f);
+   }
+   nir_def *ky_v = &ky_phi->def;
+   nir_if *ky_done = nir_push_if(b, nir_ige_imm(b, ky_v, 3));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ky_done);
+
+   nir_def *wt_tap = nir_iadd(b, nir_imul(b, nir_imul_imm(b, ky_v, 3), c_mid4), ch4);
+   nir_def *sh_r0 =
+      nir_ior(b, nir_ishl_imm(b, nir_iadd(b, nir_imul_imm(b, nir_iadd(b, ty0, ky_v), 10), tx0), 2), c4);
+   nir_def *sh_r1 =
+      nir_ior(b, nir_ishl_imm(b, nir_iadd(b, nir_imul_imm(b, nir_iadd(b, ty1, ky_v), 10), tx0), 2), c4);
+   nir_def *a0_c[4], *a1_c[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      a0_c[c] = &a0_phi[c]->def;
+      a1_c[c] = &a1_phi[c]->def;
+   }
+   for (unsigned kx = 0; kx < 3; ++kx) {
+      nir_def *wt_i = kx ? nir_iadd(b, wt_tap, nir_imul_imm(b, c_mid4, kx)) : wt_tap;
+      nir_def *wv = dw_a_load4_ordered(
+         b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo), total_push_bytes, wt_i);
+      nir_def *x0_v = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, kx ? nir_iadd_imm(b, sh_r0, 4 * kx) : sh_r0));
+      for (unsigned c = 0; c < 4; ++c)
+         a0_c[c] = dw_a_fma1(b, a0_c[c], nir_channel(b, x0_v, c), nir_channel(b, wv, c), cfg);
+      nir_def *x1_v = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, kx ? nir_iadd_imm(b, sh_r1, 4 * kx) : sh_r1));
+      for (unsigned c = 0; c < 4; ++c)
+         a1_c[c] = dw_a_fma1(b, a1_c[c], nir_channel(b, x1_v, c), nir_channel(b, wv, c), cfg);
+   }
+
+   nir_block *ky_back = nir_loop_last_block(ky_lp);
+   nir_phi_instr_add_src(ky_phi, ky_back, nir_iadd_imm(b, ky_v, 1));
+   nir_instr_insert(nir_before_block(ky_hdr), &ky_phi->instr);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_phi_instr_add_src(a0_phi[c], ky_back, a0_c[c]);
+      nir_instr_insert(nir_before_block(ky_hdr), &a0_phi[c]->instr);
+      nir_phi_instr_add_src(a1_phi[c], ky_back, a1_c[c]);
+      nir_instr_insert(nir_before_block(ky_hdr), &a1_phi[c]->instr);
+   }
+   nir_pop_loop(b, ky_lp);
+
+   nir_def *v0_s[4], *v1_s[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      v0_s[c] = &a0_phi[c]->def;
+      v1_s[c] = &a1_phi[c]->def;
+   }
+   nir_def *val0 = nir_vec(b, v0_s, 4);
+   nir_def *val1 = nir_vec(b, v1_s, 4);
+
+   nir_def *dw_flags = nir_ushr_imm(
+      b, dw_push(b, dw_off + offsetof(struct hk_dw_a_push, pad_flags), total_push_bytes), 16);
+   nir_def *v0_b = NULL, *v1_b = NULL;
+   nir_if *db_if = nir_push_if(
+      b, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_BIAS), 0));
+   {
+      nir_def *bv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, bias_va_lo),
+                               total_push_bytes, ch4);
+      b->fp_math_ctrl = cfg->bias_fadd_fp_ctrl;
+      v0_b = nir_fadd(b, val0, bv);
+      v1_b = nir_fadd(b, val1, bv);
+      b->fp_math_ctrl = 0;
+   }
+   nir_push_else(b, db_if);
+   nir_pop_if(b, db_if);
+   val0 = nir_if_phi(b, v0_b, val0);
+   val1 = nir_if_phi(b, v1_b, val1);
+
+   if (cfg->has_epilogue) {
+      val0 = apply_clamp_epilogue(b, val0, &cfg->epilogue);
+      val1 = apply_clamp_epilogue(b, val1, &cfg->epilogue);
+   }
+
+   /* Barrier #2: all threads finished reading a_sh_v4[0..399] before staging DW. */
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+
+   nir_def *sh_0 = nir_ior(b, nir_ishl_imm(b, r0, 2),
+                           nir_ixor(b, c4, nir_iand_imm(b, r0, 3)));
+   nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, sh_0), val0, 0xf);
+   nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, nir_iadd_imm(b, sh_0, 128)), val1, 0xf);
+
+   nir_if *d1_if = nir_push_if(
+      b, nir_iand(b, wg0, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_DST1), 0)));
+   {
+      nir_def *d1_va = dual_push_u64(b, dw_off + offsetof(struct hk_dw_a_push, dst1_va_lo),
+                                     total_push_bytes);
+      nir_store_global(b, val0, nir_iadd(b, d1_va, out_off0),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+      nir_store_global(b, val1, nir_iadd(b, d1_va, out_off1),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+   }
+   nir_pop_if(b, d1_if);
+   nir_if *d2_if = nir_push_if(
+      b, nir_iand(b, wg0, nir_ine_imm(b, nir_iand_imm(b, dw_flags, HK_DW_A_FLAG_HAS_DST2), 0)));
+   {
+      nir_def *d2_va = dual_push_u64(b, dw_off + offsetof(struct hk_dw_a_push, dst2_va_lo),
+                                     total_push_bytes);
+      nir_store_global(b, val0, nir_iadd(b, d2_va, out_off0),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+      nir_store_global(b, val1, nir_iadd(b, d2_va, out_off1),
+                       .align_mul = 16, .write_mask = 0xf,
+                       .access = ACCESS_NON_READABLE);
+   }
+   nir_pop_if(b, d2_if);
+}
+
 static void
 emit_cmat_dw_a_store_sh_pair(nir_builder *b,
                              const struct hk_nir_dw_a_cfg *cfg,
@@ -7776,7 +8701,7 @@ emit_gemm_dw_eval_pixel_v4(nir_builder *b, const struct hk_nir_gemm_output *info
    return val;
 }
 
-static void
+static nir_def *
 emit_gemm_dw_store_dw_outputs_n(nir_builder *b,
                                 const struct hk_nir_dw_a_cfg *gemm_dw,
                                 uint32_t dual_off, uint32_t total_push_bytes,
@@ -7834,16 +8759,133 @@ emit_gemm_dw_store_dw_outputs_n(nir_builder *b,
                        .access = ACCESS_NON_READABLE);
    }
    nir_pop_if(b, d2_if);
+   return dw_val;
 }
 
-static void
+static nir_def *
 emit_gemm_dw_store_dw_outputs(nir_builder *b,
                               const struct hk_nir_dw_a_cfg *gemm_dw,
                               uint32_t dual_off, uint32_t total_push_bytes,
                               nir_def *dw_val, nir_def *dw_idx, nir_def *col_c)
 {
-   emit_gemm_dw_store_dw_outputs_n(b, gemm_dw, dual_off, total_push_bytes,
-                                   dw_val, dw_idx, col_c, 1);
+   return emit_gemm_dw_store_dw_outputs_n(b, gemm_dw, dual_off, total_push_bytes,
+                                          dw_val, dw_idx, col_c, 1);
+}
+
+static nir_def *
+emit_gemm_dw_substep4_one(nir_builder *b,
+                          const struct hk_nir_dw_a_cfg *gemm_dw,
+                          unsigned v4_per_px,
+                          uint32_t dual_off, uint32_t total_push_bytes,
+                          nir_deref_instr *a_sh_v4,
+                          nir_def *didx, nir_def *y0, nir_def *x0,
+                          nir_def *n, nir_def *wg_col,
+                          nir_def *zero_i, nir_def *zero_f,
+                          nir_def **op_out, nir_def **c4_l_out)
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   nir_def *op, *c4_l;
+   if (v4_per_px == 6u) {
+      op = nir_ushr_imm(b, nir_imul_imm(b, didx, 43), 8);
+      c4_l = nir_isub(b, didx, nir_imul_imm(b, op, 6));
+   } else if (v4_per_px == 12u) {
+      op = nir_ushr_imm(b, nir_imul_imm(b, nir_ushr_imm(b, didx, 2), 342), 10);
+      c4_l = nir_isub(b, didx, nir_imul_imm(b, op, 12));
+   } else {
+      const unsigned sh_c4 = (v4_per_px == 8u) ? 3u : 2u;
+      op = nir_ushr_imm(b, didx, sh_c4);
+      c4_l = nir_iand_imm(b, didx, v4_per_px - 1u);
+   }
+   nir_def *oy_l = nir_ushr_imm(b, op, 2);
+   nir_def *ox_l = nir_iand_imm(b, op, 3);
+   nir_def *col_d = nir_iadd(b, wg_col, nir_ishl_imm(b, c4_l, 2));
+   nir_def *wt_va = dual_push_u64(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, dw_wt_va_lo),
+      total_push_bytes);
+   nir_def *n_x3 = nir_imul_imm(b, n, 3);
+
+   nir_loop *ky_lp = nir_push_loop(b);
+   ky_lp->control = nir_loop_control_dont_unroll;
+   nir_block *ky_pre = nir_cf_node_as_block(nir_cf_node_prev(&ky_lp->cf_node));
+   nir_block *ky_hdr = nir_loop_first_block(ky_lp);
+   nir_phi_instr *ky_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
+   nir_phi_instr_add_src(ky_phi, ky_pre, zero_i);
+   nir_phi_instr *a_phi[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      a_phi[c] = nir_phi_instr_create(b->shader);
+      nir_def_init(&a_phi[c]->instr, &a_phi[c]->def, 1, 32);
+      nir_phi_instr_add_src(a_phi[c], ky_pre, zero_f);
+   }
+   nir_phi_instr *wt_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&wt_phi->instr, &wt_phi->def, 1, 32);
+   nir_phi_instr_add_src(wt_phi, ky_pre, col_d);
+
+   nir_def *ky_v = &ky_phi->def;
+   nir_if *ky_done = nir_push_if(b, nir_ige_imm(b, ky_v, 3));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ky_done);
+
+   nir_def *ly = nir_iadd(b, nir_ishl_imm(b, oy_l, 1), ky_v);
+   nir_def *ly_lt8 = nir_ult_imm(b, ly, 8);
+   nir_def *wt_cur = &wt_phi->def;
+   nir_def *a_cur[4];
+   for (unsigned c = 0; c < 4; ++c)
+      a_cur[c] = &a_phi[c]->def;
+
+   for (unsigned kx = 0; kx < 3; ++kx) {
+      nir_def *lx = nir_iadd_imm(b, nir_ishl_imm(b, ox_l, 1), kx);
+      nir_def *slot = nir_bcsel(
+         b, ly_lt8,
+         nir_bcsel(b, nir_ult_imm(b, lx, 8),
+                   nir_ior(b, nir_ishl_imm(b, ly, 3), lx),
+                   nir_iadd_imm(b, ly, 64)),
+         nir_bcsel(b, nir_ult_imm(b, lx, 8),
+                   nir_iadd_imm(b, lx, 72),
+                   nir_imm_int(b, 80)));
+      nir_def *sh4_d = (v4_per_px == 6u || v4_per_px == 12u)
+         ? nir_iadd(b, nir_imul_imm(b, slot, v4_per_px), c4_l)
+         : nir_ior(b, nir_ishl_imm(b, slot, v4_per_px == 8u ? 3 : 2), c4_l);
+      nir_def *iv = nir_load_deref(
+         b, nir_build_deref_array(b, a_sh_v4, sh4_d));
+      nir_def *wi = kx ? nir_iadd(b, wt_cur, kx == 1 ? n : nir_ishl_imm(b, n, 1)) : wt_cur;
+      nir_def *wv = nir_load_global(
+         b, 4, 32, nir_iadd(b, wt_va, nir_u2u64(b, nir_ishl_imm(b, wi, 2))),
+         .align_mul = 4, .access = read);
+      for (unsigned c = 0; c < 4; ++c)
+         a_cur[c] = dw_a_fma1(b, a_cur[c], nir_channel(b, iv, c), nir_channel(b, wv, c), gemm_dw);
+   }
+
+   nir_block *ky_back = nir_loop_last_block(ky_lp);
+   nir_phi_instr_add_src(ky_phi, ky_back, nir_iadd_imm(b, ky_v, 1));
+   nir_phi_instr_add_src(wt_phi, ky_back, nir_iadd(b, wt_cur, n_x3));
+   nir_instr_insert(nir_before_block(ky_hdr), &ky_phi->instr);
+   nir_instr_insert(nir_before_block(ky_hdr), &wt_phi->instr);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_phi_instr_add_src(a_phi[c], ky_back, a_cur[c]);
+      nir_instr_insert(nir_before_block(ky_hdr), &a_phi[c]->instr);
+   }
+   nir_pop_loop(b, ky_lp);
+
+   nir_def *in_w_d = nir_iand_imm(
+      b, dw_push(b, dual_off + offsetof(struct hk_dual_gemm_dw_push, in_wh),
+                 total_push_bytes), 0xffff);
+   nir_def *dw_ow = nir_ushr_imm(b, in_w_d, 1);
+   nir_def *dw_oy = nir_iadd(b, nir_ushr_imm(b, y0, 1), oy_l);
+   nir_def *dw_ox = nir_iadd(b, nir_ushr_imm(b, x0, 1), ox_l);
+   nir_def *dw_idx = nir_iadd(
+      b, nir_imul(b, nir_iadd(b, nir_imul(b, dw_oy, dw_ow), dw_ox), n), col_d);
+   nir_def *dw_s[4];
+   for (unsigned c = 0; c < 4; ++c)
+      dw_s[c] = &a_phi[c]->def;
+   nir_def *dw_v4 = nir_vec(b, dw_s, 4);
+   dw_v4 = emit_gemm_dw_store_dw_outputs_n(b, gemm_dw, dual_off, total_push_bytes,
+                                           dw_v4, dw_idx, col_d, 4);
+   if (op_out)
+      *op_out = op;
+   if (c4_l_out)
+      *c4_l_out = c4_l;
+   return dw_v4;
 }
 
 static void
@@ -7892,25 +8934,27 @@ emit_gemm_dw_phase3(nir_builder *b, const struct hk_nir_gemm_output *info,
    nir_def *y0 = nir_ishl_imm(b, wg_ty, 3);
    nir_def *x0 = nir_ishl_imm(b, wg_tx, 3);
 
-   /* Read runtime pad_b[pad_idx[0..3]] after k_lp (omit ACCESS_CAN_REORDER).
-    * Fold into a single scalar pad_ok here so pval[0..3] are never live while
-    * acc[mi][t] tiles are still live in the else branch. */
-   nir_def *pad_va = dual_push_u64(
-      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_va_lo),
-      total_push_bytes);
-   nir_def *pad_or = zero_i;
-   for (unsigned d = 0; d < 4; ++d) {
-      nir_def *pidx = dw_push(
-         b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_idx) + 4 * d,
+   nir_if *pad_if = NULL;
+   if (!gemm_dw->has_proj) {
+      /* Read runtime pad_b[pad_idx[0..3]] after k_lp (omit ACCESS_CAN_REORDER).
+       * Fold into a single scalar pad_ok here so pval[0..3] are never live while
+       * acc[mi][t] tiles are still live in the else branch. */
+      nir_def *pad_va = dual_push_u64(
+         b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_va_lo),
          total_push_bytes);
-      nir_def *pv = nir_load_global(
-         b, 1, 32, nir_iadd(b, pad_va, nir_u2u64(b, nir_ishl_imm(b, pidx, 2))),
-         .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
-      pad_or = d ? nir_ior(b, pad_or, pv) : pv;
+      nir_def *pad_or = zero_i;
+      for (unsigned d = 0; d < 4; ++d) {
+         nir_def *pidx = dw_push(
+            b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_idx) + 4 * d,
+            total_push_bytes);
+         nir_def *pv = nir_load_global(
+            b, 1, 32, nir_iadd(b, pad_va, nir_u2u64(b, nir_ishl_imm(b, pidx, 2))),
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+         pad_or = d ? nir_ior(b, pad_or, pv) : pv;
+      }
+      nir_def *pad_ok = nir_ieq_imm(b, pad_or, 0);
+      pad_if = nir_push_if(b, pad_ok);
    }
-   nir_def *pad_ok = nir_ieq_imm(b, pad_or, 0);
-
-   nir_if *pad_if = nir_push_if(b, pad_ok);
    {
       /* Fast single-pass path: pad_b == {0,0,0,0}, pad_out == (in_h+1, in_w+1).
        * Layout in a_sh (81 * tile_n floats = 5.1/7.6/10.1 KiB for tile_n=16/24/32):
@@ -8518,143 +9562,115 @@ emit_gemm_dw_phase3(nir_builder *b, const struct hk_nir_gemm_output *info,
                   .memory_semantics = NIR_MEMORY_ACQ_REL);
 
       /* Substep 4: Vec4 DW 3x3 s=2 (1 pass for tile_n=16/24/32, 2 passes for
-       * tile_n=48), issuing full coalesced 16-byte vec4 stores to dst1/dst2. */
+       * tile_n=48), issuing full coalesced 16-byte vec4 stores to dst1/dst2.
+       * When gemm_dw->has_proj, also stages the 16 x tile_n post-bias/clamp DW
+       * outputs into a_sh_v4[op * (v4_per_px + 1) + c4_l] after a barrier. */
       {
          const unsigned dw_thr = 16u * v4_per_px;
          const unsigned dw_iters = (dw_thr + 127u) / 128u;
          nir_def *lid_d = nir_channel(b, nir_load_local_invocation_id(b), 0);
 
-         nir_loop *d_lp = NULL;
-         nir_block *d_hdr = NULL;
-         nir_phi_instr *d_phi = NULL;
-         nir_def *didx = lid_d;
-         if (dw_iters > 1u) {
-            d_lp = nir_push_loop(b);
-            d_lp->control = nir_loop_control_dont_unroll;
-            nir_block *d_pre = nir_cf_node_as_block(nir_cf_node_prev(&d_lp->cf_node));
-            d_hdr = nir_loop_first_block(d_lp);
-            d_phi = nir_phi_instr_create(b->shader);
-            nir_def_init(&d_phi->instr, &d_phi->def, 1, 32);
-            nir_phi_instr_add_src(d_phi, d_pre, zero_i);
-            nir_if *d_done = nir_push_if(b, nir_ige_imm(b, &d_phi->def, dw_iters));
-            nir_jump(b, nir_jump_break);
-            nir_pop_if(b, d_done);
-            didx = nir_iadd(b, nir_ishl_imm(b, &d_phi->def, 7), lid_d);
-         }
-
-         nir_if *d_if = (dw_thr != 128u) ? nir_push_if(b, nir_ult_imm(b, didx, dw_thr)) : NULL;
-         {
-            nir_def *op, *c4_l;
-            if (v4_per_px == 6u) {
-               op = nir_ushr_imm(b, nir_imul_imm(b, didx, 43), 8);
-               c4_l = nir_isub(b, didx, nir_imul_imm(b, op, 6));
-            } else if (v4_per_px == 12u) {
-               op = nir_ushr_imm(b, nir_imul_imm(b, nir_ushr_imm(b, didx, 2), 342), 10);
-               c4_l = nir_isub(b, didx, nir_imul_imm(b, op, 12));
+         if (gemm_dw->has_proj) {
+            const unsigned sh_stride_v4 = v4_per_px + 1u;
+            if (dw_iters == 1u) {
+               nir_def *v0_d = NULL, *op0_d = NULL, *c4_0_d = NULL;
+               nir_if *d_if = (dw_thr != 128u) ? nir_push_if(b, nir_ult_imm(b, lid_d, dw_thr)) : NULL;
+               {
+                  v0_d = emit_gemm_dw_substep4_one(
+                     b, gemm_dw, v4_per_px, dual_off, total_push_bytes, a_sh_v4,
+                     lid_d, y0, x0, n, wg_col, zero_i, zero_f, &op0_d, &c4_0_d);
+               }
+               if (d_if) {
+                  nir_push_else(b, d_if);
+                  nir_pop_if(b, d_if);
+                  v0_d = nir_if_phi(b, v0_d, zero_v4);
+                  op0_d = nir_if_phi(b, op0_d, zero_i);
+                  c4_0_d = nir_if_phi(b, c4_0_d, zero_i);
+               }
+               nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                           .memory_scope = SCOPE_WORKGROUP,
+                           .memory_modes = nir_var_mem_shared,
+                           .memory_semantics = NIR_MEMORY_ACQ_REL);
+               nir_if *s_if = (dw_thr != 128u) ? nir_push_if(b, nir_ult_imm(b, lid_d, dw_thr)) : NULL;
+               {
+                  nir_def *dst_sh = nir_iadd(b, nir_imul_imm(b, op0_d, sh_stride_v4), c4_0_d);
+                  nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, dst_sh), v0_d, 0xf);
+               }
+               if (s_if)
+                  nir_pop_if(b, s_if);
             } else {
-               const unsigned sh_c4 = (v4_per_px == 8u) ? 3u : 2u;
-               op = nir_ushr_imm(b, didx, sh_c4);
-               c4_l = nir_iand_imm(b, didx, v4_per_px - 1u);
+               nir_def *op0_d = NULL, *c4_0_d = NULL;
+               nir_def *v0_d = emit_gemm_dw_substep4_one(
+                  b, gemm_dw, v4_per_px, dual_off, total_push_bytes, a_sh_v4,
+                  lid_d, y0, x0, n, wg_col, zero_i, zero_f, &op0_d, &c4_0_d);
+               nir_def *v1_d = NULL, *op1_d = NULL, *c4_1_d = NULL;
+               nir_def *p1_ok = nir_ult_imm(b, lid_d, dw_thr - 128u);
+               nir_if *p1_if = nir_push_if(b, p1_ok);
+               {
+                  v1_d = emit_gemm_dw_substep4_one(
+                     b, gemm_dw, v4_per_px, dual_off, total_push_bytes, a_sh_v4,
+                     nir_iadd_imm(b, lid_d, 128), y0, x0, n, wg_col,
+                     zero_i, zero_f, &op1_d, &c4_1_d);
+               }
+               nir_push_else(b, p1_if);
+               nir_pop_if(b, p1_if);
+               v1_d = nir_if_phi(b, v1_d, zero_v4);
+               op1_d = nir_if_phi(b, op1_d, zero_i);
+               c4_1_d = nir_if_phi(b, c4_1_d, zero_i);
+
+               nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                           .memory_scope = SCOPE_WORKGROUP,
+                           .memory_modes = nir_var_mem_shared,
+                           .memory_semantics = NIR_MEMORY_ACQ_REL);
+               nir_def *dst_sh0 = nir_iadd(b, nir_imul_imm(b, op0_d, sh_stride_v4), c4_0_d);
+               nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, dst_sh0), v0_d, 0xf);
+               nir_if *s1_if = nir_push_if(b, p1_ok);
+               {
+                  nir_def *dst_sh1 = nir_iadd(b, nir_imul_imm(b, op1_d, sh_stride_v4), c4_1_d);
+                  nir_store_deref(b, nir_build_deref_array(b, a_sh_v4, dst_sh1), v1_d, 0xf);
+               }
+               nir_pop_if(b, s1_if);
             }
-            nir_def *oy_l = nir_ushr_imm(b, op, 2);
-            nir_def *ox_l = nir_iand_imm(b, op, 3);
-            nir_def *col_d = nir_iadd(b, wg_col, nir_ishl_imm(b, c4_l, 2));
-            nir_def *wt_va = dual_push_u64(
-               b, dual_off + offsetof(struct hk_dual_gemm_dw_push, dw_wt_va_lo),
-               total_push_bytes);
-            nir_def *n_x3 = nir_imul_imm(b, n, 3);
-
-            nir_loop *ky_lp = nir_push_loop(b);
-            ky_lp->control = nir_loop_control_dont_unroll;
-            nir_block *ky_pre = nir_cf_node_as_block(nir_cf_node_prev(&ky_lp->cf_node));
-            nir_block *ky_hdr = nir_loop_first_block(ky_lp);
-            nir_phi_instr *ky_phi = nir_phi_instr_create(b->shader);
-            nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
-            nir_phi_instr_add_src(ky_phi, ky_pre, zero_i);
-            nir_phi_instr *a_phi[4];
-            for (unsigned c = 0; c < 4; ++c) {
-               a_phi[c] = nir_phi_instr_create(b->shader);
-               nir_def_init(&a_phi[c]->instr, &a_phi[c]->def, 1, 32);
-               nir_phi_instr_add_src(a_phi[c], ky_pre, zero_f);
-            }
-            nir_phi_instr *wt_phi = nir_phi_instr_create(b->shader);
-            nir_def_init(&wt_phi->instr, &wt_phi->def, 1, 32);
-            nir_phi_instr_add_src(wt_phi, ky_pre, col_d);
-
-            nir_def *ky_v = &ky_phi->def;
-            nir_if *ky_done = nir_push_if(b, nir_ige_imm(b, ky_v, 3));
-            nir_jump(b, nir_jump_break);
-            nir_pop_if(b, ky_done);
-
-            nir_def *ly = nir_iadd(b, nir_ishl_imm(b, oy_l, 1), ky_v);
-            nir_def *ly_lt8 = nir_ult_imm(b, ly, 8);
-            nir_def *wt_cur = &wt_phi->def;
-            nir_def *a_cur[4];
-            for (unsigned c = 0; c < 4; ++c)
-               a_cur[c] = &a_phi[c]->def;
-
-            for (unsigned kx = 0; kx < 3; ++kx) {
-               nir_def *lx = nir_iadd_imm(b, nir_ishl_imm(b, ox_l, 1), kx);
-               nir_def *slot = nir_bcsel(
-                  b, ly_lt8,
-                  nir_bcsel(b, nir_ult_imm(b, lx, 8),
-                            nir_ior(b, nir_ishl_imm(b, ly, 3), lx),
-                            nir_iadd_imm(b, ly, 64)),
-                  nir_bcsel(b, nir_ult_imm(b, lx, 8),
-                            nir_iadd_imm(b, lx, 72),
-                            nir_imm_int(b, 80)));
-               nir_def *sh4_d = (v4_per_px == 6u || v4_per_px == 12u)
-                  ? nir_iadd(b, nir_imul_imm(b, slot, v4_per_px), c4_l)
-                  : nir_ior(b, nir_ishl_imm(b, slot, v4_per_px == 8u ? 3 : 2), c4_l);
-               nir_def *iv = nir_load_deref(
-                  b, nir_build_deref_array(b, a_sh_v4, sh4_d));
-               nir_def *wi = kx ? nir_iadd(b, wt_cur, kx == 1 ? n : nir_ishl_imm(b, n, 1)) : wt_cur;
-               nir_def *wv = nir_load_global(
-                  b, 4, 32, nir_iadd(b, wt_va, nir_u2u64(b, nir_ishl_imm(b, wi, 2))),
-                  .align_mul = 4, .access = read);
-               for (unsigned c = 0; c < 4; ++c)
-                  a_cur[c] = dw_a_fma1(b, a_cur[c], nir_channel(b, iv, c), nir_channel(b, wv, c), gemm_dw);
+         } else {
+            nir_loop *d_lp = NULL;
+            nir_block *d_hdr = NULL;
+            nir_phi_instr *d_phi = NULL;
+            nir_def *didx = lid_d;
+            if (dw_iters > 1u) {
+               d_lp = nir_push_loop(b);
+               d_lp->control = nir_loop_control_dont_unroll;
+               nir_block *d_pre = nir_cf_node_as_block(nir_cf_node_prev(&d_lp->cf_node));
+               d_hdr = nir_loop_first_block(d_lp);
+               d_phi = nir_phi_instr_create(b->shader);
+               nir_def_init(&d_phi->instr, &d_phi->def, 1, 32);
+               nir_phi_instr_add_src(d_phi, d_pre, zero_i);
+               nir_if *d_done = nir_push_if(b, nir_ige_imm(b, &d_phi->def, dw_iters));
+               nir_jump(b, nir_jump_break);
+               nir_pop_if(b, d_done);
+               didx = nir_iadd(b, nir_ishl_imm(b, &d_phi->def, 7), lid_d);
             }
 
-            nir_block *ky_back = nir_loop_last_block(ky_lp);
-            nir_phi_instr_add_src(ky_phi, ky_back, nir_iadd_imm(b, ky_v, 1));
-            nir_phi_instr_add_src(wt_phi, ky_back, nir_iadd(b, wt_cur, n_x3));
-            nir_instr_insert(nir_before_block(ky_hdr), &ky_phi->instr);
-            nir_instr_insert(nir_before_block(ky_hdr), &wt_phi->instr);
-            for (unsigned c = 0; c < 4; ++c) {
-               nir_phi_instr_add_src(a_phi[c], ky_back, a_cur[c]);
-               nir_instr_insert(nir_before_block(ky_hdr), &a_phi[c]->instr);
+            nir_if *d_if = (dw_thr != 128u) ? nir_push_if(b, nir_ult_imm(b, didx, dw_thr)) : NULL;
+            {
+               emit_gemm_dw_substep4_one(
+                  b, gemm_dw, v4_per_px, dual_off, total_push_bytes, a_sh_v4,
+                  didx, y0, x0, n, wg_col, zero_i, zero_f, NULL, NULL);
             }
-            nir_pop_loop(b, ky_lp);
+            if (d_if)
+               nir_pop_if(b, d_if);
 
-            nir_def *in_w_d = nir_iand_imm(
-               b, dw_push(b, dual_off + offsetof(struct hk_dual_gemm_dw_push, in_wh),
-                          total_push_bytes), 0xffff);
-            nir_def *dw_ow = nir_ushr_imm(b, in_w_d, 1);
-            nir_def *dw_oy = nir_iadd(b, nir_ushr_imm(b, y0, 1), oy_l);
-            nir_def *dw_ox = nir_iadd(b, nir_ushr_imm(b, x0, 1), ox_l);
-            nir_def *dw_idx = nir_iadd(
-               b, nir_imul(b, nir_iadd(b, nir_imul(b, dw_oy, dw_ow), dw_ox), n), col_d);
-            nir_def *dw_s[4];
-            for (unsigned c = 0; c < 4; ++c)
-               dw_s[c] = &a_phi[c]->def;
-            nir_def *dw_v4 = nir_vec(b, dw_s, 4);
-            emit_gemm_dw_store_dw_outputs_n(b, gemm_dw, dual_off, total_push_bytes,
-                                            dw_v4, dw_idx, col_d, 4);
-         }
-         if (d_if)
-            nir_pop_if(b, d_if);
-
-         if (d_lp) {
-            nir_block *d_back = nir_cursor_current_block(b->cursor);
-            nir_phi_instr_add_src(d_phi, d_back, nir_iadd_imm(b, &d_phi->def, 1));
-            nir_instr_insert(nir_before_block(d_hdr), &d_phi->instr);
-            nir_pop_loop(b, d_lp);
+            if (d_lp) {
+               nir_block *d_back = nir_cursor_current_block(b->cursor);
+               nir_phi_instr_add_src(d_phi, d_back, nir_iadd_imm(b, &d_phi->def, 1));
+               nir_instr_insert(nir_before_block(d_hdr), &d_phi->instr);
+               nir_pop_loop(b, d_lp);
+            }
          }
       }
    }
-   nir_push_else(b, pad_if);
-   {
+   if (!gemm_dw->has_proj) {
+      nir_push_else(b, pad_if);
+      {
       /* Rare fallback when runtime pad_b != {0,0,0,0}:
        * 1. Drain acc[mi][t] into GEMM C (if !SKIP_C) so all acc GPRs die early
        *    without keeping pad_dst/pval/cb[0..2] live simultaneously.
@@ -8756,18 +9772,22 @@ emit_gemm_dw_phase3(nir_builder *b, const struct hk_nir_gemm_output *info,
             .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
       }
 
-      /* Step 2: Disjoint grid-stride fill of pad_dst (in-box from A*B, border 0). */
-      nir_if *zp_if = nir_push_if(
-         b, nir_ieq_imm(b, nir_iand_imm(b, flags_fb, HK_GEMM_DW_FLAG_SKIP_PAD_DST), 0));
+      /* Step 2: Disjoint grid-stride fill of pad_dst (in-box from A*B, border 0).
+       * When gemm_dw->has_proj (gx == 1, looping ch_base), run once on ch_base == 0. */
+      nir_def *do_zp = nir_ieq_imm(b, nir_iand_imm(b, flags_fb, HK_GEMM_DW_FLAG_SKIP_PAD_DST), 0);
+      if (gemm_dw->has_proj)
+         do_zp = nir_iand(b, do_zp, nir_ieq_imm(b, wg_col, 0));
+      nir_if *zp_if = nir_push_if(b, do_zp);
       {
          nir_def *pad_dst_va = dual_push_u64(
             b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_dst_va_lo),
             total_push_bytes);
          nir_def *wg_id_fb = nir_load_workgroup_id(b);
          nir_def *lid_fb = nir_channel(b, nir_load_local_invocation_id(b), 0);
-         nir_def *gx = (tile_n == 24 || tile_n == 48)
-            ? nir_udiv_imm(b, n, tile_n)
-            : nir_ushr_imm(b, n, tile_n_shift);
+         nir_def *gx = gemm_dw->has_proj ? nir_imm_int(b, 1)
+            : ((tile_n == 24 || tile_n == 48)
+                  ? nir_udiv_imm(b, n, tile_n)
+                  : nir_ushr_imm(b, n, tile_n_shift));
          nir_def *gy = nir_imul(b, nir_ushr_imm(b, in_h_fb, 3),
                                 nir_ushr_imm(b, in_w_fb, 3));
          nir_def *wg_lin = nir_iadd(b, nir_imul(b, nir_channel(b, wg_id_fb, 1), gx),
@@ -8915,16 +9935,549 @@ emit_gemm_dw_phase3(nir_builder *b, const struct hk_nir_gemm_output *info,
 
          nir_def *dw_idx = nir_iadd(
             b, nir_imul(b, nir_iadd(b, nir_imul(b, dw_oy, dw_ow), dw_ox), n), col_d);
-         emit_gemm_dw_store_dw_outputs(b, gemm_dw, dual_off, total_push_bytes,
-                                       &a_phi->def, dw_idx, col_d);
+         nir_def *dw_out = emit_gemm_dw_store_dw_outputs(
+            b, gemm_dw, dual_off, total_push_bytes, &a_phi->def, dw_idx, col_d);
+         if (gemm_dw->has_proj) {
+            nir_def *op_fb = nir_ushr_imm(b, lid_fb, 3);
+            nir_def *cl_fb = nir_iadd(b, nir_ishl_imm(b, s_v, 3), c_l);
+            nir_def *sh_fb = nir_iadd(b, nir_imul_imm(b, op_fb, tile_n + 4u), cl_fb);
+            nir_store_deref(b, nir_build_deref_array(b, a_sh_f32, sh_fb), dw_out, 1);
+         }
 
          nir_block *s_back = nir_cursor_current_block(b->cursor);
          nir_phi_instr_add_src(s_phi, s_back, nir_iadd_imm(b, s_v, 1));
          nir_instr_insert(nir_before_block(s_hdr), &s_phi->instr);
          nir_pop_loop(b, s_lp);
       }
+      }
+      nir_pop_if(b, pad_if);
    }
-   nir_pop_if(b, pad_if);
+}
+
+static void
+emit_gemm_dw_proj_pks(nir_builder *b,
+                      const struct hk_nir_dw_a_cfg *gemm_dw,
+                      uint32_t tile_n, uint32_t proj_off,
+                      uint32_t total_push_bytes,
+                      nir_deref_instr *a_sh_v2,
+                      nir_def *wg_col, nir_def *zero_i,
+                      nir_def *p_in[4], nir_def *p_out[4])
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   const unsigned p_tile_n = gemm_dw->proj_tile_n;
+   const unsigned p_n_tiles = p_tile_n == 16 ? 1u : (p_tile_n == 64 ? 4u : 2u);
+   const unsigned sh_stride_v2 = (tile_n / 2u) + 2u;
+   const unsigned p_k_slices = tile_n / 8u;
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_modes = nir_var_mem_shared,
+               .memory_semantics = NIR_MEMORY_ACQ_REL);
+
+   nir_def *sg_p = nir_load_subgroup_id(b);
+   nir_def *lane_p = nir_load_subgroup_invocation(b);
+   nir_def *row8_p = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane_p, 1), 3),
+                                nir_iand_imm(b, nir_ushr_imm(b, lane_p, 2), 4));
+   nir_def *col8_p = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane_p, 1), 1),
+                                nir_iand_imm(b, nir_ushr_imm(b, lane_p, 1), 4));
+   nir_def *p_sg_row = nir_ishl_imm(b, nir_ushr_imm(b, sg_p, 1), 3);
+   nir_def *p_sg_col = nir_ishl_imm(
+      b, nir_iand_imm(b, sg_p, 1),
+      p_tile_n == 16 ? 3 : (p_tile_n == 64 ? 5 : 4));
+   nir_def *p_row = nir_iadd(b, p_sg_row, row8_p);
+   nir_def *p_col0 = nir_iadd(b, p_sg_col, col8_p);
+   nir_def *p_a_row_base = nir_iadd(
+      b, nir_imul_imm(b, p_row, sh_stride_v2), nir_ushr_imm(b, col8_p, 1));
+   nir_def *proj_n = dw_push(
+      b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_n),
+      total_push_bytes);
+   nir_def *proj_b_va = dual_push_u64(
+      b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_b_va_lo),
+      total_push_bytes);
+
+   nir_loop *pks_lp = nir_push_loop(b);
+   pks_lp->control = nir_loop_control_dont_unroll;
+   nir_block *pks_pre = nir_cf_node_as_block(nir_cf_node_prev(&pks_lp->cf_node));
+   nir_block *pks_hdr = nir_loop_first_block(pks_lp);
+   nir_phi_instr *pks_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&pks_phi->instr, &pks_phi->def, 1, 32);
+   nir_phi_instr_add_src(pks_phi, pks_pre, zero_i);
+   nir_phi_instr *ps_phi[4] = {0};
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      ps_phi[t] = nir_phi_instr_create(b->shader);
+      nir_def_init(&ps_phi[t]->instr, &ps_phi[t]->def, 2, 32);
+      nir_phi_instr_add_src(ps_phi[t], pks_pre, p_in[t]);
+   }
+   nir_def *pks_v = &pks_phi->def;
+   nir_if *pks_done = nir_push_if(b, nir_ige_imm(b, pks_v, p_k_slices));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, pks_done);
+
+   nir_def *p_left = nir_load_deref(
+      b, nir_build_deref_array(b, a_sh_v2,
+                               nir_iadd(b, p_a_row_base, nir_ishl_imm(b, pks_v, 2))));
+   nir_def *pb_row = nir_iadd(b, nir_iadd(b, wg_col, nir_ishl_imm(b, pks_v, 3)), row8_p);
+   nir_def *pb_base = nir_iadd(b, nir_imul(b, pb_row, proj_n), p_col0);
+   nir_def *p_nxt[4] = {0};
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      nir_def *p_col = t ? nir_iadd_imm(b, p_col0, 8 * t) : p_col0;
+      nir_def *pb_idx = t ? nir_iadd_imm(b, pb_base, 8 * t) : pb_base;
+      if (p_tile_n == 24 && t == 1) {
+         nir_def *v_t = NULL;
+         nir_if *c_if = nir_push_if(b, nir_ult(b, p_col, proj_n));
+         {
+            nir_def *right = nir_load_global(
+               b, 2, 32, nir_iadd(b, proj_b_va, nir_ishl_imm(b, nir_u2u64(b, pb_idx), 2)),
+               .align_mul = 8, .access = read);
+            v_t = nir_cmat_muladd_agx(b, p_left, right, &ps_phi[t]->def,
+               .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+         }
+         nir_push_else(b, c_if);
+         nir_pop_if(b, c_if);
+         p_nxt[t] = nir_if_phi(b, v_t, &ps_phi[t]->def);
+      } else {
+         nir_def *right = nir_load_global(
+            b, 2, 32, nir_iadd(b, proj_b_va, nir_ishl_imm(b, nir_u2u64(b, pb_idx), 2)),
+            .align_mul = 8, .access = read);
+         p_nxt[t] = nir_cmat_muladd_agx(b, p_left, right, &ps_phi[t]->def,
+            .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+      }
+   }
+
+   nir_block *pks_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(pks_phi, pks_back, nir_iadd_imm(b, pks_v, 1));
+   nir_instr_insert(nir_before_block(pks_hdr), &pks_phi->instr);
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      nir_phi_instr_add_src(ps_phi[t], pks_back, p_nxt[t]);
+      nir_instr_insert(nir_before_block(pks_hdr), &ps_phi[t]->instr);
+   }
+   nir_pop_loop(b, pks_lp);
+
+   for (unsigned t = 0; t < p_n_tiles; ++t)
+      p_out[t] = &ps_phi[t]->def;
+}
+
+static void
+emit_gemm_dw_proj_store(nir_builder *b,
+                        const struct hk_nir_dw_a_cfg *gemm_dw,
+                        uint32_t dual_off, uint32_t proj_off,
+                        uint32_t total_push_bytes,
+                        nir_def *zero_v2, nir_def *p_acc[4])
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   const unsigned p_tile_n = gemm_dw->proj_tile_n;
+   const unsigned p_n_tiles = p_tile_n == 16 ? 1u : (p_tile_n == 64 ? 4u : 2u);
+
+   nir_def *in_wh_p = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, in_wh), total_push_bytes);
+   nir_def *in_w_p = nir_iand_imm(b, in_wh_p, 0xffff);
+   nir_def *tx_mp_p = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, tiles_x_m_prime),
+      total_push_bytes);
+   nir_def *tx_sh_p = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, tiles_x_udiv_sh),
+      total_push_bytes);
+   struct hk_nir_fast_udiv tx_div_p =
+      im2col_a_push_udiv(b, nir_ushr_imm(b, in_w_p, 3), tx_mp_p, tx_sh_p, 0);
+   nir_def *wg_ty_p = NULL, *wg_tx_p = NULL;
+   hk_nir_fast_udivmod(b, &tx_div_p,
+                       nir_channel(b, nir_load_workgroup_id(b), 1),
+                       &wg_ty_p, &wg_tx_p);
+   nir_def *sg_pw = nir_load_subgroup_id(b);
+   nir_def *lane_pw = nir_load_subgroup_invocation(b);
+   nir_def *row8_pw = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, lane_pw, 1), 3),
+                                 nir_iand_imm(b, nir_ushr_imm(b, lane_pw, 2), 4));
+   nir_def *col8_pw = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane_pw, 1), 1),
+                                 nir_iand_imm(b, nir_ushr_imm(b, lane_pw, 1), 4));
+   nir_def *p_row_w = nir_iadd(b, nir_ishl_imm(b, nir_ushr_imm(b, sg_pw, 1), 3), row8_pw);
+   nir_def *p_col_w0 = nir_iadd(
+      b, nir_ishl_imm(b, nir_iand_imm(b, sg_pw, 1),
+                      p_tile_n == 16 ? 3 : (p_tile_n == 64 ? 5 : 4)),
+      col8_pw);
+   nir_def *dw_ow_p = nir_ushr_imm(b, in_w_p, 1);
+   nir_def *oy_p = nir_iadd(b, nir_ishl_imm(b, wg_ty_p, 2), nir_ushr_imm(b, p_row_w, 2));
+   nir_def *ox_p = nir_iadd(b, nir_ishl_imm(b, wg_tx_p, 2), nir_iand_imm(b, p_row_w, 3));
+   nir_def *proj_n_w = dw_push(
+      b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_n),
+      total_push_bytes);
+   nir_def *proj_flags = dw_push(
+      b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_flags),
+      total_push_bytes);
+   nir_def *has_pbias = nir_ine_imm(
+      b, nir_iand_imm(b, proj_flags, HK_GEMM_DW_PROJ_FLAG_HAS_BIAS), 0);
+   nir_def *do_pc = nir_ieq_imm(
+      b, nir_iand_imm(b, proj_flags, HK_GEMM_DW_PROJ_FLAG_SKIP_C), 0);
+   nir_def *do_pcopy = nir_iand(
+      b,
+      nir_ine_imm(b, nir_iand_imm(b, proj_flags, HK_GEMM_DW_PROJ_FLAG_HAS_COPY), 0),
+      nir_ieq_imm(b, nir_iand_imm(b, proj_flags, HK_GEMM_DW_PROJ_FLAG_SKIP_COPY), 0));
+   nir_def *pix_base = nir_imul(b, nir_iadd(b, nir_imul(b, oy_p, dw_ow_p), ox_p), proj_n_w);
+
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      nir_def *p_col = t ? nir_iadd_imm(b, p_col_w0, 8 * t) : p_col_w0;
+      nir_if *c_if = (p_tile_n == 24 && t == 1)
+         ? nir_push_if(b, nir_ult(b, p_col, proj_n_w))
+         : NULL;
+      {
+         nir_def *val = p_acc[t];
+         nir_def *pb_ld = NULL;
+         nir_if *pb_if = nir_push_if(b, has_pbias);
+         {
+            nir_def *pbias_va = dual_push_u64(
+               b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_bias_va_lo),
+               total_push_bytes);
+            pb_ld = nir_load_global(
+               b, 2, 32, nir_iadd(b, pbias_va, nir_ishl_imm(b, nir_u2u64(b, p_col), 2)),
+               .align_mul = 8, .access = read);
+         }
+         nir_push_else(b, pb_if);
+         nir_pop_if(b, pb_if);
+         val = nir_bcsel(b, has_pbias, nir_fadd(b, val, nir_if_phi(b, pb_ld, zero_v2)), val);
+         if (gemm_dw->has_proj_epilogue)
+            val = apply_clamp_epilogue(b, val, &gemm_dw->proj_epilogue);
+
+         nir_def *off_b = nir_ishl_imm(b, nir_u2u64(b, nir_iadd(b, pix_base, p_col)), 2);
+         nir_if *pc_if = nir_push_if(b, do_pc);
+         {
+            nir_def *pc_va = dual_push_u64(
+               b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_c_va_lo),
+               total_push_bytes);
+            nir_store_global(b, val, nir_iadd(b, pc_va, off_b),
+                             .align_mul = 8, .write_mask = 3,
+                             .access = ACCESS_NON_READABLE);
+         }
+         nir_pop_if(b, pc_if);
+         nir_if *pcp_if = nir_push_if(b, do_pcopy);
+         {
+            nir_def *pcp_va = dual_push_u64(
+               b, proj_off + offsetof(struct hk_dual_gemm_dw_proj_push, proj_copy_va_lo),
+               total_push_bytes);
+            nir_store_global(b, val, nir_iadd(b, pcp_va, off_b),
+                             .align_mul = 8, .write_mask = 3,
+                             .access = ACCESS_NON_READABLE);
+         }
+         nir_pop_if(b, pcp_if);
+      }
+      if (c_if)
+         nir_pop_if(b, c_if);
+   }
+}
+
+/* Rare pad_b != {0,0,0,0} fallback for DUAL_GEMM_DW with fused 1x1 Project.
+ * Runs OUTSIDE ch_lp so pad_dst grid-stride fill (zlp) executes once rather
+ * than being multiplied by N / tile_n in static work bounds. */
+static void
+emit_gemm_dw_proj_fallback(nir_builder *b, const struct hk_nir_gemm_output *info,
+                           const struct hk_nir_clamp_epilogue *epilogue,
+                           const struct hk_nir_dw_a_cfg *gemm_dw,
+                           uint32_t tile_n, uint32_t dual_off, uint32_t proj_off,
+                           uint32_t total_push_bytes,
+                           nir_deref_instr *a_sh_f32, nir_deref_instr *a_sh_v2,
+                           nir_def *n, nir_def *k, nir_def *bias_mode,
+                           nir_def *zero_i, nir_def *zero_f, nir_def *zero_v2,
+                           struct hk_nir_loop_binding_list *lb_list)
+{
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   const unsigned p_tile_n = gemm_dw->proj_tile_n;
+   const unsigned p_n_tiles = p_tile_n == 16 ? 1u : (p_tile_n == 64 ? 4u : 2u);
+   nir_def *flags_fb = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, flags), total_push_bytes);
+   nir_def *in_wh_fb = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, in_wh), total_push_bytes);
+   nir_def *in_w_fb = nir_iand_imm(b, in_wh_fb, 0xffff);
+   nir_def *in_h_fb = nir_ushr_imm(b, in_wh_fb, 16);
+   nir_def *out_wh_fb = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, out_wh), total_push_bytes);
+   nir_def *out_w_fb = nir_iand_imm(b, out_wh_fb, 0xffff);
+   nir_def *out_h_fb = nir_ushr_imm(b, out_wh_fb, 16);
+   nir_def *tx_mp = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, tiles_x_m_prime), total_push_bytes);
+   nir_def *tx_sh = dw_push(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, tiles_x_udiv_sh), total_push_bytes);
+   struct hk_nir_fast_udiv tx_div =
+      im2col_a_push_udiv(b, nir_ushr_imm(b, in_w_fb, 3), tx_mp, tx_sh, 0);
+   nir_def *wg_ty = NULL, *wg_tx = NULL;
+   hk_nir_fast_udivmod(b, &tx_div,
+                       nir_channel(b, nir_load_workgroup_id(b), 1),
+                       &wg_ty, &wg_tx);
+   nir_def *y0 = nir_ishl_imm(b, wg_ty, 3);
+   nir_def *x0 = nir_ishl_imm(b, wg_tx, 3);
+   nir_def *lid_fb = nir_channel(b, nir_load_local_invocation_id(b), 0);
+
+   nir_def *pad_va_fb = dual_push_u64(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_va_lo), total_push_bytes);
+   nir_def *pval[4];
+   for (unsigned d = 0; d < 4; ++d) {
+      nir_def *pidx = dw_push(
+         b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_idx) + 4 * d,
+         total_push_bytes);
+      pval[d] = nir_load_global(
+         b, 1, 32, nir_iadd(b, pad_va_fb, nir_u2u64(b, nir_ishl_imm(b, pidx, 2))),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   }
+
+   /* Step 1: Write GEMM C (if !SKIP_C) for this WG's 8x8 tile across all N channels. */
+   nir_if *wc_if = nir_push_if(
+      b, nir_ieq_imm(b, nir_iand_imm(b, flags_fb, HK_GEMM_DW_FLAG_SKIP_C), 0));
+   {
+      nir_def *px_c = nir_ushr_imm(b, lid_fb, 1);
+      nir_def *c_par = nir_iand_imm(b, lid_fb, 1);
+      nir_def *gr_c = nir_iadd(
+         b, nir_imul(b, nir_iadd(b, y0, nir_ushr_imm(b, px_c, 3)), in_w_fb),
+         nir_iadd(b, x0, nir_iand_imm(b, px_c, 7)));
+      nir_loop *co_lp = nir_push_loop(b);
+      hk_nir_loop_binding_add(lb_list, co_lp, HK_PACK_LOOP_PARAM_DW_KH);
+      co_lp->control = nir_loop_control_dont_unroll;
+      nir_block *co_pre = nir_cf_node_as_block(nir_cf_node_prev(&co_lp->cf_node));
+      nir_block *co_hdr = nir_loop_first_block(co_lp);
+      nir_phi_instr *co_phi = nir_phi_instr_create(b->shader);
+      nir_def_init(&co_phi->instr, &co_phi->def, 1, 32);
+      nir_phi_instr_add_src(co_phi, co_pre, zero_i);
+      nir_def *co_v = &co_phi->def;
+      nir_if *co_done = nir_push_if(b, nir_ige(b, co_v, n));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, co_done);
+
+      nir_loop *ci_lp = nir_push_loop(b);
+      ci_lp->control = nir_loop_control_dont_unroll;
+      nir_block *ci_pre = nir_cf_node_as_block(nir_cf_node_prev(&ci_lp->cf_node));
+      nir_block *ci_hdr = nir_loop_first_block(ci_lp);
+      nir_phi_instr *ci_phi = nir_phi_instr_create(b->shader);
+      nir_def_init(&ci_phi->instr, &ci_phi->def, 1, 32);
+      nir_phi_instr_add_src(ci_phi, ci_pre, zero_i);
+      nir_def *ci_v = &ci_phi->def;
+      nir_if *ci_done = nir_push_if(b, nir_ige_imm(b, ci_v, tile_n / 2u));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, ci_done);
+
+      nir_def *col_c = nir_iadd(b, co_v, nir_ior(b, nir_ishl_imm(b, ci_v, 1), c_par));
+      nir_def *cv = emit_gemm_dw_eval_pixel(
+         b, info, epilogue, gr_c, col_c, n, k, bias_mode, zero_i, zero_f, lb_list);
+      nir_def *ci = nir_iadd(b, nir_imul(b, gr_c, n), col_c);
+      nir_store_global(
+         b, cv,
+         gemm_f32_addr(b, info->output, info->desc_comps, info->out_res_type,
+                       ci, ACCESS_NON_READABLE),
+         .align_mul = 4, .write_mask = 1, .access = ACCESS_NON_READABLE);
+
+      nir_block *ci_back = nir_cursor_current_block(b->cursor);
+      nir_phi_instr_add_src(ci_phi, ci_back, nir_iadd_imm(b, ci_v, 1));
+      nir_instr_insert(nir_before_block(ci_hdr), &ci_phi->instr);
+      nir_pop_loop(b, ci_lp);
+
+      nir_block *co_back = nir_cursor_current_block(b->cursor);
+      nir_phi_instr_add_src(co_phi, co_back, nir_iadd_imm(b, co_v, tile_n));
+      nir_instr_insert(nir_before_block(co_hdr), &co_phi->instr);
+      nir_pop_loop(b, co_lp);
+   }
+   nir_pop_if(b, wc_if);
+
+   /* Step 2: One-shot grid-stride fill of pad_dst (gx == 1). */
+   nir_if *zp_if = nir_push_if(
+      b, nir_ieq_imm(b, nir_iand_imm(b, flags_fb, HK_GEMM_DW_FLAG_SKIP_PAD_DST), 0));
+   {
+      nir_def *pad_dst_va = dual_push_u64(
+         b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_dst_va_lo),
+         total_push_bytes);
+      nir_def *gy = nir_imul(b, nir_ushr_imm(b, in_h_fb, 3), nir_ushr_imm(b, in_w_fb, 3));
+      nir_def *tid0 = nir_iadd(
+         b, nir_ishl_imm(b, nir_channel(b, nir_load_workgroup_id(b), 1), 7), lid_fb);
+      nir_def *stride = nir_ishl_imm(b, gy, 7);
+      nir_def *out_total = nir_imul(b, nir_imul(b, out_h_fb, out_w_fb), n);
+
+      nir_loop *zlp = nir_push_loop(b);
+      hk_nir_loop_binding_add(lb_list, zlp, HK_PACK_LOOP_PARAM_PAD_ZLP_ITERS);
+      zlp->control = nir_loop_control_dont_unroll;
+      nir_block *zpre = nir_cf_node_as_block(nir_cf_node_prev(&zlp->cf_node));
+      nir_block *zhdr = nir_loop_first_block(zlp);
+      nir_phi_instr *zphi = nir_phi_instr_create(b->shader);
+      nir_def_init(&zphi->instr, &zphi->def, 1, 32);
+      nir_phi_instr_add_src(zphi, zpre, tid0);
+      nir_def *idx = &zphi->def;
+      nir_if *zbrk = nir_push_if(b, nir_uge(b, idx, out_total));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, zbrk);
+
+      nir_def *oc = nir_umod(b, idx, n);
+      nir_def *pix = nir_udiv(b, idx, n);
+      nir_def *ox = nir_umod(b, pix, out_w_fb);
+      nir_def *oy = nir_udiv(b, pix, out_w_fb);
+      nir_def *iy64 = nir_isub(b, nir_u2u64(b, oy), nir_i2i64(b, pval[1]));
+      nir_def *ix64 = nir_isub(b, nir_u2u64(b, ox), nir_i2i64(b, pval[2]));
+      nir_def *ic64 = nir_isub(b, nir_u2u64(b, oc), nir_i2i64(b, pval[3]));
+      nir_def *in_box = nir_iand(
+         b, nir_ieq_imm(b, pval[0], 0),
+         nir_iand(
+            b, nir_iand(b, nir_ige_imm(b, iy64, 0), nir_ilt(b, iy64, nir_u2u64(b, in_h_fb))),
+            nir_iand(
+               b, nir_iand(b, nir_ige_imm(b, ix64, 0), nir_ilt(b, ix64, nir_u2u64(b, in_w_fb))),
+               nir_iand(b, nir_ige_imm(b, ic64, 0), nir_ilt(b, ic64, nir_u2u64(b, n))))));
+      nir_def *pv_in = NULL;
+      nir_if *zf = nir_push_if(b, in_box);
+      {
+         nir_def *gr_z = nir_iadd(
+            b, nir_imul(b, nir_u2u32(b, iy64), in_w_fb), nir_u2u32(b, ix64));
+         pv_in = emit_gemm_dw_eval_pixel(
+            b, info, epilogue, gr_z, nir_u2u32(b, ic64), n, k, bias_mode,
+            zero_i, zero_f, lb_list);
+      }
+      nir_push_else(b, zf);
+      nir_pop_if(b, zf);
+      nir_def *pv_out = nir_if_phi(b, pv_in, zero_f);
+      nir_store_global(
+         b, pv_out, nir_iadd(b, pad_dst_va, nir_u2u64(b, nir_ishl_imm(b, idx, 2))),
+         .align_mul = 4, .write_mask = 1, .access = ACCESS_NON_READABLE);
+
+      nir_block *zback = nir_cursor_current_block(b->cursor);
+      nir_phi_instr_add_src(zphi, zback, nir_iadd(b, idx, stride));
+      nir_instr_insert(nir_before_block(zhdr), &zphi->instr);
+      nir_pop_loop(b, zlp);
+   }
+   nir_pop_if(b, zp_if);
+
+   /* Step 3: Loop ch_fb = 0, tile_n, ... < n computing DW + 1x1 Project accumulate. */
+   nir_def *oy_l = nir_ushr_imm(b, lid_fb, 5);
+   nir_def *ox_l = nir_iand_imm(b, nir_ushr_imm(b, lid_fb, 3), 3);
+   nir_def *c_l = nir_iand_imm(b, lid_fb, 7);
+   nir_def *dw_ow = nir_ushr_imm(b, in_w_fb, 1);
+   nir_def *dw_oy = nir_iadd(b, nir_ushr_imm(b, y0, 1), oy_l);
+   nir_def *dw_ox = nir_iadd(b, nir_ushr_imm(b, x0, 1), ox_l);
+
+   nir_loop *ch_fb = nir_push_loop(b);
+   hk_nir_loop_binding_add(lb_list, ch_fb, HK_PACK_LOOP_PARAM_DW_KH);
+   ch_fb->control = nir_loop_control_dont_unroll;
+   nir_block *ch_pre = nir_cf_node_as_block(nir_cf_node_prev(&ch_fb->cf_node));
+   nir_block *ch_hdr = nir_loop_first_block(ch_fb);
+   nir_phi_instr *ch_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&ch_phi->instr, &ch_phi->def, 1, 32);
+   nir_phi_instr_add_src(ch_phi, ch_pre, zero_i);
+   nir_phi_instr *pa_phi[4] = {0};
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      pa_phi[t] = nir_phi_instr_create(b->shader);
+      nir_def_init(&pa_phi[t]->instr, &pa_phi[t]->def, 2, 32);
+      nir_phi_instr_add_src(pa_phi[t], ch_pre, zero_v2);
+   }
+   nir_def *ch_v = &ch_phi->def;
+   nir_if *ch_done = nir_push_if(b, nir_ige(b, ch_v, n));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, ch_done);
+
+   nir_loop *s_lp = nir_push_loop(b);
+   s_lp->control = nir_loop_control_dont_unroll;
+   nir_block *s_pre = nir_cf_node_as_block(nir_cf_node_prev(&s_lp->cf_node));
+   nir_block *s_hdr = nir_loop_first_block(s_lp);
+   nir_phi_instr *s_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&s_phi->instr, &s_phi->def, 1, 32);
+   nir_phi_instr_add_src(s_phi, s_pre, zero_i);
+   nir_def *s_v = &s_phi->def;
+   nir_if *s_done = nir_push_if(b, nir_ige_imm(b, s_v, tile_n / 8u));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, s_done);
+
+   nir_def *col_d = nir_iadd(b, nir_iadd(b, ch_v, nir_ishl_imm(b, s_v, 3)), c_l);
+
+   nir_loop *t_lp = nir_push_loop(b);
+   t_lp->control = nir_loop_control_dont_unroll;
+   nir_block *t_pre = nir_cf_node_as_block(nir_cf_node_prev(&t_lp->cf_node));
+   nir_block *t_hdr = nir_loop_first_block(t_lp);
+   nir_phi_instr *t_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&t_phi->instr, &t_phi->def, 1, 32);
+   nir_phi_instr_add_src(t_phi, t_pre, zero_i);
+   nir_phi_instr *a_phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&a_phi->instr, &a_phi->def, 1, 32);
+   nir_phi_instr_add_src(a_phi, t_pre, zero_f);
+   nir_def *t_v = &t_phi->def;
+   nir_if *t_done = nir_push_if(b, nir_ige_imm(b, t_v, 9));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, t_done);
+
+   nir_def *ky = nir_bcsel(b, nir_ige_imm(b, t_v, 6), nir_imm_int(b, 2),
+                           nir_b2i32(b, nir_ige_imm(b, t_v, 3)));
+   nir_def *kx = nir_isub(b, t_v, nir_imul_imm(b, ky, 3));
+   nir_def *pad_y = nir_iadd(b, nir_ishl_imm(b, dw_oy, 1), ky);
+   nir_def *pad_x = nir_iadd(b, nir_ishl_imm(b, dw_ox, 1), kx);
+   nir_def *iy64 = nir_isub(b, nir_u2u64(b, pad_y), nir_i2i64(b, pval[1]));
+   nir_def *ix64 = nir_isub(b, nir_u2u64(b, pad_x), nir_i2i64(b, pval[2]));
+   nir_def *ic64 = nir_isub(b, nir_u2u64(b, col_d), nir_i2i64(b, pval[3]));
+   nir_def *in_box = nir_iand(
+      b, nir_ieq_imm(b, pval[0], 0),
+      nir_iand(
+         b, nir_iand(b, nir_ige_imm(b, iy64, 0), nir_ilt(b, iy64, nir_u2u64(b, in_h_fb))),
+         nir_iand(
+            b, nir_iand(b, nir_ige_imm(b, ix64, 0), nir_ilt(b, ix64, nir_u2u64(b, in_w_fb))),
+            nir_iand(b, nir_ige_imm(b, ic64, 0), nir_ilt(b, ic64, nir_u2u64(b, n))))));
+   nir_def *iv_in = NULL;
+   nir_if *ib_if = nir_push_if(b, in_box);
+   {
+      nir_def *gr_fb = nir_iadd(
+         b, nir_imul(b, nir_u2u32(b, iy64), in_w_fb), nir_u2u32(b, ix64));
+      iv_in = emit_gemm_dw_eval_pixel(
+         b, info, epilogue, gr_fb, nir_u2u32(b, ic64), n, k, bias_mode,
+         zero_i, zero_f, lb_list);
+   }
+   nir_push_else(b, ib_if);
+   nir_pop_if(b, ib_if);
+   nir_def *iv = nir_if_phi(b, iv_in, zero_f);
+
+   nir_def *wt_va = dual_push_u64(
+      b, dual_off + offsetof(struct hk_dual_gemm_dw_push, dw_wt_va_lo), total_push_bytes);
+   nir_def *wt_idx = nir_iadd(b, nir_imul(b, t_v, n), col_d);
+   nir_def *wv = nir_load_global(
+      b, 1, 32, nir_iadd(b, wt_va, nir_u2u64(b, nir_ishl_imm(b, wt_idx, 2))),
+      .align_mul = 4, .access = read);
+   nir_def *a_nxt = dw_a_fma1(b, &a_phi->def, iv, wv, gemm_dw);
+
+   nir_block *t_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(t_phi, t_back, nir_iadd_imm(b, t_v, 1));
+   nir_phi_instr_add_src(a_phi, t_back, a_nxt);
+   nir_instr_insert(nir_before_block(t_hdr), &t_phi->instr);
+   nir_instr_insert(nir_before_block(t_hdr), &a_phi->instr);
+   nir_pop_loop(b, t_lp);
+
+   nir_def *dw_idx = nir_iadd(
+      b, nir_imul(b, nir_iadd(b, nir_imul(b, dw_oy, dw_ow), dw_ox), n), col_d);
+   nir_def *dw_out = emit_gemm_dw_store_dw_outputs(
+      b, gemm_dw, dual_off, total_push_bytes, &a_phi->def, dw_idx, col_d);
+   nir_def *op_fb = nir_ushr_imm(b, lid_fb, 3);
+   nir_def *cl_fb = nir_iadd(b, nir_ishl_imm(b, s_v, 3), c_l);
+   nir_def *sh_fb = nir_iadd(b, nir_imul_imm(b, op_fb, tile_n + 4u), cl_fb);
+   nir_store_deref(b, nir_build_deref_array(b, a_sh_f32, sh_fb), dw_out, 1);
+
+   nir_block *s_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(s_phi, s_back, nir_iadd_imm(b, s_v, 1));
+   nir_instr_insert(nir_before_block(s_hdr), &s_phi->instr);
+   nir_pop_loop(b, s_lp);
+
+   nir_def *p_in[4] = {0}, *p_out[4] = {0};
+   for (unsigned t = 0; t < p_n_tiles; ++t)
+      p_in[t] = &pa_phi[t]->def;
+   emit_gemm_dw_proj_pks(b, gemm_dw, tile_n, proj_off, total_push_bytes,
+                         a_sh_v2, ch_v, zero_i, p_in, p_out);
+
+   nir_def *ch_next = nir_iadd_imm(b, ch_v, tile_n);
+   nir_if *chn_if = nir_push_if(b, nir_ilt(b, ch_next, n));
+   {
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_modes = nir_var_mem_shared,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL);
+   }
+   nir_pop_if(b, chn_if);
+
+   nir_block *ch_back = nir_cursor_current_block(b->cursor);
+   nir_phi_instr_add_src(ch_phi, ch_back, ch_next);
+   nir_instr_insert(nir_before_block(ch_hdr), &ch_phi->instr);
+   for (unsigned t = 0; t < p_n_tiles; ++t) {
+      nir_phi_instr_add_src(pa_phi[t], ch_back, p_out[t]);
+      nir_instr_insert(nir_before_block(ch_hdr), &pa_phi[t]->instr);
+   }
+   nir_pop_loop(b, ch_fb);
+
+   nir_def *p_final[4] = {0};
+   for (unsigned t = 0; t < p_n_tiles; ++t)
+      p_final[t] = &pa_phi[t]->def;
+   emit_gemm_dw_proj_store(b, gemm_dw, dual_off, proj_off, total_push_bytes,
+                           zero_v2, p_final);
 }
 
 nir_shader *
@@ -8950,12 +10503,16 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
    const bool unguarded_only_tile =
       tile_n == 24 || tile_n == 48 || (tile_m == 64 && tile_n == 64) ||
       (tile_m == 32 && (tile_n == 16 || tile_n == 32)) || tile_m == 16;
+   const bool exp_dw_a = dw_a != NULL && dw_a->has_expand;
    if (!producer || !info || !info->cmat_valid || !valid_tile ||
        (unguarded_only_tile && info->is_guarded))
       return NULL;
    if ((im2col_a && dw_a) || (gemm_dw && (im2col_a || dw_a)))
       return NULL;
    if (dw_a && info->is_guarded)
+      return NULL;
+   if (exp_dw_a && (tile_m != 64 ||
+                    dual_write == HK_COMPUTE_PAIR_DUAL_PAD4))
       return NULL;
    if ((dual_write == HK_COMPUTE_PAIR_DUAL_GEMM_DW) != (gemm_dw != NULL))
       return NULL;
@@ -8984,23 +10541,45 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
         producer->info.float_controls_execution_mode !=
            dw_a->epilogue.float_controls_execution_mode))
       return NULL;
+   if (exp_dw_a && dw_a->has_exp_epilogue &&
+       (!hk_nir_clamp_epilogue_valid(&dw_a->exp_epilogue) ||
+        producer->info.float_controls_execution_mode !=
+           dw_a->exp_epilogue.float_controls_execution_mode))
+      return NULL;
    if (gemm_dw && gemm_dw->has_epilogue &&
        (!hk_nir_clamp_epilogue_valid(&gemm_dw->epilogue) ||
         producer->info.float_controls_execution_mode !=
            gemm_dw->epilogue.float_controls_execution_mode))
       return NULL;
+   const bool gemm_dw_proj = gemm_dw != NULL && gemm_dw->has_proj;
+   if (gemm_dw_proj) {
+      if (gemm_dw->proj_tile_n != 16 && gemm_dw->proj_tile_n != 24 &&
+          gemm_dw->proj_tile_n != 32 && gemm_dw->proj_tile_n != 64)
+         return NULL;
+      if (gemm_dw->has_proj_epilogue &&
+          (!hk_nir_clamp_epilogue_valid(&gemm_dw->proj_epilogue) ||
+           producer->info.float_controls_execution_mode !=
+              gemm_dw->proj_epilogue.float_controls_execution_mode))
+         return NULL;
+   }
 
    const uint32_t dual_off = hk_dual_write_push_offset(info->push_bytes);
+   const uint32_t proj_off = hk_dual_gemm_dw_proj_push_offset(info->push_bytes);
    const uint32_t im2_off = hk_im2col_a_push_offset(info->push_bytes, dual_write);
    const uint32_t dw_off = hk_dw_a_push_offset(info->push_bytes, dual_write);
+   const uint32_t exp_off = hk_exp_dw_a_push_offset(info->push_bytes, dual_write);
    uint32_t total_push_bytes =
       im2col_a
          ? im2_off + sizeof(struct hk_im2col_a_push)
-         : (dw_a
-               ? dw_off + sizeof(struct hk_dw_a_push)
-               : (dual_write != HK_COMPUTE_PAIR_DUAL_NONE
-                     ? dual_off + hk_dual_write_push_size(dual_write)
-                     : info->push_bytes));
+         : (exp_dw_a
+               ? exp_off + sizeof(struct hk_exp_dw_a_push)
+               : (dw_a
+                     ? dw_off + sizeof(struct hk_dw_a_push)
+                     : (gemm_dw_proj
+                           ? proj_off + sizeof(struct hk_dual_gemm_dw_proj_push)
+                           : (dual_write != HK_COMPUTE_PAIR_DUAL_NONE
+                                 ? dual_off + hk_dual_write_push_size(dual_write)
+                                 : info->push_bytes))));
    if (total_push_bytes > 256u)
       return NULL;
 
@@ -9015,16 +10594,20 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
          : (dual_write == HK_COMPUTE_PAIR_DUAL_PAD4 ? "_dpad4"
             : (dual_write == HK_COMPUTE_PAIR_DUAL_FADD_EP ? "_dfadd"
                : (dual_write == HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY ? "_dfaddcopy"
-                  : (dual_write == HK_COMPUTE_PAIR_DUAL_GEMM_DW ? "_gemmdw" : "")))));
+                  : (dual_write == HK_COMPUTE_PAIR_DUAL_GEMM_DW
+                        ? (gemm_dw_proj ? "_gemmdwproj" : "_gemmdw")
+                        : "")))));
    const char *tile_sfx =
       (tile_m == 64 && tile_n == 64) ? "x64" :
       (tile_m == 32 && tile_n != 64) ? "_m32" :
       (tile_m == 16) ? "_m16" : "";
+   const bool exp_im2_dw_a = exp_dw_a && dw_a->has_exp_im2col;
+   const bool exp_1x1_dw_a = exp_dw_a && !dw_a->has_exp_im2col;
    nir->info.name = ralloc_asprintf(nir, "%s_gemm_cmat%u%s%s%s%s%s",
                                     producer->info.name ? producer->info.name : "cs",
                                     tile_n, tile_sfx,
                                     info->is_guarded ? "" : "_ug",
-                                    im2col_a ? "_im2a" : (dw_a ? "_dwa" : ""),
+                                    im2col_a ? "_im2a" : (exp_im2_dw_a ? "_im2expdwa" : (exp_1x1_dw_a ? "_exp1x1dwa" : (dw_a ? "_dwa" : ""))),
                                     epilogue ? "_clamp" : "", dual_sfx);
 
    /* XOR-swizzled shared A geometry (2 A vec4s per thread for all variants):
@@ -9057,17 +10640,25 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
    const unsigned wg_size = tile_m == 16 ? 64 : 128;
    const unsigned wg_size_shift = tile_m == 16 ? 6 : 7;
    const unsigned a_sh_floats = tile_m == 16 ? 512u : 1024u;
-   const bool pipe_b = (!info->is_guarded && (n_k_slices == 2 || n_n_tiles <= 2));
+   const bool pipe_b = (!info->is_guarded && (n_k_slices == 2 || n_n_tiles <= 3));
    const bool prefetch_a =
-      (!info->is_guarded && !im2col_a && !dw_a &&
+      (!info->is_guarded && !im2col_a && !dw_a && !gemm_dw_proj &&
        !(n_m_tiles == 4 && n_n_tiles >= 4) && !(gemm_dw && tile_n == 48));
    const bool prefetch_va1 =
       (prefetch_a && (n_m_tiles * n_n_tiles) <= 6u && !(gemm_dw && tile_n == 24));
 
+   const unsigned a_sh_alloc =
+      gemm_dw ? (81u * tile_n) : (exp_im2_dw_a ? 3200u : (exp_1x1_dw_a ? 1600u : a_sh_floats));
    nir_variable *a_sh_var = nir_variable_create(
       nir, nir_var_mem_shared,
-      glsl_array_type(glsl_float_type(), gemm_dw ? (81u * tile_n) : a_sh_floats, 4),
+      glsl_array_type(glsl_float_type(), a_sh_alloc, 4),
       "gemm_a_sh");
+   nir_variable *sh_exp_var = exp_dw_a
+      ? nir_variable_create(
+           nir, nir_var_mem_shared,
+           glsl_array_type(glsl_float_type(), exp_im2_dw_a ? 896u : 2400u, 4),
+           "gemm_exp_sh")
+      : NULL;
    nir->info.workgroup_size[0] = wg_size;
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
@@ -9122,6 +10713,30 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
    nir_deref_instr *a_sh_v4 = nir_build_deref_cast_with_alignment(
       &b, &a_sh_base->def, nir_var_mem_shared,
       glsl_array_type(glsl_vector_type(GLSL_TYPE_FLOAT, 4), 0, 16), 0, 16, 0);
+   nir_deref_instr *sh_exp_v2 = NULL, *sh_exp_v4 = NULL;
+   nir_def *exp_y0 = NULL, *exp_x0 = NULL;
+   if (exp_dw_a) {
+      nir_deref_instr *sh_exp_base = nir_build_deref_var(&b, sh_exp_var);
+      sh_exp_v2 = nir_build_deref_cast_with_alignment(
+         &b, &sh_exp_base->def, nir_var_mem_shared,
+         glsl_array_type(glsl_vector_type(GLSL_TYPE_FLOAT, 2), 0, 8), 0, 8, 0);
+      sh_exp_v4 = nir_build_deref_cast_with_alignment(
+         &b, &sh_exp_base->def, nir_var_mem_shared,
+         glsl_array_type(glsl_vector_type(GLSL_TYPE_FLOAT, 4), 0, 16), 0, 16, 0);
+      nir_def *in_w_e = nir_iand_imm(
+         &b, dw_push(&b, dw_off + offsetof(struct hk_dw_a_push, in_wh), total_push_bytes),
+         0xffff);
+      nir_def *tx_mp_e = dw_push(
+         &b, exp_off + offsetof(struct hk_exp_dw_a_push, tiles_x_m_prime), total_push_bytes);
+      nir_def *tx_sh_e = dw_push(
+         &b, exp_off + offsetof(struct hk_exp_dw_a_push, tiles_x_udiv_sh), total_push_bytes);
+      struct hk_nir_fast_udiv tx_div_e =
+         im2col_a_push_udiv(&b, nir_ushr_imm(&b, in_w_e, 3), tx_mp_e, tx_sh_e, 0);
+      nir_def *wg_ty_e = NULL, *wg_tx_e = NULL;
+      hk_nir_fast_udivmod(&b, &tx_div_e, nir_channel(&b, wg_id, 1), &wg_ty_e, &wg_tx_e);
+      exp_y0 = nir_ishl_imm(&b, wg_ty_e, 3);
+      exp_x0 = nir_ishl_imm(&b, wg_tx_e, 3);
+   }
 
    /* Precompute loop-invariant u16 XOR-swizzled 4 KiB shared A indices:
     *   64x16 (k_step=16): sh_idx4 = (r << 2) | (c4 ^ (r & 3)), row+32 is +128
@@ -9183,13 +10798,69 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
                                      nir_uge(&b, nir_iadd_imm(&b, m, -(int32_t)tile_m), wg_row));
    }
 
-   nir_def *b_col0 = nir_iadd(&b, nir_iadd(&b, wg_col, sg_col), col_in_8);
-   nir_def *b_k0_base = nir_iadd(&b, nir_imul(&b, row_in_8, n), b_col0);
-
    nir_def *zero_i = nir_imm_int(&b, 0);
    nir_def *zero_f = nir_imm_float(&b, 0.0f);
    nir_def *zero_v2 = nir_vec2(&b, zero_f, zero_f);
    nir_def *zero_v4 = nir_vec4(&b, zero_f, zero_f, zero_f, zero_f);
+
+   if (exp_im2_dw_a) {
+      emit_cmat_exp_dw_a_preload(
+         &b, dw_a, dw_off, exp_off, info->k_offset_B, total_push_bytes,
+         sh_exp_v2, sh_exp_v4, a_sh_v2, a_sh_v4, exp_y0, exp_x0, wg_col,
+         zero_i, zero_f, zero_v2, zero_v4, &lb_list);
+   } else if (exp_1x1_dw_a) {
+      emit_cmat_exp1x1_dw_a_preload(
+         &b, dw_off, exp_off, total_push_bytes,
+         sh_exp_v4, exp_y0, exp_x0, zero_v4);
+   }
+
+   /* When gemm_dw_proj is active (gx == 1), hoist the pad_b == {0,0,0,0} check
+    * OUTSIDE ch_lp so the rare fallback (zlp) executes once rather than being
+    * multiplied by N / tile_n in static work bounds. */
+   const unsigned p_n_tiles =
+      gemm_dw_proj ? (gemm_dw->proj_tile_n == 16 ? 1u : (gemm_dw->proj_tile_n == 64 ? 4u : 2u)) : 0u;
+   nir_if *gdw_pad_if = NULL;
+   nir_loop *ch_lp = NULL;
+   nir_block *ch_hdr = NULL;
+   nir_phi_instr *ch_phi = NULL;
+   nir_phi_instr *p_acc_phi[4] = {0};
+   if (gemm_dw_proj) {
+      nir_def *pad_va = dual_push_u64(
+         &b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_va_lo),
+         total_push_bytes);
+      nir_def *pad_or = zero_i;
+      for (unsigned d = 0; d < 4; ++d) {
+         nir_def *pidx = dw_push(
+            &b, dual_off + offsetof(struct hk_dual_gemm_dw_push, pad_idx) + 4 * d,
+            total_push_bytes);
+         nir_def *pv = nir_load_global(
+            &b, 1, 32, nir_iadd(&b, pad_va, nir_u2u64(&b, nir_ishl_imm(&b, pidx, 2))),
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+         pad_or = d ? nir_ior(&b, pad_or, pv) : pv;
+      }
+      gdw_pad_if = nir_push_if(&b, nir_ieq_imm(&b, pad_or, 0));
+
+      ch_lp = nir_push_loop(&b);
+      hk_nir_loop_binding_add(&lb_list, ch_lp, HK_PACK_LOOP_PARAM_DW_KH);
+      ch_lp->control = nir_loop_control_dont_unroll;
+      nir_block *ch_pre = nir_cf_node_as_block(nir_cf_node_prev(&ch_lp->cf_node));
+      ch_hdr = nir_loop_first_block(ch_lp);
+      ch_phi = nir_phi_instr_create(b.shader);
+      nir_def_init(&ch_phi->instr, &ch_phi->def, 1, 32);
+      nir_phi_instr_add_src(ch_phi, ch_pre, zero_i);
+      for (unsigned t = 0; t < p_n_tiles; ++t) {
+         p_acc_phi[t] = nir_phi_instr_create(b.shader);
+         nir_def_init(&p_acc_phi[t]->instr, &p_acc_phi[t]->def, 2, 32);
+         nir_phi_instr_add_src(p_acc_phi[t], ch_pre, zero_v2);
+      }
+      nir_if *ch_done = nir_push_if(&b, nir_ige(&b, &ch_phi->def, n));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, ch_done);
+      wg_col = &ch_phi->def;
+   }
+
+   nir_def *b_col0 = nir_iadd(&b, nir_iadd(&b, wg_col, sg_col), col_in_8);
+   nir_def *b_k0_base = nir_iadd(&b, nir_imul(&b, row_in_8, n), b_col0);
 
    const bool hoist_im2_rc =
       im2col_a && dual_write != HK_COMPUTE_PAIR_DUAL_PAD4;
@@ -9240,7 +10911,8 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
    }
 
    const bool hoist_dw_rc =
-      dw_a != NULL && !info->is_guarded && dual_write != HK_COMPUTE_PAIR_DUAL_PAD4;
+      dw_a != NULL && !exp_dw_a && !info->is_guarded &&
+      dual_write != HK_COMPUTE_PAIR_DUAL_PAD4;
    nir_def *dw_yx0 = NULL;
    if (hoist_dw_rc) {
       nir_def *r0_dw = nir_ishl_imm(&b, nir_ushr_imm(&b, lid, a_c4_shift), 1);
@@ -9362,6 +11034,15 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
             im2_oy0, im2_ox0, im2_yb0, im2_xb0, im2_yb1, im2_xb1,
             im2_kyx_phi ? &im2_kyx_phi->def : NULL,
             zero_i, zero_f, zero_v4);
+      } else if (exp_im2_dw_a) {
+         emit_cmat_exp_dw_a_store_sh(
+            &b, dw_a, dw_off, info->k_offset_B, total_push_bytes,
+            a_sh_v4, exp_y0, exp_x0, k_base, wg_col, zero_i, zero_f);
+      } else if (exp_1x1_dw_a) {
+         emit_cmat_exp1x1_dw_a_store_sh(
+            &b, dw_a, dw_off, exp_off, info->k_offset_B, total_push_bytes,
+            sh_exp_v2, a_sh_v2, a_sh_v4, exp_y0, exp_x0, k_base, wg_col,
+            zero_i, zero_f, zero_v2, &lb_list);
       } else if (dw_a) {
          emit_cmat_dw_a_store_sh_pair(
             &b, dw_a, dw_off, info->k_offset_B, total_push_bytes,
@@ -10366,6 +12047,47 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
          n_n_tiles, dual_off, total_push_bytes, a_sh_f32, a_sh_v2, a_sh_v4,
          n, k, bias_mode, wg_col, zero_i, zero_f, zero_v2, zero_v4, acc,
          &lb_list);
+      if (gemm_dw_proj) {
+         nir_def *p_in[4] = {0}, *p_out[4] = {0};
+         for (unsigned t = 0; t < p_n_tiles; ++t)
+            p_in[t] = &p_acc_phi[t]->def;
+         emit_gemm_dw_proj_pks(&b, gemm_dw, tile_n, proj_off, total_push_bytes,
+                               a_sh_v2, wg_col, zero_i, p_in, p_out);
+
+         nir_def *ch_next = nir_iadd_imm(&b, wg_col, tile_n);
+         nir_if *chn_if = nir_push_if(&b, nir_ilt(&b, ch_next, n));
+         {
+            nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = SCOPE_WORKGROUP,
+                        .memory_modes = nir_var_mem_shared,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL);
+         }
+         nir_pop_if(&b, chn_if);
+
+         nir_block *ch_back = nir_cursor_current_block(b.cursor);
+         nir_phi_instr_add_src(ch_phi, ch_back, ch_next);
+         nir_instr_insert(nir_before_block(ch_hdr), &ch_phi->instr);
+         for (unsigned t = 0; t < p_n_tiles; ++t) {
+            nir_phi_instr_add_src(p_acc_phi[t], ch_back, p_out[t]);
+            nir_instr_insert(nir_before_block(ch_hdr), &p_acc_phi[t]->instr);
+         }
+         nir_pop_loop(&b, ch_lp);
+
+         nir_def *p_final[4] = {0};
+         for (unsigned t = 0; t < p_n_tiles; ++t)
+            p_final[t] = &p_acc_phi[t]->def;
+         emit_gemm_dw_proj_store(&b, gemm_dw, dual_off, proj_off,
+                                 total_push_bytes, zero_v2, p_final);
+
+         nir_push_else(&b, gdw_pad_if);
+         {
+            emit_gemm_dw_proj_fallback(&b, info, epilogue, gemm_dw, tile_n,
+                                       dual_off, proj_off, total_push_bytes,
+                                       a_sh_f32, a_sh_v2, n, k, bias_mode,
+                                       zero_i, zero_f, zero_v2, &lb_list);
+         }
+         nir_pop_if(&b, gdw_pad_if);
+      }
    } else {
    struct hk_gemm_dual_ctx dual = {.mode = dual_write};
    const struct hk_gemm_dual_ctx *dual_ptr = NULL;
@@ -10458,12 +12180,24 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
                                   nir_iand_imm(&b, nir_ushr_imm(&b, lane_ep, 2), 4));
    nir_def *col8_ep = nir_ior(&b, nir_ishl_imm(&b, nir_iand_imm(&b, lane_ep, 1), 1),
                                   nir_iand_imm(&b, nir_ushr_imm(&b, lane_ep, 1), 4));
-   nir_def *c_row0 = nir_iadd(&b, nir_iadd(&b, wg_row, sg_row_ep), row8_ep);
+   nir_def *c_row0 = NULL;
+   nir_def *c_row_stride = NULL;
+   if (exp_dw_a) {
+      nir_def *in_w_ep = nir_iand_imm(
+         &b, dw_push(&b, dw_off + offsetof(struct hk_dw_a_push, in_wh), total_push_bytes),
+         0xffff);
+      c_row0 = nir_iadd(
+         &b, nir_imul(&b, nir_iadd(&b, exp_y0, nir_ushr_imm(&b, sg_row_ep, 3)), in_w_ep),
+         nir_iadd(&b, exp_x0, row8_ep));
+      c_row_stride = in_w_ep;
+   } else {
+      c_row0 = nir_iadd(&b, nir_iadd(&b, wg_row, sg_row_ep), row8_ep);
+   }
    nir_def *c_col0 = nir_iadd(&b, nir_iadd(&b, wg_col, sg_col_ep), col8_ep);
 
    if (!info->is_guarded) {
       emit_gemm_cmat_store_fast(&b, info, epilogue, dual_ptr, n_m_tiles, n_n_tiles,
-                                n, bias_mode, wg_row, c_row0, c_col0, acc);
+                                n, bias_mode, wg_row, c_row0, c_col0, c_row_stride, acc);
    } else {
       nir_def *sg_col_base_ep = nir_iadd(&b, wg_col, sg_col_ep);
       nir_def *n_sg_rem_ep = nir_bcsel(&b, nir_ult(&b, sg_col_base_ep, n),
@@ -10472,7 +12206,7 @@ hk_nir_build_gemm_cmat_tiled_with_bound(
          &b, nir_iand(&b, tile_m_full_inv, nir_uge_imm(&b, n_sg_rem_ep, 8 * n_n_tiles)));
       {
          emit_gemm_cmat_store_fast(&b, info, epilogue, dual_ptr, n_m_tiles, n_n_tiles,
-                                   n, bias_mode, wg_row, c_row0, c_col0, acc);
+                                   n, bias_mode, wg_row, c_row0, c_col0, NULL, acc);
       }
       nir_push_else(&b, cf_if);
       {

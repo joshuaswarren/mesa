@@ -40,6 +40,9 @@ struct agx3_g17p_native_compute_program_desc {
    uint64_t program_va;
    uint64_t shader_va;
    struct agx3_cdm_direct_template_sources launch_sources;
+   /* M5: every launch's ordering record takes memory scope
+    * (agx_cdm_ordering_memory_scope(), the device's choice). */
+   bool ordering_memory_scope;
 };
 
 struct agx3_g17s_minimal_compute_program_desc {
@@ -74,6 +77,8 @@ struct agx3_compute_program {
    /* Set only by agx3_g17g_native_compute_program_bind, the G18G path. */
    bool g17g_native_compute_live_bound;
    bool m5_native_compute_live_bound;
+   /* agx3_g17p_native_compute_program_desc::ordering_memory_scope */
+   bool ordering_memory_scope;
 
    /* Only the live G17S minimal-resource preparation path sets this.  Keep
     * research composers and the zero-relocation witness out of a command

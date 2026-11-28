@@ -67,8 +67,8 @@ enum agx_chip_cap {
     * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
     * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
     * launch-rate floor on large grids. Measured and qualified on G17P
-    * (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G18G, and
-    * AGX2 until per-generation hardware A/B and CTS rows are collected. */
+    * (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G17D, G15, G16, G18G,
+    * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 
    /* A compute or transfer barrier between work of one CDM stream that makes
@@ -88,8 +88,9 @@ enum agx_chip_cap {
    /* Register allocation tie-breaks co-read GPR pairs across the three 32-bit
     * register banks ((reg / 2) % 3) and coalesces single-use loop RMW
     * accumulator chains on non-preamble shaders. Measured and qualified on
-    * G17P (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G18G,
-    * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
+    * G17P (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G15, G16, G17D,
+    * G18G and AGX2 until per-generation hardware A/B and CTS rows are
+    * collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 
    /* Private Gen10 colour and depth compression. In Gallium: single-level,
@@ -163,12 +164,73 @@ enum agx_chip_cap {
     * reuse, push-descriptor elision, and direct fragment-root comparisons
     * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
+
+   /* Compute shaders skip the bottom-up register-pressure scheduler: it
+    * moves each load next to its use, which serializes the memory round
+    * trips of small compute kernels (the LLM decode chain). The ILP
+    * scheduler still runs. Measured on G13G and G13X (+1.7% tokens/s,
+    * bit-identical results); other generations keep the scheduler until
+    * they are measured. */
+   AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED = 1u << 23,
+
+   /* Constant deltas between a block's shared-memory accesses fold into the
+    * lload/lstore index immediate (4 elements of the access type per unit).
+    * Measured on G13G and G13X; other generations keep the unfolded
+    * addresses until they are measured. */
+   AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
+
+   /* AGX2 compute streams defer the post-launch CDM cache flush until the
+    * next launch sees a declared barrier, a non-deferred/meta launch runs,
+    * or the compute stream closes, avoiding redundant 0x1ff barriers between
+    * independent dispatches. Measured on G13G and G13X (0 regressions on
+    * synchronization/memory_model/compute CTS). */
+   AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
+
+   /* Compute device stores (`AGX_OPCODE_DEVICE_STORE` in MESA_SHADER_COMPUTE)
+    * pack with the AGX3 coherent-store bit (`stdev f75=1`, `d.coherent=true`).
+    *
+    * Why this is valid and coherent on G17P (AGX3b, Apple A18 Pro):
+    * - `stdev f75=1` is the hardware coherent-store encoding (the same bit
+    *   already emitted for NIR `ACCESS_COHERENT` stores). Rather than
+    *   write-allocating dirty lines into the executing core's private L1 cache,
+    *   the store bypasses L1 write-allocation and writes through to the shared
+    *   coherent L2 domain, keeping per-core L1 capacity available for streaming
+    *   compute reads.
+    * - Promoting non-coherent compute device stores to `f75=1` is strictly
+    *   stronger, never weaker, than `f75=0`: stores reach the shared L2 point
+    *   of coherence directly instead of staying dirty in private L1, same-core
+    *   subsequent reads remain coherent with the store buffer / L1-L2 protocol,
+    *   and cross-workgroup visibility (after `AGX3_BARRIER_SCOPE_DEVICE_FENCE`)
+    *   plus cross-dispatch / host visibility (after Vulkan memory barriers and
+    *   CDM cache flushes) continue to invalidate consumer caches against L2.
+    * - Every AGX3b `stdev` operand form encodes `f75=1` in
+    *   `agx3_mem_encode_store` (unlike AGX3d / G18G, which refuses coherent
+    *   stores).
+    *
+    * Enabled on G17P where per-commit J700 A/B and cross-workgroup /
+    * post-barrier visibility tests verify both correctness and compute
+    * performance; off on other chips until measured per generation. */
+   AGX_CAP_COMPUTE_COHERENT_STORE = 1u << 26,
+
+   /* Large buffer-to-buffer copies (>= 32 MiB, >= 64 MiB combined working set)
+    * benefit from writing the destination through a linear RGBA32_UINT PBE
+    * storage texel buffer instead of batched compute stores without serializing
+    * across queued copies. Measured on G17C (+11.5% at d=8, parity at d=1/4,
+    * avoiding the 24-28 MiB SLC-edge regression); G17P serializes queued PBE
+    * copies (-2.27% at d=4, -7.14% at d=8), and other M5 SKUs (G17G, G17S,
+    * G17D) remain off until measured on hardware. */
+   AGX_CAP_PBE_QUEUED_BUFFER_COPY = 1u << 27,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
 #define AGX_CAPS_AGX2                                                          \
    (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
     AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
+
+/* What the measured G13 chips (G13G, G13X) add over the AGX2 set. */
+#define AGX_CAPS_G13                                                           \
+   (AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |                      \
+    AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -185,9 +247,9 @@ enum agx_chip_cap {
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
     AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                                      \
     AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_CDM_OVERLAP_SPLIT |        \
-    AGX_CAP_CACHED_CMD_MEMORY)
+    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_COHERENT_STORE)
 
-/* What the M5 parts (G17G, G17S, G17C) share. */
+/* What the single-die M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS |            \
@@ -197,6 +259,23 @@ enum agx_chip_cap {
     AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |             \
     AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY)
 
+/* G17D partitions AGX_CAPS_M5 into measured capabilities (enabled) and
+ * unmeasured exclusions (kept off until measured on J775D). test-chip-caps.c
+ * asserts the two sets are disjoint and cover AGX_CAPS_M5, so adding a new
+ * capability to AGX_CAPS_M5 forces an explicit decision for G17D. */
+#define AGX_CAPS_G17D_MEASURED                                                 \
+   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
+    AGX_CAP_SPARSE_BINDING | AGX_CAP_GEN10_2D_COMPRESSION)
+
+#define AGX_CAPS_G17D_EXCLUDED                                                 \
+   (AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS | AGX_CAP_HW_TXF_BOUNDS |                \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |      \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
+    AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY |                    \
+    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_MOD3_REG_BANK_RA)
+
+#define AGX_CAPS_G17D AGX_CAPS_G17D_MEASURED
+
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
  *
@@ -205,8 +284,8 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
+   X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \
@@ -226,7 +305,8 @@ enum agx_chip_cap {
    X(G17A, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
+   X(G17C, AGX_CAPS_M5 | AGX_CAP_PBE_QUEUED_BUFFER_COPY, __VA_ARGS__)          \
+   X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
    X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
      __VA_ARGS__)
 
