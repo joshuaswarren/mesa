@@ -1157,6 +1157,9 @@ void hk_g17p_lower_task_kernel(nir_shader *nir);
 /* Lower provably non-overflowing 32-bit scalar uadd_sat(term, k) to iadd.nuw. */
 bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
 
+/* Lower naturally aligned robust2 UBO loads via 64-byte record bounds checks. */
+bool hk_lower_aligned_ubo_nir(nir_shader *nir, uint8_t static_set_mask);
+
 /* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
 bool hk_nir_merge_buffer_words(nir_shader *nir);
 
