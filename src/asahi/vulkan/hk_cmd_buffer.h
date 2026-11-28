@@ -2581,6 +2581,13 @@ struct hk_cmd_buffer {
          VkImageAspectFlags aspects;
          VkClearValue value;
          bool from_gfx;
+         /* Finalized clear-only VDM stream kept alive when an empty clear
+          * pass is deferred on native AGX3 / M5. Dropped if every cleared
+          * attachment it owns is absorbed or superseded; left in
+          * control_streams when a later render pass flushes it, so the clear
+          * stays on VDM without a VDM->CDM->VDM crossing; dropped for a
+          * compute fill on any other flush. */
+         struct hk_cs *vdm_cs;
          struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
@@ -3221,6 +3228,10 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
+
+/* As hk_flush_deferred_clears(), for the deferred clears a render pass that
+ * is being recorded did not absorb. */
+void hk_flush_deferred_clears_before_render(struct hk_cmd_buffer *cmd);
 
 /* Aspects of the depth/stencil image of the pending store are overwritten as a
  * whole before anything read them: drop those aspect stores (see

@@ -7058,6 +7058,25 @@ TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
    ralloc_free(b.shader);
 }
 
+/* Native mesh shaders reading a task payload emit load_mesh_payload_address_agx
+ * (SR62/SR63). Divergence analysis must classify it alongside
+ * load_mesh_primitive_storage_agx as divergent instead of hitting the
+ * unhandled-intrinsic assertion in debug builds. */
+TEST(NativeForms, MeshPayloadAddressDivergence)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+      &agx_nir_options, "m5 mesh payload address divergence");
+   nir_def *addr = nir_load_mesh_payload_address_agx(&b);
+   nir_def *ptr = nir_pack_64_2x32(&b, addr);
+   nir_def *val = nir_load_global(&b, 1, 32, ptr, .align_mul = 4);
+   nir_store_global(&b, val, nir_imm_int64(&b, 0x2000000),
+                    .write_mask = 1, .align_mul = 4);
+   nir_divergence_analysis(b.shader);
+   EXPECT_TRUE(addr->divergent);
+   nir_validate_shader(b.shader, "m5 mesh payload address divergence");
+   ralloc_free(b.shader);
+}
+
 /*
  * The 8x8 cooperative-matrix multiply-add exists on the AGX3B ISA (G15/G16 and
  * G17P) as well as on M5's AGX3C. These four f32matmad8x8 witnesses are real

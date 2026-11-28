@@ -52,7 +52,7 @@ static const unsigned all_caps =
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |
    AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH |
-   AGX_CAP_COMPUTE_COHERENT_STORE;
+   AGX_CAP_COMPUTE_COHERENT_STORE | AGX_CAP_PBE_QUEUED_BUFFER_COPY;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -331,6 +331,20 @@ test_compute_coherent_store(void)
    }
 }
 
+/* AGX_CAP_PBE_QUEUED_BUFFER_COPY is enabled only on G17C where queued >= 32 MiB
+ * PBE buffer copies have been hardware-qualified; G17P serializes queued PBE
+ * copies, and other M5 SKUs stay off until measured on hardware. */
+static void
+test_pbe_queued_buffer_copy(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_PBE_QUEUED_BUFFER_COPY) ==
+                    (c == AGX_CHIP_G17C),
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -351,6 +365,7 @@ main(void)
    test_g13_compute_codegen_caps();
    test_cdm_defer_flush();
    test_compute_coherent_store();
+   test_pbe_queued_buffer_copy();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,
