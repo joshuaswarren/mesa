@@ -50,13 +50,14 @@
 #define BIN_SIZE_B   40
 #define BIN_BLAKE3_B 48
 
-/* hk_api_shader_serialize(): stage and three flag bytes, then one marker
+/* hk_api_shader_serialize(): stage and four flag bytes, then one marker
  * byte and hk_shader_serialize() per variant. A compute shader has one. */
 #define BIN_STAGE_B   (BIN_HEADER_B + 0)
 #define BIN_FLAGS2_B  (BIN_HEADER_B + 2)
 #define BIN_FLAGS3_B  (BIN_HEADER_B + 3)
-#define BIN_MARKER_B  (BIN_HEADER_B + 4)
-#define BIN_INFO_B    (BIN_HEADER_B + 5)
+#define BIN_FLAGS4_B  (BIN_HEADER_B + 4)
+#define BIN_MARKER_B  (BIN_HEADER_B + 5)
+#define BIN_INFO_B    (BIN_HEADER_B + 6)
 #define BIN_INFO_END_B (BIN_INFO_B + sizeof(struct hk_shader_info))
 /* blob_write_uint32() aligns the blob first. */
 #define BIN_ROOT_B    ALIGN_POT(BIN_INFO_END_B, 4)

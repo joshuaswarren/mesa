@@ -70,18 +70,29 @@ hk_launch_tess_batched(struct hk_cmd_buffer *cmd, struct hk_shader *vs,
    if (!hk_tess_batch_open(cmd))
       return;
 
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+
    /* As hk_dispatch_with_local_size(), without its flush. */
    if (!agx_is_shader_empty(&vs->b)) {
       struct hk_cs *cs = hk_tess_batch_stage(cmd, HK_TESS_STAGE_VS);
-      hk_reserve_scratch(cmd, cs, vs);
-      hk_dispatch_g17p_native(cmd, cs, vs, grid_vs, agx_workgroup(64, 1, 1));
+      if (m5) {
+         hk_dispatch_m5_native(cmd, cs, vs, grid_vs, agx_workgroup(64, 1, 1));
+      } else {
+         hk_reserve_scratch(cmd, cs, vs);
+         hk_dispatch_g17p_native(cmd, cs, vs, grid_vs, agx_workgroup(64, 1, 1));
+      }
    }
    if (!agx_is_shader_empty(&tcs->b)) {
       struct hk_cs *cs = hk_tess_batch_stage(cmd, HK_TESS_STAGE_TCS);
-      hk_reserve_scratch(cmd, cs, tcs);
-      hk_dispatch_g17p_native(
-         cmd, cs, tcs, grid_tcs,
-         agx_workgroup(tcs->info.tess.tcs_output_patch_size, 1, 1));
+      const struct agx_workgroup wg =
+         agx_workgroup(tcs->info.tess.tcs_output_patch_size, 1, 1);
+      if (m5) {
+         hk_dispatch_m5_native(cmd, cs, tcs, grid_tcs, wg);
+      } else {
+         hk_reserve_scratch(cmd, cs, tcs);
+         hk_dispatch_g17p_native(cmd, cs, tcs, grid_tcs, wg);
+      }
    }
 
    /* Precompiled kernels record into the pre-graphics stream: stand each

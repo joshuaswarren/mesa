@@ -26,6 +26,10 @@
 #include <assert.h>
 #include <string.h>
 
+#include "util/futex.h"
+#if !UTIL_FUTEX_SUPPORTED
+#include "c11/threads.h"
+#endif
 #include "util/stack_array.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
@@ -91,10 +95,24 @@ vk_sync_is_private(const struct vk_sync *sync)
           !vk_sync_type_is_vk_sync_binary(sync->type);
 }
 
+#define VK_SYNC_PENDING_WAITERS_BIT (1u << 31)
+
+#if UTIL_FUTEX_SUPPORTED
+static uint32_t vk_sync_pending_wake_seq;
+#endif
+
 uint64_t
 vk_sync_pending_token(struct vk_sync *sync)
 {
    return p_atomic_read(&sync->pending_value);
+}
+
+uint64_t
+vk_sync_pending_begin(struct vk_sync *sync)
+{
+   ASSERTED uint32_t cur = p_atomic_inc_return(&sync->pending_submit_count);
+   assert((cur & ~VK_SYNC_PENDING_WAITERS_BIT) > 0);
+   return vk_sync_pending_token(sync);
 }
 
 void
@@ -117,6 +135,64 @@ vk_sync_note_pending(struct vk_sync *sync, uint64_t value, uint64_t token)
        * may no longer hold this signal and the clear wins.
        */
       p_atomic_cmpxchg(&sync->pending_value, token, token | 1);
+   }
+}
+
+void
+vk_sync_pending_end(struct vk_sync *sync, bool note, uint64_t value,
+                    uint64_t token)
+{
+   if (note)
+      vk_sync_note_pending(sync, value, token);
+
+   uint32_t cur = p_atomic_dec_return(&sync->pending_submit_count);
+   assert((cur & ~VK_SYNC_PENDING_WAITERS_BIT) !=
+          (VK_SYNC_PENDING_WAITERS_BIT - 1));
+
+   if (unlikely(cur == VK_SYNC_PENDING_WAITERS_BIT)) {
+      /* sync may be destroyed and freed as soon as our decrement becomes
+       * visible, so do not touch sync after this point.  Wake any waiting
+       * vk_sync_finish() through the shared wake sequence instead.
+       */
+#if UTIL_FUTEX_SUPPORTED
+      p_atomic_inc(&vk_sync_pending_wake_seq);
+      futex_wake(&vk_sync_pending_wake_seq, INT32_MAX);
+#endif
+   }
+}
+
+static void
+vk_sync_wait_pending_notes(struct vk_sync *sync)
+{
+   if (likely((p_atomic_read(&sync->pending_submit_count) &
+               ~VK_SYNC_PENDING_WAITERS_BIT) == 0))
+      return;
+
+   for (;;) {
+#if UTIL_FUTEX_SUPPORTED
+      uint32_t wake_seq = p_atomic_read(&vk_sync_pending_wake_seq);
+#endif
+      uint32_t cur = p_atomic_read(&sync->pending_submit_count);
+
+      while ((cur & ~VK_SYNC_PENDING_WAITERS_BIT) != 0 &&
+             !(cur & VK_SYNC_PENDING_WAITERS_BIT)) {
+         uint32_t prev = p_atomic_cmpxchg(&sync->pending_submit_count, cur,
+                                          cur | VK_SYNC_PENDING_WAITERS_BIT);
+         if (prev == cur) {
+            cur |= VK_SYNC_PENDING_WAITERS_BIT;
+            break;
+         }
+         cur = prev;
+      }
+
+      if ((cur & ~VK_SYNC_PENDING_WAITERS_BIT) == 0)
+         return;
+
+#if UTIL_FUTEX_SUPPORTED
+      futex_wait(&vk_sync_pending_wake_seq, wake_seq, NULL);
+#else
+      thrd_yield();
+#endif
    }
 }
 
@@ -189,6 +265,7 @@ void
 vk_sync_finish(struct vk_device *device,
                struct vk_sync *sync)
 {
+   vk_sync_wait_pending_notes(sync);
    sync->type->finish(device, sync);
 }
 
@@ -242,10 +319,9 @@ vk_sync_signal(struct vk_device *device,
                uint64_t value)
 {
    assert_signal_valid(sync, value);
-   const uint64_t token = vk_sync_pending_token(sync);
+   const uint64_t token = vk_sync_pending_begin(sync);
    VkResult result = sync->type->signal(device, sync, value);
-   if (likely(result == VK_SUCCESS))
-      vk_sync_note_pending(sync, value, token);
+   vk_sync_pending_end(sync, likely(result == VK_SUCCESS), value, token);
    return result;
 }
 
@@ -285,28 +361,23 @@ vk_sync_signal_many(struct vk_device *device,
    if (can_signal_many(device, signal_count, signals)) {
       STACK_ARRAY(uint64_t, tokens, signal_count);
       for (uint32_t i = 0; i < signal_count; i++)
-         tokens[i] = vk_sync_pending_token(signals[i].sync);
+         tokens[i] = vk_sync_pending_begin(signals[i].sync);
 
       VkResult result =
          signals[0].sync->type->signal_many(device, signal_count, signals);
-      if (likely(result == VK_SUCCESS)) {
-         for (uint32_t i = 0; i < signal_count; i++) {
-            vk_sync_note_pending(signals[i].sync, signals[i].signal_value,
-                                 tokens[i]);
-         }
+      for (uint32_t i = 0; i < signal_count; i++) {
+         vk_sync_pending_end(signals[i].sync, likely(result == VK_SUCCESS),
+                             signals[i].signal_value, tokens[i]);
       }
       STACK_ARRAY_FINISH(tokens);
       return result;
    }
 
    for (uint32_t i = 0; i < signal_count; i++) {
-      struct vk_sync *sync = signals[i].sync;
-      uint64_t value = signals[i].signal_value;
-      const uint64_t token = vk_sync_pending_token(sync);
-      VkResult result = sync->type->signal(device, sync, value);
+      VkResult result = vk_sync_signal(device, signals[i].sync,
+                                       signals[i].signal_value);
       if (unlikely(result != VK_SUCCESS))
          return result;
-      vk_sync_note_pending(sync, value, token);
    }
 
    return VK_SUCCESS;

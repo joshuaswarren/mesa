@@ -423,15 +423,21 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                                ushort restart, uint32_t restart_index,
                                enum agx_chip chip, enum agx_primitive topology,
-                               enum agx_index_size index_size__3)
+                               enum agx_index_size index_size__3,
+                               uint32_t batch_count)
 {
-   constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
+   uint g = get_group_id(0);
+   constant struct libagx_robust_index_draw *draw = draws + g;
+   uint64_t empty_draw_jump =
+      get_sub_group_local_id() == 0
+         ? libagx_robust_index_coalesce_empty_jump(draws, g, batch_count, chip)
+         : 0;
    libagx_draw_robust_index_impl(
       (global uint32_t *)draw->vdm, heap, printf_buffer,
       (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,
       in_buf_range_B, restart, restart_index, chip, topology,
-      draw->draw_state_offset,
-      draw->render_state_emitted, draw->empty_draw_jump, index_size__3);
+      draw->draw_state_offset, draw->render_state_emitted, empty_draw_jump,
+      index_size__3);
 }
 
 /*

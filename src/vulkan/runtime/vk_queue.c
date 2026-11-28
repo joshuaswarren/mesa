@@ -732,14 +732,16 @@ vk_queue_submit_final(struct vk_queue *queue,
          result = vk_queue_set_lost(queue, "Failed to unwrap sync signal");
    }
 
-   /* A waiter may consume a binary signal as soon as the kernel installs it,
-    * which can be before driver_submit returns.  Take the pending tokens
-    * now so that such a consume wins over vk_sync_note_pending() below.
+   /* A waiter may consume a binary signal, or destroy the sync after observing
+    * completion, as soon as the kernel installs it — which can happen before
+    * driver_submit returns.  Pin each signal sync and take its pending token
+    * now so that vk_sync_finish() waits until we are done noting pending
+    * state, and any concurrent consume wins over vk_sync_note_pending().
     */
    STACK_ARRAY(uint64_t, pending_tokens, submit->signal_count);
    for (uint32_t i = 0; i < submit->signal_count; i++) {
       pending_tokens[i] = submit->signals[i].sync != NULL ?
-                          vk_sync_pending_token(submit->signals[i].sync) : 0;
+                          vk_sync_pending_begin(submit->signals[i].sync) : 0;
    }
 
    /* For queues participating in emulation, redirect the submission to the
@@ -772,15 +774,19 @@ vk_queue_submit_final(struct vk_queue *queue,
          result = vk_queue_set_lost(queue, "queue::driver_submit failed");
          vk_queue_submit_signal_dropped(queue, submit);
       }
+      for (uint32_t i = 0; i < submit->signal_count; i++) {
+         if (submit->signals[i].sync != NULL)
+            vk_sync_pending_end(submit->signals[i].sync, false, 0, 0);
+      }
       STACK_ARRAY_FINISH(pending_tokens);
       return result;
    }
 
    for (uint32_t i = 0; i < submit->signal_count; i++) {
       if (submit->signals[i].sync != NULL) {
-         vk_sync_note_pending(submit->signals[i].sync,
-                              submit->signals[i].signal_value,
-                              pending_tokens[i]);
+         vk_sync_pending_end(submit->signals[i].sync, true,
+                             submit->signals[i].signal_value,
+                             pending_tokens[i]);
       }
    }
    STACK_ARRAY_FINISH(pending_tokens);

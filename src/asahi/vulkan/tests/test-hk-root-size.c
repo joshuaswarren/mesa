@@ -371,10 +371,31 @@ int main(void)
       assert(!hk_coalesce_workgroup_size(wg32, gsmall, 1024, out) &&
              out[0] == 32 && out[1] == 1 && out[2] == 1);
 
-      /* Prime group count along all axes cannot divide by 2 -> unchanged. */
+      /* Large prime group counts coalesce via bounded partial-edge steps
+       * (<= 6.25% inactive edge lanes), while small prime grids whose edge
+       * padding would exceed 6.25% stay uncoalesced. */
       const uint32_t gprime[3] = {32 * 997, 991, 1};
-      assert(!hk_coalesce_workgroup_size(wg32, gprime, 1024, out) &&
+      assert(hk_coalesce_workgroup_size(wg32, gprime, 1024, out) &&
+             (uint64_t)out[0] * out[1] * out[2] == 256u && out[2] == 1);
+      const uint32_t gprime_small[3] = {32 * 13, 13, 1};
+      assert(!hk_coalesce_workgroup_size(wg32, gprime_small, 1024, out) &&
              out[0] == 32 && out[1] == 1 && out[2] == 1);
+
+      /* Real odd-tiled 2D grids (1512x984 at 8x8 -> 16x16, 760x496 at 8x8 ->
+       * 16x16 after Pass 1 takes Y to 16 and Pass 2 takes X to 16). */
+      const uint16_t wg8x8[3] = {8, 8, 1};
+      const uint32_t g_odd_2d[3] = {1512, 984, 1};
+      assert(hk_coalesce_workgroup_size(wg8x8, g_odd_2d, 1024, out) &&
+             out[0] == 16 && out[1] == 16 && out[2] == 1);
+      const uint32_t g_half_odd[3] = {760, 496, 1};
+      assert(hk_coalesce_workgroup_size(wg8x8, g_half_odd, 1024, out) &&
+             out[0] == 16 && out[1] == 16 && out[2] == 1);
+      /* Asymmetric odd grid: X has only 13 groups (doubling wastes 1/13 = 7.7%
+       * > 6.25%), while Y has 301 groups (doubling to 8 wastes 3/301 = 1.0% <=
+       * 6.25% with 13 * 38 = 494 >= 256 WGs) -> coalesces along Y only. */
+      const uint32_t g_asym_odd[3] = {32 * 13, 301, 1};
+      assert(hk_coalesce_workgroup_size(wg32, g_asym_odd, 1024, out) &&
+             out[0] == 32 && out[1] == 8 && out[2] == 1);
 
       /* max_wg_threads cap (128) respected. */
       assert(hk_coalesce_workgroup_size(wg32, g118m, 128, out) &&
