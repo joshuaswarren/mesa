@@ -153,6 +153,13 @@ bool agx3_tile_store_explicit(enum agx_isa_encoding enc, uint16_t data,
                               uint16_t tile_off, uint16_t coords, bool last,
                               uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len);
 
+/* PIXINFO (AGX3B): the packed sample groups of the coverage word in half
+ * `src` into half `dest`, on scoreboard slot `slot` (1..6), waiting on the
+ * slots in `wait_mask`. Nibble k of the result holds the samples of group k. */
+bool agx3_pixinfo(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+                  uint8_t slot, uint16_t wait_mask,
+                  uint8_t out[AGX3_TILE_MAX_LENGTH], uint8_t *len);
+
 /* The lane class a compute block store names for an imageblock format, or -1:
  * 8-bit lanes, 16-bit float lanes and raw 32-bit words. */
 int agx3_block_store_lane_class(enum agx3_tile_width width, bool f16);

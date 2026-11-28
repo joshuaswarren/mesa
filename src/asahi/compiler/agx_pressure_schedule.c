@@ -1806,6 +1806,8 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
          break;
       switch (I->op) {
       case AGX_OPCODE_LD_TILE:
+         if (I->sample_groups)
+            return false;
          ++loads;
          load_target = I->colour_target;
          break;

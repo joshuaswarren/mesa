@@ -157,6 +157,38 @@ hk_compute_pair_stream_eligible(const struct hk_cs *cs)
           !cs->as_build && cs->alias_sites <= 1 && !cs->g18_dispatch_sealed;
 }
 
+/* Conservative instruction count per query thread for libagx_reset_query_struct
+ * when bounding packed query-reset command buffers. */
+#define HK_PACK_QUERY_RESET_INSTRS 32u
+
+static inline bool
+hk_pack_is_query_reset_stream(const struct hk_cs *cs)
+{
+   return cs->query_access && !cs->query_reset_pending &&
+          cs->stats.calls == 0 && cs->stats.cmds > 0 &&
+          cs->stats.query_reset_dispatches == cs->stats.cmds &&
+          cs->stats.query_reset_queries > 0;
+}
+
+static inline uint64_t
+hk_pack_member_threads(const struct hk_cs *cs, bool query_reset)
+{
+   return query_reset ? cs->stats.query_reset_queries : cs->pack_threads;
+}
+
+static inline uint64_t
+hk_pack_member_static_work(const struct hk_cs *cs, bool query_reset)
+{
+   if (!query_reset)
+      return cs->pack_static_work;
+
+   uint64_t work = 0;
+   if (__builtin_mul_overflow((uint64_t)cs->stats.query_reset_queries,
+                              HK_PACK_QUERY_RESET_INSTRS, &work))
+      return UINT64_MAX;
+   return work;
+}
+
 const struct hk_cs *
 hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
                    const uint8_t *terminate, bool atomics)
@@ -173,20 +205,30 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
 
    const struct hk_cs *cs =
       list_first_entry(&cmd->control_streams, struct hk_cs, node);
+   const bool query_reset = hk_pack_is_query_reset_stream(cs);
    const unsigned kinds = cs->sync.kind & ~HK_SYNC_GFX_MEM;
    if (cs->type != HK_CS_CDM || !kinds ||
-       ((kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) && kinds != HK_SYNC_ALL))
+       ((kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) && kinds != HK_SYNC_ALL &&
+        !(query_reset && kinds == HK_SYNC_QRESET)))
       return NULL;
 
-   /* Every launch is a direct dispatch the work estimate counts. */
-   if (!cs->stats.cmds || cs->stats.cmds != cs->stats.calls ||
-       cs->pack_dispatches != cs->stats.calls || !cs->pack_threads)
-      return NULL;
+   if (query_reset) {
+      if ((kinds != HK_SYNC_QRESET && kinds != HK_SYNC_ALL) ||
+          cs->pack_dispatches || cs->pack_threads || cs->pack_loops)
+         return NULL;
+   } else {
+      /* Every launch is a direct dispatch the work estimate counts. */
+      if (!cs->stats.cmds || cs->stats.cmds != cs->stats.calls ||
+          cs->pack_dispatches != cs->stats.calls || !cs->pack_threads)
+         return NULL;
+   }
 
    if ((cs->uses_global_atomics && !atomics) || cs->calls_stream ||
-       cs->stream_linked || cs->sib_indirect || cs->query_access ||
+       cs->stream_linked || cs->sib_indirect ||
+       (cs->query_access && !query_reset) ||
        cs->query_reset_pending || cs->timestamp.start.handle ||
-       cs->timestamp.end.handle || cs->g17p_timestamp_query ||
+       cs->timestamp.end.handle ||
+       (cs->g17p_timestamp_query && !query_reset) ||
        cs->gen1_native_rq || cs->as_build || cs->imm_writes.size)
       return NULL;
 
@@ -257,6 +299,7 @@ hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
       member->render_tail[k] =
          cmd->sync.req[k][HK_SYNC_VDM].prior & render_kinds;
    member->render_ran = render_kinds != 0;
+   member->query_reset = hk_pack_is_query_reset_stream(cs);
 }
 
 /* The render kinds come from the fields the resolver reads, so the two agree
@@ -301,9 +344,11 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
                       const struct hk_pack_limits *limits, uint64_t max_work)
 {
    const struct hk_cs *cs = m->cs;
+   const uint64_t m_threads = hk_pack_member_threads(cs, m->query_reset);
+   const uint64_t m_work = hk_pack_member_static_work(cs, m->query_reset);
    return cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
-          cs->pack_threads <= HK_PACK_MAX_THREADS &&
-          cs->pack_static_work <= max_work &&
+          m_threads <= HK_PACK_MAX_THREADS &&
+          m_work <= max_work &&
           (!cs->pack_loops || m->obs_ns <= HK_PACK_MAX_OBS_NS) &&
           m->bytes <= UINT32_MAX - limits->overhead &&
           cs->compute_resources.size <= UINT16_MAX &&
@@ -341,6 +386,7 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    uint32_t attachments = 0;
    uint8_t kinds = 0, waits = 0, tails[HK_SYNC_NUM_KINDS] = {0};
    bool unbounded_loops = false;
+   bool run_query_reset = false;
    uint64_t obs_ns = 0;
 
    *packed_members = 0;
@@ -351,8 +397,14 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       const struct hk_cs *cs = m ? m->cs : NULL;
       const bool m_unbounded = cs && cs->pack_loops && !m->obs_ns;
       const uint64_t m_obs = (cs && cs->pack_loops) ? m->obs_ns : 0;
+      const uint64_t m_threads =
+         cs ? hk_pack_member_threads(cs, m->query_reset) : 0;
+      const uint64_t m_work =
+         cs ? hk_pack_member_static_work(cs, m->query_reset) : 0;
 
       const bool fits = cs && run.count &&
+         m->query_reset == run_query_reset &&
+         (!m->query_reset || ((m->kinds ^ kinds) & ~HK_SYNC_GFX_MEM) == 0) &&
          !(m->render_ran && (m->kinds & ~kinds)) &&
          !((m->render_waits | hk_pack_tail(tails, kinds | m->kinds)) &
            ~waits) &&
@@ -360,8 +412,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          !(m_unbounded && obs_ns > 0) &&
          m_obs <= HK_PACK_MAX_OBS_NS - obs_ns &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
-         cs->pack_threads <= HK_PACK_MAX_THREADS - threads &&
-         cs->pack_static_work <= max_work - work &&
+         m_threads <= HK_PACK_MAX_THREADS - threads &&
+         m_work <= max_work - work &&
          m->bytes <= UINT32_MAX - limits->overhead - run.bytes &&
          cs->compute_resources.size <= UINT16_MAX - resources &&
          cs->compute_attachments.count <=
@@ -370,8 +422,8 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          run.count++;
          run.bytes += m->bytes;
          dispatches += cs->stats.cmds;
-         threads += cs->pack_threads;
-         work += cs->pack_static_work;
+         threads += m_threads;
+         work += m_work;
          resources += cs->compute_resources.size;
          attachments += cs->compute_attachments.count;
          kinds |= m->kinds;
@@ -395,20 +447,22 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       resources = 0;
       attachments = 0;
       unbounded_loops = false;
+      run_query_reset = false;
       obs_ns = 0;
 
       /* Start a new run with this member when it is within the bounds. */
       if (cs && hk_pack_within_bounds(m, limits, max_work)) {
          run = (struct hk_pack_run){.first = i, .count = 1, .bytes = m->bytes};
          dispatches = cs->stats.cmds;
-         threads = cs->pack_threads;
-         work = cs->pack_static_work;
+         threads = m_threads;
+         work = m_work;
          resources = cs->compute_resources.size;
          attachments = cs->compute_attachments.count;
          kinds = m->kinds;
          waits = m->render_waits;
          memcpy(tails, m->render_tail, sizeof(tails));
          unbounded_loops = m_unbounded;
+         run_query_reset = m->query_reset;
          obs_ns = m_obs;
       }
    }
@@ -472,6 +526,7 @@ hk_pack_fold_member(struct hk_cmd_buffer *packet, struct hk_cs *cs,
             cs->sync.dep[sq].prior |= req->prior;
       }
    }
+   packet->sync.has_gpu_query_reset |= source->sync.has_gpu_query_reset;
    *preceding_kinds |= item->sync.kind;
 }
 

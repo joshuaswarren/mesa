@@ -875,6 +875,46 @@ g17p_equiv_find_probe(const struct g17p_equiv_probe *probes,
    return -1;
 }
 
+/* Intrinsics whose value depends on which sample, or which lanes of the
+ * subgroup, run the body. Shading one sample for several changes them. */
+static bool
+g17p_equiv_sample_dependent(nir_intrinsic_op op)
+{
+   switch (op) {
+   case nir_intrinsic_load_sample_id:
+   case nir_intrinsic_load_sample_pos:
+   case nir_intrinsic_load_samples_log2_agx:
+   case nir_intrinsic_load_barycentric_sample:
+   case nir_intrinsic_load_barycentric_at_sample:
+   case nir_intrinsic_load_exported_agx:
+   case nir_intrinsic_is_helper_invocation:
+   case nir_intrinsic_ballot:
+   case nir_intrinsic_vote_all:
+   case nir_intrinsic_vote_any:
+   case nir_intrinsic_vote_ieq:
+   case nir_intrinsic_vote_feq:
+   case nir_intrinsic_elect:
+   case nir_intrinsic_first_invocation:
+   case nir_intrinsic_read_invocation:
+   case nir_intrinsic_read_first_invocation:
+   case nir_intrinsic_shuffle:
+   case nir_intrinsic_shuffle_xor:
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down:
+   case nir_intrinsic_quad_broadcast:
+   case nir_intrinsic_quad_swap_horizontal:
+   case nir_intrinsic_quad_swap_vertical:
+   case nir_intrinsic_quad_swap_diagonal:
+   case nir_intrinsic_quad_ballot_agx:
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static void
 specialize_g17p_equiv_copy(nir_function_impl *impl, nir_cf_list *copy,
                            nir_def *load_samples, nir_def *store_samples,
@@ -1167,39 +1207,14 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
          case nir_intrinsic_load_sample_mask:
             continue;
 
-         case nir_intrinsic_load_sample_id:
-         case nir_intrinsic_load_sample_pos:
-         case nir_intrinsic_load_samples_log2_agx:
-         case nir_intrinsic_load_barycentric_sample:
-         case nir_intrinsic_load_barycentric_at_sample:
-         case nir_intrinsic_load_exported_agx:
-         case nir_intrinsic_is_helper_invocation:
-         case nir_intrinsic_ballot:
-         case nir_intrinsic_vote_all:
-         case nir_intrinsic_vote_any:
-         case nir_intrinsic_vote_ieq:
-         case nir_intrinsic_vote_feq:
-         case nir_intrinsic_elect:
-         case nir_intrinsic_first_invocation:
-         case nir_intrinsic_read_invocation:
-         case nir_intrinsic_read_first_invocation:
-         case nir_intrinsic_shuffle:
-         case nir_intrinsic_shuffle_xor:
-         case nir_intrinsic_shuffle_up:
-         case nir_intrinsic_shuffle_down:
-         case nir_intrinsic_quad_broadcast:
-         case nir_intrinsic_quad_swap_horizontal:
-         case nir_intrinsic_quad_swap_vertical:
-         case nir_intrinsic_quad_swap_diagonal:
-         case nir_intrinsic_quad_ballot_agx:
-         case nir_intrinsic_reduce:
-         case nir_intrinsic_inclusive_scan:
-         case nir_intrinsic_exclusive_scan:
-            return false;
-
          default: {
+            if (g17p_equiv_sample_dependent(intr->intrinsic))
+               return false;
             const unsigned flags = nir_intrinsic_infos[intr->intrinsic].flags;
             if (!(flags & NIR_INTRINSIC_CAN_ELIMINATE))
+               return false;
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
                return false;
             if (flags & NIR_INTRINSIC_QUADGROUP) {
                has_derivatives = true;
@@ -1441,6 +1456,152 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
    nir_progress(true, impl, nir_metadata_none);
    if (!has_derivatives)
       nir_lower_vars_to_ssa(shader);
+   return true;
+}
+
+/*
+ * AGX3B keeps track of which samples of a pixel hold the same tilebuffer
+ * contents, and PIXINFO returns those sample groups for the fragment's coverage
+ * (nir_intrinsic_load_sample_groups_agx). A monolithic multisample local-read
+ * body already lowered to per-sample form then needs one shading per group, not
+ * one per sample, and no software comparison of the samples:
+ *
+ *    w = groups(coverage)
+ *    loop {
+ *       load ..., mask w            ; a sample of group 0 of w
+ *       ... shade ...
+ *       store ..., mask coverage & w
+ *       w >>= 4; break if w == 0
+ *    }
+ *
+ * Every sample of a group holds the same bytes, so the group's shading is the
+ * shading of each of its samples. The body must not depend on the sample index
+ * or position, on other lanes (a divergent loop has no quads), or have side
+ * effects other than tile stores, exactly as for the probed path
+ * (agx_nir_unroll_g17p_samples_equiv()).
+ */
+bool
+agx_nir_unroll_g17p_samples_groups(nir_shader *shader, unsigned nr_samples,
+                                   enum agx_isa_encoding encoding)
+{
+   assert(shader->info.stage == MESA_SHADER_FRAGMENT);
+   if (encoding != AGX_ISA_ENCODING_AGX3B ||
+       (nr_samples != 2 && nr_samples != 4) ||
+       shader->info.fs.uses_discard || shader->info.writes_memory)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   unsigned loads = 0, stores = 0;
+   nir_intrinsic_instr *force_early_instr = NULL;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_call)
+            return false;
+         if (instr->type == nir_instr_type_tex) {
+            if (nir_tex_instr_has_implicit_derivative(nir_instr_as_tex(instr)))
+               return false;
+            continue;
+         }
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_sample_mask_agx:
+            if (shader->info.fs.early_fragment_tests && !force_early_instr &&
+                block == nir_start_block(impl) && loads == 0 && stores == 0 &&
+                nir_src_is_const(intr->src[0]) &&
+                nir_src_is_const(intr->src[1]) &&
+                nir_src_as_uint(intr->src[0]) == G17P_EQUIV_ALL_SAMPLES &&
+                nir_src_as_uint(intr->src[1]) == G17P_EQUIV_ALL_SAMPLES) {
+               force_early_instr = intr;
+               continue;
+            }
+            return false;
+
+         case nir_intrinsic_load_active_samples_agx:
+            if (!g17p_equiv_active_samples_uses_valid(&intr->def))
+               return false;
+            continue;
+
+         case nir_intrinsic_load_local_pixel_agx:
+            if (!g17p_equiv_is_valid_tile_mask(intr->src[0].ssa))
+               return false;
+            loads++;
+            continue;
+
+         case nir_intrinsic_store_local_pixel_agx:
+            if (!g17p_equiv_is_valid_tile_mask(intr->src[1].ssa))
+               return false;
+            stores++;
+            continue;
+
+         case nir_intrinsic_load_sample_mask:
+            continue;
+
+         default: {
+            if (g17p_equiv_sample_dependent(intr->intrinsic))
+               return false;
+            const unsigned flags = nir_intrinsic_infos[intr->intrinsic].flags;
+            if (!(flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
+                (flags & (NIR_INTRINSIC_QUADGROUP | NIR_INTRINSIC_SUBGROUP)))
+               return false;
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+               return false;
+            continue;
+         }
+         }
+      }
+   }
+
+   if (loads == 0 || stores == 0)
+      return false;
+
+   if (force_early_instr)
+      nir_instr_remove(&force_early_instr->instr);
+
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   if (force_early_instr)
+      nir_sample_mask_agx(&b, nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16),
+                          nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16));
+
+   /* Coverage cannot change in the body: discard, demote, depth and stencil
+    * writes and every other sample-mask update were rejected above. */
+   /* The remaining groups are shifted as a 32-bit word: G17P's SRL takes an
+    * immediate count only at 32 bits. Its low half is the 16-bit mask. */
+   nir_def *coverage = nir_load_active_samples_agx(&b);
+   nir_variable *groups =
+      nir_local_variable_create(impl, glsl_uint_type(), "sample_groups");
+   nir_store_var(&b, groups,
+                 nir_u2u32(&b, nir_load_sample_groups_agx(&b, coverage)), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   loop->control = nir_loop_control_dont_unroll;
+   {
+      nir_def *remaining = nir_load_var(&b, groups);
+      nir_def *group = nir_u2u16(&b, remaining);
+      nir_def *store_samples = nir_iand(&b, coverage, group);
+
+      nir_cf_list copy;
+      nir_cf_list_clone(&copy, &body, &impl->cf_node, NULL);
+      specialize_g17p_equiv_copy(impl, &copy, group, store_samples, NULL,
+                                 NULL, 0);
+      b.cursor = nir_cf_reinsert(&copy, b.cursor);
+
+      nir_def *rest = nir_ushr_imm(&b, remaining, 4);
+      nir_store_var(&b, groups, rest, 1);
+      nir_break_if(&b, nir_ieq_imm(&b, rest, 0));
+   }
+   nir_pop_loop(&b, loop);
+
+   nir_cf_delete(&body);
+   nir_progress(true, impl, nir_metadata_none);
+   nir_lower_vars_to_ssa(shader);
    return true;
 }
 

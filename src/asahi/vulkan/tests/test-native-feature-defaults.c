@@ -87,6 +87,14 @@ main(void)
    assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G15P));
    assert(!agx_chip_has_packed_ycbcr(AGX_CHIP_G18G));
 
+   /* Hardware ASTC HDR decode stays on across AGX2, native AGX3, and
+    * AGX3C/HAL300 (M5), and fails closed on AGX3D (G18G). */
+   assert(agx_chip_has_astc_hdr(AGX_CHIP_G13G));
+   assert(agx_chip_has_astc_hdr(AGX_CHIP_G14X));
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_astc_hdr(elide_chips[i]));
+   assert(!agx_chip_has_astc_hdr(AGX_CHIP_G18G));
+
    /* Kernel-feature-gated cumulative signals and sibling compute queues apply
     * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C/G17D) without chip
     * forks. */

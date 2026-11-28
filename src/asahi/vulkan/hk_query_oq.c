@@ -381,11 +381,12 @@ hk_resolve_oq_reverse(struct hk_cmd_buffer *cmd)
 bool
 hk_oq_render_stamps_supported(enum agx_chip chip)
 {
-   /* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) kernel runtimes publish
-    * a render's four stage timestamps only after full retirement (including
-    * end-of-render maintenance) before signalling the fence
+   /* Native HAL200 (G16G/G17P), M5 (G17G/G17S/G17C), and G18G kernel runtimes
+    * publish a render's four stage timestamps only after full retirement
+    * (including end-of-render maintenance) before signalling the fence
     * (g16/poll.rs, g17/queue/render/retirement.rs, g17/completion.rs). */
-   return agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip);
+   return agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip) ||
+          chip == AGX_CHIP_G18G;
 }
 
 void

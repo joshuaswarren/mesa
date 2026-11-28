@@ -581,8 +581,8 @@ struct agx_shader_key {
    bool has_scratch;
 
    /* Maximum thread-private scratch/spill frame in bytes admitted by the
-    * driver for this AGX3 shader. Zero defaults to AGX3_G17P_MAX_SPILL_B
-    * (4 KiB). Ignored on AGX2, which stays capped at AGX2_MAX_SPILL_SLOTS. */
+    * driver for this shader. Zero defaults to AGX3_G17P_MAX_SPILL_B (4 KiB) on
+    * AGX3 and AGX2_MAX_SPILL_SLOTS (4 KiB) of spill slots on AGX2. */
    uint32_t max_scratch_B;
 
    /* Whether we're compiling the helper program used for scratch allocation.

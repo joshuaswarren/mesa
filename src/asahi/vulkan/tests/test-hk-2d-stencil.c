@@ -813,6 +813,15 @@ test_sobel_3x3_matcher_and_builder(void)
             NULL, s, &plan, nir_address_format_64bit_bounded_global);
          assert(tiled != NULL);
          assert(tiled->info.workgroup_size[0] == 256);
+         /* Sobel 3x3 angle quantization uses cross-multiply, no SFU frcp. */
+         nir_foreach_function_impl(impl, tiled) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type == nir_instr_type_alu)
+                     assert(nir_instr_as_alu(instr)->op != nir_op_frcp);
+               }
+            }
+         }
          ralloc_free(tiled);
       }
       ralloc_free(s);
