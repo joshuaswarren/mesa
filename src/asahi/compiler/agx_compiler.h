@@ -47,8 +47,9 @@ extern "C" {
 
 /* Representable spill-slot bitfield capacity in agx_index::reg (8192 halves =
  * 16 KiB). Actual RA spill allocation is bounded per-target and per-stage in
- * agx_register_allocate.c; AGX2 stays at AGX2_MAX_SPILL_SLOTS (4 KiB) to
- * preserve its per-core agx_scratch memory bound.
+ * agx_register_allocate.c; AGX2 defaults to AGX2_MAX_SPILL_SLOTS (4 KiB) when
+ * max_scratch_B is unset and honors larger max_scratch_B up to
+ * AGX_NUM_MODELED_REGS within its 64 KiB immediate stack offset ceiling.
  */
 #define AGX_NUM_MODELED_REGS_LOG2 (13)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
